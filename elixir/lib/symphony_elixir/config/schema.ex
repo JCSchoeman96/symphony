@@ -5,6 +5,7 @@ defmodule SymphonyElixir.Config.Schema do
 
   import Ecto.Changeset
 
+  alias SymphonyElixir.AgentRuntime.Profile
   alias SymphonyElixir.PathSafety
 
   @primary_key false
@@ -153,6 +154,7 @@ defmodule SymphonyElixir.Config.Schema do
       field(:max_turns, :integer, default: 20)
       field(:max_retry_backoff_ms, :integer, default: 300_000)
       field(:max_concurrent_agents_by_state, :map, default: %{})
+      field(:profiles, :map, default: %{})
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
@@ -160,7 +162,13 @@ defmodule SymphonyElixir.Config.Schema do
       schema
       |> cast(
         attrs,
-        [:max_concurrent_agents, :max_turns, :max_retry_backoff_ms, :max_concurrent_agents_by_state],
+        [
+          :max_concurrent_agents,
+          :max_turns,
+          :max_retry_backoff_ms,
+          :max_concurrent_agents_by_state,
+          :profiles
+        ],
         empty_values: []
       )
       |> validate_number(:max_concurrent_agents, greater_than: 0)
@@ -310,7 +318,7 @@ defmodule SymphonyElixir.Config.Schema do
     |> apply_action(:validate)
     |> case do
       {:ok, settings} ->
-        {:ok, finalize_settings(settings)}
+        finalize_settings(settings)
 
       {:error, changeset} ->
         {:error, {:invalid_workflow_config, format_errors(changeset)}}
@@ -460,7 +468,19 @@ defmodule SymphonyElixir.Config.Schema do
         turn_sandbox_policy: normalize_optional_map(settings.codex.turn_sandbox_policy)
     }
 
-    %{settings | tracker: tracker, workspace: workspace, codex: codex}
+    settings = %{settings | tracker: tracker, workspace: workspace, codex: codex}
+
+    case Profile.resolve_profiles(
+           settings.agent.profiles,
+           settings.codex.command,
+           settings.agent.max_turns
+         ) do
+      {:ok, profiles} ->
+        {:ok, %{settings | agent: %{settings.agent | profiles: profiles}}}
+
+      {:error, {:invalid_profile, name, message}} ->
+        {:error, {:invalid_workflow_config, "agent.profiles.#{name} #{message}"}}
+    end
   end
 
   defp normalize_keys(value) when is_map(value) do
