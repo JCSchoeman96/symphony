@@ -113,31 +113,29 @@ defmodule SymphonyElixir.AgentRunner do
     runtime_opts = opts |> Keyword.put(:worker_host, worker_host) |> profile_runtime_options(route)
 
     with {:ok, session} <- runtime.start_session(workspace, runtime_opts) do
-      try do
-        context = %{
-          runtime: runtime,
-          app_session: session,
-          workspace: workspace,
-          issue: issue,
-          codex_update_recipient: codex_update_recipient,
-          opts: opts,
-          issue_state_fetcher: issue_state_fetcher,
-          route: route
-        }
+      context = %{
+        runtime: runtime,
+        session: session,
+        workspace: workspace,
+        issue: issue,
+        codex_update_recipient: codex_update_recipient,
+        opts: opts,
+        issue_state_fetcher: issue_state_fetcher,
+        route: route
+      }
 
+      run_runtime_session(runtime, session, fn ->
         do_run_codex_turns(context, 1, max_turns)
-      after
-        runtime.stop_session(session)
-      end
+      end)
     end
   end
 
   defp do_run_codex_turns(context, turn_number, max_turns) do
     prompt = build_turn_prompt(context.issue, context.opts, turn_number, max_turns)
 
-    with {:ok, turn_session} <-
+    with {:ok, _turn_result} <-
            context.runtime.run_turn(
-             context.app_session,
+             context.session,
              prompt,
              context.issue,
              Keyword.put(
@@ -147,7 +145,7 @@ defmodule SymphonyElixir.AgentRunner do
              )
            ) do
       Logger.info(
-        "Completed agent run for #{issue_context(context.issue)} session_id=#{turn_session[:session_id]} " <>
+        "Completed agent run for #{issue_context(context.issue)} " <>
           "workspace=#{context.workspace} turn=#{turn_number}/#{max_turns}"
       )
 
@@ -166,6 +164,44 @@ defmodule SymphonyElixir.AgentRunner do
           {:error, reason}
       end
     end
+  end
+
+  defp run_runtime_session(runtime, session, fun) when is_function(fun, 0) do
+    execution_result =
+      try do
+        {:returned, fun.()}
+      catch
+        kind, reason -> {:raised, kind, reason, __STACKTRACE__}
+      end
+
+    case stop_runtime_session(runtime, session) do
+      :ok ->
+        restore_execution_result(execution_result)
+
+      {:error, {:session_not_active, :stopped}} ->
+        restore_execution_result(execution_result)
+
+      {:error, reason} ->
+        {:error, {:runtime_stop_failed, reason}}
+    end
+  end
+
+  defp stop_runtime_session(runtime, session) do
+    case runtime.stop_session(session) do
+      :ok -> :ok
+      {:error, reason} -> {:error, reason}
+      other -> {:error, {:invalid_result, other}}
+    end
+  rescue
+    exception -> {:error, {:exception, exception}}
+  catch
+    kind, reason -> {:error, {kind, reason}}
+  end
+
+  defp restore_execution_result({:returned, result}), do: result
+
+  defp restore_execution_result({:raised, kind, reason, stacktrace}) do
+    :erlang.raise(kind, reason, stacktrace)
   end
 
   defp continue_after_turn(context, refreshed_issue, refreshed_route, turn_number, max_turns) do

@@ -151,7 +151,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  @spec stop_session(session()) :: :ok
+  @spec stop_session(session()) :: :ok | {:error, {:stop_failed, term()}}
   def stop_session(%{port: port}) when is_port(port) do
     stop_port(port)
   end
@@ -1001,16 +1001,11 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp stop_port(port) when is_port(port) do
     case :erlang.port_info(port) do
       :undefined ->
-        :ok
+        {:error, {:stop_failed, :session_stopped}}
 
       _ ->
-        try do
-          Port.close(port)
-          :ok
-        rescue
-          ArgumentError ->
-            :ok
-        end
+        Port.close(port)
+        :ok
     end
   end
 
