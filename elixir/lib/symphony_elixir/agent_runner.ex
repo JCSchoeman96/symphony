@@ -5,6 +5,7 @@ defmodule SymphonyElixir.AgentRunner do
 
   require Logger
   alias SymphonyElixir.{AgentRuntime, Config, PromptBuilder, Tracker, Workspace}
+  alias SymphonyElixir.AgentRuntime.{Profile, Route, Router}
   alias SymphonyElixir.Tracker.Issue
 
   @type worker_host :: String.t() | nil
@@ -22,15 +23,27 @@ defmodule SymphonyElixir.AgentRunner do
     # The orchestrator owns host retries so one worker lifetime never hops machines.
     worker_host = selected_worker_host(Keyword.get(opts, :worker_host), Config.settings!().worker.ssh_hosts)
 
-    Logger.info("Starting agent run for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
+    case route_from_options(issue, opts) do
+      {:ok, route} ->
+        opts = maybe_put_route(opts, route)
 
-    case run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
-      :ok ->
-        :ok
+        Logger.info(
+          "Starting agent run for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}" <>
+            route_log_context(route)
+        )
+
+        case run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
+          :ok ->
+            :ok
+
+          {:error, reason} ->
+            Logger.error("Agent run failed for #{issue_context(issue)}: #{inspect(reason)}")
+            raise RuntimeError, "Agent run failed for #{issue_context(issue)}: #{inspect(reason)}"
+        end
 
       {:error, reason} ->
-        Logger.error("Agent run failed for #{issue_context(issue)}: #{inspect(reason)}")
-        raise RuntimeError, "Agent run failed for #{issue_context(issue)}: #{inspect(reason)}"
+        Logger.error("Agent route resolution failed for #{issue_context(issue)}: #{inspect(reason)}")
+        raise RuntimeError, "Agent route resolution failed for #{issue_context(issue)}: #{inspect(reason)}"
     end
   end
 
@@ -85,11 +98,13 @@ defmodule SymphonyElixir.AgentRunner do
   defp send_worker_runtime_info(_recipient, _issue, _worker_host, _workspace), do: :ok
 
   defp run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host) do
-    max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
+    route = Keyword.get(opts, :route)
+    max_turns = Keyword.get(opts, :max_turns, max_turns_for_route(route))
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issues_by_ids/1)
     runtime = Keyword.get(opts, :runtime, AgentRuntime.Codex)
+    runtime_opts = opts |> Keyword.put(:worker_host, worker_host) |> profile_runtime_options(route)
 
-    with {:ok, session} <- runtime.start_session(workspace, Keyword.put(opts, :worker_host, worker_host)) do
+    with {:ok, session} <- runtime.start_session(workspace, runtime_opts) do
       try do
         do_run_codex_turns(
           runtime,
@@ -100,7 +115,8 @@ defmodule SymphonyElixir.AgentRunner do
           opts,
           issue_state_fetcher,
           1,
-          max_turns
+          max_turns,
+          route
         )
       after
         runtime.stop_session(session)
@@ -117,7 +133,8 @@ defmodule SymphonyElixir.AgentRunner do
          opts,
          issue_state_fetcher,
          turn_number,
-         max_turns
+         max_turns,
+         route
        ) do
     prompt = build_turn_prompt(issue, opts, turn_number, max_turns)
 
@@ -130,26 +147,33 @@ defmodule SymphonyElixir.AgentRunner do
            ) do
       Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
 
-      case continue_with_issue?(issue, issue_state_fetcher) do
-        {:continue, refreshed_issue} when turn_number < max_turns ->
-          Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}")
+      case continue_with_issue_and_route(issue, issue_state_fetcher, route) do
+        {:continue, refreshed_issue, refreshed_route} ->
+          if route_changed?(route, refreshed_route) do
+            notify_route_change(codex_update_recipient, refreshed_issue, route, refreshed_route)
+            :ok
+          else
+            if turn_number < max_turns do
+              Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}")
 
-          do_run_codex_turns(
-            runtime,
-            app_session,
-            workspace,
-            refreshed_issue,
-            codex_update_recipient,
-            opts,
-            issue_state_fetcher,
-            turn_number + 1,
-            max_turns
-          )
+              do_run_codex_turns(
+                runtime,
+                app_session,
+                workspace,
+                refreshed_issue,
+                codex_update_recipient,
+                opts,
+                issue_state_fetcher,
+                turn_number + 1,
+                max_turns,
+                refreshed_route
+              )
+            else
+              Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator")
 
-        {:continue, refreshed_issue} ->
-          Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator")
-
-          :ok
+              :ok
+            end
+          end
 
         {:done, _refreshed_issue} ->
           :ok
@@ -158,6 +182,72 @@ defmodule SymphonyElixir.AgentRunner do
           {:error, reason}
       end
     end
+  end
+
+  defp continue_with_issue_and_route(issue, issue_state_fetcher, nil) do
+    case continue_with_issue?(issue, issue_state_fetcher) do
+      {:continue, refreshed_issue} -> {:continue, refreshed_issue, nil}
+      other -> other
+    end
+  end
+
+  defp continue_with_issue_and_route(issue, issue_state_fetcher, %Route{}) do
+    case continue_with_issue?(issue, issue_state_fetcher) do
+      {:continue, %Issue{} = refreshed_issue} ->
+        case Router.resolve(refreshed_issue, Config.settings!().agent.profiles) do
+          {:ok, %Route{} = refreshed_route} ->
+            {:continue, refreshed_issue, refreshed_route}
+
+          {:error, reason} ->
+            {:error, {:route_resolution_failed, reason}}
+        end
+
+      other ->
+        other
+    end
+  end
+
+  defp route_changed?(nil, nil), do: false
+  defp route_changed?(%Route{} = left, %Route{} = right), do: not Route.same?(left, right)
+  defp route_changed?(_left, _right), do: true
+
+  defp notify_route_change(
+         recipient,
+         %Issue{id: issue_id},
+         %Route{} = previous_route,
+         %Route{} = next_route
+       )
+       when is_pid(recipient) and is_binary(issue_id) do
+    send(recipient, {:agent_route_changed, issue_id, previous_route, next_route})
+    :ok
+  end
+
+  defp notify_route_change(_recipient, _issue, _previous_route, _next_route), do: :ok
+
+  defp max_turns_for_route(%Route{profile: %Profile{max_turns: max_turns}}), do: max_turns
+  defp max_turns_for_route(_route), do: Config.settings!().agent.max_turns
+
+  defp profile_runtime_options(opts, %Route{profile: %Profile{} = profile}) do
+    Keyword.merge(opts, Profile.runtime_options(profile))
+  end
+
+  defp profile_runtime_options(opts, _route), do: opts
+
+  defp route_from_options(_issue, opts) do
+    case Keyword.get(opts, :route) do
+      nil -> {:ok, nil}
+      %Route{} = route -> {:ok, route}
+      route -> {:error, {:invalid_route, route}}
+    end
+  end
+
+  defp maybe_put_route(opts, nil), do: opts
+  defp maybe_put_route(opts, %Route{} = route), do: Keyword.put(opts, :route, route)
+
+  defp route_log_context(nil), do: ""
+
+  defp route_log_context(%Route{} = route) do
+    " profile=#{route.profile_name} runtime=#{route.runtime_name} responsibility=#{route.responsibility}"
   end
 
   defp build_turn_prompt(issue, opts, 1, _max_turns), do: PromptBuilder.build_prompt(issue, opts)

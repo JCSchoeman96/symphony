@@ -8,6 +8,7 @@ defmodule SymphonyElixir.Orchestrator do
   import Bitwise, only: [<<<: 2]
 
   alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.AgentRuntime.{Route, Router}
   alias SymphonyElixir.Tracker.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -34,6 +35,7 @@ defmodule SymphonyElixir.Orchestrator do
       :tick_timer_ref,
       :tick_token,
       task_supervisor: SymphonyElixir.TaskSupervisor,
+      agent_runner: AgentRunner,
       running: %{},
       completed: MapSet.new(),
       claimed: MapSet.new(),
@@ -65,6 +67,7 @@ defmodule SymphonyElixir.Orchestrator do
           tick_timer_ref: nil,
           tick_token: nil,
           task_supervisor: Keyword.get(opts, :task_supervisor, SymphonyElixir.TaskSupervisor),
+          agent_runner: Keyword.get(opts, :agent_runner, AgentRunner),
           codex_totals: @empty_codex_totals,
           codex_rate_limits: nil
         }
@@ -158,6 +161,33 @@ defmodule SymphonyElixir.Orchestrator do
           running_entry
           |> maybe_put_runtime_value(:worker_host, runtime_info[:worker_host])
           |> maybe_put_runtime_value(:workspace_path, runtime_info[:workspace_path])
+
+        notify_dashboard()
+        {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+    end
+  end
+
+  def handle_info(
+        {:agent_route_changed, issue_id, %Route{} = previous_route, %Route{} = next_route},
+        %{running: running} = state
+      )
+      when is_binary(issue_id) do
+    case Map.get(running, issue_id) do
+      nil ->
+        {:noreply, state}
+
+      running_entry ->
+        Logger.info(
+          "Agent route changed for issue_id=#{issue_id}; ending worker attempt " <>
+            "previous=#{previous_route.profile_name}/#{previous_route.responsibility} " <>
+            "next=#{next_route.profile_name}/#{next_route.responsibility}"
+        )
+
+        updated_running_entry =
+          Map.merge(running_entry, %{
+            route_change_termination: true,
+            route_change: route_change_metadata(previous_route, next_route)
+          })
 
         notify_dashboard()
         {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
@@ -533,6 +563,27 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp refresh_running_issue_state(%State{} = state, %Issue{} = issue) do
     case Map.get(state.running, issue.id) do
+      %{issue: _, route: %Route{} = current_route} = running_entry ->
+        case route_for_issue(issue) do
+          {:ok, %Route{} = next_route} ->
+            if Route.same?(current_route, next_route) do
+              %{state | running: Map.put(state.running, issue.id, %{running_entry | issue: issue})}
+            else
+              Logger.info(
+                "Stopping active agent after route refresh for #{issue_context(issue)} " <>
+                  "previous=#{current_route.profile_name}/#{current_route.responsibility} " <>
+                  "next=#{next_route.profile_name}/#{next_route.responsibility}"
+              )
+
+              terminate_running_issue(state, issue.id, false)
+            end
+
+          {:error, reason} ->
+            Logger.info("Stopping active agent after route refresh failed for #{issue_context(issue)}: #{inspect(reason)}")
+
+            terminate_running_issue(state, issue.id, false)
+        end
+
       %{issue: _} = running_entry ->
         %{state | running: Map.put(state.running, issue.id, %{running_entry | issue: issue})}
 
@@ -823,6 +874,7 @@ defmodule SymphonyElixir.Orchestrator do
       !MapSet.member?(claimed, issue.id) and
       !Map.has_key?(running, issue.id) and
       !Map.has_key?(blocked, issue.id) and
+      route_dispatchable?(issue) and
       available_slots(state) > 0 and
       state_slots_available?(issue, running) and
       worker_slots_available?(state)
@@ -907,7 +959,15 @@ defmodule SymphonyElixir.Orchestrator do
   defp dispatch_issue(%State{} = state, issue, attempt \\ nil, preferred_worker_host \\ nil) do
     case refresh_issue_for_dispatch(issue) do
       {:ok, %Issue{} = refreshed_issue} ->
-        do_dispatch_issue(state, refreshed_issue, attempt, preferred_worker_host)
+        case route_for_issue(refreshed_issue) do
+          {:ok, %Route{} = route} ->
+            do_dispatch_issue(state, refreshed_issue, route, attempt, preferred_worker_host)
+
+          {:error, reason} ->
+            Logger.warning("Skipping dispatch; issue route is unavailable for #{issue_context(refreshed_issue)}: #{inspect(reason)}")
+
+            state
+        end
 
       {:skip, _reason} ->
         state
@@ -937,7 +997,7 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp do_dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host) do
+  defp do_dispatch_issue(%State{} = state, issue, route, attempt, preferred_worker_host) do
     recipient = self()
 
     case select_worker_host(state, preferred_worker_host) do
@@ -946,13 +1006,17 @@ defmodule SymphonyElixir.Orchestrator do
         state
 
       worker_host ->
-        spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host)
+        spawn_issue_on_worker_host(state, issue, route, attempt, recipient, worker_host)
     end
   end
 
-  defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host) do
+  defp spawn_issue_on_worker_host(%State{} = state, issue, route, attempt, recipient, worker_host) do
     case Task.Supervisor.start_child(state.task_supervisor, fn ->
-           AgentRunner.run(issue, recipient, attempt: attempt, worker_host: worker_host)
+           state.agent_runner.run(issue, recipient,
+             attempt: attempt,
+             worker_host: worker_host,
+             route: route
+           )
          end) do
       {:ok, pid} ->
         ref = Process.monitor(pid)
@@ -965,6 +1029,13 @@ defmodule SymphonyElixir.Orchestrator do
             ref: ref,
             identifier: issue.identifier,
             issue: issue,
+            route: route,
+            profile_name: route.profile_name,
+            runtime_name: route.runtime_name,
+            responsibility: route.responsibility,
+            route_fingerprint: route.fingerprint,
+            route_change_termination: false,
+            route_change: nil,
             worker_host: worker_host,
             workspace_path: nil,
             session_id: nil,
@@ -1184,7 +1255,19 @@ defmodule SymphonyElixir.Orchestrator do
          worker_slots_available?(state, metadata[:worker_host]) do
       case refresh_issue_for_dispatch(issue) do
         {:ok, %Issue{} = refreshed_issue} ->
-          {:noreply, do_dispatch_issue(state, refreshed_issue, attempt, metadata[:worker_host])}
+          case route_for_issue(refreshed_issue) do
+            {:ok, %Route{} = route} ->
+              {:noreply, do_dispatch_issue(state, refreshed_issue, route, attempt, metadata[:worker_host])}
+
+            {:error, reason} ->
+              {:noreply,
+               schedule_issue_retry(
+                 state,
+                 issue.id,
+                 attempt + 1,
+                 Map.merge(metadata, %{error: "retry route resolution failed: #{inspect(reason)}"})
+               )}
+          end
 
         {:skip, :missing} ->
           {:noreply, release_issue_claim(state, issue.id)}
@@ -1362,6 +1445,41 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp running_entry_session_id(_running_entry), do: "n/a"
 
+  defp route_for_issue(%Issue{} = issue) do
+    case Router.resolve(issue, Config.settings!().agent.profiles) do
+      {:ok, %Route{runtime_name: "codex"} = route} ->
+        {:ok, route}
+
+      {:ok, %Route{runtime_name: runtime_name}} ->
+        {:error, {:runtime_not_available, runtime_name}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp route_dispatchable?(%Issue{} = issue) do
+    match?({:ok, %Route{}}, route_for_issue(issue))
+  end
+
+  defp route_dispatchable?(_issue), do: false
+
+  defp route_change_metadata(%Route{} = previous_route, %Route{} = next_route) do
+    %{
+      previous: route_metadata(previous_route),
+      next: route_metadata(next_route)
+    }
+  end
+
+  defp route_metadata(%Route{} = route) do
+    %{
+      profile_name: route.profile_name,
+      runtime_name: route.runtime_name,
+      responsibility: route.responsibility,
+      fingerprint: route.fingerprint
+    }
+  end
+
   defp issue_context(%Issue{id: issue_id, identifier: identifier}) do
     "issue_id=#{issue_id} issue_identifier=#{identifier}"
   end
@@ -1419,6 +1537,12 @@ defmodule SymphonyElixir.Orchestrator do
           identifier: metadata.identifier,
           issue_url: metadata.issue.url,
           state: metadata.issue.state,
+          profile_name: Map.get(metadata, :profile_name),
+          runtime_name: Map.get(metadata, :runtime_name),
+          responsibility: Map.get(metadata, :responsibility),
+          route_fingerprint: Map.get(metadata, :route_fingerprint),
+          route_change_termination: Map.get(metadata, :route_change_termination, false),
+          route_change: Map.get(metadata, :route_change),
           worker_host: Map.get(metadata, :worker_host),
           workspace_path: Map.get(metadata, :workspace_path),
           session_id: metadata.session_id,

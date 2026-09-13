@@ -45,7 +45,6 @@ defmodule SymphonyElixir.AgentRuntime.Route do
   def fingerprint(%__MODULE__{} = route) do
     data = {
       route.issue_id,
-      route.starting_state,
       route.profile_name,
       route.runtime_name,
       route.responsibility,
