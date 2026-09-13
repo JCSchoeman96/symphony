@@ -10,6 +10,11 @@ defmodule SymphonyElixir.AgentRuntime.Router do
     "planning" => "planner",
     "ready" => "builder",
     "todo" => "builder",
+    "open" => "builder",
+    "opened" => "builder",
+    "pending" => "builder",
+    "started" => "builder",
+    "in development" => "builder",
     "in progress" => "builder",
     "in review" => "reviewer",
     "human review" => "reviewer",
@@ -31,8 +36,9 @@ defmodule SymphonyElixir.AgentRuntime.Router do
 
   @spec resolve(Issue.t(), %{String.t() => Profile.t()}) ::
           {:ok, Route.t()} | {:error, term()}
-  def resolve(%Issue{state: state} = issue, profiles) when is_map(profiles) do
-    normalized_state = Route.normalize_state(state || "")
+  def resolve(%Issue{id: issue_id, state: state} = issue, profiles)
+      when is_map(profiles) and is_binary(issue_id) and is_binary(state) do
+    normalized_state = Route.normalize_state(state)
 
     case Map.fetch(@state_profiles, normalized_state) do
       {:ok, profile_name} ->
@@ -56,5 +62,6 @@ defmodule SymphonyElixir.AgentRuntime.Router do
     end
   end
 
-  def resolve(%Issue{}, _profiles), do: {:error, :invalid_profiles}
+  def resolve(%Issue{}, profiles) when not is_map(profiles), do: {:error, :invalid_profiles}
+  def resolve(%Issue{}, _profiles), do: {:error, :invalid_issue}
 end

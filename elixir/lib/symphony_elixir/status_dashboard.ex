@@ -334,6 +334,7 @@ defmodule SymphonyElixir.StatusDashboard do
     case snapshot_data do
       {:ok, %{running: running, retrying: retrying, codex_totals: codex_totals} = snapshot} ->
         rate_limits = Map.get(snapshot, :rate_limits)
+        blocked = Map.get(snapshot, :blocked, [])
         project_link_lines = format_project_link_lines()
         project_refresh_line = format_project_refresh_line(Map.get(snapshot, :polling))
         codex_input_tokens = Map.get(codex_totals, :input_tokens, 0)
@@ -346,6 +347,13 @@ defmodule SymphonyElixir.StatusDashboard do
         running_rows = format_running_rows(running, running_event_width)
         running_to_backoff_spacer = if(running == [], do: [], else: ["│"])
         backoff_rows = format_retry_rows(retrying)
+        blocked_rows = format_blocked_rows(blocked)
+
+        dependency_rows =
+          format_dependency_rows(
+            Map.get(snapshot, :dependency_diagnostics, []),
+            Map.get(snapshot, :dependency_graph, %{})
+          )
 
         ([
            colorize("╭─ SYMPHONY STATUS", @ansi_bold),
@@ -374,6 +382,8 @@ defmodule SymphonyElixir.StatusDashboard do
            running_to_backoff_spacer ++
            [colorize("├─ Backoff queue", @ansi_bold), "│"] ++
            backoff_rows ++
+           blocked_rows ++
+           dependency_rows ++
            [closing_border()])
         |> List.flatten()
         |> Enum.join("\n")
@@ -561,6 +571,9 @@ defmodule SymphonyElixir.StatusDashboard do
            %{
              running: running,
              retrying: retrying,
+             blocked: Map.get(snapshot, :blocked, []),
+             dependency_diagnostics: Map.get(snapshot, :dependency_diagnostics, []),
+             dependency_graph: Map.get(snapshot, :dependency_graph, %{}),
              codex_totals: codex_totals,
              rate_limits: Map.get(snapshot, :rate_limits),
              polling: Map.get(snapshot, :polling)
@@ -591,7 +604,7 @@ defmodule SymphonyElixir.StatusDashboard do
   defp format_running_summary(running_entry, running_event_width) do
     issue = format_cell(running_entry.identifier || "unknown", @running_id_width)
     state = running_entry.state || "unknown"
-    state_display = format_cell(to_string(state), @running_stage_width)
+    state_display = format_cell(running_stage_label(running_entry, state), @running_stage_width)
     session = running_entry.session_id |> compact_session_id() |> format_cell(@running_session_width)
     pid = format_cell(running_entry.codex_app_server_pid || "n/a", @running_pid_width)
     total_tokens = running_entry.codex_total_tokens || 0
@@ -599,7 +612,7 @@ defmodule SymphonyElixir.StatusDashboard do
     turn_count = Map.get(running_entry, :turn_count, 0)
     age = format_cell(format_runtime_and_turns(runtime_seconds, turn_count), @running_age_width)
     event = running_entry.last_codex_event || "none"
-    event_label = format_cell(summarize_message(running_entry.last_codex_message), running_event_width)
+    event_label = format_cell(running_event_label(running_entry), running_event_width)
 
     tokens = format_count(total_tokens) |> format_cell(@running_tokens_width, :right)
 
@@ -631,6 +644,22 @@ defmodule SymphonyElixir.StatusDashboard do
       colorize(event_label, status_color)
     ]
     |> Enum.join("")
+  end
+
+  defp running_stage_label(running_entry, state) do
+    case Map.get(running_entry, :profile_name) do
+      profile when is_binary(profile) and profile != "" -> profile
+      _ -> to_string(state)
+    end
+  end
+
+  defp running_event_label(running_entry) do
+    base = summarize_message(Map.get(running_entry, :last_codex_message))
+
+    case get_in(running_entry, [:dependency, :reason]) do
+      nil -> base
+      reason -> "#{base} dependency=#{reason}"
+    end
   end
 
   @doc false
@@ -701,6 +730,117 @@ defmodule SymphonyElixir.StatusDashboard do
   end
 
   defp format_retry_error(_), do: ""
+
+  defp format_blocked_rows([]), do: []
+
+  defp format_blocked_rows(blocked) when is_list(blocked) do
+    rows =
+      blocked
+      |> Enum.sort_by(&Map.get(&1, :identifier, Map.get(&1, :issue_id, "")))
+      |> Enum.map(fn entry ->
+        identifier = Map.get(entry, :identifier) || Map.get(entry, :issue_id) || "unknown"
+        state = Map.get(entry, :state) || "Blocked"
+        reason = get_in(entry, [:dependency, :reason]) || Map.get(entry, :error) || "blocked"
+
+        "│  " <>
+          colorize("⏸", @ansi_red) <>
+          " " <>
+          colorize("#{identifier}", @ansi_cyan) <>
+          " " <>
+          colorize("#{state}", @ansi_yellow) <>
+          " " <>
+          colorize("reason=#{reason}", @ansi_dim)
+      end)
+
+    ["│", colorize("├─ Blocked diagnostics", @ansi_bold), "│"] ++ rows
+  end
+
+  defp format_blocked_rows(_blocked), do: []
+
+  defp format_dependency_rows(diagnostics, graph) when is_list(diagnostics) and is_map(graph) do
+    decision_rows =
+      diagnostics
+      |> Enum.sort_by(&Map.get(&1, :identifier, Map.get(&1, :issue_id, "")))
+      |> Enum.map(&format_dependency_decision/1)
+
+    cycle_rows =
+      graph
+      |> Map.get(:cycles, [])
+      |> Enum.filter(&is_list/1)
+      |> Enum.map(fn cycle ->
+        "│  " <> colorize("⟳", @ansi_red) <> " " <> colorize("cycle=#{format_dependency_ids(cycle)}", @ansi_dim)
+      end)
+
+    graph_rows =
+      graph
+      |> Map.get(:diagnostics, [])
+      |> Enum.map(&format_dependency_graph_diagnostic/1)
+
+    rows = decision_rows ++ cycle_rows ++ graph_rows
+
+    if rows == [] do
+      []
+    else
+      ["│", colorize("├─ Dependency diagnostics", @ansi_bold), "│"] ++ rows
+    end
+  end
+
+  defp format_dependency_rows(_diagnostics, _graph), do: []
+
+  defp format_dependency_decision(entry) when is_map(entry) do
+    identifier = Map.get(entry, :identifier) || Map.get(entry, :issue_id) || "unknown"
+    responsibility = Map.get(entry, :responsibility) || "n/a"
+    status = Map.get(entry, :dependency_status) || "n/a"
+    reason = Map.get(entry, :reason) || "n/a"
+    blockers = Map.get(entry, :unresolved_blockers) || Map.get(entry, :blockers, [])
+
+    "│  " <>
+      colorize("⚑", @ansi_orange) <>
+      " " <>
+      colorize("#{identifier}", @ansi_cyan) <>
+      " " <>
+      colorize("role=#{responsibility}", @ansi_gray) <>
+      " " <>
+      colorize("status=#{status}", @ansi_yellow) <>
+      " " <>
+      colorize("reason=#{reason}", @ansi_dim) <>
+      " " <>
+      colorize("blockers=#{format_dependency_blockers(blockers)}", @ansi_dim)
+  end
+
+  defp format_dependency_decision(_entry), do: "│  " <> colorize("⚑ invalid dependency diagnostic", @ansi_red)
+
+  defp format_dependency_graph_diagnostic(%{kind: kind} = diagnostic) do
+    dependent_id = Map.get(diagnostic, :dependent_id) || "unknown"
+    blocker_id = Map.get(diagnostic, :blocker_id) || "unknown"
+
+    "│  " <>
+      colorize("⚠", @ansi_red) <>
+      " " <>
+      colorize("graph=#{kind}", @ansi_dim) <>
+      " " <>
+      colorize("dependent=#{dependent_id}", @ansi_cyan) <>
+      " " <>
+      colorize("blocker=#{blocker_id}", @ansi_yellow)
+  end
+
+  defp format_dependency_graph_diagnostic(_diagnostic), do: "│  " <> colorize("⚠ invalid graph diagnostic", @ansi_red)
+
+  defp format_dependency_blockers(blockers) when is_list(blockers) do
+    blockers
+    |> Enum.map_join(",", fn blocker ->
+      Map.get(blocker, :identifier) || Map.get(blocker, "identifier") || Map.get(blocker, :id) || Map.get(blocker, "id") || "unknown"
+    end)
+    |> case do
+      "" -> "none"
+      value -> value
+    end
+  end
+
+  defp format_dependency_blockers(_blockers), do: "none"
+
+  defp format_dependency_ids(ids) when is_list(ids), do: Enum.map_join(ids, "->", &to_string/1)
+  defp format_dependency_ids(_ids), do: "unknown"
 
   defp format_runtime_seconds(seconds) when is_integer(seconds) do
     mins = div(seconds, 60)

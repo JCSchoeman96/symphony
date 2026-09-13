@@ -45,6 +45,8 @@ defmodule SymphonyElixir.Tracker.Issue do
           updated_at: DateTime.t() | nil
         }
 
+  @type routable_t :: %__MODULE__{id: String.t(), state: String.t()}
+
   @spec label_names(t()) :: [String.t()]
   def label_names(%__MODULE__{labels: labels}) do
     labels

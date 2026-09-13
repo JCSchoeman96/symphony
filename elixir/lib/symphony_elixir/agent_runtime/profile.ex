@@ -66,22 +66,26 @@ defmodule SymphonyElixir.AgentRuntime.Profile do
     raw_profiles = raw_profiles || %{}
 
     Enum.reduce_while(raw_profiles, {:ok, defaults}, fn {raw_name, raw_profile}, {:ok, profiles} ->
-      name = normalize_name(raw_name)
-
-      case Map.fetch(defaults, name) do
-        {:ok, default} ->
-          case normalize_profile(name, raw_profile, default) do
-            {:ok, profile} -> {:cont, {:ok, Map.put(profiles, name, profile)}}
-            {:error, message} -> {:halt, {:error, {:invalid_profile, name, message}}}
-          end
-
-        :error ->
-          case normalize_custom_profile(name, raw_profile, command, max_turns) do
-            {:ok, profile} -> {:cont, {:ok, Map.put(profiles, name, profile)}}
-            {:error, message} -> {:halt, {:error, {:invalid_profile, name, message}}}
-          end
+      case resolve_profile_entry(raw_name, raw_profile, defaults, command, max_turns) do
+        {:ok, name, profile} -> {:cont, {:ok, Map.put(profiles, name, profile)}}
+        {:error, name, message} -> {:halt, {:error, {:invalid_profile, name, message}}}
       end
     end)
+  end
+
+  defp resolve_profile_entry(raw_name, raw_profile, defaults, command, max_turns) do
+    name = normalize_name(raw_name)
+
+    result =
+      case Map.fetch(defaults, name) do
+        {:ok, default} -> normalize_profile(name, raw_profile, default)
+        :error -> normalize_custom_profile(name, raw_profile, command, max_turns)
+      end
+
+    case result do
+      {:ok, profile} -> {:ok, name, profile}
+      {:error, message} -> {:error, name, message}
+    end
   end
 
   @spec runtime_options(t()) :: keyword()

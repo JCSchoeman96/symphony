@@ -378,6 +378,65 @@ defmodule SymphonyElixir.ExtensionsTest do
              json_response(conn, 202)
   end
 
+  test "observability projections expose route and dependency diagnostics without secrets" do
+    orchestrator_name = Module.concat(__MODULE__, :RouteDependencyProjectionOrchestrator)
+
+    snapshot = %{
+      running: [
+        %{
+          issue_id: "issue-route",
+          identifier: "SYM-ROUTE",
+          issue_url: "https://example.org/issues/SYM-ROUTE",
+          state: "Planning",
+          profile_name: "planner",
+          runtime_name: "codex",
+          responsibility: "planning",
+          route_fingerprint: "sha256:route",
+          route_change_termination: false,
+          route_change: nil,
+          dependency: %{
+            dependency_status: :unresolved,
+            reason: :planning_allowed_with_unresolved_dependencies,
+            allowed?: true,
+            blockers: [%{id: "blocker", identifier: "SYM-BLOCKER", state: "In Progress"}]
+          },
+          session_id: "session-route",
+          turn_count: 1,
+          codex_app_server_pid: nil,
+          last_codex_message: nil,
+          last_codex_timestamp: nil,
+          last_codex_event: nil,
+          codex_input_tokens: 0,
+          codex_output_tokens: 0,
+          codex_total_tokens: 0,
+          started_at: DateTime.utc_now()
+        }
+      ],
+      retrying: [],
+      blocked: [],
+      dependency_diagnostics: [
+        %{issue_id: "issue-route", reason: :planning_allowed_with_unresolved_dependencies}
+      ],
+      dependency_graph: %{cycles: [], diagnostics: []},
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      rate_limits: nil
+    }
+
+    {:ok, _pid} = StaticOrchestrator.start_link(name: orchestrator_name, snapshot: snapshot)
+    payload = SymphonyElixirWeb.Presenter.state_payload(orchestrator_name, 50)
+
+    [running] = payload.running
+    assert running.profile_name == "planner"
+    assert running.runtime_name == "codex"
+    assert running.responsibility == "planning"
+    assert running.route_fingerprint == "sha256:route"
+    assert running.dependency.reason == :planning_allowed_with_unresolved_dependencies
+    assert payload.dependency_diagnostics != []
+    assert payload.dependency_graph.cycles == []
+    refute inspect(payload) =~ "LINEAR_API_KEY"
+    refute inspect(payload) =~ "codex app-server"
+  end
+
   test "phoenix observability api preserves 405, 404, and unavailable behavior" do
     unavailable_orchestrator = Module.concat(__MODULE__, :UnavailableOrchestrator)
     start_test_endpoint(orchestrator: unavailable_orchestrator, snapshot_timeout_ms: 5)
@@ -482,7 +541,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
   test "dashboard liveview renders and refreshes over pubsub" do
     orchestrator_name = Module.concat(__MODULE__, :DashboardOrchestrator)
-    snapshot = static_snapshot()
+    snapshot = dashboard_snapshot()
 
     {:ok, orchestrator_pid} =
       StaticOrchestrator.start_link(
@@ -514,6 +573,10 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "Offline"
     assert html =~ "Copy ID"
     assert html =~ "Codex update"
+    assert html =~ "role=builder"
+    assert html =~ "dep=unresolved_hard_dependency"
+    assert html =~ "Dependency diagnostics"
+    assert html =~ "SYM-DIAGNOSTIC"
     refute html =~ "data-runtime-clock="
     refute html =~ "setInterval(refreshRuntimeClocks"
     refute html =~ "Refresh now"
@@ -705,6 +768,37 @@ defmodule SymphonyElixir.ExtensionsTest do
       codex_totals: %{input_tokens: 4, output_tokens: 8, total_tokens: 12, seconds_running: 42.5},
       rate_limits: %{"primary" => %{"remaining" => 11}}
     }
+  end
+
+  defp dashboard_snapshot do
+    snapshot = static_snapshot()
+
+    Map.merge(snapshot, %{
+      running: [
+        Map.merge(List.first(snapshot.running), %{
+          profile_name: "builder",
+          responsibility: "implementation",
+          dependency: %{reason: :unresolved_hard_dependency}
+        })
+      ],
+      blocked: [
+        Map.merge(List.first(snapshot.blocked), %{
+          profile_name: "reviewer",
+          responsibility: "review",
+          dependency: %{reason: :invalidated_dependency}
+        })
+      ],
+      dependency_diagnostics: [
+        %{
+          issue_id: "issue-diagnostic",
+          identifier: "SYM-DIAGNOSTIC",
+          responsibility: "implementation",
+          dependency_status: :unresolved,
+          reason: :unresolved_hard_dependency,
+          blockers: [%{identifier: "SYM-FOUNDATION", state: "In Progress"}]
+        }
+      ]
+    })
   end
 
   defp wait_for_bound_port do

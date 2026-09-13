@@ -21,7 +21,22 @@ end
 defmodule SymphonyElixir.AgentRuntimeTest do
   use SymphonyElixir.TestSupport
 
-  alias SymphonyElixir.AgentRuntime.Router
+  alias SymphonyElixir.AgentRuntime.{Codex, Router}
+
+  test "Codex runtime delegates invalid startup and turn calls to AppServer" do
+    assert {:error, _reason} =
+             Codex.start_session(Path.join(System.tmp_dir!(), "symphony-runtime-outside-default-#{System.unique_integer()}"))
+
+    assert {:error, _reason} =
+             Codex.start_session(
+               Path.join(System.tmp_dir!(), "symphony-runtime-outside-#{System.unique_integer()}"),
+               worker_host: nil
+             )
+
+    assert_raise FunctionClauseError, fn ->
+      Codex.run_turn(%{}, "prompt", %Issue{})
+    end
+  end
 
   test "AgentRunner executes an injected runtime through the runtime contract" do
     test_pid = self()
@@ -109,5 +124,48 @@ defmodule SymphonyElixir.AgentRuntimeTest do
     assert_receive {:runtime_turn, _session, _second_prompt, %{state: "In Progress"}}
     refute_receive {:agent_route_changed, "same-route", _previous_route, _next_route}, 50
     assert_receive {:runtime_stopped, %{session_id: "fake-session"}}
+  end
+
+  test "AgentRunner stops when a refreshed implementation becomes dependency-blocked" do
+    test_pid = self()
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_active_states: ["In Progress"],
+      max_turns: 2
+    )
+
+    issue = %Issue{
+      id: "dependency-change",
+      identifier: "SYM-DEPENDENCY",
+      title: "Dependency change",
+      state: "In Progress",
+      dispatchable: true
+    }
+
+    profiles = Config.settings!().agent.profiles
+    assert {:ok, route} = Router.resolve(issue, profiles)
+
+    assert :ok =
+             AgentRunner.run(issue, test_pid,
+               runtime: SymphonyElixir.AgentRuntimeTestFake,
+               test_pid: test_pid,
+               route: route,
+               issue_state_fetcher: fn [_issue_id] ->
+                 {:ok,
+                  [
+                    %{
+                      issue
+                      | blocked_by: [%{id: "new-blocker", identifier: "SYM-BLOCKER", state: "Ready"}]
+                    }
+                  ]}
+               end
+             )
+
+    assert_receive {:runtime_turn, _session, _prompt, ^issue}
+    assert_receive {:agent_dependency_blocked, "dependency-change", decision}
+    assert decision.reason == :unresolved_hard_dependency
+    assert_receive {:runtime_stopped, %{session_id: "fake-session"}}
+    refute_receive {:runtime_turn, _session, _prompt, _issue}, 50
   end
 end

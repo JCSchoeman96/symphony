@@ -58,6 +58,15 @@ defmodule SymphonyElixir.AgentRouterTest do
     assert route.fingerprint == Route.fingerprint(route)
   end
 
+  test "router preserves common provider active-state aliases as builder work" do
+    profiles = Profile.default_profiles("codex app-server", 20)
+
+    for state <- ["Open", "Opened", "Pending", "Started", "In Development"] do
+      assert {:ok, %Route{profile_name: "builder", responsibility: "implementation"}} =
+               Router.resolve(%Issue{id: "issue-#{state}", state: state}, profiles)
+    end
+  end
+
   test "router refuses unknown states and missing profiles" do
     profiles = Profile.default_profiles("codex app-server", 20)
 
@@ -66,6 +75,15 @@ defmodule SymphonyElixir.AgentRouterTest do
 
     assert {:error, {:missing_profile, "reviewer"}} =
              Router.resolve(%Issue{id: "issue-1", state: "In Review"}, Map.delete(profiles, "reviewer"))
+
+    assert {:error, {:invalid_profile, "planner"}} =
+             Router.resolve(%Issue{id: "issue-1", state: "Planning"}, %{"planner" => :invalid})
+
+    assert {:error, :invalid_profiles} =
+             Router.resolve(%Issue{id: "issue-1", state: "Planning"}, nil)
+
+    assert {:error, :invalid_issue} =
+             Router.resolve(%Issue{id: nil, state: "Planning"}, profiles)
   end
 
   test "profile validation rejects unknown runtimes and unsafe sandbox names" do
@@ -86,6 +104,104 @@ defmodule SymphonyElixir.AgentRouterTest do
              )
 
     assert message =~ "sandbox"
+  end
+
+  test "custom profiles and profile predicates cover normalized runtime settings" do
+    assert {:ok, profiles} =
+             Profile.resolve_profiles(
+               %{
+                 "custom role" => %{
+                   "responsibility" => "Implementation",
+                   "runtime" => "Codex",
+                   "command" => "custom-codex",
+                   "model" => "custom-model",
+                   "prompt" => "custom-prompt",
+                   "sandbox" => "Workspace-Write",
+                   "max_turns" => 2,
+                   "concurrency_class" => "isolated"
+                 }
+               },
+               "codex app-server",
+               20
+             )
+
+    assert %Profile{
+             name: "custom_role",
+             responsibility: "implementation",
+             runtime: "codex",
+             command: "custom-codex",
+             model: "custom-model",
+             prompt: "custom-prompt",
+             sandbox: "workspace-write",
+             max_turns: 2,
+             concurrency_class: "isolated"
+           } = profiles["custom_role"]
+
+    assert Profile.responsibility?("Planning")
+    refute Profile.responsibility?(:planning)
+    assert Profile.runtime?("Deferred")
+    refute Profile.runtime?("cursor")
+    assert Profile.sandbox?("Read-Only")
+    refute Profile.sandbox?(nil)
+    assert Profile.normalize_name("  Custom  Name ") == "custom_name"
+  end
+
+  test "profile normalization rejects malformed values and supports deferred commands" do
+    assert {:error, {:invalid_profile, "builder", "must be a map"}} =
+             Profile.resolve_profiles(%{"builder" => "invalid"}, "codex", 20)
+
+    wrong_name = %{Profile.default_profiles("codex", 20)["builder"] | name: "other"}
+
+    assert {:error, {:invalid_profile, "builder", "name must match profile key"}} =
+             Profile.resolve_profiles(%{"builder" => wrong_name}, "codex", 20)
+
+    assert {:error, {:invalid_profile, "custom", "must be a map"}} =
+             Profile.resolve_profiles(%{"custom" => :invalid}, "codex", 20)
+
+    assert {:ok, profiles} =
+             Profile.resolve_profiles(%{"merge_gatekeeper" => %{"command" => nil}}, "codex", 20)
+
+    assert profiles["merge_gatekeeper"].command == nil
+
+    assert {:ok, profiles} =
+             Profile.resolve_profiles(%{"merge_gatekeeper" => %{"command" => "gatekeeper"}}, "codex", 20)
+
+    assert profiles["merge_gatekeeper"].command == "gatekeeper"
+
+    assert {:error, {:invalid_profile, "merge_gatekeeper", message}} =
+             Profile.resolve_profiles(%{"merge_gatekeeper" => %{"command" => " "}}, "codex", 20)
+
+    assert message =~ "executable profile"
+
+    assert {:error, {:invalid_profile, "merge_gatekeeper", message}} =
+             Profile.resolve_profiles(%{"merge_gatekeeper" => %{"command" => 123}}, "codex", 20)
+
+    assert message =~ "executable profile"
+
+    assert {:error, {:invalid_profile, "builder", message}} =
+             Profile.resolve_profiles(%{"builder" => %{"command" => " "}}, "codex", 20)
+
+    assert message =~ "non-empty string"
+
+    assert {:error, {:invalid_profile, "builder", message}} =
+             Profile.resolve_profiles(%{"builder" => %{"command" => 123}}, "codex", 20)
+
+    assert message =~ "non-empty string"
+
+    assert {:error, {:invalid_profile, "builder", message}} =
+             Profile.resolve_profiles(%{"builder" => %{"model" => 123}}, "codex", 20)
+
+    assert message =~ "model must be a string"
+
+    assert {:error, {:invalid_profile, "builder", message}} =
+             Profile.resolve_profiles(%{"builder" => %{"model" => " "}}, "codex", 20)
+
+    assert message =~ "model must not be blank"
+
+    assert {:error, {:invalid_profile, "builder", message}} =
+             Profile.resolve_profiles(%{"builder" => %{"max_turns" => 0}}, "codex", 20)
+
+    assert message =~ "max_turns must be a positive integer"
   end
 
   test "workflow schema materializes default profiles and validates overrides" do

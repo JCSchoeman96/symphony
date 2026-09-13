@@ -486,7 +486,34 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert issue.priority == 2
     assert issue.state == "Todo"
     assert issue.assignee_id == "user-1"
-    refute issue.dispatchable
+    assert issue.dispatchable
+  end
+
+  test "linear blocker relations remain routable for the lifecycle dependency guard" do
+    raw_issue = %{
+      "id" => "issue-planning",
+      "identifier" => "MT-PLANNING",
+      "title" => "Planning with dependency",
+      "state" => %{"name" => "Todo"},
+      "assignee" => %{"id" => "user-1"},
+      "inverseRelations" => %{
+        "nodes" => [
+          %{
+            "type" => "blocks",
+            "issue" => %{
+              "id" => "issue-blocker",
+              "identifier" => "MT-BLOCKER",
+              "state" => %{"name" => "In Progress"}
+            }
+          }
+        ]
+      }
+    }
+
+    issue = Client.normalize_issue_for_test(raw_issue, "user-1")
+
+    assert issue.blocked_by == [%{id: "issue-blocker", identifier: "MT-BLOCKER", state: "In Progress"}]
+    assert issue.dispatchable
   end
 
   test "linear client rejects malformed issues instead of returning invalid scheduler records" do
@@ -800,7 +827,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       identifier: "MT-1003",
       title: "Ready work",
       state: "Todo",
-      blocked_by: [%{id: "blocker-2", identifier: "MT-1004", state: "Closed"}],
+      blocked_by: [%{id: "blocker-2", identifier: "MT-1004", state: "Done"}],
       dispatchable: true
     }
 

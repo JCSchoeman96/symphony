@@ -6,6 +6,7 @@ defmodule SymphonyElixir.AgentRunner do
   require Logger
   alias SymphonyElixir.{AgentRuntime, Config, PromptBuilder, Tracker, Workspace}
   alias SymphonyElixir.AgentRuntime.{Profile, Route, Router}
+  alias SymphonyElixir.Dependency.Guard
   alias SymphonyElixir.Tracker.Issue
 
   @type worker_host :: String.t() | nil
@@ -16,6 +17,13 @@ defmodule SymphonyElixir.AgentRunner do
   def continue_with_issue_for_test(%Issue{} = issue, issue_state_fetcher)
       when is_function(issue_state_fetcher, 1) do
     continue_with_issue?(issue, issue_state_fetcher)
+  end
+
+  @doc false
+  @spec continuation_prompt_for_test(Issue.t(), Route.t(), pos_integer(), pos_integer()) :: String.t()
+  def continuation_prompt_for_test(%Issue{} = issue, %Route{} = route, turn_number, max_turns)
+      when is_integer(turn_number) and is_integer(max_turns) do
+    build_turn_prompt(issue, [route: route], turn_number, max_turns)
   end
 
   @spec run(map(), pid() | nil, keyword()) :: :ok | no_return()
@@ -99,81 +107,57 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host) do
     route = Keyword.get(opts, :route)
-    max_turns = Keyword.get(opts, :max_turns, max_turns_for_route(route))
+    max_turns = max_turns_for_run(route, opts)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issues_by_ids/1)
     runtime = Keyword.get(opts, :runtime, AgentRuntime.Codex)
     runtime_opts = opts |> Keyword.put(:worker_host, worker_host) |> profile_runtime_options(route)
 
     with {:ok, session} <- runtime.start_session(workspace, runtime_opts) do
       try do
-        do_run_codex_turns(
-          runtime,
-          session,
-          workspace,
-          issue,
-          codex_update_recipient,
-          opts,
-          issue_state_fetcher,
-          1,
-          max_turns,
-          route
-        )
+        context = %{
+          runtime: runtime,
+          app_session: session,
+          workspace: workspace,
+          issue: issue,
+          codex_update_recipient: codex_update_recipient,
+          opts: opts,
+          issue_state_fetcher: issue_state_fetcher,
+          route: route
+        }
+
+        do_run_codex_turns(context, 1, max_turns)
       after
         runtime.stop_session(session)
       end
     end
   end
 
-  defp do_run_codex_turns(
-         runtime,
-         app_session,
-         workspace,
-         issue,
-         codex_update_recipient,
-         opts,
-         issue_state_fetcher,
-         turn_number,
-         max_turns,
-         route
-       ) do
-    prompt = build_turn_prompt(issue, opts, turn_number, max_turns)
+  defp do_run_codex_turns(context, turn_number, max_turns) do
+    prompt = build_turn_prompt(context.issue, context.opts, turn_number, max_turns)
 
     with {:ok, turn_session} <-
-           runtime.run_turn(
-             app_session,
+           context.runtime.run_turn(
+             context.app_session,
              prompt,
-             issue,
-             Keyword.put(opts, :on_message, codex_message_handler(codex_update_recipient, issue))
+             context.issue,
+             Keyword.put(
+               context.opts,
+               :on_message,
+               codex_message_handler(context.codex_update_recipient, context.issue)
+             )
            ) do
-      Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
+      Logger.info(
+        "Completed agent run for #{issue_context(context.issue)} session_id=#{turn_session[:session_id]} " <>
+          "workspace=#{context.workspace} turn=#{turn_number}/#{max_turns}"
+      )
 
-      case continue_with_issue_and_route(issue, issue_state_fetcher, route) do
+      case continue_with_issue_and_route(
+             context.issue,
+             context.issue_state_fetcher,
+             context.route
+           ) do
         {:continue, refreshed_issue, refreshed_route} ->
-          if route_changed?(route, refreshed_route) do
-            notify_route_change(codex_update_recipient, refreshed_issue, route, refreshed_route)
-            :ok
-          else
-            if turn_number < max_turns do
-              Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}")
-
-              do_run_codex_turns(
-                runtime,
-                app_session,
-                workspace,
-                refreshed_issue,
-                codex_update_recipient,
-                opts,
-                issue_state_fetcher,
-                turn_number + 1,
-                max_turns,
-                refreshed_route
-              )
-            else
-              Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator")
-
-              :ok
-            end
-          end
+          continue_after_turn(context, refreshed_issue, refreshed_route, turn_number, max_turns)
 
         {:done, _refreshed_issue} ->
           :ok
@@ -181,6 +165,43 @@ defmodule SymphonyElixir.AgentRunner do
         {:error, reason} ->
           {:error, reason}
       end
+    end
+  end
+
+  defp continue_after_turn(context, refreshed_issue, refreshed_route, turn_number, max_turns) do
+    decision = dependency_decision(refreshed_issue, refreshed_route)
+
+    cond do
+      decision.allowed? != true ->
+        notify_dependency_blocked(context.codex_update_recipient, refreshed_issue, decision)
+        :ok
+
+      route_changed?(context.route, refreshed_route) ->
+        notify_route_change(
+          context.codex_update_recipient,
+          refreshed_issue,
+          context.route,
+          refreshed_route
+        )
+
+        :ok
+
+      turn_number >= max_turns ->
+        Logger.info(
+          "Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; " <>
+            "returning control to orchestrator"
+        )
+
+        :ok
+
+      true ->
+        Logger.info(
+          "Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion " <>
+            "turn=#{turn_number}/#{max_turns}"
+        )
+
+        next_context = %{context | issue: refreshed_issue, route: refreshed_route}
+        do_run_codex_turns(next_context, turn_number + 1, max_turns)
     end
   end
 
@@ -224,8 +245,47 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp notify_route_change(_recipient, _issue, _previous_route, _next_route), do: :ok
 
+  defp notify_dependency_blocked(recipient, %Issue{id: issue_id}, decision)
+       when is_pid(recipient) and is_binary(issue_id) do
+    send(recipient, {:agent_dependency_blocked, issue_id, dependency_metadata(decision)})
+    :ok
+  end
+
+  defp notify_dependency_blocked(_recipient, _issue, _decision), do: :ok
+
+  defp dependency_metadata(decision) when is_map(decision) do
+    Map.take(decision, [
+      :dependency_status,
+      :dependent_state,
+      :responsibility,
+      :reason,
+      :blockers,
+      :unresolved_blockers,
+      :invalidated_blockers,
+      :diagnostic
+    ])
+  end
+
+  defp dependency_decision(%Issue{} = issue, %Route{responsibility: responsibility}) do
+    Guard.evaluate(issue, responsibility, dependency_policy_options())
+  end
+
+  defp dependency_decision(_issue, _route), do: %{allowed?: true}
+
+  defp dependency_policy_options do
+    settings = Config.settings!()
+
+    [
+      active_states: settings.tracker.active_states || [],
+      terminal_states: settings.tracker.terminal_states || []
+    ]
+  end
+
   defp max_turns_for_route(%Route{profile: %Profile{max_turns: max_turns}}), do: max_turns
   defp max_turns_for_route(_route), do: Config.settings!().agent.max_turns
+
+  defp max_turns_for_run(%Route{} = route, _opts), do: max_turns_for_route(route)
+  defp max_turns_for_run(_route, opts), do: Keyword.get(opts, :max_turns, max_turns_for_route(nil))
 
   defp profile_runtime_options(opts, %Route{profile: %Profile{} = profile}) do
     Keyword.merge(opts, Profile.runtime_options(profile))
@@ -252,8 +312,8 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp build_turn_prompt(issue, opts, 1, _max_turns), do: PromptBuilder.build_prompt(issue, opts)
 
-  defp build_turn_prompt(_issue, _opts, turn_number, max_turns) do
-    """
+  defp build_turn_prompt(_issue, opts, turn_number, max_turns) do
+    continuation = """
     Continuation guidance:
 
     - The previous Codex turn completed normally, but the tracker work item is still in an active state.
@@ -262,6 +322,8 @@ defmodule SymphonyElixir.AgentRunner do
     - The original task instructions and prior turn context are already present in this thread, so do not restate them before acting.
     - Focus on the remaining ticket work and do not end the turn while the issue stays active unless you are truly blocked.
     """
+
+    PromptBuilder.with_role_prompt(continuation, Keyword.get(opts, :route))
   end
 
   defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher) when is_binary(issue_id) do

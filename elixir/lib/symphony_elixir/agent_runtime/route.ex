@@ -26,7 +26,7 @@ defmodule SymphonyElixir.AgentRuntime.Route do
           fingerprint: String.t()
         }
 
-  @spec new(Issue.t(), Profile.t()) :: t()
+  @spec new(Issue.routable_t(), Profile.t()) :: t()
   def new(%Issue{id: issue_id, state: state}, %Profile{} = profile)
       when is_binary(issue_id) and is_binary(state) do
     route = %__MODULE__{
@@ -35,7 +35,8 @@ defmodule SymphonyElixir.AgentRuntime.Route do
       profile_name: profile.name,
       runtime_name: profile.runtime,
       responsibility: profile.responsibility,
-      profile: profile
+      profile: profile,
+      fingerprint: ""
     }
 
     %{route | fingerprint: fingerprint(route)}
