@@ -37,6 +37,28 @@ defmodule SymphonyElixir.ProfileRuntimeTest do
     end
   end
 
+  test "legacy runtime settings preserve the workflow sandbox without a routed profile" do
+    root = Path.join(System.tmp_dir!(), "symphony-legacy-runtime-#{System.unique_integer([:positive])}")
+    workspace = Path.join(root, "SYM-LEGACY")
+    File.mkdir_p!(workspace)
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: root,
+        agent_routing: "legacy",
+        codex_thread_sandbox: "read-only",
+        codex_turn_sandbox_policy: %{type: "readOnly"}
+      )
+
+      assert Config.settings!().agent.profiles == nil
+      assert {:ok, settings} = Config.codex_runtime_settings(workspace)
+      assert settings.thread_sandbox == "read-only"
+      assert settings.turn_sandbox_policy == %{"type" => "readOnly"}
+    after
+      File.rm_rf(root)
+    end
+  end
+
   test "workspace-write profile settings use the bounded workspace policy" do
     root = Path.join(System.tmp_dir!(), "symphony-profile-runtime-write-#{System.unique_integer([:positive])}")
     workspace = Path.join(root, "SYM-WRITE")

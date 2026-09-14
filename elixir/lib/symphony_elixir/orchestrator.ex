@@ -1720,15 +1720,25 @@ defmodule SymphonyElixir.Orchestrator do
   defp running_entry_session_id(_running_entry), do: "n/a"
 
   defp route_for_issue(%Issue{} = issue) do
-    case Router.resolve(issue, Config.settings!().agent.profiles) do
-      {:ok, %Route{runtime_name: "codex"} = route} ->
-        {:ok, route}
+    settings = Config.settings!()
 
-      {:ok, %Route{runtime_name: runtime_name}} ->
-        {:error, {:runtime_not_available, runtime_name}}
+    if settings.agent.routing == "legacy" do
+      if active_issue_state?(issue.state, active_state_set()) do
+        {:ok, Route.legacy(issue)}
+      else
+        {:error, {:not_dispatchable_state, normalize_issue_state(issue.state)}}
+      end
+    else
+      case Router.resolve(issue, settings.agent.profiles, settings.agent.routes) do
+        {:ok, %Route{runtime_name: "codex"} = route} ->
+          {:ok, route}
 
-      {:error, reason} ->
-        {:error, reason}
+        {:ok, %Route{runtime_name: runtime_name}} ->
+          {:error, {:runtime_not_available, runtime_name}}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
     end
   end
 

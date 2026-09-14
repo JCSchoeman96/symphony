@@ -49,6 +49,48 @@ defmodule SymphonyElixir.AgentRouterOrchestratorTest do
     assert opts[:route].responsibility == "planning"
   end
 
+  test "legacy workflows dispatch without applying routed profile permissions" do
+    test_pid = self()
+    Process.register(test_pid, :symphony_agent_router_capture)
+
+    issue = %Issue{
+      id: "legacy-route",
+      identifier: "SYM-LEGACY-ROUTE",
+      title: "Keep legacy policy",
+      state: "In Progress",
+      dispatchable: true
+    }
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      agent_routing: "legacy",
+      tracker_active_states: ["In Progress"],
+      codex_thread_sandbox: "read-only",
+      codex_turn_sandbox_policy: %{type: "readOnly"},
+      poll_interval_ms: 60_000
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+    orchestrator_name = Module.concat(__MODULE__, "LegacyOrchestrator#{System.unique_integer([:positive])}")
+
+    {:ok, pid} =
+      Orchestrator.start_link(
+        name: orchestrator_name,
+        agent_runner: SymphonyElixir.AgentRouterOrchestratorRunnerFake
+      )
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: GenServer.stop(pid)
+
+      if Process.whereis(:symphony_agent_router_capture) == test_pid,
+        do: Process.unregister(:symphony_agent_router_capture)
+    end)
+
+    assert_receive {:fake_agent_run, ^issue, opts}, 1_000
+    assert opts[:route].profile == nil
+    assert opts[:route].responsibility == "implementation"
+  end
+
   test "orchestrator keeps implementation behind active dependencies while allowing planning" do
     test_pid = self()
     Process.register(test_pid, :symphony_agent_router_capture)

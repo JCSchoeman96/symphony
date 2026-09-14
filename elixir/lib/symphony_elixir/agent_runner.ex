@@ -251,7 +251,7 @@ defmodule SymphonyElixir.AgentRunner do
   defp continue_with_issue_and_route(issue, issue_state_fetcher, %Route{}) do
     case continue_with_issue?(issue, issue_state_fetcher) do
       {:continue, %Issue{} = refreshed_issue} ->
-        case Router.resolve(refreshed_issue, Config.settings!().agent.profiles) do
+        case resolve_route(refreshed_issue) do
           {:ok, %Route{} = refreshed_route} ->
             {:continue, refreshed_issue, refreshed_route}
 
@@ -261,6 +261,16 @@ defmodule SymphonyElixir.AgentRunner do
 
       other ->
         other
+    end
+  end
+
+  defp resolve_route(%Issue{} = issue) do
+    settings = Config.settings!()
+
+    if settings.agent.routing == "legacy" do
+      {:ok, Route.legacy(issue)}
+    else
+      Router.resolve(issue, settings.agent.profiles, settings.agent.routes)
     end
   end
 
