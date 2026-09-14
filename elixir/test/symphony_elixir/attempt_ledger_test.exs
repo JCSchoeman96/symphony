@@ -51,6 +51,18 @@ defmodule SymphonyElixir.AttemptLedgerTest do
     refute String.starts_with?(default_path, System.tmp_dir!())
   end
 
+  test "keeps independent ledger paths open concurrently", %{root: root} do
+    path_a = Path.join(root, "project-a.dets")
+    path_b = Path.join(root, "project-b.dets")
+
+    {:ok, ledger_a} = AttemptLedger.open("project-a", @identity, path: path_a)
+    {:ok, ledger_b} = AttemptLedger.open("project-b", @identity, path: path_b)
+
+    assert ledger_a.table != ledger_b.table
+    assert :ok = AttemptLedger.close(ledger_a)
+    assert :ok = AttemptLedger.close(ledger_b)
+  end
+
   test "rejects newer schema records and corrupt snapshots", %{path: path} do
     seed(path, [{{:meta, "project-a"}, metadata("project-a", @identity, 999)}])
 
@@ -419,7 +431,7 @@ defmodule SymphonyElixir.AttemptLedgerTest do
   end
 
   defp seed(path, records) do
-    {:ok, table} = :dets.open_file(:symphony_attempt_ledger, type: :set, file: String.to_charlist(path))
+    {:ok, table} = :dets.open_file(path, type: :set, file: String.to_charlist(path))
     :ok = :dets.delete_all_objects(table)
     :ok = :dets.insert(table, records)
     :ok = :dets.sync(table)
