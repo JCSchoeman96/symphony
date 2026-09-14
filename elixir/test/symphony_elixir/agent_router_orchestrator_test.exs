@@ -6,6 +6,18 @@ defmodule SymphonyElixir.AgentRouterOrchestratorRunnerFake do
   end
 end
 
+defmodule SymphonyElixir.AgentRouterOrchestratorLongRunningFake do
+  @spec run(map(), pid() | nil, keyword()) :: :ok
+  def run(issue, _recipient, opts) do
+    parent = Process.whereis(:symphony_agent_router_long_running_capture)
+    send(parent, {:long_running_worker_started, self(), issue, opts})
+
+    receive do
+      :finish -> :ok
+    end
+  end
+end
+
 defmodule SymphonyElixir.AgentRouterOrchestratorTest do
   use SymphonyElixir.TestSupport
 
@@ -283,5 +295,133 @@ defmodule SymphonyElixir.AgentRouterOrchestratorTest do
 
     refute Map.has_key?(updated_state.blocked, issue.id)
     refute MapSet.member?(updated_state.claimed, issue.id)
+  end
+
+  test "poll reconciliation stops a live worker when a dependency reappears" do
+    test_pid = self()
+    Process.register(test_pid, :symphony_agent_router_long_running_capture)
+
+    issue = %Issue{
+      id: "poll-dependency-change",
+      identifier: "SYM-POLL-DEPENDENCY",
+      title: "Poll dependency change",
+      state: "In Progress",
+      dispatchable: true
+    }
+
+    blocker = %Issue{
+      id: "poll-blocker",
+      identifier: "SYM-POLL-BLOCKER",
+      title: "Poll blocker",
+      state: "Ready",
+      dispatchable: true
+    }
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_active_states: ["In Progress"],
+      poll_interval_ms: 60_000
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+    orchestrator_name = Module.concat(__MODULE__, "PollDependencyOrchestrator#{System.unique_integer([:positive])}")
+
+    {:ok, pid} =
+      Orchestrator.start_link(
+        name: orchestrator_name,
+        agent_runner: SymphonyElixir.AgentRouterOrchestratorLongRunningFake
+      )
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: GenServer.stop(pid)
+
+      if Process.whereis(:symphony_agent_router_long_running_capture) == test_pid,
+        do: Process.unregister(:symphony_agent_router_long_running_capture)
+    end)
+
+    assert_receive {:long_running_worker_started, worker_pid, ^issue, _opts}, 1_000
+    assert Process.alive?(worker_pid)
+
+    changed_issue = %{
+      issue
+      | blocked_by: [%{id: blocker.id, identifier: blocker.identifier, state: blocker.state}]
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [changed_issue, blocker])
+    send(pid, :run_poll_cycle)
+
+    snapshot = Orchestrator.snapshot(orchestrator_name, 1_000)
+
+    refute Process.alive?(worker_pid)
+    assert snapshot.running == []
+    assert [%{issue_id: "poll-dependency-change", responsibility: "implementation", attempt: 0} = blocked] = snapshot.blocked
+    assert blocked.error =~ "dependency guard blocked"
+    assert blocked.dependency.reason == :unresolved_hard_dependency
+
+    assert blocked.dependency.unresolved_blockers == [
+             %{id: blocker.id, identifier: blocker.identifier, state: "ready"}
+           ]
+
+    send(pid, {:DOWN, make_ref(), :process, worker_pid, :normal})
+    send(pid, {:agent_dependency_blocked, changed_issue.id, blocked.dependency})
+
+    assert Orchestrator.snapshot(orchestrator_name, 1_000).blocked == snapshot.blocked
+  end
+
+  test "poll route changes stop the old worker and preserve a retry claim" do
+    test_pid = self()
+    Process.register(test_pid, :symphony_agent_router_long_running_capture)
+
+    issue = %Issue{
+      id: "poll-route-change",
+      identifier: "SYM-POLL-ROUTE",
+      title: "Poll route change",
+      state: "Planning",
+      dispatchable: true
+    }
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_active_states: ["Planning", "Ready"],
+      poll_interval_ms: 60_000
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+    orchestrator_name = Module.concat(__MODULE__, "PollRouteOrchestrator#{System.unique_integer([:positive])}")
+
+    {:ok, pid} =
+      Orchestrator.start_link(
+        name: orchestrator_name,
+        agent_runner: SymphonyElixir.AgentRouterOrchestratorLongRunningFake
+      )
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: GenServer.stop(pid)
+
+      if Process.whereis(:symphony_agent_router_long_running_capture) == test_pid,
+        do: Process.unregister(:symphony_agent_router_long_running_capture)
+    end)
+
+    assert_receive {:long_running_worker_started, worker_pid, ^issue, _opts}, 1_000
+
+    changed_issue = %{issue | state: "Ready"}
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [changed_issue])
+    send(pid, :run_poll_cycle)
+
+    snapshot = Orchestrator.snapshot(orchestrator_name, 1_000)
+    state = :sys.get_state(pid)
+
+    refute Process.alive?(worker_pid)
+    assert snapshot.running == []
+    assert [%{issue_id: "poll-route-change", attempt: 1, route_change: route_change}] = snapshot.retrying
+    assert route_change.previous.profile_name == "planner"
+    assert route_change.next.profile_name == "builder"
+    assert state.retry_attempts[issue.id].attempt == 1
+    assert MapSet.member?(state.claimed, issue.id)
+
+    send(pid, {:DOWN, make_ref(), :process, worker_pid, :normal})
+    assert [snapshot_retry] = snapshot.retrying
+    assert [refreshed_retry] = Orchestrator.snapshot(orchestrator_name, 1_000).retrying
+    assert Map.delete(refreshed_retry, :due_in_ms) == Map.delete(snapshot_retry, :due_in_ms)
   end
 end

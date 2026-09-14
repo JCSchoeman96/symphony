@@ -439,6 +439,8 @@ defmodule SymphonyElixir.Orchestrator do
     else
       case Tracker.fetch_issues_by_ids(running_ids) do
         {:ok, issues} ->
+          state = refresh_dependency_state_for_running(state, issues)
+
           issues
           |> reconcile_running_issue_states(
             state,
@@ -453,6 +455,28 @@ defmodule SymphonyElixir.Orchestrator do
           state
       end
     end
+  end
+
+  defp refresh_dependency_state_for_running(%State{} = state, running_issues)
+       when is_list(running_issues) do
+    case Tracker.fetch_dependency_graph() do
+      {:ok, graph_issues} when is_list(graph_issues) ->
+        state
+        |> refresh_dependency_state(graph_issues, :complete)
+        |> ensure_graph_contains_running_issues(running_issues)
+
+      {:ok, _invalid_graph} ->
+        Logger.warning("Running dependency graph provider returned invalid data; active implementation workers are unsafe")
+        refresh_dependency_state(state, running_issues, {:unavailable, :invalid_dependency_graph})
+
+      {:error, reason} ->
+        Logger.warning("Running dependency graph refresh unavailable; active implementation workers are unsafe: #{inspect(reason)}")
+        refresh_dependency_state(state, running_issues, {:unavailable, :dependency_graph_unavailable})
+    end
+  end
+
+  defp refresh_dependency_state_for_running(%State{} = state, _running_issues) do
+    refresh_dependency_state(state, [], {:unavailable, :invalid_running_issue_collection})
   end
 
   defp reconcile_blocked_issues(%State{} = state) do
@@ -680,7 +704,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp refresh_routed_running_issue(state, issue, running_entry, current_route, next_route) do
     if Route.same?(current_route, next_route) do
-      %{state | running: Map.put(state.running, issue.id, %{running_entry | issue: issue})}
+      refresh_running_dependency_state(state, issue, running_entry, current_route)
     else
       Logger.info(
         "Stopping active agent after route refresh for #{issue_context(issue)} " <>
@@ -688,8 +712,61 @@ defmodule SymphonyElixir.Orchestrator do
           "next=#{next_route.profile_name}/#{next_route.responsibility}"
       )
 
-      terminate_running_issue(state, issue.id, false)
+      stop_running_issue_for_route_change(state, issue, running_entry, current_route, next_route)
     end
+  end
+
+  defp refresh_running_dependency_state(%State{} = state, %Issue{} = issue, running_entry, route) do
+    decision = dependency_decision_for_state(issue, route, state)
+
+    if decision.allowed? == true do
+      %{state | running: Map.put(state.running, issue.id, %{running_entry | issue: issue})}
+    else
+      Logger.warning(
+        "Stopping active agent after dependency refresh for #{issue_context(issue)}: " <>
+          dependency_blocker_error(decision)
+      )
+
+      updated_entry = %{running_entry | issue: issue}
+
+      state
+      |> record_session_completion_totals(running_entry)
+      |> stop_and_block_issue(issue.id, updated_entry, dependency_blocker_error(decision), decision)
+    end
+  end
+
+  defp stop_running_issue_for_route_change(
+         %State{} = state,
+         %Issue{} = issue,
+         running_entry,
+         %Route{} = previous_route,
+         %Route{} = next_route
+       ) do
+    next_attempt = next_retry_attempt_from_running(running_entry)
+    stop_running_task(Map.get(running_entry, :pid), Map.get(running_entry, :ref), state.task_supervisor)
+
+    state =
+      state
+      |> record_session_completion_totals(running_entry)
+      |> Map.update!(:running, &Map.delete(&1, issue.id))
+
+    state
+    |> schedule_issue_retry(
+      issue.id,
+      next_attempt,
+      Map.merge(
+        %{
+          identifier: issue.identifier,
+          issue_url: issue.url,
+          error: "route changed during poll refresh",
+          delay_type: :route_change,
+          route_change: route_change_metadata(previous_route, next_route),
+          worker_host: Map.get(running_entry, :worker_host),
+          workspace_path: Map.get(running_entry, :workspace_path)
+        },
+        route_retry_metadata(running_entry)
+      )
+    )
   end
 
   defp refresh_blocked_issue_state(%State{} = state, %Issue{} = issue) do
@@ -953,14 +1030,14 @@ defmodule SymphonyElixir.Orchestrator do
     :ok
   end
 
-  defp stop_and_block_issue(%State{} = state, issue_id, running_entry, error) do
+  defp stop_and_block_issue(%State{} = state, issue_id, running_entry, error, dependency \\ nil) do
     stop_running_task(
       Map.get(running_entry, :pid),
       Map.get(running_entry, :ref),
       state.task_supervisor
     )
 
-    block_issue_from_entry(state, issue_id, running_entry, error)
+    block_issue_from_entry(state, issue_id, running_entry, error, dependency)
   end
 
   defp block_issue_from_entry(%State{} = state, issue_id, running_entry, error, dependency \\ nil) do
@@ -974,6 +1051,7 @@ defmodule SymphonyElixir.Orchestrator do
       route_fingerprint: Map.get(running_entry, :route_fingerprint),
       worker_host: Map.get(running_entry, :worker_host),
       workspace_path: Map.get(running_entry, :workspace_path),
+      retry_attempt: Map.get(running_entry, :retry_attempt, 0),
       session_id: running_entry_session_id(running_entry),
       error: error,
       blocked_at: DateTime.utc_now(),
@@ -1026,6 +1104,18 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp dependency_decision(%Issue{} = issue, responsibility) do
     Guard.evaluate(issue, responsibility, dependency_policy_options())
+  end
+
+  defp dependency_decision_for_state(
+         %Issue{id: issue_id} = issue,
+         %Route{responsibility: responsibility},
+         %State{} = state
+       )
+       when is_binary(issue_id) do
+    issue
+    |> Guard.evaluate(responsibility, dependency_policy_options())
+    |> maybe_mark_dependency_incomplete(state.dependency_graph, issue_id)
+    |> maybe_mark_dependency_cycle(state.dependency_graph, issue_id)
   end
 
   defp maybe_mark_dependency_cycle(decision, %Graph{} = graph, issue_id) do
@@ -1289,8 +1379,17 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp ensure_graph_contains_active_issues(%State{} = state, active_issues) when is_list(active_issues) do
+    ensure_graph_contains_issues(state, active_issues)
+  end
+
+  defp ensure_graph_contains_running_issues(%State{} = state, running_issues)
+       when is_list(running_issues) do
+    ensure_graph_contains_issues(state, running_issues)
+  end
+
+  defp ensure_graph_contains_issues(%State{} = state, issues) when is_list(issues) do
     missing_issue? =
-      Enum.any?(active_issues, fn
+      Enum.any?(issues, fn
         %Issue{id: issue_id} when is_binary(issue_id) ->
           not Map.has_key?(state.dependency_graph.nodes, issue_id)
 
@@ -2072,6 +2171,7 @@ defmodule SymphonyElixir.Orchestrator do
           route_fingerprint: Map.get(metadata, :route_fingerprint),
           worker_host: Map.get(metadata, :worker_host),
           workspace_path: Map.get(metadata, :workspace_path),
+          attempt: Map.get(metadata, :retry_attempt, 0),
           session_id: Map.get(metadata, :session_id),
           error: Map.get(metadata, :error),
           dependency: snapshot_dependency_metadata(Map.get(metadata, :dependency)),
