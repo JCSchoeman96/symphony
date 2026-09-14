@@ -143,8 +143,9 @@ defmodule SymphonyElixir.Config do
     if is_nil(settings.tracker.kind) do
       {:error, :missing_tracker_kind}
     else
-      with :ok <- Tracker.validate_config(settings.tracker) do
-        Tracker.validate_routed_capabilities(settings)
+      with :ok <- Tracker.validate_config(settings.tracker),
+           :ok <- Tracker.validate_routed_capabilities(settings) do
+        Schema.validate_project_identity(settings)
       end
     end
   end

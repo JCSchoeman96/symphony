@@ -8,12 +8,13 @@ defmodule SymphonyElixir.Orchestrator do
   import Bitwise, only: [<<<: 2]
 
   alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
-  alias SymphonyElixir.AgentRuntime.{AttemptPolicy, Route, Router}
+  alias SymphonyElixir.AgentRuntime.{AttemptLedger, AttemptPolicy, Route, Router}
   alias SymphonyElixir.Dependency.{Graph, Guard}
   alias SymphonyElixir.Tracker.Issue
 
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
+  @durable_attempt_events [:ordinary_failure, :review_cycle, :ci_failure]
   @recent_attempt_limit 20
   @observability_text_limit 240
   @observability_rate_limit_keys ["limit_id", "limit_name", "primary", "secondary", "credits"]
@@ -74,6 +75,8 @@ defmodule SymphonyElixir.Orchestrator do
     Runtime state for the orchestrator polling loop.
     """
 
+    @type t :: %__MODULE__{}
+
     defstruct [
       :poll_interval_ms,
       :max_concurrent_agents,
@@ -91,6 +94,10 @@ defmodule SymphonyElixir.Orchestrator do
       dependency_diagnostics: %{},
       retry_attempts: %{},
       attempt_counters: %{},
+      attempt_ledger: nil,
+      attempt_ledger_status: :disabled,
+      attempt_ledger_opts: [],
+      durable_exhausted: %{},
       recent_attempts: [],
       codex_totals: nil,
       codex_rate_limits: nil
@@ -123,7 +130,14 @@ defmodule SymphonyElixir.Orchestrator do
           codex_rate_limits: nil
         }
 
-        run_terminal_workspace_cleanup()
+        state = initialize_attempt_ledger(state, config, opts)
+
+        if autonomous_dispatch_allowed?(state) do
+          run_terminal_workspace_cleanup()
+        else
+          Logger.error("Autonomous dispatch is held: #{inspect(ledger_block_reason(state))}")
+        end
+
         state = schedule_tick(state, 0)
 
         {:ok, state}
@@ -132,6 +146,173 @@ defmodule SymphonyElixir.Orchestrator do
         {:stop, reason}
     end
   end
+
+  @impl true
+  def terminate(_reason, %State{attempt_ledger: nil}), do: :ok
+
+  def terminate(_reason, %State{attempt_ledger: ledger}) do
+    case AttemptLedger.close(ledger) do
+      :ok -> :ok
+      {:error, reason} -> Logger.error("Failed to close attempt ledger: #{inspect(reason)}")
+    end
+
+    :ok
+  end
+
+  defp initialize_attempt_ledger(%State{} = state, %{agent: %{routing: "legacy"}}, _opts) do
+    %{state | attempt_ledger_status: :disabled, attempt_ledger_opts: []}
+  end
+
+  defp initialize_attempt_ledger(%State{} = state, config, opts) do
+    project_id = config.symphony.project_id
+    tracker_identity = Tracker.identity(config.tracker)
+    ledger_opts = Keyword.get(opts, :attempt_ledger_opts, [])
+
+    case AttemptLedger.open(project_id, tracker_identity, ledger_opts) do
+      {:ok, ledger} ->
+        case reconcile_attempt_ledger(state, ledger) do
+          {:ok, state} ->
+            %{
+              state
+              | attempt_ledger: ledger,
+                attempt_ledger_status: :ready,
+                attempt_ledger_opts: ledger_opts
+            }
+
+          {:blocked, state, reason} ->
+            %{
+              state
+              | attempt_ledger: ledger,
+                attempt_ledger_status: {:blocked, reason},
+                attempt_ledger_opts: ledger_opts
+            }
+        end
+
+      {:error, reason} ->
+        %{
+          state
+          | attempt_ledger_status: {:blocked, {:attempt_ledger_unavailable, reason}},
+            attempt_ledger_opts: ledger_opts
+        }
+    end
+  end
+
+  defp reconcile_attempt_ledger(%State{} = state, %AttemptLedger{} = ledger) do
+    case AttemptLedger.open_lineages(ledger) do
+      {:ok, records} ->
+        state = restore_durable_lineages(state, records)
+        issue_ids = Enum.map(records, & &1.issue_id)
+
+        if issue_ids == [] do
+          {:ok, state}
+        else
+          reconcile_durable_issue_states(state, ledger, records, issue_ids)
+        end
+
+      {:error, reason} ->
+        {:blocked, state, {:attempt_ledger_unavailable, reason}}
+    end
+  end
+
+  defp restore_durable_lineages(%State{} = state, records) when is_list(records) do
+    Enum.reduce(records, state, fn record, state_acc ->
+      counters = Map.merge(AttemptPolicy.new(), record.safety_counters)
+
+      state_acc = %{
+        state_acc
+        | attempt_counters: Map.put(state_acc.attempt_counters, record.issue_id, counters)
+      }
+
+      if record.status == :exhausted do
+        %{state_acc | durable_exhausted: Map.put(state_acc.durable_exhausted, record.issue_id, record)}
+      else
+        state_acc
+      end
+    end)
+  end
+
+  defp reconcile_durable_issue_states(%State{} = state, ledger, records, issue_ids) do
+    case Tracker.fetch_issues_by_ids(issue_ids) do
+      {:ok, issues} when is_list(issues) ->
+        case durable_issue_map(issues) do
+          {:ok, issues_by_id} ->
+            reconcile_fetched_durable_issue_states(state, ledger, records, issues_by_id)
+
+          :error ->
+            {:blocked, state, {:attempt_ledger_tracker_unavailable, :invalid_issue_collection}}
+        end
+
+      {:error, reason} ->
+        {:blocked, state, {:attempt_ledger_tracker_unavailable, reason}}
+    end
+  end
+
+  defp durable_issue_map(issues) do
+    case Enum.reduce_while(issues, %{}, fn
+           %Issue{id: issue_id} = issue, issues_by_id when is_binary(issue_id) ->
+             {:cont, Map.put(issues_by_id, issue_id, issue)}
+
+           _issue, _issues_by_id ->
+             {:halt, :error}
+         end) do
+      :error -> :error
+      issues_by_id -> {:ok, issues_by_id}
+    end
+  end
+
+  defp reconcile_fetched_durable_issue_states(state, ledger, records, issues_by_id) do
+    result =
+      Enum.reduce(records, {state, [], []}, fn record, acc ->
+        reconcile_durable_record(record, issues_by_id, ledger, acc)
+      end)
+
+    finish_durable_reconciliation(result)
+  end
+
+  defp reconcile_durable_record(record, issues_by_id, ledger, {state, missing, errors}) do
+    case Map.get(issues_by_id, record.issue_id) do
+      nil ->
+        {state, [record.issue_id | missing], errors}
+
+      %Issue{} = issue ->
+        reconcile_visible_durable_record(issue, ledger, {state, missing, errors})
+    end
+  end
+
+  defp reconcile_visible_durable_record(%Issue{} = issue, ledger, {state, missing, errors}) do
+    if terminal_issue_state?(issue.state, terminal_state_set()) do
+      case AttemptLedger.close_lineage(ledger, issue.id, reason: :terminal) do
+        :ok -> {reset_durable_lineage(state, issue.id), missing, errors}
+        {:error, reason} -> {state, missing, [{issue.id, reason} | errors]}
+      end
+    else
+      {state, missing, errors}
+    end
+  end
+
+  defp finish_durable_reconciliation({state, [], []}), do: {:ok, state}
+
+  defp finish_durable_reconciliation({state, _missing, close_errors}) when close_errors != [] do
+    {:blocked, state, {:attempt_ledger_close_failed, Enum.reverse(close_errors)}}
+  end
+
+  defp finish_durable_reconciliation({state, missing, []}) do
+    {:blocked, state, {:attempt_ledger_issue_missing, Enum.sort(missing)}}
+  end
+
+  defp reset_durable_lineage(%State{} = state, issue_id) do
+    %{
+      state
+      | attempt_counters: Map.delete(state.attempt_counters, issue_id),
+        durable_exhausted: Map.delete(state.durable_exhausted, issue_id)
+    }
+  end
+
+  defp autonomous_dispatch_allowed?(%State{attempt_ledger_status: {:blocked, _reason}}), do: false
+  defp autonomous_dispatch_allowed?(%State{}), do: true
+
+  defp ledger_block_reason(%State{attempt_ledger_status: {:blocked, reason}}), do: reason
+  defp ledger_block_reason(_state), do: nil
 
   @impl true
   def handle_info({:tick, tick_token}, %{tick_token: tick_token} = state)
@@ -378,6 +559,10 @@ defmodule SymphonyElixir.Orchestrator do
       {:stop, state, reason} ->
         Logger.error("Automatic retries exhausted for issue_id=#{issue_id} session_id=#{session_id}; requiring human attention")
         block_issue_from_entry(state, issue_id, running_entry, attempt_policy_error(reason))
+
+      {:error, state, reason} ->
+        Logger.error("Automatic retry blocked for issue_id=#{issue_id} session_id=#{session_id}: #{inspect(reason)}")
+        block_issue_from_entry(state, issue_id, running_entry, attempt_ledger_error(reason))
     end
   end
 
@@ -407,6 +592,9 @@ defmodule SymphonyElixir.Orchestrator do
 
       {:stop, state, reason} ->
         block_issue_from_entry(state, issue_id, running_entry, attempt_policy_error(reason))
+
+      {:error, state, reason} ->
+        block_issue_from_entry(state, issue_id, running_entry, attempt_ledger_error(reason))
     end
   end
 
@@ -433,6 +621,50 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp maybe_dispatch(%State{} = state) do
+    case state.attempt_ledger_status do
+      {:blocked, reason} ->
+        maybe_reconcile_blocked_ledger(state, reason)
+
+      status when status in [:disabled, :ready] ->
+        maybe_dispatch_ready(state)
+
+      status ->
+        Logger.debug("Skipping autonomous dispatch with invalid attempt ledger status: #{inspect(status)}")
+        state
+    end
+  end
+
+  defp maybe_reconcile_blocked_ledger(%State{} = state, reason) do
+    with true <- retryable_ledger_reconciliation_reason?(reason),
+         %AttemptLedger{} = ledger <- state.attempt_ledger do
+      reconcile_blocked_ledger(state, ledger)
+    else
+      _ -> blocked_ledger_state(state, reason)
+    end
+  end
+
+  defp reconcile_blocked_ledger(%State{} = state, %AttemptLedger{} = ledger) do
+    case reconcile_attempt_ledger(state, ledger) do
+      {:ok, state} ->
+        maybe_dispatch_ready(%{state | attempt_ledger_status: :ready})
+
+      {:blocked, state, reason} ->
+        Logger.debug("Attempt ledger reconciliation remains blocked: #{inspect(reason)}")
+        %{state | attempt_ledger_status: {:blocked, reason}}
+    end
+  end
+
+  defp blocked_ledger_state(%State{} = state, reason) do
+    Logger.debug("Skipping autonomous dispatch while attempt ledger is blocked: #{inspect(reason)}")
+    state
+  end
+
+  defp retryable_ledger_reconciliation_reason?({:attempt_ledger_issue_missing, _}), do: true
+  defp retryable_ledger_reconciliation_reason?({:attempt_ledger_tracker_unavailable, _}), do: true
+  defp retryable_ledger_reconciliation_reason?({:attempt_ledger_close_failed, _}), do: true
+  defp retryable_ledger_reconciliation_reason?(_reason), do: false
+
+  defp maybe_dispatch_ready(%State{} = state) do
     state =
       state
       |> reconcile_running_issues()
@@ -458,12 +690,10 @@ defmodule SymphonyElixir.Orchestrator do
 
       {:error, :missing_tracker_kind} ->
         Logger.error("Tracker kind missing in WORKFLOW.md")
-
         state
 
       {:error, {:unsupported_tracker_kind, kind}} ->
         Logger.error("Unsupported tracker kind in WORKFLOW.md: #{inspect(kind)}")
-
         state
 
       {:error, {:invalid_workflow_config, message}} ->
@@ -1010,6 +1240,11 @@ defmodule SymphonyElixir.Orchestrator do
         state
         |> record_session_completion_totals(running_entry)
         |> stop_and_block_issue(issue_id, running_entry, attempt_policy_error(reason))
+
+      {:error, state, reason} ->
+        state
+        |> record_session_completion_totals(running_entry)
+        |> stop_and_block_issue(issue_id, running_entry, attempt_ledger_error(reason))
     end
   end
 
@@ -1397,22 +1632,31 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp should_dispatch_issue?(
          %Issue{} = issue,
-         %State{running: running, claimed: claimed, blocked: blocked} = state,
+         %State{} = state,
          active_states,
          terminal_states
        ) do
     candidate_issue?(issue, active_states, terminal_states) and
-      !MapSet.member?(claimed, issue.id) and
-      !Map.has_key?(running, issue.id) and
-      !Map.has_key?(blocked, issue.id) and
+      issue_not_reserved?(state, issue.id) and
       route_dispatchable?(issue) and
       dependency_dispatchable?(issue, state) and
-      available_slots(state) > 0 and
-      state_slots_available?(issue, running) and
-      worker_slots_available?(state)
+      dispatch_resources_available?(state, issue)
   end
 
   defp should_dispatch_issue?(_issue, _state, _active_states, _terminal_states), do: false
+
+  defp issue_not_reserved?(%State{} = state, issue_id) do
+    !MapSet.member?(state.claimed, issue_id) and
+      !Map.has_key?(state.running, issue_id) and
+      !Map.has_key?(state.blocked, issue_id) and
+      !Map.has_key?(Map.get(state, :durable_exhausted, %{}), issue_id)
+  end
+
+  defp dispatch_resources_available?(%State{} = state, %Issue{} = issue) do
+    available_slots(state) > 0 and
+      state_slots_available?(issue, state.running) and
+      worker_slots_available?(state)
+  end
 
   defp state_slots_available?(%Issue{state: issue_state}, running) when is_map(running) do
     limit = Config.max_concurrent_agents_for_state(issue_state)
@@ -1697,6 +1941,14 @@ defmodule SymphonyElixir.Orchestrator do
 
           {:stop, state, reason} ->
             block_issue_after_attempt_limit(state, issue, attempt, retry_metadata, reason)
+
+          {:error, state, reason} ->
+            block_issue_from_entry(
+              state,
+              issue.id,
+              Map.put(retry_metadata, :retry_attempt, attempt),
+              attempt_ledger_error(reason)
+            )
         end
     end
   end
@@ -1721,6 +1973,12 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp revalidate_issue_for_dispatch(issue, _issue_fetcher, _terminal_states), do: {:ok, issue}
 
+  @doc false
+  @spec record_attempt_event_for_test(State.t(), String.t(), atom()) :: term()
+  def record_attempt_event_for_test(%State{} = state, issue_id, event) do
+    record_attempt_event(state, issue_id, event)
+  end
+
   defp record_attempt_event(%State{} = state, issue_id, event)
        when is_binary(issue_id) and is_atom(event) do
     counters =
@@ -1730,17 +1988,104 @@ defmodule SymphonyElixir.Orchestrator do
 
     case AttemptPolicy.record(counters, event) do
       {:ok, counters} ->
-        {:ok, %{state | attempt_counters: Map.put(state.attempt_counters, issue_id, counters)}}
+        persist_attempt_event(state, issue_id, event, counters, :open, nil)
 
       {:stop, counters, reason} ->
-        {:stop, %{state | attempt_counters: Map.put(state.attempt_counters, issue_id, counters)}, reason}
+        persist_attempt_event(state, issue_id, event, counters, :exhausted, reason)
     end
+  end
+
+  defp persist_attempt_event(%State{} = state, issue_id, event, counters, status, stop_reason) do
+    if event in @durable_attempt_events do
+      persist_durable_attempt_event(state, issue_id, counters, status, stop_reason)
+    else
+      apply_attempt_event_result(state, issue_id, counters, status, stop_reason)
+    end
+  end
+
+  defp persist_durable_attempt_event(%State{} = state, issue_id, counters, status, stop_reason) do
+    case state.attempt_ledger_status do
+      :disabled ->
+        apply_attempt_event_result(state, issue_id, counters, status, stop_reason)
+
+      :ready ->
+        persist_ready_attempt_event(state, issue_id, counters, status, stop_reason)
+
+      {:blocked, reason} ->
+        {:error, state, {:attempt_ledger_unavailable, reason}}
+
+      _ ->
+        reason = :invalid_ledger_status
+        {:error, block_ledger(state, reason), {:attempt_ledger_unavailable, reason}}
+    end
+  end
+
+  defp persist_ready_attempt_event(%State{attempt_ledger: %AttemptLedger{} = ledger} = state, issue_id, counters, status, stop_reason) do
+    case AttemptLedger.persist_safety(ledger, issue_id, counters,
+           status: status,
+           stop_reason: stop_reason,
+           route_fingerprint: route_fingerprint_for_issue(state, issue_id)
+         ) do
+      {:ok, _record} ->
+        apply_attempt_event_result(state, issue_id, counters, status, stop_reason)
+
+      {:error, reason} ->
+        {:error, block_ledger(state, reason), {:attempt_ledger_unavailable, reason}}
+    end
+  end
+
+  defp persist_ready_attempt_event(%State{} = state, _issue_id, _counters, _status, _stop_reason) do
+    reason = :missing_ledger_handle
+
+    {:error, block_ledger(state, reason), {:attempt_ledger_unavailable, reason}}
+  end
+
+  defp apply_attempt_event_result(%State{} = state, issue_id, counters, :open, _stop_reason) do
+    {:ok,
+     %{
+       state
+       | attempt_counters: Map.put(state.attempt_counters, issue_id, counters),
+         durable_exhausted: Map.delete(Map.get(state, :durable_exhausted, %{}), issue_id)
+     }}
+  end
+
+  defp apply_attempt_event_result(%State{} = state, issue_id, counters, :exhausted, stop_reason) do
+    state = %{state | attempt_counters: Map.put(state.attempt_counters, issue_id, counters)}
+
+    {:stop,
+     %{
+       state
+       | durable_exhausted:
+           Map.put(Map.get(state, :durable_exhausted, %{}), issue_id, %{
+             issue_id: issue_id,
+             status: :exhausted,
+             safety_counters: counters,
+             stop_reason: stop_reason
+           })
+     }, stop_reason}
+  end
+
+  defp block_ledger(%State{} = state, reason) do
+    %{state | attempt_ledger_status: {:blocked, {:attempt_ledger_unavailable, reason}}}
+  end
+
+  defp route_fingerprint_for_issue(%State{} = state, issue_id) do
+    running = Map.get(state.running, issue_id)
+    retry = Map.get(state.retry_attempts, issue_id)
+    blocked = Map.get(state.blocked, issue_id)
+
+    Map.get(running || retry || blocked || %{}, :route_fingerprint)
+  end
+
+  defp attempt_ledger_error({:attempt_ledger_unavailable, reason}) do
+    "attempt ledger unavailable; automatic work is blocked: #{inspect(reason)}"
   end
 
   defp record_route_change_events(state, issue_id, route_change) do
     case record_attempt_event(state, issue_id, :route_change) do
       {:ok, state} -> record_review_cycle_event(state, issue_id, route_change)
       {:stop, _state, _reason} = result -> result
+      {:error, _state, _reason} = result -> result
     end
   end
 
@@ -2096,6 +2441,9 @@ defmodule SymphonyElixir.Orchestrator do
 
       {:stop, state, reason} ->
         {:noreply, block_issue_after_attempt_limit(state, refreshed_issue, attempt, metadata, reason)}
+
+      {:error, state, reason} ->
+        {:noreply, block_issue_from_entry(state, refreshed_issue.id, metadata, attempt_ledger_error(reason))}
     end
   end
 
@@ -2140,6 +2488,9 @@ defmodule SymphonyElixir.Orchestrator do
 
       {:stop, state, reason} ->
         {:noreply, block_issue_after_attempt_limit(state, issue, attempt, metadata, reason)}
+
+      {:error, state, reason} ->
+        {:noreply, block_issue_from_entry(state, issue.id, metadata, attempt_ledger_error(reason))}
     end
   end
 
@@ -2162,8 +2513,30 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp reset_attempt_counters(%State{} = state, issue_id) when is_binary(issue_id) do
-    %{state | attempt_counters: Map.delete(state.attempt_counters, issue_id)}
+    case state.attempt_ledger_status do
+      :disabled ->
+        reset_durable_lineage(state, issue_id)
+
+      :ready ->
+        reset_ready_attempt_counters(state, issue_id)
+
+      {:blocked, _reason} ->
+        state
+
+      _ ->
+        block_ledger(state, :invalid_ledger_status)
+    end
   end
+
+  defp reset_ready_attempt_counters(%State{attempt_ledger: %AttemptLedger{} = ledger} = state, issue_id) do
+    case AttemptLedger.close_lineage(ledger, issue_id, reason: :terminal) do
+      :ok -> reset_durable_lineage(state, issue_id)
+      {:error, reason} -> block_ledger(state, reason)
+    end
+  end
+
+  defp reset_ready_attempt_counters(%State{} = state, _issue_id),
+    do: block_ledger(state, :missing_ledger_handle)
 
   defp retry_delay(attempt, metadata) when is_integer(attempt) and attempt > 0 and is_map(metadata) do
     if metadata[:delay_type] in [:continuation, :route_change, :capacity_wait] do
@@ -3321,11 +3694,68 @@ defmodule SymphonyElixir.Orchestrator do
   defp refresh_runtime_config(%State{} = state) do
     config = Config.settings!()
 
-    %{
+    state = %{
       state
       | poll_interval_ms: config.polling.interval_ms,
         max_concurrent_agents: config.agent.max_concurrent_agents
     }
+
+    synchronize_attempt_ledger_config(state, config)
+  end
+
+  defp synchronize_attempt_ledger_config(%State{} = state, %{agent: %{routing: "legacy"}}) do
+    case state.attempt_ledger do
+      nil ->
+        %{state | attempt_ledger_status: :disabled, attempt_ledger_opts: []}
+
+      %AttemptLedger{} = ledger ->
+        case AttemptLedger.close(ledger) do
+          :ok -> %{state | attempt_ledger: nil, attempt_ledger_status: :disabled, attempt_ledger_opts: []}
+          {:error, reason} -> block_ledger(state, {:ledger_close_failed, reason})
+        end
+    end
+  end
+
+  defp synchronize_attempt_ledger_config(%State{} = state, config) do
+    project_id = config.symphony.project_id
+    tracker_identity = Tracker.identity(config.tracker)
+
+    case state.attempt_ledger_status do
+      :disabled ->
+        initialize_attempt_ledger(
+          state,
+          config,
+          attempt_ledger_opts: state.attempt_ledger_opts
+        )
+
+      :ready ->
+        case state.attempt_ledger do
+          %AttemptLedger{project_id: ^project_id, tracker_identity: ^tracker_identity} ->
+            state
+
+          %AttemptLedger{project_id: stored_project_id}
+          when stored_project_id != project_id ->
+            block_ledger(
+              state,
+              {:ledger_project_namespace_mismatch, stored_project_id, project_id}
+            )
+
+          %AttemptLedger{tracker_identity: stored_identity} ->
+            block_ledger(
+              state,
+              {:ledger_tracker_identity_mismatch, stored_identity, tracker_identity}
+            )
+
+          _ ->
+            block_ledger(state, :missing_ledger_handle)
+        end
+
+      {:blocked, _reason} ->
+        state
+
+      _ ->
+        block_ledger(state, :invalid_ledger_status)
+    end
   end
 
   defp retry_candidate_issue?(%Issue{} = issue, terminal_states) do
