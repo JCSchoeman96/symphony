@@ -25,7 +25,7 @@ Finished in 0.7 seconds (0.00s async, 0.7s sync)
 2 tests, 0 failures
 ```
 
-## SYM-14 lifecycle evidence
+## SYM-14 deterministic lifecycle evidence (not live completion)
 
 The proof follows the required state sequence:
 
@@ -48,7 +48,7 @@ The recorded assertions establish:
 - `Ready to Merge` resolves to the deferred `merge_gatekeeper` route and no
   `auto_merge` configuration exists.
 
-## SYM-15 dependency-DAG evidence
+## SYM-15 deterministic dependency-DAG evidence (not live completion)
 
 The disposable fixture contains the required fan-out/fan-in graph plus an
 independent item, a canceled blocker, and the cycle `X → Y → Z → X`.
