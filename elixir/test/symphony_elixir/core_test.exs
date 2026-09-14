@@ -1510,16 +1510,15 @@ defmodule SymphonyElixir.CoreTest do
     prompt = PromptBuilder.build_prompt(issue, attempt: 2)
 
     assert prompt =~ "You are working on a Linear ticket `MT-616`"
-    assert prompt =~ "Issue context:"
+    assert prompt =~ "## Issue context"
     assert prompt =~ "Identifier: MT-616"
     assert prompt =~ "Title: Use rich templates for WORKFLOW.md"
     assert prompt =~ "Current status: In Progress"
     assert prompt =~ "https://example.org/issues/MT-616/use-rich-templates-for-workflowmd"
-    assert prompt =~ "This is an unattended orchestration session."
-    assert prompt =~ "Only stop early for a true external blocker"
-    assert prompt =~ "Do not include \"next steps for user\""
-    assert prompt =~ "open and follow `.codex/skills/land/SKILL.md`"
-    assert prompt =~ "Do not call `gh pr merge` directly"
+    assert prompt =~ "role policy"
+    assert prompt =~ "The orchestrator owns polling"
+    assert prompt =~ "Do not invent completion"
+    refute prompt =~ "Do not call `gh pr merge` directly"
     assert prompt =~ "Follow-up context:"
     assert prompt =~ "follow-up attempt #2"
   end

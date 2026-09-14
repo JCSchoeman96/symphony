@@ -143,6 +143,13 @@ Title: {{ issue.title }} Body: {{ issue.description }}
 Notes:
 
 - If a value is missing, defaults are used.
+- `agent.routing: routed` opts into explicit responsibility-aware profiles and
+  state routes. The shipped `WORKFLOW.md` shows the complete sample; workflows
+  without `agent.profiles` retain the legacy compatibility path.
+- Routed role policies are shipped in `prompts/`. Symphony reads those files
+  at runtime and uses the packaged copy when a file is unavailable. An active
+  attempt captures its role prompt when it starts, so a later file edit applies
+  to future attempts only.
 - `tracker.kind` selects an adapter. Adapter-owned endpoint, scope, and auth settings belong under
   `tracker.provider`; the current Linear adapter still accepts the older flat `endpoint`,
   `api_key`, `project_slug`, and `assignee` aliases for compatibility.

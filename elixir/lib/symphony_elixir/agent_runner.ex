@@ -111,6 +111,7 @@ defmodule SymphonyElixir.AgentRunner do
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issues_by_ids/1)
     runtime = Keyword.get(opts, :runtime, AgentRuntime.Codex)
     runtime_opts = opts |> Keyword.put(:worker_host, worker_host) |> profile_runtime_options(route)
+    role_prompt = PromptBuilder.role_prompt(route)
 
     with {:ok, session} <- runtime.start_session(workspace, runtime_opts) do
       context = %{
@@ -121,7 +122,8 @@ defmodule SymphonyElixir.AgentRunner do
         codex_update_recipient: codex_update_recipient,
         opts: runtime_opts,
         issue_state_fetcher: issue_state_fetcher,
-        route: route
+        route: route,
+        role_prompt: role_prompt
       }
 
       run_runtime_session(runtime, session, fn ->
@@ -131,7 +133,8 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp do_run_codex_turns(context, turn_number, max_turns) do
-    prompt = build_turn_prompt(context.issue, context.opts, turn_number, max_turns)
+    prompt_opts = Keyword.put(context.opts, :role_prompt, context.role_prompt)
+    prompt = build_turn_prompt(context.issue, prompt_opts, turn_number, max_turns)
 
     with {:ok, _turn_result} <-
            context.runtime.run_turn(
@@ -369,7 +372,13 @@ defmodule SymphonyElixir.AgentRunner do
     - Focus on the remaining ticket work and do not end the turn while the issue stays active unless you are truly blocked.
     """
 
-    PromptBuilder.with_role_prompt(continuation, Keyword.get(opts, :route))
+    case Keyword.fetch(opts, :role_prompt) do
+      {:ok, role_prompt} ->
+        PromptBuilder.with_role_prompt(continuation, Keyword.get(opts, :route), role_prompt)
+
+      :error ->
+        PromptBuilder.with_role_prompt(continuation, Keyword.get(opts, :route))
+    end
   end
 
   defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher) when is_binary(issue_id) do

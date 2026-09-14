@@ -34,6 +34,14 @@ help with the setup:
 > Set up Symphony for my repository based on
 > https://github.com/openai/symphony/blob/main/elixir/README.md
 
+## Routed agent lifecycle
+
+The reference Elixir implementation can route each tracker state to a bounded
+role: planning, implementation, review, correction, or a deferred merge gate.
+Use the explicit `agent.routing: routed` configuration and the shipped
+`elixir/prompts/` role policies when enabling this mode. Workflows without
+`agent.profiles` remain on the legacy runtime path for compatibility.
+
 ---
 
 ## License
