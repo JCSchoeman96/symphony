@@ -379,4 +379,3 @@ Validation: proof tests, docs review, `mise exec -- make all`, and
 - Use requesting-code-review for a final review of the diff and tests.
 - Use finishing-a-development-branch to present integration options. Do not
   merge or publish without separate authorization.
-
