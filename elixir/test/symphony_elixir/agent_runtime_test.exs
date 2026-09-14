@@ -353,6 +353,9 @@ defmodule SymphonyElixir.AgentRuntimeTest do
 
     assert_receive {:runtime_turn, _session, _prompt, ^issue}
     assert_receive {:agent_dependency_blocked, "dependency-change", decision}
+    assert decision.allowed? == false
+    assert decision.dependency_completeness == :complete
+    assert decision.merge_permitted? == false
     assert decision.reason == :unresolved_hard_dependency
     assert_receive {:runtime_stopped, %{session_id: "fake-session"}}
     refute_receive {:runtime_turn, _session, _prompt, _issue}, 50

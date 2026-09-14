@@ -49,7 +49,7 @@ defmodule SymphonyElixir.Tracker do
     if Code.ensure_loaded?(adapter) and function_exported?(adapter, :fetch_dependency_graph, 0) do
       adapter.fetch_dependency_graph()
     else
-      {:error, :dependency_graph_unavailable}
+      {:error, :dependency_graph_unsupported}
     end
   end
 
@@ -68,6 +68,7 @@ defmodule SymphonyElixir.Tracker do
       tracker_settings: tracker_settings,
       tool_specs: adapter_agent_tool_specs(adapter),
       secret_environment_names: adapter_secret_environment_names(adapter, tracker_settings),
+      transition_guard: :atomics.new(1, []),
       agent_tool_context: Keyword.get(opts, :agent_tool_context, %{})
     }
   end
@@ -85,6 +86,7 @@ defmodule SymphonyElixir.Tracker do
       arguments,
       opts
       |> Keyword.put(:tracker_settings, tracker_settings)
+      |> Keyword.put(:transition_guard, Map.get(binding, :transition_guard))
       |> Keyword.put(:agent_tool_context, Map.get(binding, :agent_tool_context, %{}))
     )
   end

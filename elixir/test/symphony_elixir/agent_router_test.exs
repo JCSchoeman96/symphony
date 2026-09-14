@@ -4,6 +4,13 @@ defmodule SymphonyElixir.AgentRouterTest do
   alias SymphonyElixir.AgentRuntime.{Profile, Route, Router}
   alias SymphonyElixir.Config.Schema
 
+  test "profiles cannot select another built-in responsibility prompt" do
+    for prompt <- ["builder", "builder.md", "fixer", "reviewer"] do
+      assert {:error, {:invalid_profile, "planner", _}} =
+               Profile.resolve_profiles(%{"planner" => %{"prompt" => prompt}}, "codex app-server", 2)
+    end
+  end
+
   test "default profiles provide isolated responsibility and sandbox settings" do
     profiles = Profile.default_profiles("codex app-server", 7)
 

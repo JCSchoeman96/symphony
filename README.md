@@ -55,6 +55,16 @@ handoffs and denies implementation/correction or merge handoffs when dependency 
 Raw Linear GraphQL mutations are rejected at this boundary; provider-native mutation tools for
 other adapters remain provider-specific permission boundaries.
 
+Linear handoffs revalidate current issue state and the dependency graph with the session's bound
+provider settings. A session may attempt one handoff; an uncertain mutation response requires a
+fresh attempt. This is a fresh authorization check, not an atomic transaction with concurrent
+tracker edits. Retry dispatch also rechecks eligibility, capacity, and role after its final graph
+refresh, and counts review-to-correction transitions observed while waiting for retry.
+
+Legacy adapters without graph support retain their per-issue dependency checks. Explicit routed
+work still requires authoritative graph support for implementation and correction. Built-in prompt
+names must match the configured responsibility; custom prompt content remains operator-controlled.
+
 ## Live proof
 
 Provider live tests are skipped unless the operator explicitly enables the test, names a disposable

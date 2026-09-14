@@ -999,13 +999,18 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp stop_port(port) when is_port(port) do
-    case :erlang.port_info(port) do
-      :undefined ->
-        {:error, {:stop_failed, :session_stopped}}
+    ref = :erlang.monitor(:port, port)
 
-      _ ->
+    result =
+      try do
         Port.close(port)
         :ok
+      rescue
+        ArgumentError -> {:error, {:stop_failed, :session_stopped}}
+      end
+
+    receive do
+      {:DOWN, ^ref, :port, ^port, _reason} -> result
     end
   end
 

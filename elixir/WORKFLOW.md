@@ -134,3 +134,8 @@ Follow-up context:
 Attempt counters live in the orchestrator's OTP state. Workflow reloads retain
 the counters for the current live issue lineage; a process restart performs the
 existing tracker/filesystem recovery and does not synthesize retry history.
+
+Use `linear_transition` for one authorized handoff per session, then stop. The tool checks current
+issue state and dependencies before writing. If a handoff response is uncertain, report it and stop;
+the next attempt must reread the tracker before proceeding. Do not repeat the write in this session.
+Built-in prompt selections must match the configured responsibility.

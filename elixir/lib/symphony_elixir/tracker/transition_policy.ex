@@ -50,6 +50,20 @@ defmodule SymphonyElixir.Tracker.TransitionPolicy do
 
   def authorize(_context), do: {:error, invalid_context_error(:not_a_map)}
 
+  @doc "Checks the role-owned handoff before reading mutable provider state."
+  @spec authorize_intent(map()) :: :ok | {:error, authorization_error()}
+  def authorize_intent(context) do
+    with {:ok, responsibility} <- normalized_context_token(context, :responsibility),
+         {:ok, current_state} <- normalized_context_token(context, :current_state),
+         {:ok, target_state} <- normalized_context_token(context, :target_state),
+         :ok <- authorize_handoff(responsibility, current_state, target_state) do
+      :ok
+    else
+      {:error, %{} = error} -> {:error, error}
+      {:error, reason} -> {:error, invalid_context_error(reason)}
+    end
+  end
+
   defp normalized_context_token(context, key) do
     value = context_value(context, key)
 

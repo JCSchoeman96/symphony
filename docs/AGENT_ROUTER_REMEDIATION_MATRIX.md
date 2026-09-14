@@ -1,9 +1,36 @@
 # Agent-router remediation requirement/evidence matrix
 
-Status: deterministic remediation complete; live provider proof remains
-explicitly pending authorization. The code in this worktree is based on the
+Status: follow-up correction of locally reproduced review gaps; final validation
+is recorded below. Live provider proof remains pending authorization. The code in this worktree is based on the
 merged PR #2 commit `af74d10` (2026-09-14). This file deliberately separates
 deterministic component evidence from live Linear/GitHub/Codex proof.
+
+## Follow-up review corrections
+
+The original 418-test ledger below is historical evidence for `6c12d98`, not proof that the
+reviewed implementation had no remaining defects. Follow-up regressions cover:
+
+- `retry_refresh_test.exs`: terminal and role changes during the final retry graph refresh;
+  review-cycle exhaustion during retry wait, including dependency-denied correction.
+- `transition_freshness_test.exs`: fresh state/dependency rejection, missing or cyclic graph
+  data, provider read failures, bound settings across reload and pagination, resolved blockers,
+  and one mutation attempt per bound session despite stale provider reads.
+- `legacy_graph_test.exs`: legacy per-issue checks for unsupported graph adapters and routed
+  fail-closed behavior without claiming complete graph data.
+- `agent_router_test.exs`: reject a built-in prompt belonging to another responsibility.
+- `agent_runtime_test.exs`: preserve dependency decision fields and classify a closed Codex port.
+
+The follow-up also fixes closed-port handling exposed during verification. Runtime liveness uses
+a port monitor because closed ports can temporarily retain `port_info` metadata.
+
+Coverage percentages in this document refer to the configured included modules. The existing
+`mix.exs` exclusions include the orchestrator, runner, Linear client, and Codex app server;
+100% reported coverage is not whole-codebase coverage. No exclusions were added by this follow-up.
+
+Remaining boundaries: provider reads and mutations are not atomic with concurrent tracker edits;
+custom prompt content is trusted operator configuration; graph-dependent routed execution for
+adapters lacking graph support remains unavailable; restart clears in-memory retry accounting.
+No live provider proof, push, merge, or deployment is claimed.
 
 ## Frozen base evidence
 
@@ -87,6 +114,7 @@ post-remediation validation claim.
 | Task 8 | `transition_policy_test.exs` + `dynamic_tool_test.exs`: `31 tests, 0 failures`; affected runtime/tool/app-server/provider set: `75 tests, 0 failures`; full run: `413 tests, 0 failures, 6 skipped`; 100% total coverage | `mise exec -- make all`: passed; Credo clean; Dialyzer 0 errors | Clean | `8a28391` |
 | Task 9 | `live_proof_gate_test.exs` + live provider set: `11 tests, 0 failures, 6 skipped`; full run: `418 tests, 0 failures, 6 skipped`; 100% total coverage | `mise exec -- make all`: passed; Credo clean; Dialyzer 0 errors | Clean | `d482e36` |
 | Task 10 | Fresh `mise exec -- mix test --seed 0`: `418 tests, 0 failures, 6 skipped`; final matrix audit completed | `mise exec -- make all`: passed; build, format check, specs/Credo, coverage at 100% total, Dialyzer 0 errors | Clean | `b56d2dc` |
+| Follow-up review | Fresh regressions cover retry final-refresh eligibility, review-cycle exhaustion during retry wait, fresh Linear transition authorization, one handoff per session, legacy graph capability, prompt-role coherence, dependency metadata, and closed-port liveness; full run: `432 tests, 0 failures, 6 skipped` | `mise exec -- make all`: passed; build, format check, specs/Credo, coverage at 100% configured total, Dialyzer 0 errors | Clean | Uncommitted follow-up |
 
 ## External-proof boundary
 

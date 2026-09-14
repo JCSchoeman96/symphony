@@ -501,7 +501,7 @@ defmodule SymphonyElixir.Orchestrator do
 
       {:error, reason} ->
         Logger.warning("Dependency graph refresh unavailable; implementation dispatch is disabled: #{inspect(reason)}")
-        refresh_dependency_state(state, active_issues, {:unavailable, :dependency_graph_unavailable})
+        refresh_dependency_state(state, active_issues, {:unavailable, graph_failure_reason(reason)})
     end
   end
 
@@ -550,7 +550,7 @@ defmodule SymphonyElixir.Orchestrator do
 
       {:error, reason} ->
         Logger.warning("Running dependency graph refresh unavailable; active implementation workers are unsafe: #{inspect(reason)}")
-        refresh_dependency_state(state, running_issues, {:unavailable, :dependency_graph_unavailable})
+        refresh_dependency_state(state, running_issues, {:unavailable, graph_failure_reason(reason)})
     end
   end
 
@@ -1319,6 +1319,13 @@ defmodule SymphonyElixir.Orchestrator do
       nil ->
         decision
 
+      {:unavailable, :dependency_graph_unsupported} = reason ->
+        if Config.settings!().agent.routing == "legacy" do
+          Map.put(decision, :dependency_completeness, reason)
+        else
+          incomplete_dependency_decision(decision, reason)
+        end
+
       reason ->
         if decision.allowed? == false do
           Map.put(decision, :dependency_completeness, reason)
@@ -1497,7 +1504,8 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp dispatch_refreshed_issue(state, refreshed_issue, attempt, preferred_worker_host) do
-    if candidate_issue?(refreshed_issue, active_state_set(), terminal_state_set()) do
+    if candidate_issue?(refreshed_issue, active_state_set(), terminal_state_set()) and
+         dispatch_slots_available?(refreshed_issue, state) do
       case route_for_issue(refreshed_issue) do
         {:ok, %Route{} = route} ->
           dispatch_if_dependency_allowed(state, refreshed_issue, route, attempt, preferred_worker_host)
@@ -1556,9 +1564,12 @@ defmodule SymphonyElixir.Orchestrator do
 
       {:error, reason} ->
         Logger.warning("Final dependency graph refresh unavailable; implementation dispatch is disabled: #{inspect(reason)}")
-        refresh_dependency_state(state, [fallback_issue], {:unavailable, :dependency_graph_unavailable})
+        refresh_dependency_state(state, [fallback_issue], {:unavailable, graph_failure_reason(reason)})
     end
   end
+
+  defp graph_failure_reason(:dependency_graph_unsupported), do: :dependency_graph_unsupported
+  defp graph_failure_reason(_reason), do: :dependency_graph_unavailable
 
   defp ensure_graph_contains_active_issues(%State{} = state, active_issues) when is_list(active_issues) do
     ensure_graph_contains_issues(state, active_issues)
@@ -2046,6 +2057,22 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp dispatch_refreshed_retry(state, issue, refreshed_issue, attempt, metadata) do
+    state = refresh_dependency_graph_for_dispatch(state, refreshed_issue)
+    refreshed_issue = Map.get(state.dependency_graph.nodes, refreshed_issue.id, refreshed_issue)
+
+    cond do
+      not retry_candidate_issue?(refreshed_issue, terminal_state_set()) ->
+        handle_retry_issue_lookup(refreshed_issue, state, issue.id, attempt, metadata)
+
+      not retry_available_for_dispatch?(refreshed_issue, state, metadata) ->
+        schedule_retry_without_slots(state, refreshed_issue, attempt, metadata)
+
+      true ->
+        dispatch_final_retry(state, issue, refreshed_issue, attempt, metadata)
+    end
+  end
+
+  defp dispatch_final_retry(state, issue, refreshed_issue, attempt, metadata) do
     case route_for_issue(refreshed_issue) do
       {:ok, %Route{} = route} ->
         dispatch_routable_retry(state, issue, refreshed_issue, route, attempt, metadata)
@@ -2056,14 +2083,19 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp dispatch_routable_retry(state, issue, refreshed_issue, route, attempt, metadata) do
-    state = refresh_dependency_graph_for_dispatch(state, refreshed_issue)
-    refreshed_issue = Map.get(state.dependency_graph.nodes, refreshed_issue.id, refreshed_issue)
     state = put_dependency_decision(state, refreshed_issue, route)
+    previous = get_in(metadata, [:route_change, :next]) || metadata
 
-    if dependency_dispatchable?(refreshed_issue, state) do
-      {:noreply, do_dispatch_issue(state, refreshed_issue, route, attempt, metadata[:worker_host])}
-    else
-      {:noreply, release_issue_claim(state, issue.id)}
+    case record_review_cycle_event(state, issue.id, %{previous: previous, next: route_metadata(route)}) do
+      {:ok, state} ->
+        if dependency_dispatchable?(refreshed_issue, state) do
+          {:noreply, do_dispatch_issue(state, refreshed_issue, route, attempt, metadata[:worker_host])}
+        else
+          {:noreply, release_issue_claim(state, issue.id)}
+        end
+
+      {:stop, state, reason} ->
+        {:noreply, block_issue_after_attempt_limit(state, refreshed_issue, attempt, metadata, reason)}
     end
   end
 

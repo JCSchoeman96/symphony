@@ -170,6 +170,12 @@ no live Linear/GitHub/Codex claim is made without captured external artifacts.
 
 ## Observability and safety evidence
 
+Follow-up review found local defects after the original 418-test run. The remediation matrix's
+follow-up section records the added regression tests. Linear transition authorization now rereads
+the full graph using bound provider settings and permits one mutation attempt per session. This
+does not make a read followed by a write atomic against concurrent provider edits. Reported 100%
+coverage applies only to the modules included by `elixir/mix.exs`, not all production code.
+
 The existing projection tests cover route/profile/runtime/responsibility,
 dependency reasons, route-change metadata, dashboard labels, and secret
 redaction in the Presenter/API and terminal/LiveView surfaces. The proof and

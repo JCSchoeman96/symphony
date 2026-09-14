@@ -237,6 +237,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
             {:ok,
              %{
                "data" => %{
+                 "issues" => graph_connection("issue-builder", "In Progress"),
                  "issue" => %{
                    "team" => %{
                      "states" => %{
@@ -259,7 +260,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     assert response["success"] == true
   end
 
-  test "linear_transition denies unresolved implementation work before calling Linear" do
+  test "linear_transition denies unresolved implementation work after refreshing Linear" do
     response =
       DynamicTool.execute(
         "linear_transition",
@@ -274,7 +275,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
             dependency_completeness: :complete
           }
         },
-        linear_client: fn _query, _variables, _opts -> flunk("blocked transition must not execute") end
+        linear_client: blocked_transition_client("issue-blocked", "Ready", "In Review", "state-review")
       )
 
     assert response["success"] == false
@@ -297,7 +298,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
             dependency_completeness: :complete
           }
         },
-        linear_client: fn _query, _variables, _opts -> flunk("unresolved merge handoff must not execute") end
+        linear_client: blocked_transition_client("issue-review", "In Review", "Ready to Merge", "state-merge")
       )
 
     assert response["success"] == false
@@ -329,6 +330,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
             {:ok,
              %{
                "data" => %{
+                 "issues" => graph_connection("issue-fixer", "Changes Requested"),
                  "issue" => %{
                    "team" => %{
                      "states" => %{
@@ -695,7 +697,16 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
       transition_arguments(),
       agent_tool_context: transition_context(overrides),
       linear_client: fn query, _variables, _opts ->
-        if String.starts_with?(String.trim(query), "query"), do: state_result, else: mutation_result
+        cond do
+          String.contains?(query, "SymphonyLinearDependencyGraph") ->
+            {:ok, %{"data" => %{"issues" => graph_connection("issue-transition", "In Progress")}}}
+
+          String.starts_with?(String.trim(query), "query") ->
+            state_result
+
+          true ->
+            mutation_result
+        end
       end
     )
   end
@@ -722,5 +733,31 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
         }
       }
     }
+  end
+
+  defp graph_connection(id, state) do
+    %{
+      "nodes" => [%{"id" => id, "identifier" => id, "title" => id, "state" => %{"name" => state}, "inverseRelations" => %{"nodes" => [], "pageInfo" => %{"hasNextPage" => false, "endCursor" => nil}}}],
+      "pageInfo" => %{"hasNextPage" => false, "endCursor" => nil}
+    }
+  end
+
+  defp blocked_transition_client(id, state, target, target_id) do
+    fn query, _variables, _opts ->
+      cond do
+        String.contains?(query, "SymphonyLinearDependencyGraph") ->
+          graph = graph_connection(id, state)
+          [issue] = graph["nodes"]
+          blocker = %{"type" => "blocks", "issue" => %{"id" => "blocker", "identifier" => "BLOCKER", "state" => %{"name" => "Ready"}}}
+          issue = put_in(issue, ["inverseRelations", "nodes"], [blocker])
+          {:ok, %{"data" => %{"issues" => %{graph | "nodes" => [issue]}}}}
+
+        String.starts_with?(String.trim(query), "query") ->
+          {:ok, state_response([%{"id" => target_id, "name" => target}])}
+
+        true ->
+          flunk("blocked transition must not execute a mutation")
+      end
+    end
   end
 end

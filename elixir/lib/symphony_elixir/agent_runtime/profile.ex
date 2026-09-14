@@ -136,11 +136,24 @@ defmodule SymphonyElixir.AgentRuntime.Profile do
 
   @spec validate_effective_policy(t()) :: :ok | {:error, String.t()}
   def validate_effective_policy(%__MODULE__{} = profile) do
-    case validate_standard_responsibility(profile) do
-      :ok -> validate_responsibility_capabilities(profile)
-      {:error, _reason} = error -> error
+    with :ok <- validate_standard_responsibility(profile),
+         :ok <- validate_responsibility_capabilities(profile) do
+      validate_prompt_responsibility(profile)
     end
   end
+
+  defp validate_prompt_responsibility(%__MODULE__{prompt: prompt, responsibility: responsibility})
+       when is_binary(prompt) do
+    prompt_role = prompt |> String.trim() |> String.downcase() |> Path.rootname(".md")
+
+    case Map.get(@standard_responsibilities, prompt_role) do
+      nil -> :ok
+      ^responsibility -> :ok
+      _other -> {:error, "built-in role prompt must match the profile responsibility"}
+    end
+  end
+
+  defp validate_prompt_responsibility(_profile), do: :ok
 
   defp validate_responsibility_capabilities(%__MODULE__{responsibility: responsibility} = profile)
        when responsibility in ["planning", "review"] do

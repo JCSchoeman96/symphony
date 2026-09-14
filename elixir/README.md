@@ -41,6 +41,16 @@ at most three retries, capacity waits do not consume that failure budget, and re
 loops stop after three cycles. Normal continuations and route changes are tracked separately. CI
 infrastructure is not retried automatically; a human or provider path must handle it.
 
+Retry dispatch rechecks eligibility, capacity, and the selected role after the final graph read.
+Review-to-correction transitions count even if observed during retry wait or denied by dependencies.
+Previously counted route changes are not charged again when the retry starts.
+
+Legacy routing preserves per-issue dependency checks for adapters that do not implement a graph
+read, without reporting a complete graph. Routed implementation/correction remain disabled for
+those adapters. A graph fetch failure from a supported adapter still fails closed in either mode.
+Built-in role prompt names must match the profile responsibility, including `.md` names. Custom
+prompt text and files are trusted operator configuration and require manual role-policy review.
+
 ## How to use it
 
 1. Make sure your codebase is set up to work well with agents: see
@@ -245,7 +255,11 @@ codex:
   reads, while the configured Linear credential remains the provider permission boundary.
 - Responsibility and errors: `linear_transition` is the only lifecycle write path exposed by the
   Linear adapter. It verifies the requested state name/ID against the current issue's team before
-  issuing the fixed `issueUpdate` mutation. Read/config failures use
+  issuing the fixed `issueUpdate` mutation. Each handoff refreshes the project dependency graph
+  with bound provider settings and authorizes against current state, completeness, and cycles.
+  Each bound session may attempt one mutation, including uncertain transport outcomes. A new
+  session is required for another handoff. Concurrent tracker edits can still race between the
+  final read and mutation; this is not provider-side atomic authorization. Read/config failures use
   `{:error, :missing_linear_api_token}`, `{:error, :missing_linear_project_slug}`,
   `{:error, :invalid_linear_endpoint}`, `{:error, :invalid_linear_assignee}`,
   `{:error, :missing_linear_viewer_identity}`, `{:error, {:linear_api_status, status}}`,

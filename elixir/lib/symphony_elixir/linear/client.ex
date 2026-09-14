@@ -224,6 +224,14 @@ defmodule SymphonyElixir.Linear.Client do
     end
   end
 
+  @doc "Reads the full graph using the provider settings captured by a bound tool session."
+  @spec fetch_dependency_graph(keyword()) :: {:ok, [Issue.t()]} | {:error, term()}
+  def fetch_dependency_graph(opts) when is_list(opts) do
+    tracker = Keyword.fetch!(opts, :tracker_settings)
+    graphql_fun = Keyword.get(opts, :graphql_fun, fn query, variables -> graphql(query, variables, opts) end)
+    do_fetch_dependency_graph(tracker.project_slug, nil, graphql_fun)
+  end
+
   @spec graphql(String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
   def graphql(query, variables \\ %{}, opts \\ [])
       when is_binary(query) and is_map(variables) and is_list(opts) do

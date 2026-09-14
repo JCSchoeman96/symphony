@@ -3,7 +3,10 @@ defmodule SymphonyElixir.Linear.AgentTool do
   Provider-native Linear tool exposed to Codex app-server turns.
   """
 
+  alias SymphonyElixir.Config
+  alias SymphonyElixir.Dependency.{Graph, Guard}
   alias SymphonyElixir.Linear.Client
+  alias SymphonyElixir.Tracker.Issue
   alias SymphonyElixir.Tracker.TransitionPolicy
 
   @linear_graphql_tool "linear_graphql"
@@ -129,7 +132,7 @@ defmodule SymphonyElixir.Linear.AgentTool do
     with {:ok, target_state, target_state_id} <- normalize_transition_arguments(arguments),
          {:ok, issue_id} <- normalize_issue_id(context),
          :ok <-
-           TransitionPolicy.authorize(
+           TransitionPolicy.authorize_intent(
              Map.merge(context, %{
                issue_id: issue_id,
                target_state: target_state
@@ -139,12 +142,62 @@ defmodule SymphonyElixir.Linear.AgentTool do
            linear_client.(@transition_state_query, %{"issueId" => issue_id}, client_opts),
          {:ok, ^target_state_id} <-
            verify_transition_state(state_response, target_state, target_state_id),
+         :ok <- authorize_fresh_transition(context, issue_id, target_state, linear_client, client_opts),
+         :ok <- claim_transition(Keyword.get(opts, :transition_guard)),
          {:ok, response} <-
            linear_client.(@transition_mutation, %{"issueId" => issue_id, "stateId" => target_state_id}, client_opts) do
       transition_response(response)
     else
       {:error, %{code: _code} = reason} -> failure_response(transition_error_payload(reason))
       {:error, reason} -> failure_response(tool_error_payload(reason))
+    end
+  end
+
+  defp authorize_fresh_transition(context, issue_id, target_state, linear_client, client_opts) do
+    tracker = Keyword.get_lazy(client_opts, :tracker_settings, fn -> Config.settings!().tracker end)
+
+    with {:ok, issues} <-
+           Client.fetch_dependency_graph(
+             tracker_settings: tracker,
+             graphql_fun: fn query, variables -> linear_client.(query, variables, client_opts) end
+           ),
+         %Issue{} = issue <- Enum.find(issues, &(&1.id == issue_id)) do
+      graph = Graph.build(issues)
+      responsibility = Map.get(context, :responsibility) || Map.get(context, "responsibility")
+
+      decision =
+        Guard.evaluate(issue, responsibility,
+          active_states: tracker.active_states,
+          terminal_states: tracker.terminal_states
+        )
+
+      decision =
+        if Graph.incomplete?(graph, issue_id) or Graph.cyclic?(graph, issue_id) do
+          Map.merge(decision, %{allowed?: false, merge_permitted?: false})
+        else
+          decision
+        end
+
+      TransitionPolicy.authorize(
+        Map.merge(context, %{
+          current_state: issue.state,
+          target_state: target_state,
+          dependency_decision: decision
+        })
+      )
+    else
+      _ -> {:error, :transition_context_unavailable}
+    end
+  end
+
+  # Bound sessions share this guard across calls. Consume before sending the mutation:
+  # a transport error can mean the provider committed it without returning a response.
+  defp claim_transition(nil), do: :ok
+
+  defp claim_transition(guard) do
+    case :atomics.compare_exchange(guard, 1, 0, 1) do
+      :ok -> :ok
+      _ -> {:error, :transition_already_attempted}
     end
   end
 
@@ -385,6 +438,14 @@ defmodule SymphonyElixir.Linear.AgentTool do
         "message" => "The current issue workflow states could not be read safely; no transition was performed."
       }
     }
+  end
+
+  defp tool_error_payload(:transition_context_unavailable) do
+    %{"error" => %{"code" => "transition_context_unavailable", "message" => "Current issue and dependency data could not be verified; no transition was performed."}}
+  end
+
+  defp tool_error_payload(:transition_already_attempted) do
+    %{"error" => %{"code" => "transition_already_attempted", "message" => "This session has already attempted its workflow handoff; start a fresh attempt before another transition."}}
   end
 
   defp tool_error_payload(:transition_state_unverified) do

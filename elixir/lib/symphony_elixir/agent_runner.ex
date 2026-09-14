@@ -310,6 +310,9 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp dependency_metadata(decision) when is_map(decision) do
     Map.take(decision, [
+      :allowed?,
+      :dependency_completeness,
+      :merge_permitted?,
       :dependency_status,
       :dependent_state,
       :responsibility,
