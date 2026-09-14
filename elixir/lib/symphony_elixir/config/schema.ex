@@ -13,6 +13,7 @@ defmodule SymphonyElixir.Config.Schema do
   @linear_endpoint "https://api.linear.app/graphql"
   @linear_active_states ["Todo", "In Progress"]
   @linear_terminal_states ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
+  @project_id_pattern ~r/\A[A-Za-z0-9][A-Za-z0-9._-]*\z/
 
   @type t :: %__MODULE__{}
 
@@ -40,6 +41,41 @@ defmodule SymphonyElixir.Config.Schema do
     @spec dump(term()) :: {:ok, String.t() | map()} | :error
     def dump(value) when is_binary(value) or is_map(value), do: {:ok, value}
     def dump(_value), do: :error
+  end
+
+  defmodule Symphony do
+    @moduledoc false
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    @primary_key false
+    @project_id_pattern ~r/\A[A-Za-z0-9][A-Za-z0-9._-]*\z/
+
+    embedded_schema do
+      field(:project_id, :string)
+    end
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      schema
+      |> cast(attrs, [:project_id], empty_values: [])
+      |> update_change(:project_id, &String.trim/1)
+      |> validate_change(:project_id, fn :project_id, project_id ->
+        cond do
+          project_id == "" ->
+            [project_id: "must not be blank"]
+
+          byte_size(project_id) > 128 ->
+            [project_id: "must be at most 128 bytes"]
+
+          not Regex.match?(@project_id_pattern, project_id) ->
+            [project_id: "must be a stable identifier, not a path"]
+
+          true ->
+            []
+        end
+      end)
+    end
   end
 
   defmodule Tracker do
@@ -307,6 +343,7 @@ defmodule SymphonyElixir.Config.Schema do
   end
 
   embedded_schema do
+    embeds_one(:symphony, Symphony, on_replace: :update, defaults_to_struct: true)
     embeds_one(:tracker, Tracker, on_replace: :update, defaults_to_struct: true)
     embeds_one(:polling, Polling, on_replace: :update, defaults_to_struct: true)
     embeds_one(:workspace, Workspace, on_replace: :update, defaults_to_struct: true)
@@ -347,6 +384,38 @@ defmodule SymphonyElixir.Config.Schema do
         |> default_turn_sandbox_policy()
     end
   end
+
+  @spec validate_project_identity(%__MODULE__{}) :: :ok | {:error, term()}
+  def validate_project_identity(%__MODULE__{agent: %{routing: "legacy"}}), do: :ok
+
+  def validate_project_identity(%__MODULE__{
+        agent: %{routing: "routed"},
+        symphony: %{project_id: nil}
+      }),
+      do: {:error, :missing_symphony_project_id}
+
+  def validate_project_identity(%__MODULE__{
+        agent: %{routing: "routed"},
+        symphony: %{project_id: project_id}
+      })
+      when is_binary(project_id) do
+    if valid_project_id?(project_id) do
+      :ok
+    else
+      {:error, {:invalid_symphony_project_id, project_id}}
+    end
+  end
+
+  def validate_project_identity(_settings), do: {:error, :missing_symphony_project_id}
+
+  @spec valid_project_id?(term()) :: boolean()
+  def valid_project_id?(project_id) when is_binary(project_id) do
+    project_id = String.trim(project_id)
+
+    project_id != "" and byte_size(project_id) <= 128 and Regex.match?(@project_id_pattern, project_id)
+  end
+
+  def valid_project_id?(_project_id), do: false
 
   @spec resolve_runtime_turn_sandbox_policy(%__MODULE__{}, Path.t() | nil, keyword()) ::
           {:ok, map()} | {:error, term()}
@@ -414,6 +483,7 @@ defmodule SymphonyElixir.Config.Schema do
   defp changeset(attrs) do
     %__MODULE__{}
     |> cast(attrs, [])
+    |> cast_embed(:symphony, with: &Symphony.changeset/2)
     |> cast_embed(:tracker, with: &Tracker.changeset/2)
     |> cast_embed(:polling, with: &Polling.changeset/2)
     |> cast_embed(:workspace, with: &Workspace.changeset/2)

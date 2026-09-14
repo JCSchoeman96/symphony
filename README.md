@@ -38,16 +38,30 @@ help with the setup:
 
 The reference Elixir implementation can route each tracker state to a bounded
 role: planning, implementation, review, correction, or a deferred merge gate.
-Use the explicit `agent.routing: routed` configuration and the shipped
-`elixir/prompts/` role policies when enabling this mode. Workflows without
-`agent.profiles` remain on the legacy runtime path for compatibility.
+Use the explicit `agent.routing: routed` configuration, a stable
+`symphony.project_id`, and the shipped `elixir/prompts/` role policies when
+enabling this mode. Workflows without `agent.profiles` remain on the legacy
+runtime path for compatibility. The current Linear adapter is intentionally
+rejected in routed mode until it can truthfully satisfy the complete capability
+contract; the deterministic memory adapter is used for routed local tests.
 
 The orchestrator bounds ordinary runtime/spawn retries to three per issue
 lineage. Capacity waits, normal continuations, and route changes are tracked
 separately; reviewer-to-correction loops stop after three cycles. CI
-infrastructure is not retried automatically. Attempt counters are live OTP
-state and survive workflow reloads; restart recovery remains tracker/filesystem
-driven and does not synthesize prior retry history.
+infrastructure is not retried automatically. In routed mode, safety-relevant
+attempt lineage state is stored in a project-scoped DETS ledger outside the
+repository and workspaces, synced before automatic follow-up, and reconciled
+against fresh tracker state after restart. Runtime sessions and retry timers
+are never restored.
+
+An exhausted lineage requires an explicit host-only rearm:
+
+```bash
+mix symphony.attempt_rearm --project-id symphony-main --issue-id ENG-123 \
+  --reason "provider state verified" --operator alice
+```
+
+Manual DETS deletion is unsupported because it can destroy safety history.
 
 For Linear workflows, read-only `linear_graphql` queries remain available to every role. Lifecycle
 state changes use the session-bound `linear_transition` tool, which authorizes only role-owned

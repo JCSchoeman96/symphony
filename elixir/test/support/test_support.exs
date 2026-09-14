@@ -33,8 +33,11 @@ defmodule SymphonyElixir.TestSupport do
 
         File.mkdir_p!(workflow_root)
         workflow_file = Path.join(workflow_root, "WORKFLOW.md")
+        attempt_ledger_root = Path.join(workflow_root, "attempt-ledger")
+        File.mkdir_p!(attempt_ledger_root)
         write_workflow_file!(workflow_file)
         Workflow.set_workflow_file_path(workflow_file)
+        Application.put_env(:symphony_elixir, :attempt_ledger_root, attempt_ledger_root)
         if Process.whereis(SymphonyElixir.WorkflowStore), do: SymphonyElixir.WorkflowStore.force_reload()
         stop_default_http_server()
 
@@ -42,6 +45,7 @@ defmodule SymphonyElixir.TestSupport do
           Application.delete_env(:symphony_elixir, :workflow_file_path)
           Application.delete_env(:symphony_elixir, :server_port_override)
           Application.delete_env(:symphony_elixir, :memory_tracker_issues)
+          Application.delete_env(:symphony_elixir, :attempt_ledger_root)
           File.rm_rf(workflow_root)
         end)
 
@@ -51,7 +55,7 @@ defmodule SymphonyElixir.TestSupport do
   end
 
   def write_workflow_file!(path, overrides \\ []) do
-    workflow = workflow_content(overrides)
+    workflow = workflow_content(default_identity_override(path, overrides))
     File.write!(path, workflow)
 
     if Process.whereis(SymphonyElixir.WorkflowStore) do
@@ -166,6 +170,7 @@ defmodule SymphonyElixir.TestSupport do
     server_port = Keyword.get(config, :server_port)
     server_host = Keyword.get(config, :server_host)
     prompt = Keyword.get(config, :prompt)
+    symphony_project_id = Keyword.get(config, :symphony_project_id)
 
     sections =
       [
@@ -179,6 +184,8 @@ defmodule SymphonyElixir.TestSupport do
         "  required_labels: #{yaml_value(tracker_required_labels)}",
         "  active_states: #{yaml_value(tracker_active_states)}",
         "  terminal_states: #{yaml_value(tracker_terminal_states)}",
+        "symphony:",
+        "  project_id: #{yaml_value(symphony_project_id)}",
         "polling:",
         "  interval_ms: #{yaml_value(poll_interval_ms)}",
         "workspace:",
@@ -231,6 +238,15 @@ defmodule SymphonyElixir.TestSupport do
   end
 
   defp yaml_value(value), do: yaml_value(to_string(value))
+
+  defp default_identity_override(path, overrides) do
+    if Keyword.get(overrides, :tracker_kind, "linear") == "memory" and
+         not Keyword.has_key?(overrides, :symphony_project_id) do
+      Keyword.put(overrides, :symphony_project_id, "test-#{:erlang.phash2(Path.expand(path))}")
+    else
+      overrides
+    end
+  end
 
   defp maybe_default_agent_routing(config, overrides) do
     if Keyword.has_key?(overrides, :agent_routing) do

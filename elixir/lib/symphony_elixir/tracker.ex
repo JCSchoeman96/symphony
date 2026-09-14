@@ -111,6 +111,14 @@ defmodule SymphonyElixir.Tracker do
     |> capabilities_for_kind()
   end
 
+  @spec identity(map()) :: %{tracker_kind: String.t(), provider_scope: map()}
+  def identity(%{kind: kind} = tracker_settings) when is_binary(kind) do
+    %{
+      tracker_kind: kind,
+      provider_scope: provider_scope(kind, tracker_settings)
+    }
+  end
+
   @spec capabilities_for_kind(String.t()) ::
           {:ok, [Capabilities.capability()]} | {:error, term()}
   def capabilities_for_kind(kind) when is_binary(kind) do
@@ -158,6 +166,47 @@ defmodule SymphonyElixir.Tracker do
   defp adapter_for_settings!(%{kind: kind}) do
     {:ok, adapter} = adapter_for_kind(kind)
     adapter
+  end
+
+  defp provider_scope("linear", tracker_settings) do
+    compact_scope(%{
+      project_slug: tracker_settings.project_slug || provider_value(tracker_settings.provider, "project_slug")
+    })
+  end
+
+  defp provider_scope(kind, tracker_settings) when kind in ["github", "gitlab"] do
+    compact_scope(%{repo: provider_value(tracker_settings.provider, "repo")})
+  end
+
+  defp provider_scope("jira", tracker_settings) do
+    compact_scope(%{project_key: provider_value(tracker_settings.provider, "project_key")})
+  end
+
+  defp provider_scope("asana", tracker_settings) do
+    compact_scope(%{project_gid: provider_value(tracker_settings.provider, "project_gid")})
+  end
+
+  defp provider_scope(_kind, _tracker_settings), do: %{}
+
+  defp provider_value(provider, key) when is_map(provider) do
+    case key do
+      "project_slug" -> Map.get(provider, "project_slug") || Map.get(provider, :project_slug)
+      "repo" -> Map.get(provider, "repo") || Map.get(provider, :repo)
+      "project_key" -> Map.get(provider, "project_key") || Map.get(provider, :project_key)
+      "project_gid" -> Map.get(provider, "project_gid") || Map.get(provider, :project_gid)
+    end
+  end
+
+  defp provider_value(_provider, _key), do: nil
+
+  defp compact_scope(scope) do
+    Enum.reduce(scope, %{}, fn
+      {key, value}, acc when is_binary(value) ->
+        if String.trim(value) == "", do: acc, else: Map.put(acc, key, String.trim(value))
+
+      {_key, _value}, acc ->
+        acc
+    end)
   end
 
   defp adapter_agent_tool_specs(adapter) do
