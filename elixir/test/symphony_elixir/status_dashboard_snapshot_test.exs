@@ -166,6 +166,66 @@ defmodule SymphonyElixir.StatusDashboardSnapshotTest do
     refute backoff_line =~ "\\n"
   end
 
+  test "running rows show the selected role and dependency status when present" do
+    summary =
+      StatusDashboard.format_running_summary_for_test(%{
+        identifier: "SYM-ROLE",
+        state: "Planning",
+        profile_name: "planner",
+        session_id: "session-role",
+        codex_app_server_pid: "4242",
+        codex_total_tokens: 0,
+        runtime_seconds: 1,
+        turn_count: 1,
+        last_codex_event: :notification,
+        last_codex_message: nil,
+        dependency: %{reason: :planning_allowed_with_unresolved_dependencies}
+      })
+
+    assert summary =~ "planner"
+    assert summary =~ "dependency="
+  end
+
+  test "terminal dashboard renders blocked dependency diagnostics when present" do
+    content =
+      StatusDashboard.format_snapshot_content_for_test(
+        {:ok,
+         %{
+           running: [],
+           retrying: [],
+           blocked: [
+             %{
+               identifier: "SYM-BLOCKED",
+               state: "Ready",
+               error: "dependency guard blocked",
+               dependency: %{reason: :unresolved_hard_dependency}
+             }
+           ],
+           dependency_diagnostics: [
+             %{
+               identifier: "SYM-DIAGNOSTIC",
+               responsibility: "implementation",
+               dependency_status: :unresolved,
+               reason: :unresolved_hard_dependency,
+               unresolved_blockers: [%{identifier: "SYM-FOUNDATION"}]
+             }
+           ],
+           dependency_graph: %{cycles: [["SYM-CYCLE-A", "SYM-CYCLE-B"]], diagnostics: []},
+           codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+           rate_limits: nil
+         }},
+        0.0,
+        115
+      )
+
+    assert content =~ "Blocked diagnostics"
+    assert content =~ "SYM-BLOCKED"
+    assert content =~ "unresolved_hard_dependency"
+    assert content =~ "Dependency diagnostics"
+    assert content =~ "SYM-DIAGNOSTIC"
+    assert content =~ "cycle=SYM-CYCLE-A->SYM-CYCLE-B"
+  end
+
   test "snapshot fixture: unlimited credits variant" do
     snapshot_data =
       {:ok,

@@ -103,15 +103,39 @@ defmodule SymphonyElixir.Config do
     with {:ok, settings} <- settings() do
       with {:ok, turn_sandbox_policy} <-
              Schema.resolve_runtime_turn_sandbox_policy(settings, workspace, opts) do
-        {:ok,
-         %{
-           approval_policy: settings.codex.approval_policy,
-           thread_sandbox: settings.codex.thread_sandbox,
-           turn_sandbox_policy: turn_sandbox_policy
-         }}
+        runtime_settings = %{
+          approval_policy: settings.codex.approval_policy,
+          thread_sandbox: settings.codex.thread_sandbox,
+          turn_sandbox_policy: turn_sandbox_policy
+        }
+
+        apply_profile_sandbox(runtime_settings, Keyword.get(opts, :sandbox))
       end
     end
   end
+
+  defp apply_profile_sandbox(runtime_settings, nil), do: {:ok, runtime_settings}
+
+  defp apply_profile_sandbox(runtime_settings, "read-only") do
+    {:ok,
+     %{
+       runtime_settings
+       | thread_sandbox: "read-only",
+         turn_sandbox_policy: %{
+           "type" => "readOnly",
+           "networkAccess" => false,
+           "excludeTmpdirEnvVar" => false,
+           "excludeSlashTmp" => false
+         }
+     }}
+  end
+
+  defp apply_profile_sandbox(runtime_settings, "workspace-write") do
+    {:ok, %{runtime_settings | thread_sandbox: "workspace-write"}}
+  end
+
+  defp apply_profile_sandbox(_runtime_settings, sandbox),
+    do: {:error, {:invalid_profile_sandbox, sandbox}}
 
   @doc false
   @spec validate_settings(Schema.t()) :: :ok | {:error, term()}

@@ -1,6 +1,9 @@
 defmodule SymphonyElixir.OrchestratorStatusTest do
   use SymphonyElixir.TestSupport
 
+  alias SymphonyElixir.AgentRuntime.Router
+  alias SymphonyElixir.Dependency.{Graph, Guard}
+
   test "snapshot returns :timeout when snapshot server is unresponsive" do
     server_name = Module.concat(__MODULE__, :UnresponsiveSnapshotServer)
     parent = self()
@@ -100,6 +103,76 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
              message: %{method: "some-event"},
              timestamp: now
            }
+  end
+
+  test "snapshot exposes safe route and dependency metadata" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+
+    issue = %Issue{
+      id: "issue-route-snapshot",
+      identifier: "SYM-SNAPSHOT-ROUTE",
+      title: "Route snapshot",
+      state: "In Progress",
+      blocked_by: [%{id: "blocker", identifier: "SYM-BLOCKER", state: "Ready"}]
+    }
+
+    assert {:ok, route} = Router.resolve(issue, Config.settings!().agent.profiles)
+    decision = Guard.evaluate(issue, route.responsibility)
+    graph = Graph.build([issue])
+    orchestrator_name = Module.concat(__MODULE__, :RouteSnapshotOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+    end)
+
+    running_entry = %{
+      pid: self(),
+      ref: make_ref(),
+      identifier: issue.identifier,
+      issue: issue,
+      route: route,
+      profile_name: route.profile_name,
+      runtime_name: route.runtime_name,
+      responsibility: route.responsibility,
+      route_fingerprint: route.fingerprint,
+      route_change_termination: true,
+      route_change: %{previous: %{profile_name: "planner"}, next: %{profile_name: "builder"}},
+      session_id: "session-route",
+      codex_app_server_pid: nil,
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      turn_count: 1,
+      started_at: DateTime.utc_now(),
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil
+    }
+
+    :sys.replace_state(pid, fn state ->
+      %{
+        state
+        | running: %{issue.id => running_entry},
+          claimed: MapSet.put(state.claimed, issue.id),
+          dependency_graph: graph,
+          dependency_diagnostics: %{issue.id => decision}
+      }
+    end)
+
+    snapshot = Orchestrator.snapshot(orchestrator_name, 1_000)
+    [entry] = snapshot.running
+
+    assert entry.profile_name == "builder"
+    assert entry.runtime_name == "codex"
+    assert entry.responsibility == "implementation"
+    assert entry.route_fingerprint == route.fingerprint
+    assert entry.route_change_termination
+    assert entry.route_change.next.profile_name == "builder"
+    assert entry.dependency.reason == :unresolved_hard_dependency
+    assert snapshot.dependency_diagnostics != []
+    assert snapshot.dependency_graph.cycles == []
+    refute inspect(snapshot) =~ "codex app-server"
   end
 
   test "orchestrator snapshot tracks codex thread totals and app-server pid" do

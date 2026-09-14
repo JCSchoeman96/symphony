@@ -5,6 +5,7 @@ defmodule SymphonyElixir.Config.Schema do
 
   import Ecto.Changeset
 
+  alias SymphonyElixir.AgentRuntime.Profile
   alias SymphonyElixir.PathSafety
 
   @primary_key false
@@ -153,6 +154,7 @@ defmodule SymphonyElixir.Config.Schema do
       field(:max_turns, :integer, default: 20)
       field(:max_retry_backoff_ms, :integer, default: 300_000)
       field(:max_concurrent_agents_by_state, :map, default: %{})
+      field(:profiles, :map, default: %{})
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
@@ -160,7 +162,13 @@ defmodule SymphonyElixir.Config.Schema do
       schema
       |> cast(
         attrs,
-        [:max_concurrent_agents, :max_turns, :max_retry_backoff_ms, :max_concurrent_agents_by_state],
+        [
+          :max_concurrent_agents,
+          :max_turns,
+          :max_retry_backoff_ms,
+          :max_concurrent_agents_by_state,
+          :profiles
+        ],
         empty_values: []
       )
       |> validate_number(:max_concurrent_agents, greater_than: 0)
@@ -310,7 +318,7 @@ defmodule SymphonyElixir.Config.Schema do
     |> apply_action(:validate)
     |> case do
       {:ok, settings} ->
-        {:ok, finalize_settings(settings)}
+        finalize_settings(settings)
 
       {:error, changeset} ->
         {:error, {:invalid_workflow_config, format_errors(changeset)}}
@@ -334,8 +342,13 @@ defmodule SymphonyElixir.Config.Schema do
   @spec resolve_runtime_turn_sandbox_policy(%__MODULE__{}, Path.t() | nil, keyword()) ::
           {:ok, map()} | {:error, term()}
   def resolve_runtime_turn_sandbox_policy(settings, workspace \\ nil, opts \\ []) do
-    case settings.codex.turn_sandbox_policy do
-      %{} = policy ->
+    case {Keyword.get(opts, :sandbox), settings.codex.turn_sandbox_policy} do
+      {"workspace-write", _policy} ->
+        workspace
+        |> default_workspace_root(settings.workspace.root)
+        |> default_runtime_turn_sandbox_policy(opts)
+
+      {_sandbox, %{} = policy} ->
         {:ok, policy}
 
       _ ->
@@ -399,43 +412,9 @@ defmodule SymphonyElixir.Config.Schema do
     provider = normalize_optional_map(settings.tracker.provider) || %{}
 
     {api_key, assignee, provider, secret_environment_names} =
-      case settings.tracker.kind do
-        "linear" ->
-          linear_provider =
-            provider
-            |> Map.put_new("endpoint", settings.tracker.endpoint || @linear_endpoint)
-            |> Map.put_new("api_key", settings.tracker.api_key)
-            |> Map.put_new("project_slug", settings.tracker.project_slug)
-            |> Map.put_new("assignee", settings.tracker.assignee)
+      resolve_tracker_credentials(settings.tracker, provider)
 
-          resolved_api_key =
-            resolve_secret_setting(linear_provider["api_key"], System.get_env("LINEAR_API_KEY"))
-
-          resolved_assignee =
-            resolve_secret_setting(linear_provider["assignee"], System.get_env("LINEAR_ASSIGNEE"))
-
-          {
-            resolved_api_key,
-            resolved_assignee,
-            linear_provider,
-            ["LINEAR_API_KEY" | env_reference_names([linear_provider["api_key"]])]
-          }
-
-        _ ->
-          {settings.tracker.api_key, settings.tracker.assignee, provider, []}
-      end
-
-    {active_states, terminal_states} =
-      case settings.tracker.kind do
-        kind when kind in ["linear", "memory"] ->
-          {
-            settings.tracker.active_states || @linear_active_states,
-            settings.tracker.terminal_states || @linear_terminal_states
-          }
-
-        _ ->
-          {settings.tracker.active_states, settings.tracker.terminal_states}
-      end
+    {active_states, terminal_states} = resolve_tracker_states(settings.tracker)
 
     tracker = %{
       settings.tracker
@@ -460,7 +439,61 @@ defmodule SymphonyElixir.Config.Schema do
         turn_sandbox_policy: normalize_optional_map(settings.codex.turn_sandbox_policy)
     }
 
-    %{settings | tracker: tracker, workspace: workspace, codex: codex}
+    settings = %{settings | tracker: tracker, workspace: workspace, codex: codex}
+
+    finalize_agent_profiles(settings)
+  end
+
+  defp resolve_tracker_credentials(%{kind: "linear"} = tracker, provider) do
+    linear_provider =
+      provider
+      |> Map.put_new("endpoint", tracker.endpoint || @linear_endpoint)
+      |> Map.put_new("api_key", tracker.api_key)
+      |> Map.put_new("project_slug", tracker.project_slug)
+      |> Map.put_new("assignee", tracker.assignee)
+
+    resolved_api_key =
+      resolve_secret_setting(linear_provider["api_key"], System.get_env("LINEAR_API_KEY"))
+
+    resolved_assignee =
+      resolve_secret_setting(linear_provider["assignee"], System.get_env("LINEAR_ASSIGNEE"))
+
+    {
+      resolved_api_key,
+      resolved_assignee,
+      linear_provider,
+      ["LINEAR_API_KEY" | env_reference_names([linear_provider["api_key"]])]
+    }
+  end
+
+  defp resolve_tracker_credentials(tracker, provider) do
+    {tracker.api_key, tracker.assignee, provider, []}
+  end
+
+  defp resolve_tracker_states(%{kind: kind, active_states: active_states, terminal_states: terminal_states})
+       when kind in ["linear", "memory"] do
+    {
+      active_states || @linear_active_states,
+      terminal_states || @linear_terminal_states
+    }
+  end
+
+  defp resolve_tracker_states(%{active_states: active_states, terminal_states: terminal_states}) do
+    {active_states, terminal_states}
+  end
+
+  defp finalize_agent_profiles(settings) do
+    case Profile.resolve_profiles(
+           settings.agent.profiles,
+           settings.codex.command,
+           settings.agent.max_turns
+         ) do
+      {:ok, profiles} ->
+        {:ok, %{settings | agent: %{settings.agent | profiles: profiles}}}
+
+      {:error, {:invalid_profile, name, message}} ->
+        {:error, {:invalid_workflow_config, "agent.profiles.#{name} #{message}"}}
+    end
   end
 
   defp normalize_keys(value) when is_map(value) do

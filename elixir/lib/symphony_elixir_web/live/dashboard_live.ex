@@ -163,9 +163,17 @@ defmodule SymphonyElixirWeb.DashboardLive do
                       </div>
                     </td>
                     <td>
-                      <span class={state_badge_class(entry.state)}>
-                        <%= entry.state %>
-                      </span>
+                      <div class="detail-stack">
+                        <span class={state_badge_class(entry.state)}>
+                          <%= entry.state %>
+                        </span>
+                        <%= if Map.get(entry, :profile_name) do %>
+                          <span class="muted mono">role=<%= Map.get(entry, :profile_name) %></span>
+                        <% end %>
+                        <%= if get_in(entry, [:dependency, :reason]) do %>
+                          <span class="muted">dep=<%= get_in(entry, [:dependency, :reason]) %></span>
+                        <% end %>
+                      </div>
                     </td>
                     <td>
                       <div class="session-stack">
@@ -244,9 +252,17 @@ defmodule SymphonyElixirWeb.DashboardLive do
                       </div>
                     </td>
                     <td>
-                      <span class={state_badge_class(entry.state || "Blocked")}>
-                        <%= entry.state || "Blocked" %>
-                      </span>
+                      <div class="detail-stack">
+                        <span class={state_badge_class(entry.state || "Blocked")}>
+                          <%= entry.state || "Blocked" %>
+                        </span>
+                        <%= if Map.get(entry, :profile_name) do %>
+                          <span class="muted mono">role=<%= Map.get(entry, :profile_name) %></span>
+                        <% end %>
+                        <%= if get_in(entry, [:dependency, :reason]) do %>
+                          <span class="muted">dep=<%= get_in(entry, [:dependency, :reason]) %></span>
+                        <% end %>
+                      </div>
                     </td>
                     <td>
                       <%= if entry.session_id do %>
@@ -285,6 +301,40 @@ defmodule SymphonyElixirWeb.DashboardLive do
             </div>
           <% end %>
         </section>
+
+        <%= if Map.get(@payload, :dependency_diagnostics, []) != [] do %>
+          <section class="section-card">
+            <div class="section-header">
+              <div>
+                <h2 class="section-title">Dependency diagnostics</h2>
+                <p class="section-copy">Current dependency decisions, blockers, and cycle evidence.</p>
+              </div>
+            </div>
+
+            <div class="table-wrap">
+              <table class="data-table" style="min-width: 760px;">
+                <thead>
+                  <tr>
+                    <th>Issue</th>
+                    <th>Role</th>
+                    <th>Status</th>
+                    <th>Decision</th>
+                    <th>Blockers</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr :for={entry <- Map.get(@payload, :dependency_diagnostics, [])}>
+                    <td class="mono"><%= Map.get(entry, :identifier) || Map.get(entry, :issue_id) || "unknown" %></td>
+                    <td><%= Map.get(entry, :responsibility) || "n/a" %></td>
+                    <td><%= Map.get(entry, :dependency_status) || "n/a" %></td>
+                    <td><%= Map.get(entry, :reason) || "n/a" %></td>
+                    <td class="mono"><%= dependency_blocker_labels(Map.get(entry, :blockers, [])) %></td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </section>
+        <% end %>
 
         <section class="section-card">
           <div class="section-header">
@@ -424,6 +474,14 @@ defmodule SymphonyElixirWeb.DashboardLive do
   end
 
   defp format_int(_value), do: "n/a"
+
+  defp dependency_blocker_labels(blockers) when is_list(blockers) do
+    Enum.map_join(blockers, ", ", fn blocker ->
+      Map.get(blocker, :identifier) || Map.get(blocker, :id) || "unknown"
+    end)
+  end
+
+  defp dependency_blocker_labels(_blockers), do: "n/a"
 
   defp state_badge_class(state) do
     base = "state-badge"

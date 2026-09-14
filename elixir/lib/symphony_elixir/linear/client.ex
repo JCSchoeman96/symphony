@@ -493,38 +493,8 @@ defmodule SymphonyElixir.Linear.Client do
   defp assignee_field(%{} = assignee, field) when is_binary(field), do: assignee[field]
   defp assignee_field(_assignee, _field), do: nil
 
-  defp dispatchable?(state_name, blockers, assignee, assignee_filter) do
-    assigned_to_worker?(assignee, assignee_filter) and
-      not blocked_before_dispatch?(state_name, blockers)
-  end
-
-  defp blocked_before_dispatch?(state_name, blockers)
-       when is_binary(state_name) and is_list(blockers) do
-    normalize_state_name(state_name) == "todo" and
-      Enum.any?(blockers, fn
-        %{state: blocker_state} when is_binary(blocker_state) ->
-          not terminal_state?(blocker_state)
-
-        _ ->
-          true
-      end)
-  end
-
-  defp blocked_before_dispatch?(_state_name, _blockers), do: false
-
-  defp terminal_state?(state_name) when is_binary(state_name) do
-    terminal_states =
-      Config.settings!().tracker.terminal_states
-      |> Enum.map(&normalize_state_name/1)
-      |> MapSet.new()
-
-    MapSet.member?(terminal_states, normalize_state_name(state_name))
-  end
-
-  defp normalize_state_name(state_name) when is_binary(state_name) do
-    state_name
-    |> String.trim()
-    |> String.downcase()
+  defp dispatchable?(_state_name, _blockers, assignee, assignee_filter) do
+    assigned_to_worker?(assignee, assignee_filter)
   end
 
   defp assigned_to_worker?(_assignee, nil), do: true
