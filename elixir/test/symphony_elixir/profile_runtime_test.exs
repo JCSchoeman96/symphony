@@ -4,8 +4,8 @@ defmodule SymphonyElixir.ProfileRuntimeTestFake do
     {:ok, %{test_pid: Keyword.fetch!(opts, :test_pid)}}
   end
 
-  def run_turn(session, _prompt, issue, _opts) do
-    send(session.test_pid, {:profile_runtime_turn, issue})
+  def run_turn(session, _prompt, issue, opts) do
+    send(session.test_pid, {:profile_runtime_turn, issue, opts})
     {:ok, %{session_id: "profile-runtime-turn"}}
   end
 
@@ -125,6 +125,10 @@ defmodule SymphonyElixir.ProfileRuntimeTest do
     assert opts[:model] == "custom-model"
     assert opts[:sandbox] == "read-only"
     assert opts[:profile] == profile
+    assert_receive {:profile_runtime_turn, ^issue, turn_opts}
+    assert turn_opts[:model] == "custom-model"
+    assert turn_opts[:sandbox] == "read-only"
+    assert turn_opts[:profile] == profile
     assert_receive {:profile_runtime_stopped, _session}
   end
 end

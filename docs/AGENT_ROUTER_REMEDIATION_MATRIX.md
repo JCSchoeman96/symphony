@@ -26,7 +26,7 @@ completed. “Pending” is intentional until a test and validation command exis
 | R2 | Absent profiles must preserve legacy read-only behavior; writable routed defaults require explicit migration. | `agent_router_test.exs` and `profile_runtime_test.exs`: legacy mode retains nil profiles and configured read-only policy; orchestrator legacy dispatch test | `Schema.Agent.routing` defaults to `legacy`; routed profiles require explicit `routing: routed`; legacy route does not apply profile sandbox | Affected 89-test suite and full `make all` passed | Component proof only; real Codex denied-write proof unavailable |
 | R3 | Poll refresh must stop a running worker when a blocker/route/state becomes unsafe; completion and shutdown races are idempotent. | Pending: real long-running worker/poll race tests | Pending | Pending | Component proof only |
 | R4 | Linear relations require complete pagination and explicit missing/malformed/error state; empty must be verified empty. | Pending: >50 relations, mixed types, page-info/error tests | Pending | Pending | Requires disposable Linear proof for provider confirmation |
-| R5 | Effective profile model/sandbox/command must reach every runtime turn. | Pending: startup plus every `run_turn` payload | Pending | Pending | Component proof only |
+| R5 | Effective profile model/sandbox/command must reach every runtime turn. | `profile_runtime_test.exs` and `agent_runtime_test.exs`: startup plus every turn, including a two-turn continuation; `core_test.exs`: traced `turn/start` model payload | `AgentRunner` stores normalized `runtime_opts` in the session context and reuses them for turn calls | `mise exec -- make all`: 362 tests, 0 failures, 6 skipped; 100% coverage; Credo clean; Dialyzer 0 errors | Component proof only; real Codex process unavailable |
 | R6 | Graph acquisition must include non-dispatchable closure nodes and detect self/multi-node cycles without blocking independent work. | Pending: full-graph closure/cycle tests | Pending | Pending | Component proof only; live provider graph still unverified |
 | R7 | Role prompts must be coherent, runtime-reloadable for future attempts, stable for active attempts, and packaged. | Pending: prompt reload/fallback tests | Pending | Pending | Component proof only |
 | R8 | Bound ordinary retries and review cycles; separate capacity/continuation/route-change accounting; CI retry disabled or tightly bounded. | Pending: policy/counter threshold tests | Pending | Pending | Component proof only |
@@ -54,7 +54,7 @@ completed. “Pending” is intentional until a test and validation command exis
 | SYM-02 | Reviewer is read-only and reports exact PASS/FAIL/BLOCKED evidence. | Existing local deterministic role tests; effective policy was permissive. | Pending |
 | SYM-03 | Ready/In Progress implementation dispatch obeys dependencies and profile policy. | Existing route tests plus new legacy/profile-policy regressions | Explicit routed mode and effective responsibility/sandbox validation | Affected suite and full gate: 361 tests, 0 failures, 6 skipped |
 | SYM-04 | Changes Requested correction is bounded, reviewed, and retry-limited. | Existing route tests; no hard retry/review threshold. | Pending |
-| SYM-05 | Profile runtime options survive into each turn. | Characterization exposed `nil` model in later turn payload. | Pending |
+| SYM-05 | Profile runtime options survive into each turn. | Characterization reproduced nil model; new continuation and `turn/start` tests now assert selected model | Effective options are captured per attempt and passed to every turn | `mise exec -- make all`: 362 tests, 0 failures, 6 skipped; 100% coverage; Credo clean; Dialyzer 0 errors |
 | SYM-06 | Dependency policy distinguishes Done, active, and invalidated blockers. | Existing unit tests pass; completeness/closure is insufficient. | Pending |
 | SYM-07 | Blocker reappearance/reconciliation stops unsafe work. | Existing turn-boundary stop test; poll-level interruption missing. | Pending |
 | SYM-08 | Merge route is deferred/non-executable. | Merge override regression in `agent_router_test.exs` | Merge tuple cannot be made executable through config | Affected suite and full gate passed |
@@ -76,7 +76,8 @@ claim.
 | --- | --- | --- | --- |
 | Baseline | `351 tests, 0 failures, 6 skipped` | Pending after remediation | Clean at base |
 | Task 1 | 361 full tests, 0 failures, 6 skipped; 100% coverage | `mise exec -- make all`: passed; Credo clean; Dialyzer 0 errors | Clean |
-| 2–10 | Pending | Pending | Pending |
+| Task 2 | `362 tests, 0 failures, 6 skipped`; 100% coverage | `mise exec -- make all`: passed; Credo clean; Dialyzer 0 errors | Clean |
+| 3–10 | Pending | Pending | Pending |
 
 ## External-proof boundary
 

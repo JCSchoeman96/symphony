@@ -2088,6 +2088,7 @@ defmodule SymphonyElixir.CoreTest do
       }
 
       assert {:ok, _result} = AppServer.run(workspace, "Fix workspace start args", issue)
+
       assert {:ok, canonical_workspace} = SymphonyElixir.PathSafety.canonicalize(workspace)
 
       trace = File.read!(trace_file)
@@ -2326,7 +2327,8 @@ defmodule SymphonyElixir.CoreTest do
         labels: ["backend"]
       }
 
-      assert {:ok, _result} = AppServer.run(workspace, "Fix workspace start args", issue)
+      assert {:ok, _result} =
+               AppServer.run(workspace, "Fix workspace start args", issue, model: "selected-model")
 
       lines = File.read!(trace_file) |> String.split("\n", trim: true)
 
@@ -2358,6 +2360,7 @@ defmodule SymphonyElixir.CoreTest do
                  |> then(fn payload ->
                    payload["method"] == "turn/start" &&
                      get_in(payload, ["params", "approvalPolicy"]) == "on-request" &&
+                     get_in(payload, ["params", "model"]) == "selected-model" &&
                      get_in(payload, ["params", "sandboxPolicy"]) == expected_turn_policy
                  end)
                else

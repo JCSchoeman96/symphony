@@ -119,7 +119,7 @@ defmodule SymphonyElixir.AgentRunner do
         workspace: workspace,
         issue: issue,
         codex_update_recipient: codex_update_recipient,
-        opts: opts,
+        opts: runtime_opts,
         issue_state_fetcher: issue_state_fetcher,
         route: route
       }
