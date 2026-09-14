@@ -14,6 +14,52 @@ defmodule SymphonyElixir.Orchestrator do
 
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
+  @recent_attempt_limit 20
+  @observability_text_limit 240
+  @observability_rate_limit_keys ["limit_id", "limit_name", "primary", "secondary", "credits"]
+  @observability_rate_bucket_keys [
+    "remaining",
+    "limit",
+    "reset_in_seconds",
+    "resetinseconds",
+    "reset_at",
+    "resetat",
+    "resets_at",
+    "resetsat",
+    "usedpercent",
+    "windowdurationmins"
+  ]
+  @observability_rate_credit_keys ["has_credits", "unlimited", "balance"]
+  @blocked_termination_rules [
+    {"review cycle limit", :review_cycle_exhausted},
+    {"retry limit", :retry_exhausted},
+    {"CI retry", :ci_retry_disabled},
+    {"runtime", :runtime_unavailable},
+    {"operator input", :operator_input_required},
+    {"approval", :operator_approval_required}
+  ]
+  @observability_termination_reasons [
+    :normal_completion,
+    :route_changed,
+    :dependency_blocked,
+    :retry_exhausted,
+    :review_cycle_exhausted,
+    :ci_retry_disabled,
+    :capacity_wait,
+    :runtime_failure,
+    :runtime_unavailable,
+    :runtime_stalled,
+    :operator_input_required,
+    :operator_approval_required,
+    :terminal,
+    :shutdown,
+    :not_routable,
+    :non_active,
+    :tracker_missing,
+    :blocked,
+    :invalid_attempt,
+    :observed
+  ]
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
   @empty_codex_totals %{
@@ -45,6 +91,7 @@ defmodule SymphonyElixir.Orchestrator do
       dependency_diagnostics: %{},
       retry_attempts: %{},
       attempt_counters: %{},
+      recent_attempts: [],
       codex_totals: nil,
       codex_rate_limits: nil
     ]
@@ -302,6 +349,8 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp retry_agent_down(state, issue_id, running_entry, session_id, reason) do
+    termination_reason = worker_exit_termination_reason(reason)
+
     case record_attempt_event(state, issue_id, :ordinary_failure) do
       {:ok, state} ->
         Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; scheduling retry")
@@ -317,12 +366,14 @@ defmodule SymphonyElixir.Orchestrator do
               identifier: running_entry.identifier,
               issue_url: running_entry.issue.url,
               error: "agent exited: #{inspect(reason)}",
+              termination_reason: termination_reason,
               worker_host: Map.get(running_entry, :worker_host),
               workspace_path: Map.get(running_entry, :workspace_path)
             },
             route_retry_metadata(running_entry)
           )
         )
+        |> record_recent_attempt(issue_id, running_entry, termination_reason, "agent exited")
 
       {:stop, state, reason} ->
         Logger.error("Automatic retries exhausted for issue_id=#{issue_id} session_id=#{session_id}; requiring human attention")
@@ -336,6 +387,7 @@ defmodule SymphonyElixir.Orchestrator do
     case record_route_change_events(state, issue_id, route_change) do
       {:ok, state} ->
         state
+        |> record_recent_attempt(issue_id, running_entry, :route_changed)
         |> complete_issue(issue_id)
         |> schedule_issue_retry(
           issue_id,
@@ -362,6 +414,7 @@ defmodule SymphonyElixir.Orchestrator do
     {:ok, state} = record_attempt_event(state, issue_id, :continuation)
 
     state
+    |> record_recent_attempt(issue_id, running_entry, :normal_completion)
     |> complete_issue(issue_id)
     |> schedule_issue_retry(
       issue_id,
@@ -596,12 +649,12 @@ defmodule SymphonyElixir.Orchestrator do
       terminal_issue_state?(issue.state, terminal_states) ->
         Logger.info("Issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; stopping active agent")
 
-        terminate_running_issue(state, issue.id, true)
+        terminate_running_issue(state, issue.id, true, :terminal)
 
       !issue_routable?(issue) ->
         Logger.info("Issue no longer routed to this worker: #{issue_context(issue)} assignee=#{inspect(issue.assignee_id)}; stopping active agent")
 
-        terminate_running_issue(state, issue.id, false)
+        terminate_running_issue(state, issue.id, false, :not_routable)
 
       active_issue_state?(issue.state, active_states) ->
         refresh_running_issue_state(state, issue)
@@ -609,7 +662,7 @@ defmodule SymphonyElixir.Orchestrator do
       true ->
         Logger.info("Issue moved to non-active state: #{issue_context(issue)} state=#{issue.state}; stopping active agent")
 
-        terminate_running_issue(state, issue.id, false)
+        terminate_running_issue(state, issue.id, false, :non_active)
     end
   end
 
@@ -666,7 +719,7 @@ defmodule SymphonyElixir.Orchestrator do
         state_acc
       else
         log_missing_running_issue(state_acc, issue_id)
-        terminate_running_issue(state_acc, issue_id, false)
+        terminate_running_issue(state_acc, issue_id, false, :tracker_missing)
       end
     end)
   end
@@ -727,7 +780,7 @@ defmodule SymphonyElixir.Orchestrator do
 
       {:error, reason} ->
         Logger.info("Stopping active agent after route refresh failed for #{issue_context(issue)}: #{inspect(reason)}")
-        terminate_running_issue(state, issue.id, false)
+        terminate_running_issue(state, issue.id, false, :runtime_unavailable)
     end
   end
 
@@ -780,7 +833,10 @@ defmodule SymphonyElixir.Orchestrator do
       {:ok, state} ->
         stop_running_task(Map.get(running_entry, :pid), Map.get(running_entry, :ref), state.task_supervisor)
 
-        state = Map.update!(state, :running, &Map.delete(&1, issue.id))
+        state =
+          state
+          |> record_recent_attempt(issue.id, %{running_entry | issue: issue}, :route_changed)
+          |> then(&Map.update!(&1, :running, fn running -> Map.delete(running, issue.id) end))
 
         schedule_issue_retry(
           state,
@@ -843,7 +899,7 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp terminate_running_issue(%State{} = state, issue_id, cleanup_workspace) do
+  defp terminate_running_issue(%State{} = state, issue_id, cleanup_workspace, termination_reason) do
     case Map.get(state.running, issue_id) do
       nil ->
         state = release_issue_claim(state, issue_id)
@@ -851,6 +907,7 @@ defmodule SymphonyElixir.Orchestrator do
 
       %{pid: pid, ref: ref, identifier: identifier} = running_entry ->
         state = record_session_completion_totals(state, running_entry)
+        state = record_recent_attempt(state, issue_id, running_entry, termination_reason)
 
         stop_running_task(pid, ref, state.task_supervisor)
 
@@ -937,7 +994,8 @@ defmodule SymphonyElixir.Orchestrator do
         %{
           identifier: identifier,
           issue_url: running_entry.issue.url,
-          error: "stalled for #{elapsed_ms}ms without codex activity"
+          error: "stalled for #{elapsed_ms}ms without codex activity",
+          termination_reason: :runtime_stalled
         },
         route_retry_metadata(running_entry)
       )
@@ -945,7 +1003,7 @@ defmodule SymphonyElixir.Orchestrator do
     case record_attempt_event(state, issue_id, :ordinary_failure) do
       {:ok, state} ->
         state
-        |> terminate_running_issue(issue_id, false)
+        |> terminate_running_issue(issue_id, false, :runtime_stalled)
         |> schedule_issue_retry(issue_id, next_attempt, retry_metadata)
 
       {:stop, state, reason} ->
@@ -1099,6 +1157,61 @@ defmodule SymphonyElixir.Orchestrator do
     block_issue_from_entry(state, issue_id, running_entry, error, dependency)
   end
 
+  defp record_recent_attempt(state, issue_id, entry, reason, error \\ nil)
+
+  defp record_recent_attempt(%State{} = state, issue_id, entry, reason, error)
+       when is_binary(issue_id) and is_atom(reason) and is_map(entry) do
+    issue = Map.get(entry, :issue)
+    attempt = Map.get(entry, :retry_attempt, Map.get(entry, :attempt, 0))
+
+    history_entry = %{
+      issue_id: issue_id,
+      identifier: Map.get(entry, :identifier) || issue_identifier(issue) || issue_id,
+      issue_url: Map.get(entry, :issue_url) || issue_url(issue),
+      termination_reason: reason,
+      attempt: normalize_retry_attempt(attempt),
+      profile_name: Map.get(entry, :profile_name),
+      runtime_name: Map.get(entry, :runtime_name),
+      responsibility: Map.get(entry, :responsibility),
+      sandbox: sandbox_for_entry(entry),
+      route_fingerprint: Map.get(entry, :route_fingerprint),
+      worker_host: Map.get(entry, :worker_host),
+      workspace_path: Map.get(entry, :workspace_path),
+      session_id: Map.get(entry, :session_id),
+      attempt_counters: attempt_counters_for(state, issue_id),
+      dependency_completeness: snapshot_dependency_completeness(state, issue_id),
+      dependency: snapshot_dependency_metadata(Map.get(entry, :dependency)),
+      error: observability_error(error || Map.get(entry, :error)),
+      at: DateTime.utc_now()
+    }
+
+    %{state | recent_attempts: [history_entry | List.wrap(state.recent_attempts)] |> Enum.take(@recent_attempt_limit)}
+  end
+
+  defp record_recent_attempt(state, _issue_id, _entry, _reason, _error), do: state
+
+  defp issue_identifier(%Issue{identifier: identifier}), do: identifier
+  defp issue_identifier(_issue), do: nil
+
+  defp issue_url(%Issue{url: url}), do: url
+  defp issue_url(_issue), do: nil
+
+  defp termination_reason_for_block(error, dependency) do
+    if dependency_denied?(dependency), do: :dependency_blocked, else: error_termination_reason(error)
+  end
+
+  defp error_termination_reason(error) when is_binary(error) do
+    Enum.find_value(@blocked_termination_rules, :blocked, fn {marker, reason} ->
+      if String.contains?(error, marker), do: reason
+    end)
+  end
+
+  defp error_termination_reason(_error), do: :blocked
+
+  defp dependency_denied?(%{allowed?: false}), do: true
+  defp dependency_denied?(%{"allowed?" => false}), do: true
+  defp dependency_denied?(_dependency), do: false
+
   defp block_issue_from_entry(%State{} = state, issue_id, running_entry, error, dependency \\ nil) do
     blocked_entry = %{
       issue_id: issue_id,
@@ -1107,12 +1220,14 @@ defmodule SymphonyElixir.Orchestrator do
       profile_name: Map.get(running_entry, :profile_name),
       runtime_name: Map.get(running_entry, :runtime_name),
       responsibility: Map.get(running_entry, :responsibility),
+      sandbox: sandbox_for_entry(running_entry),
       route_fingerprint: Map.get(running_entry, :route_fingerprint),
       worker_host: Map.get(running_entry, :worker_host),
       workspace_path: Map.get(running_entry, :workspace_path),
       retry_attempt: Map.get(running_entry, :retry_attempt, 0),
       session_id: running_entry_session_id(running_entry),
       error: error,
+      termination_reason: termination_reason_for_block(error, dependency),
       blocked_at: DateTime.utc_now(),
       last_codex_message: Map.get(running_entry, :last_codex_message),
       last_codex_event: Map.get(running_entry, :last_codex_event),
@@ -1120,13 +1235,21 @@ defmodule SymphonyElixir.Orchestrator do
       dependency: dependency
     }
 
-    %{
+    state = %{
       state
       | running: Map.delete(state.running, issue_id),
         retry_attempts: Map.delete(state.retry_attempts, issue_id),
         claimed: MapSet.put(state.claimed, issue_id),
         blocked: Map.put(state.blocked, issue_id, blocked_entry)
     }
+
+    record_recent_attempt(
+      state,
+      issue_id,
+      Map.put(blocked_entry, :dependency, dependency),
+      blocked_entry.termination_reason,
+      error
+    )
   end
 
   defp refresh_dependency_state(%State{} = state, issues, completeness) when is_list(issues) do
@@ -1509,6 +1632,7 @@ defmodule SymphonyElixir.Orchestrator do
             profile_name: route.profile_name,
             runtime_name: route.runtime_name,
             responsibility: route.responsibility,
+            sandbox: route_sandbox(route),
             route_fingerprint: route.fingerprint,
             route_change_termination: false,
             route_change: nil,
@@ -1549,12 +1673,15 @@ defmodule SymphonyElixir.Orchestrator do
           profile_name: route.profile_name,
           runtime_name: route.runtime_name,
           responsibility: route.responsibility,
+          sandbox: route_sandbox(route),
           route_fingerprint: route.fingerprint
         }
 
         case record_attempt_event(state, issue.id, :ordinary_failure) do
           {:ok, state} ->
-            schedule_issue_retry(state, issue.id, next_attempt, retry_metadata)
+            state
+            |> record_recent_attempt(issue.id, Map.put(retry_metadata, :issue, issue), :runtime_failure, retry_metadata.error)
+            |> schedule_issue_retry(issue.id, next_attempt, retry_metadata)
 
           {:stop, state, reason} ->
             block_issue_after_attempt_limit(state, issue, attempt, retry_metadata, reason)
@@ -1640,6 +1767,10 @@ defmodule SymphonyElixir.Orchestrator do
   defp attempt_policy_error(:ci_retry_disabled),
     do: "automatic CI retry is disabled; human or provider attention required"
 
+  defp worker_exit_termination_reason(:shutdown), do: :shutdown
+  defp worker_exit_termination_reason({:shutdown, _detail}), do: :shutdown
+  defp worker_exit_termination_reason(_reason), do: :runtime_failure
+
   defp block_issue_after_attempt_limit(%State{} = state, %Issue{} = issue, attempt, metadata, reason)
        when is_map(metadata) do
     running_entry = %{
@@ -1684,10 +1815,12 @@ defmodule SymphonyElixir.Orchestrator do
     error = pick_retry_error(previous_retry, metadata)
     worker_host = pick_retry_worker_host(previous_retry, metadata)
     workspace_path = pick_retry_workspace_path(previous_retry, metadata)
+    session_id = pick_retry_metadata(previous_retry, metadata, :session_id)
     delay_type = pick_retry_metadata(previous_retry, metadata, :delay_type)
     profile_name = pick_retry_metadata(previous_retry, metadata, :profile_name)
     runtime_name = pick_retry_metadata(previous_retry, metadata, :runtime_name)
     responsibility = pick_retry_metadata(previous_retry, metadata, :responsibility)
+    sandbox = pick_retry_metadata(previous_retry, metadata, :sandbox)
     route_fingerprint = pick_retry_metadata(previous_retry, metadata, :route_fingerprint)
     route_change = pick_retry_metadata(previous_retry, metadata, :route_change)
 
@@ -1713,11 +1846,14 @@ defmodule SymphonyElixir.Orchestrator do
             issue_url: issue_url,
             error: error,
             delay_type: delay_type,
+            termination_reason: pick_retry_metadata(previous_retry, metadata, :termination_reason),
             worker_host: worker_host,
             workspace_path: workspace_path,
+            session_id: session_id,
             profile_name: profile_name,
             runtime_name: runtime_name,
             responsibility: responsibility,
+            sandbox: sandbox,
             route_fingerprint: route_fingerprint,
             route_change: route_change
           }),
@@ -1733,11 +1869,14 @@ defmodule SymphonyElixir.Orchestrator do
           issue_url: Map.get(retry_entry, :issue_url),
           error: Map.get(retry_entry, :error),
           delay_type: Map.get(retry_entry, :delay_type),
+          termination_reason: Map.get(retry_entry, :termination_reason),
           worker_host: Map.get(retry_entry, :worker_host),
           workspace_path: Map.get(retry_entry, :workspace_path),
+          session_id: Map.get(retry_entry, :session_id),
           profile_name: Map.get(retry_entry, :profile_name),
           runtime_name: Map.get(retry_entry, :runtime_name),
           responsibility: Map.get(retry_entry, :responsibility),
+          sandbox: Map.get(retry_entry, :sandbox),
           route_fingerprint: Map.get(retry_entry, :route_fingerprint),
           route_change: Map.get(retry_entry, :route_change)
         }
@@ -1779,7 +1918,18 @@ defmodule SymphonyElixir.Orchestrator do
         Logger.info("Issue state is terminal: issue_id=#{issue_id} issue_identifier=#{issue.identifier} state=#{issue.state}; removing associated workspace")
 
         cleanup_issue_workspace(issue, metadata)
-        {:noreply, state |> release_issue_claim(issue_id) |> reset_attempt_counters(issue_id)}
+
+        state =
+          state
+          |> record_recent_attempt(
+            issue_id,
+            Map.merge(metadata, %{issue: issue, identifier: issue.identifier, attempt: attempt}),
+            :terminal
+          )
+          |> release_issue_claim(issue_id)
+          |> reset_attempt_counters(issue_id)
+
+        {:noreply, state}
 
       retry_candidate_issue?(issue, terminal_states) ->
         handle_active_retry(state, issue, attempt, metadata)
@@ -1859,6 +2009,12 @@ defmodule SymphonyElixir.Orchestrator do
     {:ok, state} = record_attempt_event(state, issue.id, :capacity_wait)
     attempt = if is_integer(attempt) and attempt > 0, do: attempt, else: 1
 
+    history_entry =
+      metadata
+      |> Map.merge(%{issue: issue, identifier: issue.identifier, attempt: attempt})
+
+    state = record_recent_attempt(state, issue.id, history_entry, :capacity_wait, "no available orchestrator slots")
+
     {:noreply,
      schedule_issue_retry(
        state,
@@ -1936,6 +2092,17 @@ defmodule SymphonyElixir.Orchestrator do
 
     case record_attempt_event(state, issue.id, :ordinary_failure) do
       {:ok, state} ->
+        termination_reason = if runtime_unavailable_error?(error), do: :runtime_unavailable, else: :runtime_failure
+
+        state =
+          record_recent_attempt(
+            state,
+            issue.id,
+            Map.merge(metadata, %{issue: issue, identifier: issue.identifier, attempt: attempt + 1}),
+            termination_reason,
+            error
+          )
+
         {:noreply, schedule_issue_retry(state, issue.id, attempt + 1, metadata)}
 
       {:stop, state, reason} ->
@@ -2017,7 +2184,9 @@ defmodule SymphonyElixir.Orchestrator do
       profile_name: Map.get(running_entry, :profile_name),
       runtime_name: Map.get(running_entry, :runtime_name),
       responsibility: Map.get(running_entry, :responsibility),
-      route_fingerprint: Map.get(running_entry, :route_fingerprint)
+      sandbox: sandbox_for_entry(running_entry),
+      route_fingerprint: Map.get(running_entry, :route_fingerprint),
+      session_id: Map.get(running_entry, :session_id)
     }
   end
 
@@ -2150,6 +2319,7 @@ defmodule SymphonyElixir.Orchestrator do
       profile_name: route.profile_name,
       runtime_name: route.runtime_name,
       responsibility: route.responsibility,
+      sandbox: route_sandbox(route),
       fingerprint: route.fingerprint
     }
   end
@@ -2281,6 +2451,46 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  @doc false
+  @spec observability_error(term()) :: String.t() | nil
+  def observability_error(value), do: snapshot_safe_error(value)
+
+  @doc false
+  @spec observability_codex_message(term()) :: term()
+  def observability_codex_message(value), do: snapshot_safe_codex_message(value)
+
+  @doc false
+  @spec observability_event(term()) :: term()
+  def observability_event(value), do: snapshot_safe_event(value)
+
+  @doc false
+  @spec observability_dependency(term()) :: map() | nil
+  def observability_dependency(value), do: snapshot_dependency_metadata(value)
+
+  @doc false
+  @spec observability_rate_limits(term()) :: map() | nil
+  def observability_rate_limits(value), do: snapshot_safe_rate_limits(value)
+
+  @doc false
+  @spec observability_route_change(term()) :: map() | nil
+  def observability_route_change(value), do: snapshot_safe_route_change(value)
+
+  @doc false
+  @spec observability_graph(term()) :: map()
+  def observability_graph(value), do: snapshot_dependency_graph_value(value)
+
+  @doc false
+  @spec observability_completeness(term()) :: term()
+  def observability_completeness(value), do: safe_dependency_completeness(value)
+
+  @doc false
+  @spec observability_termination_reason(term()) :: atom() | nil
+  def observability_termination_reason(reason) when reason in @observability_termination_reasons,
+    do: reason
+
+  def observability_termination_reason(nil), do: nil
+  def observability_termination_reason(_reason), do: :unknown
+
   @impl true
   def handle_call(:snapshot, _from, state) do
     state = refresh_runtime_config(state)
@@ -2292,29 +2502,33 @@ defmodule SymphonyElixir.Orchestrator do
       |> Enum.map(fn {issue_id, metadata} ->
         %{
           issue_id: issue_id,
-          identifier: metadata.identifier,
-          issue_url: metadata.issue.url,
-          state: metadata.issue.state,
+          identifier: safe_identifier(Map.get(metadata, :identifier)),
+          issue_url: safe_identifier(issue_url(Map.get(metadata, :issue))),
+          state: safe_identifier(Map.get(Map.get(metadata, :issue), :state)),
           dependency: snapshot_dependency_for_issue(state, issue_id),
-          profile_name: Map.get(metadata, :profile_name),
-          runtime_name: Map.get(metadata, :runtime_name),
-          responsibility: Map.get(metadata, :responsibility),
-          route_fingerprint: Map.get(metadata, :route_fingerprint),
+          dependency_completeness: snapshot_dependency_completeness(state, issue_id),
+          profile_name: safe_identifier(Map.get(metadata, :profile_name)),
+          runtime_name: safe_identifier(Map.get(metadata, :runtime_name)),
+          responsibility: safe_identifier(Map.get(metadata, :responsibility)),
+          sandbox: safe_identifier(sandbox_for_entry(metadata)),
+          route_fingerprint: safe_identifier(Map.get(metadata, :route_fingerprint)),
           route_change_termination: Map.get(metadata, :route_change_termination, false),
-          route_change: Map.get(metadata, :route_change),
-          worker_host: Map.get(metadata, :worker_host),
-          workspace_path: Map.get(metadata, :workspace_path),
-          session_id: metadata.session_id,
-          codex_app_server_pid: metadata.codex_app_server_pid,
-          codex_input_tokens: metadata.codex_input_tokens,
-          codex_output_tokens: metadata.codex_output_tokens,
-          codex_total_tokens: metadata.codex_total_tokens,
+          route_change: observability_route_change(Map.get(metadata, :route_change)),
+          worker_host: safe_identifier(Map.get(metadata, :worker_host)),
+          workspace_path: safe_identifier(Map.get(metadata, :workspace_path)),
+          session_id: safe_identifier(Map.get(metadata, :session_id)),
+          codex_app_server_pid: safe_identifier(Map.get(metadata, :codex_app_server_pid)),
+          codex_input_tokens: Map.get(metadata, :codex_input_tokens, 0),
+          codex_output_tokens: Map.get(metadata, :codex_output_tokens, 0),
+          codex_total_tokens: Map.get(metadata, :codex_total_tokens, 0),
           turn_count: Map.get(metadata, :turn_count, 0),
-          started_at: metadata.started_at,
-          last_codex_timestamp: metadata.last_codex_timestamp,
-          last_codex_message: metadata.last_codex_message,
-          last_codex_event: metadata.last_codex_event,
-          runtime_seconds: running_seconds(metadata.started_at, now)
+          started_at: Map.get(metadata, :started_at),
+          last_codex_timestamp: Map.get(metadata, :last_codex_timestamp),
+          last_codex_message: observability_codex_message(Map.get(metadata, :last_codex_message)),
+          last_codex_event: observability_event(Map.get(metadata, :last_codex_event)),
+          attempt_counters: attempt_counters_for(state, issue_id),
+          termination_reason: observability_termination_reason(Map.get(metadata, :termination_reason)),
+          runtime_seconds: running_seconds(Map.get(metadata, :started_at), now)
         }
       end)
 
@@ -2325,16 +2539,22 @@ defmodule SymphonyElixir.Orchestrator do
           issue_id: issue_id,
           attempt: attempt,
           due_in_ms: max(0, due_at_ms - now_ms),
-          identifier: Map.get(retry, :identifier),
-          issue_url: Map.get(retry, :issue_url),
-          error: Map.get(retry, :error),
-          worker_host: Map.get(retry, :worker_host),
-          workspace_path: Map.get(retry, :workspace_path),
-          profile_name: Map.get(retry, :profile_name),
-          runtime_name: Map.get(retry, :runtime_name),
-          responsibility: Map.get(retry, :responsibility),
-          route_fingerprint: Map.get(retry, :route_fingerprint),
-          route_change: Map.get(retry, :route_change)
+          identifier: safe_identifier(Map.get(retry, :identifier)),
+          issue_url: safe_identifier(Map.get(retry, :issue_url)),
+          error: observability_error(Map.get(retry, :error)),
+          worker_host: safe_identifier(Map.get(retry, :worker_host)),
+          workspace_path: safe_identifier(Map.get(retry, :workspace_path)),
+          session_id: safe_identifier(Map.get(retry, :session_id)),
+          profile_name: safe_identifier(Map.get(retry, :profile_name)),
+          runtime_name: safe_identifier(Map.get(retry, :runtime_name)),
+          responsibility: safe_identifier(Map.get(retry, :responsibility)),
+          sandbox: safe_identifier(Map.get(retry, :sandbox)),
+          route_fingerprint: safe_identifier(Map.get(retry, :route_fingerprint)),
+          route_change: observability_route_change(Map.get(retry, :route_change)),
+          attempt_counters: attempt_counters_for(state, issue_id),
+          dependency_completeness: snapshot_dependency_completeness(state, issue_id),
+          delay_type: Map.get(retry, :delay_type),
+          termination_reason: retry_termination_reason(retry)
         }
       end)
 
@@ -2343,23 +2563,27 @@ defmodule SymphonyElixir.Orchestrator do
       |> Enum.map(fn {issue_id, metadata} ->
         %{
           issue_id: issue_id,
-          identifier: Map.get(metadata, :identifier),
-          issue_url: blocked_issue_url(metadata),
-          state: blocked_issue_state(metadata),
-          profile_name: Map.get(metadata, :profile_name),
-          runtime_name: Map.get(metadata, :runtime_name),
-          responsibility: Map.get(metadata, :responsibility),
-          route_fingerprint: Map.get(metadata, :route_fingerprint),
-          worker_host: Map.get(metadata, :worker_host),
-          workspace_path: Map.get(metadata, :workspace_path),
+          identifier: safe_identifier(Map.get(metadata, :identifier)),
+          issue_url: safe_identifier(blocked_issue_url(metadata)),
+          state: safe_identifier(blocked_issue_state(metadata)),
+          profile_name: safe_identifier(Map.get(metadata, :profile_name)),
+          runtime_name: safe_identifier(Map.get(metadata, :runtime_name)),
+          responsibility: safe_identifier(Map.get(metadata, :responsibility)),
+          sandbox: safe_identifier(sandbox_for_entry(metadata)),
+          route_fingerprint: safe_identifier(Map.get(metadata, :route_fingerprint)),
+          worker_host: safe_identifier(Map.get(metadata, :worker_host)),
+          workspace_path: safe_identifier(Map.get(metadata, :workspace_path)),
           attempt: Map.get(metadata, :retry_attempt, 0),
-          session_id: Map.get(metadata, :session_id),
-          error: Map.get(metadata, :error),
+          session_id: safe_identifier(Map.get(metadata, :session_id)),
+          error: observability_error(Map.get(metadata, :error)),
+          attempt_counters: attempt_counters_for(state, issue_id),
+          dependency_completeness: snapshot_dependency_completeness(state, issue_id),
+          termination_reason: observability_termination_reason(Map.get(metadata, :termination_reason)),
           dependency: snapshot_dependency_metadata(Map.get(metadata, :dependency)),
           blocked_at: Map.get(metadata, :blocked_at),
           last_codex_timestamp: Map.get(metadata, :last_codex_timestamp),
-          last_codex_message: Map.get(metadata, :last_codex_message),
-          last_codex_event: Map.get(metadata, :last_codex_event)
+          last_codex_message: observability_codex_message(Map.get(metadata, :last_codex_message)),
+          last_codex_event: observability_event(Map.get(metadata, :last_codex_event))
         }
       end)
 
@@ -2368,10 +2592,11 @@ defmodule SymphonyElixir.Orchestrator do
        running: running,
        retrying: retrying,
        blocked: blocked,
+       recent_attempts: snapshot_recent_attempts(state),
        dependency_diagnostics: snapshot_dependency_diagnostics(state),
        dependency_graph: snapshot_dependency_graph(state),
        codex_totals: state.codex_totals,
-       rate_limits: Map.get(state, :codex_rate_limits),
+       rate_limits: observability_rate_limits(Map.get(state, :codex_rate_limits)),
        polling: %{
          checking?: state.poll_check_in_progress == true,
          next_poll_in_ms: next_poll_in_ms(state.next_poll_due_at_ms, now_ms),
@@ -2401,6 +2626,98 @@ defmodule SymphonyElixir.Orchestrator do
   defp blocked_issue_url(%{issue: %Issue{url: url}}), do: url
   defp blocked_issue_url(_metadata), do: nil
 
+  defp attempt_counters_for(%State{} = state, issue_id) when is_binary(issue_id) do
+    state.attempt_counters
+    |> Map.get(issue_id, AttemptPolicy.new())
+    |> then(&Map.merge(AttemptPolicy.new(), &1))
+    |> safe_attempt_counters()
+  end
+
+  defp attempt_counters_for(_state, _issue_id), do: AttemptPolicy.new()
+
+  defp snapshot_dependency_completeness(%State{dependency_graph: %Graph{} = graph} = state, issue_id)
+       when is_binary(issue_id) do
+    decision = Map.get(state.dependency_diagnostics, issue_id)
+
+    (Map.get(decision || %{}, :dependency_completeness) ||
+       Graph.incompleteness_reason(graph, issue_id) || graph.completeness)
+    |> safe_dependency_completeness()
+  end
+
+  defp snapshot_dependency_completeness(%State{dependency_graph: graph}, _issue_id),
+    do: safe_dependency_completeness(graph)
+
+  defp snapshot_dependency_completeness(_state, _issue_id), do: {:unavailable, :unknown}
+
+  defp sandbox_for_entry(entry) when is_map(entry) do
+    Map.get(entry, :sandbox) || route_sandbox(Map.get(entry, :route))
+  end
+
+  defp route_sandbox(%Route{profile: profile}) when is_map(profile), do: Map.get(profile, :sandbox)
+  defp route_sandbox(_route), do: nil
+
+  defp retry_termination_reason(retry) when is_map(retry) do
+    retry_termination_reason(
+      observability_termination_reason(Map.get(retry, :termination_reason)),
+      retry
+    )
+  end
+
+  defp retry_termination_reason(nil, retry), do: retry_default_termination_reason(retry)
+  defp retry_termination_reason(reason, _retry), do: reason
+
+  defp retry_default_termination_reason(%{delay_type: :capacity_wait}), do: :capacity_wait
+  defp retry_default_termination_reason(%{delay_type: :route_change}), do: :route_changed
+  defp retry_default_termination_reason(%{delay_type: :continuation}), do: :normal_completion
+
+  defp retry_default_termination_reason(retry) do
+    if runtime_unavailable_error?(Map.get(retry, :error)),
+      do: :runtime_unavailable,
+      else: :runtime_failure
+  end
+
+  defp snapshot_recent_attempts(%State{recent_attempts: attempts}) when is_list(attempts) do
+    attempts
+    |> Enum.take(@recent_attempt_limit)
+    |> Enum.map(&snapshot_recent_attempt/1)
+  end
+
+  defp snapshot_recent_attempts(_state), do: []
+
+  defp snapshot_recent_attempt(attempt) when is_map(attempt) do
+    %{
+      issue_id: Map.get(attempt, :issue_id),
+      identifier: safe_identifier(Map.get(attempt, :identifier)),
+      issue_url: safe_identifier(Map.get(attempt, :issue_url)),
+      termination_reason: observability_termination_reason(Map.get(attempt, :termination_reason)),
+      attempt: Map.get(attempt, :attempt, 0),
+      profile_name: safe_identifier(Map.get(attempt, :profile_name)),
+      runtime_name: safe_identifier(Map.get(attempt, :runtime_name)),
+      responsibility: safe_identifier(Map.get(attempt, :responsibility)),
+      sandbox: safe_identifier(Map.get(attempt, :sandbox)),
+      route_fingerprint: safe_identifier(Map.get(attempt, :route_fingerprint)),
+      worker_host: safe_identifier(Map.get(attempt, :worker_host)),
+      workspace_path: safe_identifier(Map.get(attempt, :workspace_path)),
+      session_id: safe_identifier(Map.get(attempt, :session_id)),
+      attempt_counters: safe_attempt_counters(Map.get(attempt, :attempt_counters)),
+      dependency_completeness: safe_dependency_completeness(Map.get(attempt, :dependency_completeness)),
+      dependency: snapshot_dependency_metadata(Map.get(attempt, :dependency)),
+      error: observability_error(Map.get(attempt, :error)),
+      at: Map.get(attempt, :at)
+    }
+  end
+
+  defp snapshot_recent_attempt(_attempt), do: %{termination_reason: :invalid_attempt}
+
+  defp safe_attempt_counters(counters) when is_map(counters) do
+    AttemptPolicy.new()
+    |> Map.merge(Map.take(counters, Map.keys(AttemptPolicy.new())))
+    |> Enum.map(fn {key, value} -> {key, if(is_integer(value) and value >= 0, do: value, else: 0)} end)
+    |> Map.new()
+  end
+
+  defp safe_attempt_counters(_counters), do: AttemptPolicy.new()
+
   defp snapshot_dependency_for_issue(%State{} = state, issue_id) do
     state.dependency_diagnostics
     |> Map.get(issue_id)
@@ -2419,26 +2736,68 @@ defmodule SymphonyElixir.Orchestrator do
   defp snapshot_dependency_diagnostics(_state), do: []
 
   defp snapshot_dependency_graph(%State{dependency_graph: %Graph{} = graph}) do
+    snapshot_dependency_graph_value(graph)
+  end
+
+  defp snapshot_dependency_graph(_state), do: snapshot_dependency_graph_value(nil)
+
+  defp snapshot_dependency_graph_value(%Graph{} = graph) do
     %{
-      cycles: Graph.cycles(graph),
+      completeness: safe_dependency_completeness(graph.completeness),
+      cycles: safe_cycle_list(Graph.cycles(graph)),
       diagnostics: Enum.map(graph.diagnostics, &snapshot_graph_diagnostic/1)
     }
   end
 
-  defp snapshot_dependency_graph(_state), do: %{cycles: [], diagnostics: []}
+  defp snapshot_dependency_graph_value(%{} = graph) do
+    %{
+      completeness: safe_dependency_completeness(Map.get(graph, :completeness)),
+      cycles: safe_cycle_list(Map.get(graph, :cycles, [])),
+      diagnostics: safe_graph_diagnostics(Map.get(graph, :diagnostics, []))
+    }
+  end
+
+  defp snapshot_dependency_graph_value(_graph), do: %{completeness: {:unavailable, :unknown}, cycles: [], diagnostics: []}
+
+  defp safe_cycle_list(cycles) when is_list(cycles) do
+    cycles
+    |> Enum.filter(&is_list/1)
+    |> Enum.take(@recent_attempt_limit)
+    |> Enum.map(fn cycle -> Enum.take(cycle, @recent_attempt_limit) |> Enum.map(&safe_identifier/1) end)
+  end
+
+  defp safe_cycle_list(_cycles), do: []
+
+  defp safe_graph_diagnostics(diagnostics) when is_list(diagnostics),
+    do: Enum.take(diagnostics, @recent_attempt_limit) |> Enum.map(&snapshot_graph_diagnostic/1)
+
+  defp safe_graph_diagnostics(_diagnostics), do: []
+
+  defp safe_dependency_completeness(nil), do: nil
+  defp safe_dependency_completeness(:complete), do: :complete
+
+  defp safe_dependency_completeness({kind, reason}) when kind in [:incomplete, :unavailable] do
+    {kind, safe_reason(reason)}
+  end
+
+  defp safe_dependency_completeness(_completeness), do: {:incomplete, :redacted}
+
+  defp safe_boolean(value) when is_boolean(value), do: value
+  defp safe_boolean(_value), do: nil
 
   defp snapshot_dependency_metadata(nil), do: nil
 
   defp snapshot_dependency_metadata(decision) when is_map(decision) do
     %{
-      issue_id: Map.get(decision, :issue_id),
-      identifier: Map.get(decision, :identifier),
-      dependent_state: Map.get(decision, :dependent_state),
-      responsibility: Map.get(decision, :responsibility),
-      dependency_status: Map.get(decision, :dependency_status),
-      reason: Map.get(decision, :reason),
-      allowed?: Map.get(decision, :allowed?, false),
-      merge_permitted?: Map.get(decision, :merge_permitted?, false),
+      issue_id: safe_identifier(Map.get(decision, :issue_id)),
+      identifier: safe_identifier(Map.get(decision, :identifier)),
+      dependent_state: safe_identifier(Map.get(decision, :dependent_state)),
+      responsibility: safe_identifier(Map.get(decision, :responsibility)),
+      dependency_status: safe_identifier(Map.get(decision, :dependency_status)),
+      reason: safe_reason(Map.get(decision, :reason)),
+      allowed?: safe_boolean(Map.get(decision, :allowed?)),
+      merge_permitted?: safe_boolean(Map.get(decision, :merge_permitted?)),
+      dependency_completeness: safe_dependency_completeness(Map.get(decision, :dependency_completeness)),
       blockers: safe_blocker_list(Map.get(decision, :blockers, [])),
       unresolved_blockers: safe_blocker_list(Map.get(decision, :unresolved_blockers, [])),
       invalidated_blockers: safe_blocker_list(Map.get(decision, :invalidated_blockers, [])),
@@ -2453,26 +2812,354 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp safe_blocker(blocker) when is_map(blocker) do
     %{
-      id: Map.get(blocker, :id) || Map.get(blocker, "id"),
-      identifier: Map.get(blocker, :identifier) || Map.get(blocker, "identifier"),
-      state: Map.get(blocker, :state) || Map.get(blocker, "state")
+      id: safe_identifier(Map.get(blocker, :id) || Map.get(blocker, "id")),
+      identifier: safe_identifier(Map.get(blocker, :identifier) || Map.get(blocker, "identifier")),
+      state: safe_identifier(Map.get(blocker, :state) || Map.get(blocker, "state"))
     }
   end
 
   defp safe_blocker(_blocker), do: %{id: nil, identifier: nil, state: nil}
 
   defp safe_dependency_diagnostic(nil), do: nil
-  defp safe_dependency_diagnostic({:dependency_cycle, cycle}) when is_list(cycle), do: %{kind: :dependency_cycle, members: cycle}
-  defp safe_dependency_diagnostic({:unknown_blocker_state, state}) when is_binary(state), do: %{kind: :unknown_blocker_state, state: state}
+  defp safe_dependency_diagnostic({:dependency_cycle, cycle}) when is_list(cycle), do: %{kind: :dependency_cycle, members: safe_cycle_ids(cycle)}
+  defp safe_dependency_diagnostic({:unknown_blocker_state, state}) when is_binary(state), do: %{kind: :unknown_blocker_state, state: safe_identifier(state)}
   defp safe_dependency_diagnostic({:malformed_blocker, blocker}), do: %{kind: :malformed_blocker, blocker: safe_blocker(blocker)}
   defp safe_dependency_diagnostic(reason) when is_atom(reason), do: reason
   defp safe_dependency_diagnostic(_reason), do: :redacted
 
   defp snapshot_graph_diagnostic(%{kind: kind, dependent_id: dependent_id, blocker_id: blocker_id, blocker: blocker}) do
-    %{kind: kind, dependent_id: dependent_id, blocker_id: blocker_id, blocker: safe_blocker(blocker)}
+    %{
+      kind: safe_identifier(kind),
+      dependent_id: safe_identifier(dependent_id),
+      blocker_id: safe_identifier(blocker_id),
+      blocker: safe_blocker(blocker)
+    }
   end
 
   defp snapshot_graph_diagnostic(_diagnostic), do: %{kind: :invalid_diagnostic}
+
+  defp safe_cycle_ids(ids) when is_list(ids) do
+    ids
+    |> Enum.take(@recent_attempt_limit)
+    |> Enum.map(&safe_identifier/1)
+  end
+
+  defp safe_cycle_ids(_ids), do: []
+
+  defp safe_identifier(nil), do: nil
+
+  defp safe_identifier(value) when is_atom(value), do: value
+
+  defp safe_identifier(value) when is_binary(value) do
+    value = normalize_observability_text(value)
+
+    if unsafe_observability_text?(value) do
+      "[redacted]"
+    else
+      String.slice(value, 0, @observability_text_limit)
+    end
+  end
+
+  defp safe_identifier(_value), do: "[redacted]"
+
+  defp snapshot_safe_error(nil), do: nil
+
+  defp snapshot_safe_error(value) when is_binary(value) do
+    value = normalize_observability_text(value)
+
+    cond do
+      value == "" -> nil
+      unsafe_observability_text?(value) -> "runtime error details redacted"
+      true -> String.slice(value, 0, @observability_text_limit)
+    end
+  end
+
+  defp snapshot_safe_error(_value), do: "runtime error details redacted"
+
+  defp snapshot_safe_codex_message(nil), do: nil
+
+  defp snapshot_safe_codex_message(%{event: event, message: message, timestamp: timestamp}) do
+    %{event: snapshot_safe_event(event), message: safe_codex_value(message), timestamp: timestamp}
+  end
+
+  defp snapshot_safe_codex_message(%{} = message), do: safe_codex_value(message)
+
+  defp snapshot_safe_codex_message(value) when is_binary(value) do
+    if unsafe_observability_text?(value), do: "codex event details redacted", else: safe_codex_string(value)
+  end
+
+  defp snapshot_safe_codex_message(_value), do: "codex event details redacted"
+
+  defp snapshot_safe_event(nil), do: nil
+  defp snapshot_safe_event(value) when is_atom(value), do: value
+
+  defp snapshot_safe_event(value) when is_binary(value) do
+    value = normalize_observability_text(value)
+
+    if unsafe_observability_text?(value) do
+      "[redacted]"
+    else
+      String.slice(value, 0, @observability_text_limit)
+    end
+  end
+
+  defp snapshot_safe_event(_value), do: :unknown
+
+  defp safe_codex_value(%DateTime{} = value), do: value
+
+  defp safe_codex_value(value) when is_map(value) do
+    {safe_value, redacted?} =
+      value
+      |> Enum.take(@recent_attempt_limit)
+      |> Enum.reduce({%{}, false}, fn {key, nested}, {result, redacted?} ->
+        if unsafe_observability_key?(key) do
+          {result, true}
+        else
+          {Map.put(result, key, safe_codex_value_for_key(key, nested)), redacted?}
+        end
+      end)
+
+    if redacted?, do: Map.put(safe_value, redacted_key(value), true), else: safe_value
+  end
+
+  defp safe_codex_value(value) when is_list(value) do
+    value
+    |> Enum.take(@recent_attempt_limit)
+    |> Enum.map(&safe_codex_value/1)
+  end
+
+  defp safe_codex_value(value) when is_binary(value), do: safe_codex_string(value)
+  defp safe_codex_value(value) when is_number(value) or is_boolean(value) or is_atom(value), do: value
+  defp safe_codex_value(_value), do: "[redacted]"
+
+  defp safe_codex_value_for_key(key, value) do
+    if key_name(key) in ["method", "event", "type", "status", "tool"] and is_binary(value) do
+      safe_codex_string(value)
+    else
+      safe_codex_value(value)
+    end
+  end
+
+  defp safe_codex_string(value) when is_binary(value) do
+    value = normalize_observability_text(value)
+    if unsafe_observability_text?(value), do: "[redacted]", else: String.slice(value, 0, @observability_text_limit)
+  end
+
+  defp redacted_key(value) when is_map(value) do
+    if Enum.any?(Map.keys(value), &is_binary/1), do: "redacted", else: :redacted
+  end
+
+  defp snapshot_safe_rate_limits(nil), do: nil
+
+  defp snapshot_safe_rate_limits(%{} = rate_limits) do
+    snapshot_safe_rate_limit_map(rate_limits, @observability_rate_limit_keys)
+  end
+
+  defp snapshot_safe_rate_limits(_rate_limits), do: nil
+
+  defp snapshot_safe_rate_limit_map(value, allowed_keys) when is_map(value) do
+    value
+    |> Enum.take(@recent_attempt_limit)
+    |> Enum.reduce(%{}, &put_safe_rate_limit_field(&1, &2, allowed_keys))
+  end
+
+  defp put_safe_rate_limit_field({key, nested}, result, allowed_keys) do
+    normalized_key = key_name(key)
+
+    if normalized_key in allowed_keys do
+      put_safe_rate_limit_value(result, key, normalized_key, nested)
+    else
+      result
+    end
+  end
+
+  defp put_safe_rate_limit_value(result, output_key, normalized_key, nested) do
+    case snapshot_safe_rate_limit_value(normalized_key, nested) do
+      {:ok, safe_value} -> Map.put(result, output_key, safe_value)
+      :drop -> result
+    end
+  end
+
+  defp snapshot_safe_rate_limit_value(key, value)
+       when key in ["primary", "secondary"] and is_map(value) do
+    {:ok, snapshot_safe_rate_limit_map(value, @observability_rate_bucket_keys)}
+  end
+
+  defp snapshot_safe_rate_limit_value("credits", value) when is_map(value) do
+    {:ok, snapshot_safe_rate_limit_map(value, @observability_rate_credit_keys)}
+  end
+
+  defp snapshot_safe_rate_limit_value(key, value) when key in ["primary", "secondary", "credits"],
+    do: safe_rate_limit_scalar(value)
+
+  defp snapshot_safe_rate_limit_value(key, value) when key in @observability_rate_bucket_keys,
+    do: safe_rate_limit_scalar(value)
+
+  defp snapshot_safe_rate_limit_value(key, value) when key in @observability_rate_credit_keys,
+    do: safe_rate_limit_scalar(value)
+
+  defp snapshot_safe_rate_limit_value(key, value) when key in ["limit_id", "limit_name"],
+    do: safe_rate_limit_scalar(value)
+
+  defp snapshot_safe_rate_limit_value(_key, _value), do: :drop
+
+  defp safe_rate_limit_scalar(nil), do: {:ok, nil}
+  defp safe_rate_limit_scalar(value) when is_number(value) or is_boolean(value), do: {:ok, value}
+
+  defp safe_rate_limit_scalar(%DateTime{} = value),
+    do: {:ok, DateTime.to_iso8601(DateTime.truncate(value, :second))}
+
+  defp safe_rate_limit_scalar(value) when is_binary(value) do
+    value = normalize_observability_text(value)
+
+    if unsafe_observability_text?(value) do
+      {:ok, "[redacted]"}
+    else
+      {:ok, String.slice(value, 0, @observability_text_limit)}
+    end
+  end
+
+  defp safe_rate_limit_scalar(_value), do: :drop
+
+  defp snapshot_safe_route_change(nil), do: nil
+
+  defp snapshot_safe_route_change(%{} = route_change) do
+    result =
+      Enum.reduce([:previous, :next], %{}, fn key, result ->
+        put_safe_route_change(result, route_change, key)
+      end)
+
+    result
+    |> case do
+      result when map_size(result) == 0 -> nil
+      result -> result
+    end
+  end
+
+  defp snapshot_safe_route_change(_route_change), do: nil
+
+  defp put_safe_route_change(result, route_change, key) do
+    case observability_map_value(route_change, key) do
+      metadata when is_map(metadata) -> Map.put(result, key, snapshot_safe_route_metadata(metadata))
+      _ -> result
+    end
+  end
+
+  defp snapshot_safe_route_metadata(metadata) when is_map(metadata) do
+    [:profile_name, :runtime_name, :responsibility, :sandbox, :fingerprint]
+    |> Enum.reduce(%{}, fn key, result ->
+      case observability_map_value(metadata, key) do
+        nil -> result
+        value -> Map.put(result, key, safe_identifier(value))
+      end
+    end)
+  end
+
+  defp observability_map_value(value, key) when is_map(value) and is_atom(key) do
+    case Map.fetch(value, key) do
+      {:ok, nested} -> nested
+      :error -> Map.get(value, Atom.to_string(key))
+    end
+  end
+
+  defp observability_map_value(_value, _key), do: nil
+
+  defp key_name(key) when is_atom(key), do: Atom.to_string(key)
+  defp key_name(key) when is_binary(key), do: String.downcase(key)
+  defp key_name(key), do: to_string(key) |> String.downcase()
+
+  defp unsafe_observability_key?(key) do
+    key = key_name(key)
+
+    Enum.any?(
+      [
+        "api_key",
+        "apikey",
+        "authorization",
+        "bearer",
+        "client_secret",
+        "cookie",
+        "command",
+        "parsedcmd",
+        "environment",
+        "env",
+        "graphql",
+        "headers",
+        "password",
+        "prompt",
+        "question",
+        "query",
+        "raw",
+        "refresh_token",
+        "secret",
+        "token",
+        "variables"
+      ],
+      &String.contains?(key, &1)
+    )
+  end
+
+  defp unsafe_observability_text?(value) when is_binary(value) do
+    downcased = String.downcase(value)
+
+    Enum.any?(
+      [
+        "api_key",
+        "api-key",
+        "authorization",
+        "bearer ",
+        "client_secret",
+        "command=",
+        "parsedcmd",
+        "environment",
+        "graphql",
+        "mutation ",
+        "password",
+        "query ",
+        "raw_",
+        "refresh_token",
+        "secret",
+        "secret=",
+        "private_key",
+        "token=",
+        "token:",
+        "access_token",
+        "cookie"
+      ],
+      &String.contains?(downcased, &1)
+    ) or
+      Regex.match?(~r/(^|\s)(curl|wget|git|mix|npm|yarn|pnpm|bash|sh|rm|mv|cp|mkdir|find|sed|awk|docker|kubectl|terraform|node|python|python3|ruby|go|cargo|make|pytest|java|gradle)\s+/, downcased)
+  end
+
+  defp normalize_observability_text(value) when is_binary(value) do
+    value
+    |> String.replace(~r/[\r\n\t]+/, " ")
+    |> String.replace(~r/\s+/, " ")
+    |> String.trim()
+  end
+
+  defp safe_reason(nil), do: nil
+  defp safe_reason(reason) when is_atom(reason), do: reason
+  defp safe_reason({kind, _detail}) when is_atom(kind), do: kind
+  defp safe_reason(_reason), do: :redacted
+
+  defp runtime_unavailable_error?(error) when is_binary(error) do
+    downcased = String.downcase(error)
+
+    Enum.any?(
+      [
+        "retry poll failed",
+        "retry route resolution failed",
+        "retry dispatch refresh failed",
+        "runtime unavailable",
+        "runtime not available",
+        "provider"
+      ],
+      &String.contains?(downcased, &1)
+    )
+  end
+
+  defp runtime_unavailable_error?(_error), do: false
 
   defp integrate_codex_update(running_entry, %{event: event, timestamp: timestamp} = update) do
     token_delta = extract_token_delta(running_entry, update)

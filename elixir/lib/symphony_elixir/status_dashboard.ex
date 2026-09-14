@@ -315,6 +315,10 @@ defmodule SymphonyElixir.StatusDashboard do
            %{
              running: running,
              retrying: retrying,
+             blocked: Map.get(snapshot, :blocked, []),
+             dependency_diagnostics: Map.get(snapshot, :dependency_diagnostics, []),
+             dependency_graph: Map.get(snapshot, :dependency_graph, %{}),
+             recent_attempts: Map.get(snapshot, :recent_attempts, []),
              codex_totals: codex_totals,
              rate_limits: Map.get(snapshot, :rate_limits),
              polling: Map.get(snapshot, :polling)
@@ -355,6 +359,8 @@ defmodule SymphonyElixir.StatusDashboard do
             Map.get(snapshot, :dependency_graph, %{})
           )
 
+        recent_attempt_rows = format_recent_attempt_rows(Map.get(snapshot, :recent_attempts, []))
+
         ([
            colorize("╭─ SYMPHONY STATUS", @ansi_bold),
            colorize("│ Agents: ", @ansi_bold) <>
@@ -384,6 +390,7 @@ defmodule SymphonyElixir.StatusDashboard do
            backoff_rows ++
            blocked_rows ++
            dependency_rows ++
+           recent_attempt_rows ++
            [closing_border()])
         |> List.flatten()
         |> Enum.join("\n")
@@ -615,6 +622,7 @@ defmodule SymphonyElixir.StatusDashboard do
     event_label = format_cell(running_event_label(running_entry), running_event_width)
 
     tokens = format_count(total_tokens) |> format_cell(@running_tokens_width, :right)
+    observability_suffix = format_observability_suffix(running_entry)
 
     status_color =
       case event do
@@ -641,7 +649,8 @@ defmodule SymphonyElixir.StatusDashboard do
       " ",
       colorize(session, @ansi_cyan),
       " ",
-      colorize(event_label, status_color)
+      colorize(event_label, status_color),
+      observability_suffix
     ]
     |> Enum.join("")
   end
@@ -661,6 +670,23 @@ defmodule SymphonyElixir.StatusDashboard do
       reason -> "#{base} dependency=#{reason}"
     end
   end
+
+  defp format_observability_suffix(entry) when is_map(entry) do
+    fields =
+      [
+        format_observability_field("sandbox", Map.get(entry, :sandbox)),
+        format_observability_field("reason", Map.get(entry, :termination_reason))
+      ]
+      |> Enum.reject(&is_nil/1)
+
+    case fields do
+      [] -> ""
+      _ -> " " <> colorize(Enum.join(fields, " "), @ansi_dim)
+    end
+  end
+
+  defp format_observability_field(_label, nil), do: nil
+  defp format_observability_field(label, value), do: "#{label}=#{value}"
 
   @doc false
   @spec format_running_summary_for_test(map(), integer() | nil) :: String.t()
@@ -693,13 +719,25 @@ defmodule SymphonyElixir.StatusDashboard do
     due_in_ms = retry_entry.due_in_ms || 0
     error = format_retry_error(retry_entry.error)
 
+    details =
+      [
+        format_observability_field("reason", Map.get(retry_entry, :termination_reason)),
+        format_observability_field("sandbox", Map.get(retry_entry, :sandbox))
+      ]
+      |> Enum.reject(&is_nil/1)
+      |> case do
+        [] -> ""
+        fields -> " " <> colorize(Enum.join(fields, " "), @ansi_dim)
+      end
+
     "│  #{colorize("↻", @ansi_orange)} " <>
       colorize("#{identifier}", @ansi_red) <>
       " " <>
       colorize("attempt=#{attempt}", @ansi_yellow) <>
       colorize(" in ", @ansi_dim) <>
       colorize(next_in_words(due_in_ms), @ansi_cyan) <>
-      error
+      error <>
+      details
   end
 
   defp next_in_words(due_in_ms) when is_integer(due_in_ms) do
@@ -740,7 +778,15 @@ defmodule SymphonyElixir.StatusDashboard do
       |> Enum.map(fn entry ->
         identifier = Map.get(entry, :identifier) || Map.get(entry, :issue_id) || "unknown"
         state = Map.get(entry, :state) || "Blocked"
-        reason = get_in(entry, [:dependency, :reason]) || Map.get(entry, :error) || "blocked"
+
+        reason =
+          Map.get(entry, :termination_reason) ||
+            get_in(entry, [:dependency, :reason]) ||
+            Map.get(entry, :error) ||
+            "blocked"
+
+        sandbox = format_observability_field("sandbox", Map.get(entry, :sandbox))
+        sandbox = if is_nil(sandbox), do: "", else: " " <> sandbox
 
         "│  " <>
           colorize("⏸", @ansi_red) <>
@@ -749,7 +795,7 @@ defmodule SymphonyElixir.StatusDashboard do
           " " <>
           colorize("#{state}", @ansi_yellow) <>
           " " <>
-          colorize("reason=#{reason}", @ansi_dim)
+          colorize("reason=#{reason}#{sandbox}", @ansi_dim)
       end)
 
     ["│", colorize("├─ Blocked diagnostics", @ansi_bold), "│"] ++ rows
@@ -776,7 +822,14 @@ defmodule SymphonyElixir.StatusDashboard do
       |> Map.get(:diagnostics, [])
       |> Enum.map(&format_dependency_graph_diagnostic/1)
 
-    rows = decision_rows ++ cycle_rows ++ graph_rows
+    completeness_rows =
+      case Map.get(graph, :completeness) do
+        nil -> []
+        :complete -> []
+        completeness -> ["│  " <> colorize("graph_completeness=#{completeness}", @ansi_orange)]
+      end
+
+    rows = decision_rows ++ cycle_rows ++ graph_rows ++ completeness_rows
 
     if rows == [] do
       []
@@ -786,6 +839,42 @@ defmodule SymphonyElixir.StatusDashboard do
   end
 
   defp format_dependency_rows(_diagnostics, _graph), do: []
+
+  defp format_recent_attempt_rows([]), do: []
+
+  defp format_recent_attempt_rows(attempts) when is_list(attempts) do
+    rows =
+      attempts
+      |> Enum.take(20)
+      |> Enum.map(fn entry ->
+        identifier = Map.get(entry, :identifier) || Map.get(entry, :issue_id) || "unknown"
+        reason = Map.get(entry, :termination_reason) || "unknown"
+        attempt = Map.get(entry, :attempt, 0)
+        sandbox = Map.get(entry, :sandbox)
+        error = Orchestrator.observability_error(Map.get(entry, :error))
+
+        fields =
+          [
+            "attempt=#{attempt}",
+            format_observability_field("sandbox", sandbox),
+            format_observability_field("error", error)
+          ]
+          |> Enum.reject(&is_nil/1)
+
+        "│  " <>
+          colorize("•", @ansi_gray) <>
+          " " <>
+          colorize("#{identifier}", @ansi_cyan) <>
+          " " <>
+          colorize("reason=#{reason}", @ansi_dim) <>
+          " " <>
+          colorize(Enum.join(fields, " "), @ansi_dim)
+      end)
+
+    ["│", colorize("├─ Recent attempt history", @ansi_bold), "│"] ++ rows
+  end
+
+  defp format_recent_attempt_rows(_attempts), do: []
 
   defp format_dependency_decision(entry) when is_map(entry) do
     identifier = Map.get(entry, :identifier) || Map.get(entry, :issue_id) || "unknown"

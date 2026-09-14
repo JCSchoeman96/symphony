@@ -173,6 +173,12 @@ defmodule SymphonyElixirWeb.DashboardLive do
                         <%= if get_in(entry, [:dependency, :reason]) do %>
                           <span class="muted">dep=<%= get_in(entry, [:dependency, :reason]) %></span>
                         <% end %>
+                        <%= if Map.get(entry, :sandbox) do %>
+                          <span class="muted mono">sandbox=<%= Map.get(entry, :sandbox) %></span>
+                        <% end %>
+                        <%= if Map.get(entry, :termination_reason) do %>
+                          <span class="muted mono">reason=<%= Map.get(entry, :termination_reason) %></span>
+                        <% end %>
                       </div>
                     </td>
                     <td>
@@ -261,6 +267,12 @@ defmodule SymphonyElixirWeb.DashboardLive do
                         <% end %>
                         <%= if get_in(entry, [:dependency, :reason]) do %>
                           <span class="muted">dep=<%= get_in(entry, [:dependency, :reason]) %></span>
+                        <% end %>
+                        <%= if Map.get(entry, :sandbox) do %>
+                          <span class="muted mono">sandbox=<%= Map.get(entry, :sandbox) %></span>
+                        <% end %>
+                        <%= if Map.get(entry, :termination_reason) do %>
+                          <span class="muted mono">reason=<%= Map.get(entry, :termination_reason) %></span>
                         <% end %>
                       </div>
                     </td>
@@ -365,7 +377,17 @@ defmodule SymphonyElixirWeb.DashboardLive do
                         <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>JSON details</a>
                       </div>
                     </td>
-                    <td><%= entry.attempt %></td>
+                    <td>
+                      <div class="detail-stack">
+                        <span><%= entry.attempt %></span>
+                        <%= if Map.get(entry, :termination_reason) do %>
+                          <span class="muted mono">reason=<%= Map.get(entry, :termination_reason) %></span>
+                        <% end %>
+                        <%= if Map.get(entry, :sandbox) do %>
+                          <span class="muted mono">sandbox=<%= Map.get(entry, :sandbox) %></span>
+                        <% end %>
+                      </div>
+                    </td>
                     <td class="mono"><%= entry.due_at || "n/a" %></td>
                     <td><%= entry.error || "n/a" %></td>
                   </tr>
@@ -374,6 +396,42 @@ defmodule SymphonyElixirWeb.DashboardLive do
             </div>
           <% end %>
         </section>
+
+        <%= if Map.get(@payload, :recent_attempts, []) != [] do %>
+          <section class="section-card">
+            <div class="section-header">
+              <div>
+                <h2 class="section-title">Recent attempt history</h2>
+                <p class="section-copy">Bounded terminal and stop records retained after workers leave the active view.</p>
+              </div>
+            </div>
+
+            <div class="table-wrap">
+              <table class="data-table" style="min-width: 680px;">
+                <thead>
+                  <tr>
+                    <th>Issue</th>
+                    <th>Reason</th>
+                    <th>Attempt</th>
+                    <th>At</th>
+                    <th>Error</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr :for={entry <- Map.get(@payload, :recent_attempts, [])}>
+                    <td>
+                      <.issue_identifier identifier={entry.issue_identifier || entry.issue_id} url={entry.issue_url} />
+                    </td>
+                    <td class="mono"><%= entry.termination_reason || "n/a" %></td>
+                    <td><%= entry.attempt %></td>
+                    <td class="mono"><%= entry.at || "n/a" %></td>
+                    <td><%= entry.error || "n/a" %></td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </section>
+        <% end %>
       <% end %>
     </section>
     """
