@@ -361,7 +361,7 @@ defmodule SymphonyElixir.Orchestrator do
 
     with :ok <- Config.validate!(),
          {:ok, issues} <- Tracker.fetch_issues_by_states(Config.settings!().tracker.active_states) do
-      state = refresh_dependency_state(state, issues)
+      state = refresh_dependency_state_for_poll(state, issues)
 
       if available_slots(state) > 0 do
         choose_issues(issues, state)
@@ -407,6 +407,27 @@ defmodule SymphonyElixir.Orchestrator do
         Logger.error("Failed to fetch from issue tracker: #{inspect(reason)}")
         state
     end
+  end
+
+  defp refresh_dependency_state_for_poll(%State{} = state, active_issues) when is_list(active_issues) do
+    case Tracker.fetch_dependency_graph() do
+      {:ok, graph_issues} when is_list(graph_issues) ->
+        state
+        |> refresh_dependency_state(graph_issues, :complete)
+        |> ensure_graph_contains_active_issues(active_issues)
+
+      {:ok, _invalid_graph} ->
+        Logger.warning("Dependency graph provider returned invalid data; implementation dispatch is disabled")
+        refresh_dependency_state(state, active_issues, {:unavailable, :invalid_dependency_graph})
+
+      {:error, reason} ->
+        Logger.warning("Dependency graph refresh unavailable; implementation dispatch is disabled: #{inspect(reason)}")
+        refresh_dependency_state(state, active_issues, {:unavailable, :dependency_graph_unavailable})
+    end
+  end
+
+  defp refresh_dependency_state_for_poll(%State{} = state, _active_issues) do
+    refresh_dependency_state(state, [], {:unavailable, :invalid_active_issue_collection})
   end
 
   defp reconcile_running_issues(%State{} = state) do
@@ -971,8 +992,8 @@ defmodule SymphonyElixir.Orchestrator do
     }
   end
 
-  defp refresh_dependency_state(%State{} = state, issues) when is_list(issues) do
-    graph = Graph.build(issues)
+  defp refresh_dependency_state(%State{} = state, issues, completeness) when is_list(issues) do
+    graph = Graph.build(issues, completeness: completeness)
 
     dependency_diagnostics =
       Enum.reduce(issues, %{}, fn
@@ -990,13 +1011,12 @@ defmodule SymphonyElixir.Orchestrator do
     }
   end
 
-  defp refresh_dependency_state(%State{} = state, _issues), do: state
-
   defp dependency_diagnostic_for_issue(%Issue{id: issue_id} = issue, %Graph{} = graph) do
     case route_for_issue(issue) do
       {:ok, %Route{responsibility: responsibility}} ->
         issue
         |> dependency_decision(responsibility)
+        |> maybe_mark_dependency_incomplete(graph, issue_id)
         |> maybe_mark_dependency_cycle(graph, issue_id)
 
       {:error, reason} ->
@@ -1021,6 +1041,45 @@ defmodule SymphonyElixir.Orchestrator do
       decision
     end
   end
+
+  defp maybe_mark_dependency_incomplete(decision, %Graph{} = graph, issue_id) do
+    case Graph.incompleteness_reason(graph, issue_id) do
+      nil ->
+        decision
+
+      reason ->
+        if decision.allowed? == false do
+          Map.put(decision, :dependency_completeness, reason)
+        else
+          incomplete_dependency_decision(decision, reason)
+        end
+    end
+  end
+
+  defp incomplete_dependency_decision(decision, reason) do
+    if read_only_dependency_responsibility?(Map.get(decision, :responsibility)) do
+      Map.merge(decision, %{
+        dependency_status: :incomplete,
+        dependency_completeness: reason,
+        diagnostic: {:dependency_graph_incomplete, reason}
+      })
+    else
+      Map.merge(decision, %{
+        allowed?: false,
+        dependency_status: :incomplete,
+        reason: :dependency_data_incomplete,
+        merge_permitted?: false,
+        dependency_completeness: reason,
+        diagnostic: {:dependency_graph_incomplete, reason}
+      })
+    end
+  end
+
+  defp read_only_dependency_responsibility?(responsibility) when is_binary(responsibility) do
+    String.downcase(String.trim(responsibility)) in ["planning", "review"]
+  end
+
+  defp read_only_dependency_responsibility?(_responsibility), do: false
 
   defp choose_issues(issues, state) do
     active_states = active_state_set()
@@ -1153,7 +1212,9 @@ defmodule SymphonyElixir.Orchestrator do
   defp dispatch_issue(%State{} = state, issue, attempt \\ nil, preferred_worker_host \\ nil) do
     case refresh_issue_for_dispatch(issue) do
       {:ok, %Issue{} = refreshed_issue} ->
-        dispatch_refreshed_issue(state, refreshed_issue, attempt, preferred_worker_host)
+        state = refresh_dependency_graph_for_dispatch(state, refreshed_issue)
+        final_issue = Map.get(state.dependency_graph.nodes, refreshed_issue.id, refreshed_issue)
+        dispatch_refreshed_issue(state, final_issue, attempt, preferred_worker_host)
 
       {:skip, _reason} ->
         state
@@ -1164,13 +1225,18 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp dispatch_refreshed_issue(state, refreshed_issue, attempt, preferred_worker_host) do
-    case route_for_issue(refreshed_issue) do
-      {:ok, %Route{} = route} ->
-        dispatch_if_dependency_allowed(state, refreshed_issue, route, attempt, preferred_worker_host)
+    if candidate_issue?(refreshed_issue, active_state_set(), terminal_state_set()) do
+      case route_for_issue(refreshed_issue) do
+        {:ok, %Route{} = route} ->
+          dispatch_if_dependency_allowed(state, refreshed_issue, route, attempt, preferred_worker_host)
 
-      {:error, reason} ->
-        Logger.warning("Skipping dispatch; issue route is unavailable for #{issue_context(refreshed_issue)}: #{inspect(reason)}")
-        state
+        {:error, reason} ->
+          Logger.warning("Skipping dispatch; issue route is unavailable for #{issue_context(refreshed_issue)}: #{inspect(reason)}")
+          state
+      end
+    else
+      Logger.info("Skipping final dispatch after candidate eligibility changed for #{issue_context(refreshed_issue)}")
+      state
     end
   end
 
@@ -1203,6 +1269,50 @@ defmodule SymphonyElixir.Orchestrator do
         Logger.warning("Skipping dispatch; issue refresh failed for #{issue_context(issue)}: #{inspect(reason)}")
         {:error, reason}
     end
+  end
+
+  defp refresh_dependency_graph_for_dispatch(%State{} = state, fallback_issue) do
+    case Tracker.fetch_dependency_graph() do
+      {:ok, graph_issues} when is_list(graph_issues) ->
+        state
+        |> refresh_dependency_state(graph_issues, :complete)
+        |> ensure_graph_contains_issue(fallback_issue)
+
+      {:ok, _invalid_graph} ->
+        Logger.warning("Final dependency graph refresh returned invalid data; implementation dispatch is disabled")
+        refresh_dependency_state(state, [fallback_issue], {:unavailable, :invalid_dependency_graph})
+
+      {:error, reason} ->
+        Logger.warning("Final dependency graph refresh unavailable; implementation dispatch is disabled: #{inspect(reason)}")
+        refresh_dependency_state(state, [fallback_issue], {:unavailable, :dependency_graph_unavailable})
+    end
+  end
+
+  defp ensure_graph_contains_active_issues(%State{} = state, active_issues) when is_list(active_issues) do
+    missing_issue? =
+      Enum.any?(active_issues, fn
+        %Issue{id: issue_id} when is_binary(issue_id) ->
+          not Map.has_key?(state.dependency_graph.nodes, issue_id)
+
+        _issue ->
+          false
+      end)
+
+    if missing_issue?, do: mark_graph_incomplete(state, :missing_graph_node), else: state
+  end
+
+  defp ensure_graph_contains_issue(%State{} = state, %Issue{id: issue_id}) when is_binary(issue_id) do
+    if Map.has_key?(state.dependency_graph.nodes, issue_id) do
+      state
+    else
+      mark_graph_incomplete(state, :missing_graph_node)
+    end
+  end
+
+  defp ensure_graph_contains_issue(state, _issue), do: mark_graph_incomplete(state, :invalid_dispatch_issue)
+
+  defp mark_graph_incomplete(%State{dependency_graph: %Graph{} = graph} = state, reason) do
+    %{state | dependency_graph: %{graph | completeness: {:incomplete, reason}}}
   end
 
   defp do_dispatch_issue(%State{} = state, issue, route, attempt, preferred_worker_host) do
@@ -1532,6 +1642,8 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp dispatch_routable_retry(state, issue, refreshed_issue, route, attempt, metadata) do
+    state = refresh_dependency_graph_for_dispatch(state, refreshed_issue)
+    refreshed_issue = Map.get(state.dependency_graph.nodes, refreshed_issue.id, refreshed_issue)
     state = put_dependency_decision(state, refreshed_issue, route)
 
     if dependency_dispatchable?(refreshed_issue, state) do
@@ -1772,7 +1884,10 @@ defmodule SymphonyElixir.Orchestrator do
         _ ->
           case route_for_issue(issue) do
             {:ok, %Route{responsibility: responsibility}} ->
-              Guard.evaluate(issue, responsibility, dependency_policy_options())
+              issue
+              |> Guard.evaluate(responsibility, dependency_policy_options())
+              |> maybe_mark_dependency_incomplete(state.dependency_graph, issue_id)
+              |> maybe_mark_dependency_cycle(state.dependency_graph, issue_id)
 
             {:error, reason} ->
               route_diagnostic(issue, reason)
@@ -1798,17 +1913,9 @@ defmodule SymphonyElixir.Orchestrator do
       )
 
     decision =
-      if dependency_cycle?(state, issue_id) do
-        Map.merge(decision, %{
-          allowed?: false,
-          reason: :dependency_cycle,
-          dependency_status: :invalidated,
-          merge_permitted?: false,
-          diagnostic: {:dependency_cycle, cycle_for_issue(state.dependency_graph, issue_id)}
-        })
-      else
-        decision
-      end
+      decision
+      |> maybe_mark_dependency_incomplete(state.dependency_graph, issue_id)
+      |> maybe_mark_dependency_cycle(state.dependency_graph, issue_id)
 
     %{state | dependency_diagnostics: Map.put(state.dependency_diagnostics, issue_id, decision)}
   end

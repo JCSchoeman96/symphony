@@ -30,6 +30,9 @@ defmodule SymphonyElixir.Tracker.Memory do
      end)}
   end
 
+  @spec fetch_dependency_graph() :: {:ok, [Issue.t()]}
+  def fetch_dependency_graph, do: {:ok, issue_entries()}
+
   @spec secret_environment_names(map()) :: [String.t()]
   def secret_environment_names(_tracker_settings), do: []
 

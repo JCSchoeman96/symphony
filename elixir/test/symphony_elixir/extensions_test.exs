@@ -19,6 +19,11 @@ defmodule SymphonyElixir.ExtensionsTest do
       send(self(), {:fetch_issues_by_ids_called, issue_ids})
       {:ok, issue_ids}
     end
+
+    def fetch_dependency_graph do
+      send(self(), :fetch_dependency_graph_called)
+      {:ok, []}
+    end
   end
 
   defmodule SlowOrchestrator do
@@ -209,6 +214,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert SymphonyElixir.Tracker.adapter() == Memory
     assert {:ok, [^issue]} = SymphonyElixir.Tracker.fetch_issues_by_states([" in progress ", 42])
     assert {:ok, [^issue]} = SymphonyElixir.Tracker.fetch_issues_by_ids(["issue-1"])
+    assert {:ok, [^issue]} = SymphonyElixir.Tracker.fetch_dependency_graph()
 
     binding = SymphonyElixir.Tracker.bind_agent_tools()
     assert binding.adapter == Memory
@@ -235,6 +241,9 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert {:ok, ["issue-1"]} = Adapter.fetch_issues_by_ids(["issue-1"])
     assert_receive {:fetch_issues_by_ids_called, ["issue-1"]}
+
+    assert {:ok, []} = Adapter.fetch_dependency_graph()
+    assert_receive :fetch_dependency_graph_called
 
     assert [%{"name" => "linear_graphql"}] = Adapter.agent_tool_specs()
   end

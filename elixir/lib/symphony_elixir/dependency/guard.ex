@@ -16,12 +16,18 @@ defmodule SymphonyElixir.Dependency.Guard do
 
   @spec evaluate(Issue.t(), String.t(), keyword()) :: decision()
   def evaluate(%Issue{} = issue, responsibility, opts) do
-    case Policy.evaluate(issue.state, responsibility, issue.blocked_by, opts) do
-      {:ok, decision} ->
-        Map.merge(decision, %{issue_id: issue.id, identifier: issue.identifier})
+    case Map.get(issue, :dependency_completeness, :complete) do
+      :complete ->
+        evaluate_complete_issue(issue, responsibility, opts)
 
-      {:error, reason} ->
-        invalid_decision(issue, responsibility, reason)
+      {:incomplete, reason} ->
+        incomplete_decision(issue, responsibility, :incomplete, reason)
+
+      {:unavailable, reason} ->
+        incomplete_decision(issue, responsibility, :unavailable, reason)
+
+      _invalid ->
+        invalid_decision(issue, responsibility, :invalid_dependency_completeness)
     end
   end
 
@@ -38,9 +44,48 @@ defmodule SymphonyElixir.Dependency.Guard do
       invalidated_blockers: [],
       diagnostic: {:invalid_issue, issue},
       issue_id: nil,
-      identifier: nil
+      identifier: nil,
+      dependency_completeness: :unavailable
     }
   end
+
+  defp evaluate_complete_issue(%Issue{} = issue, responsibility, opts) do
+    case Policy.evaluate(issue.state, responsibility, issue.blocked_by, opts) do
+      {:ok, decision} ->
+        Map.merge(decision, %{
+          issue_id: issue.id,
+          identifier: issue.identifier,
+          dependency_completeness: :complete
+        })
+
+      {:error, reason} ->
+        invalid_decision(issue, responsibility, reason)
+    end
+  end
+
+  defp incomplete_decision(%Issue{} = issue, responsibility, status, reason) do
+    %{
+      allowed?: read_only_dependency_responsibility?(responsibility),
+      dependency_status: status,
+      dependent_state: normalize_state(issue.state),
+      responsibility: responsibility,
+      reason: :dependency_data_incomplete,
+      merge_permitted?: false,
+      blockers: issue.blocked_by,
+      unresolved_blockers: [],
+      invalidated_blockers: [],
+      diagnostic: {:dependency_data_incomplete, reason},
+      issue_id: issue.id,
+      identifier: issue.identifier,
+      dependency_completeness: Map.get(issue, :dependency_completeness)
+    }
+  end
+
+  defp read_only_dependency_responsibility?(responsibility) when is_binary(responsibility) do
+    String.downcase(String.trim(responsibility)) in ["planning", "review"]
+  end
+
+  defp read_only_dependency_responsibility?(_responsibility), do: false
 
   @spec allowed?(Issue.t(), String.t(), keyword()) :: boolean()
   def allowed?(%Issue{} = issue, responsibility, opts \\ []) do
@@ -60,7 +105,8 @@ defmodule SymphonyElixir.Dependency.Guard do
       invalidated_blockers: [],
       diagnostic: reason,
       issue_id: issue.id,
-      identifier: issue.identifier
+      identifier: issue.identifier,
+      dependency_completeness: Map.get(issue, :dependency_completeness, :complete)
     }
   end
 

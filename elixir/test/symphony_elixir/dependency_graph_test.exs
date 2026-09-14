@@ -30,6 +30,18 @@ defmodule SymphonyElixir.DependencyGraphTest do
     refute Graph.cyclic?(graph, "missing")
   end
 
+  test "detects self-cycles without blocking an independent component" do
+    graph =
+      Graph.build([
+        issue("self", [%{id: "self", state: "Backlog"}]),
+        issue("independent", [])
+      ])
+
+    assert Graph.cycles(graph) == [["self"]]
+    assert Graph.cyclic?(graph, "self")
+    refute Graph.cyclic?(graph, "independent")
+  end
+
   test "keeps independent branches separate and orders multiple blockers" do
     graph =
       Graph.build([
@@ -78,6 +90,59 @@ defmodule SymphonyElixir.DependencyGraphTest do
     assert Enum.any?(graph.diagnostics, &(&1.kind == :malformed_blocker_list))
     assert Enum.any?(graph.diagnostics, &(&1.kind == :malformed_blocker))
     assert Enum.any?(graph.diagnostics, &(&1.kind == :duplicate_issue))
+  end
+
+  test "exposes graph acquisition and issue completeness without guessing" do
+    incomplete_issue =
+      issue("incomplete", [])
+      |> Map.put(:dependency_completeness, {:incomplete, :missing_relation_page_info})
+
+    unavailable_issue =
+      issue("unavailable", [])
+      |> Map.put(:dependency_completeness, {:unavailable, :provider_error})
+
+    invalid_issue = Map.put(issue("invalid", []), :dependency_completeness, :invalid)
+
+    graph = Graph.build([incomplete_issue, unavailable_issue, invalid_issue])
+
+    assert Graph.incompleteness_reason(graph, "incomplete") ==
+             {:incomplete, :missing_relation_page_info}
+
+    assert Graph.incompleteness_reason(graph, "unavailable") ==
+             {:unavailable, :provider_error}
+
+    assert Graph.incompleteness_reason(graph, "invalid") == {:incomplete, :invalid_dependency_completeness}
+    assert Graph.incomplete?(graph, "incomplete")
+    assert Graph.incomplete?(graph, "unavailable")
+    assert Graph.incomplete?(graph, :invalid_id)
+
+    assert Graph.complete?(Graph.build([issue("complete", [])]))
+    refute Graph.complete?(Graph.unavailable(:provider_unavailable))
+
+    assert Graph.incompleteness_reason(Graph.unavailable(:provider_unavailable), "complete") ==
+             {:unavailable, :provider_unavailable}
+
+    assert Graph.incompleteness_reason(
+             Graph.build([issue("partial", [])], completeness: {:incomplete, {:provider_error, :detail}}),
+             "partial"
+           ) == {:incomplete, :provider_error}
+
+    assert Graph.incompleteness_reason(
+             Graph.build([issue("fallback", [])], completeness: "unexpected"),
+             "fallback"
+           ) == {:incomplete, :unknown}
+
+    missing_graph = Graph.build([issue("dependent-missing", [%{id: "hidden", state: "Done"}])])
+
+    assert Graph.incompleteness_reason(missing_graph, "dependent-missing") ==
+             {:incomplete, :missing_blocker}
+
+    assert Graph.incompleteness_reason(Graph.build([issue("present", [])]), "absent") == nil
+
+    assert Graph.build(:invalid, []).completeness == {:incomplete, :invalid_issue_collection}
+
+    assert Graph.incompleteness_reason(Graph.build([issue("invalid-id", [])]), nil) ==
+             {:incomplete, :invalid_issue_id}
   end
 
   defp issue(id, blocked_by) do

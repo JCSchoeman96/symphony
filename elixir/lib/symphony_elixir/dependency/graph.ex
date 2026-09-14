@@ -9,7 +9,9 @@ defmodule SymphonyElixir.Dependency.Graph do
 
   alias SymphonyElixir.Tracker.Issue
 
-  defstruct nodes: %{}, edges: %{}, reverse_edges: %{}, diagnostics: []
+  defstruct nodes: %{}, edges: %{}, reverse_edges: %{}, diagnostics: [], completeness: :complete
+
+  @type completeness :: :complete | {:incomplete, term()} | {:unavailable, term()}
 
   @type diagnostic :: %{
           kind: atom(),
@@ -22,12 +24,18 @@ defmodule SymphonyElixir.Dependency.Graph do
           nodes: %{String.t() => Issue.t()},
           edges: %{String.t() => [String.t()]},
           reverse_edges: %{String.t() => [String.t()]},
-          diagnostics: [diagnostic()]
+          diagnostics: [diagnostic()],
+          completeness: completeness()
         }
 
   @spec build([Issue.t()]) :: t()
-  def build(issues) when is_list(issues) do
+  def build(issues) when is_list(issues), do: build(issues, [])
+  def build(_issues), do: %__MODULE__{completeness: {:incomplete, :invalid_issue_collection}}
+
+  @spec build([Issue.t()], keyword()) :: t()
+  def build(issues, opts) when is_list(issues) and is_list(opts) do
     {nodes, diagnostics} = collect_nodes(issues)
+    diagnostics = diagnostics ++ incomplete_dependency_diagnostics(nodes)
     node_ids = nodes |> Map.keys() |> Enum.sort()
 
     {edges, diagnostics} =
@@ -43,11 +51,52 @@ defmodule SymphonyElixir.Dependency.Graph do
       nodes: nodes,
       edges: edges,
       reverse_edges: reverse_edges,
-      diagnostics: sort_diagnostics(diagnostics)
+      diagnostics: sort_diagnostics(diagnostics),
+      completeness: normalize_completeness(Keyword.get(opts, :completeness, :complete))
     }
   end
 
-  def build(_issues), do: %__MODULE__{}
+  def build(_issues, _opts), do: %__MODULE__{completeness: {:incomplete, :invalid_issue_collection}}
+
+  @spec unavailable(term()) :: t()
+  def unavailable(reason), do: %__MODULE__{completeness: {:unavailable, normalize_reason(reason)}}
+
+  @spec complete?(t()) :: boolean()
+  def complete?(%__MODULE__{completeness: :complete}), do: true
+  def complete?(%__MODULE__{}), do: false
+
+  @spec incomplete?(t(), String.t()) :: boolean()
+  def incomplete?(%__MODULE__{} = graph, issue_id) when is_binary(issue_id) do
+    not is_nil(incompleteness_reason(graph, issue_id))
+  end
+
+  def incomplete?(_graph, _issue_id), do: true
+
+  @spec incompleteness_reason(t(), String.t()) :: term() | nil
+  def incompleteness_reason(%__MODULE__{completeness: {:unavailable, reason}}, _issue_id), do: {:unavailable, reason}
+  def incompleteness_reason(%__MODULE__{completeness: {:incomplete, reason}}, _issue_id), do: {:incomplete, reason}
+
+  def incompleteness_reason(%__MODULE__{} = graph, issue_id) when is_binary(issue_id) do
+    cond do
+      match?(%Issue{dependency_completeness: {:incomplete, _}}, graph.nodes[issue_id]) ->
+        graph.nodes[issue_id].dependency_completeness
+
+      match?(%Issue{dependency_completeness: {:unavailable, _}}, graph.nodes[issue_id]) ->
+        graph.nodes[issue_id].dependency_completeness
+
+      match?(%Issue{}, graph.nodes[issue_id]) ->
+        if graph.nodes[issue_id].dependency_completeness == :complete do
+          dependency_diagnostic_reason(graph, issue_id)
+        else
+          {:incomplete, :invalid_dependency_completeness}
+        end
+
+      true ->
+        dependency_diagnostic_reason(graph, issue_id)
+    end
+  end
+
+  def incompleteness_reason(_graph, _issue_id), do: {:incomplete, :invalid_issue_id}
 
   @spec cycles(t()) :: [[String.t()]]
   def cycles(%__MODULE__{} = graph) do
@@ -91,6 +140,48 @@ defmodule SymphonyElixir.Dependency.Graph do
         {nodes, [diagnostic(:malformed_issue, nil, nil, issue) | diagnostics]}
     end)
   end
+
+  defp incomplete_dependency_diagnostics(nodes) when is_map(nodes) do
+    nodes
+    |> Enum.flat_map(fn
+      {issue_id, %Issue{dependency_completeness: {:incomplete, reason}}} ->
+        [diagnostic(:incomplete_dependency_data, issue_id, nil, reason)]
+
+      {issue_id, %Issue{dependency_completeness: {:unavailable, reason}}} ->
+        [diagnostic(:unavailable_dependency_data, issue_id, nil, reason)]
+
+      _ ->
+        []
+    end)
+  end
+
+  defp incomplete_diagnostic?(kind) do
+    kind in [
+      :incomplete_dependency_data,
+      :unavailable_dependency_data,
+      :malformed_blocker,
+      :malformed_blocker_list,
+      :malformed_issue,
+      :missing_blocker
+    ]
+  end
+
+  defp dependency_diagnostic_reason(%__MODULE__{diagnostics: diagnostics}, issue_id) do
+    diagnostics
+    |> Enum.find(&(&1.dependent_id == issue_id and incomplete_diagnostic?(&1.kind)))
+    |> case do
+      %{kind: kind} -> {:incomplete, kind}
+      nil -> nil
+    end
+  end
+
+  defp normalize_completeness(:complete), do: :complete
+  defp normalize_completeness({kind, reason}) when kind in [:incomplete, :unavailable], do: {kind, normalize_reason(reason)}
+  defp normalize_completeness(reason), do: {:incomplete, normalize_reason(reason)}
+
+  defp normalize_reason(reason) when is_atom(reason), do: reason
+  defp normalize_reason({kind, _detail}) when is_atom(kind), do: kind
+  defp normalize_reason(_reason), do: :unknown
 
   defp dependency_edges(dependent_id, blockers, nodes) when is_list(blockers) do
     Enum.reduce(blockers, {[], []}, fn blocker, {blocker_ids, diagnostics} ->
