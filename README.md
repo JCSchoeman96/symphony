@@ -49,6 +49,12 @@ infrastructure is not retried automatically. Attempt counters are live OTP
 state and survive workflow reloads; restart recovery remains tracker/filesystem
 driven and does not synthesize prior retry history.
 
+For Linear workflows, read-only `linear_graphql` queries remain available to every role. Lifecycle
+state changes use the session-bound `linear_transition` tool, which authorizes only role-owned
+handoffs and denies implementation/correction or merge handoffs when dependency data is unsafe.
+Raw Linear GraphQL mutations are rejected at this boundary; provider-native mutation tools for
+other adapters remain provider-specific permission boundaries.
+
 ---
 
 ## License

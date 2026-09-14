@@ -22,7 +22,8 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 5. Keeps Codex working on the issue until the work is done
 
 During app-server sessions, the selected tracker adapter may advertise provider-native tools. The
-Linear serves `linear_graphql`, GitHub Issues serves `github_api`, Jira Cloud serves
+Linear adapter serves read-only `linear_graphql` plus the workflow-controlled `linear_transition`,
+GitHub Issues serves `github_api`, Jira Cloud serves
 `jira_rest`, Asana serves `asana_api`, and GitLab serves `gitlab_api`. Symphony executes those
 tools with configured host-side auth and removes declared tracker-token environment variables from
 the Codex child, so the agent does not need a second tracker login.
@@ -48,8 +49,9 @@ infrastructure is not retried automatically; a human or provider path must handl
    set it as the `LINEAR_API_KEY` environment variable.
 3. Copy this directory's `WORKFLOW.md` to your repo.
 4. Optionally copy the `commit`, `push`, `pull`, `land`, and `linear` skills to your repo.
-   - The `linear` skill expects Symphony's `linear_graphql` app-server tool for raw Linear GraphQL
-     operations such as comment editing or upload flows.
+   - The `linear` skill can use Symphony's `linear_graphql` app-server tool for read-only Linear
+     GraphQL queries. Workflow state changes must use `linear_transition`; raw GraphQL mutations
+     are rejected at the Linear boundary.
 5. Customize the copied `WORKFLOW.md` file for your project.
    - To get your project's slug, right-click the project and copy its URL. The slug is part of the
      URL.
@@ -232,14 +234,19 @@ codex:
 - Dispatchability: the adapter marks an issue dispatchable only when optional assignee routing
   matches and a `Todo` issue has no non-terminal blocker. The generic scheduler then applies
   active/terminal states, required labels, claims, retries, and concurrency.
-- Tool: the Linear adapter advertises `linear_graphql`, accepting either a raw query string or an
-  object with nonblank `query` and optional object `variables`. Symphony executes it host-side
-  with the session-bound endpoint/token and strips declared token environment variables from the
-  Codex child. `project_slug` scopes scheduler reads, not raw tool calls; the tool can access
-  whatever the configured Linear token can access.
-- Responsibility and errors: `linear_graphql` adds no idempotency key, retry, scope guard, or
-  rate-limit policy, so workflows own idempotent mutations and handling provider errors. Read/config
-  failures use `{:error, :missing_linear_api_token}`, `{:error, :missing_linear_project_slug}`,
+- Tools: the Linear adapter advertises read-only `linear_graphql`, accepting either a raw query
+  string or an object with nonblank `query` and optional object `variables`, and
+  `linear_transition`, which accepts `targetState` plus a verified `targetStateId` for the
+  bound current issue. The transition tool authorizes only the handoff owned by the bound
+  responsibility; implementation/correction require a complete, allowed dependency decision,
+  and `In Review` → `Ready to Merge` additionally requires `merge_permitted?`. Raw GraphQL
+  mutations are rejected. Both tools execute host-side with the session-bound endpoint/token and
+  strip declared token environment variables from the Codex child. `project_slug` scopes scheduler
+  reads, while the configured Linear credential remains the provider permission boundary.
+- Responsibility and errors: `linear_transition` is the only lifecycle write path exposed by the
+  Linear adapter. It verifies the requested state name/ID against the current issue's team before
+  issuing the fixed `issueUpdate` mutation. Read/config failures use
+  `{:error, :missing_linear_api_token}`, `{:error, :missing_linear_project_slug}`,
   `{:error, :invalid_linear_endpoint}`, `{:error, :invalid_linear_assignee}`,
   `{:error, :missing_linear_viewer_identity}`, `{:error, {:linear_api_status, status}}`,
   `{:error, {:linear_api_request, reason}}`, `{:error, {:linear_graphql_errors, errors}}`,

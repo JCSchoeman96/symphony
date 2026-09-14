@@ -110,7 +110,13 @@ defmodule SymphonyElixir.AgentRunner do
     max_turns = max_turns_for_run(route, opts)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issues_by_ids/1)
     runtime = Keyword.get(opts, :runtime, AgentRuntime.Codex)
-    runtime_opts = opts |> Keyword.put(:worker_host, worker_host) |> profile_runtime_options(route)
+
+    runtime_opts =
+      opts
+      |> Keyword.put(:worker_host, worker_host)
+      |> profile_runtime_options(route)
+      |> Keyword.put(:agent_tool_context, agent_tool_context(issue, route, opts))
+
     role_prompt = PromptBuilder.role_prompt(route)
 
     with {:ok, session} <- runtime.start_session(workspace, runtime_opts) do
@@ -320,6 +326,31 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp dependency_decision(_issue, _route), do: %{allowed?: true}
+
+  defp agent_tool_context(%Issue{} = issue, %Route{} = route, opts) do
+    %{
+      issue_id: issue.id,
+      current_issue_state: issue.state,
+      responsibility: route.responsibility,
+      dependency_decision: dependency_decision_from_options(issue, route, opts)
+    }
+  end
+
+  defp agent_tool_context(%Issue{} = issue, _route, _opts) do
+    %{
+      issue_id: issue.id,
+      current_issue_state: issue.state,
+      responsibility: nil,
+      dependency_decision: %{allowed?: false, dependency_completeness: :unavailable}
+    }
+  end
+
+  defp dependency_decision_from_options(issue, route, opts) do
+    case Keyword.get(opts, :dependency_decision) do
+      %{allowed?: _} = decision -> decision
+      _ -> dependency_decision(issue, route)
+    end
+  end
 
   defp dependency_policy_options do
     settings = Config.settings!()

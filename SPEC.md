@@ -1312,7 +1312,9 @@ Orchestrator behavior on tracker errors:
 Symphony does not require first-class tracker write APIs in the orchestrator.
 
 - Ticket mutations (state transitions, comments, attachments, PR metadata) are typically handled by
-  the coding agent through the selected adapter's provider-native tools.
+  the coding agent through the selected adapter's provider-native tools. Adapters that expose
+  workflow-controlled lifecycle transitions SHOULD provide a structured transition operation so
+  responsibility and dependency policy can be enforced at the tool boundary.
 - Tools execute in Symphony with the configured adapter credential; the child receives tool results,
   not a raw token.
 - The current normalized issue is available to tool execution as context, including opaque
@@ -1320,6 +1322,10 @@ Symphony does not require first-class tracker write APIs in the orchestrator.
 - The service remains a scheduler/runner and tracker reader.
 - Workflow-specific success often means "reached the next handoff state" (for example
   `Human Review`) rather than tracker terminal state `Done`.
+
+The current Elixir Linear adapter exposes read-only `linear_graphql` and a structured
+`linear_transition`; raw Linear GraphQL mutations are rejected. Other provider-native tools retain
+their adapter-specific capabilities and are not implied to share Linear's transition policy.
 
 ## 12. Prompt Construction and Context Assembly
 

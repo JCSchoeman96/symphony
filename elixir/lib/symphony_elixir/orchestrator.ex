@@ -1614,7 +1614,8 @@ defmodule SymphonyElixir.Orchestrator do
            state.agent_runner.run(issue, recipient,
              attempt: attempt,
              worker_host: worker_host,
-             route: route
+             route: route,
+             dependency_decision: Map.get(state.dependency_diagnostics, issue.id)
            )
          end) do
       {:ok, pid} ->

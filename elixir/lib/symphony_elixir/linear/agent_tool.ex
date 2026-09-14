@@ -4,10 +4,13 @@ defmodule SymphonyElixir.Linear.AgentTool do
   """
 
   alias SymphonyElixir.Linear.Client
+  alias SymphonyElixir.Tracker.TransitionPolicy
 
   @linear_graphql_tool "linear_graphql"
+  @linear_transition_tool "linear_transition"
   @linear_graphql_description """
-  Execute a raw GraphQL query or mutation against Linear using Symphony's configured auth.
+  Execute a read-only GraphQL query against Linear using Symphony's configured auth. Use
+  `linear_transition` for workflow-controlled state changes.
   """
   @linear_graphql_input_schema %{
     "type" => "object",
@@ -16,7 +19,7 @@ defmodule SymphonyElixir.Linear.AgentTool do
     "properties" => %{
       "query" => %{
         "type" => "string",
-        "description" => "GraphQL query or mutation document to execute against Linear."
+        "description" => "Read-only GraphQL query document to execute against Linear."
       },
       "variables" => %{
         "type" => ["object", "null"],
@@ -25,12 +28,58 @@ defmodule SymphonyElixir.Linear.AgentTool do
       }
     }
   }
+  @linear_transition_description """
+  Move the current issue to an authorized workflow state using the responsibility and dependency
+  decision bound to this agent session.
+  """
+  @linear_transition_input_schema %{
+    "type" => "object",
+    "additionalProperties" => false,
+    "required" => ["targetState", "targetStateId"],
+    "properties" => %{
+      "targetState" => %{
+        "type" => "string",
+        "description" => "Workflow state name for the authorized handoff."
+      },
+      "targetStateId" => %{
+        "type" => "string",
+        "description" => "Linear workflow state ID returned by a read-only state query."
+      }
+    }
+  }
+  @transition_mutation """
+  mutation SymphonyAuthorizedTransition($issueId: String!, $stateId: String!) {
+    issueUpdate(id: $issueId, input: {stateId: $stateId}) {
+      success
+    }
+  }
+  """
+  @transition_state_query """
+  query SymphonyAuthorizedTransitionState($issueId: String!) {
+    issue(id: $issueId) {
+      team {
+        states(first: 50) {
+          nodes {
+            id
+            name
+          }
+          pageInfo {
+            hasNextPage
+          }
+        }
+      }
+    }
+  }
+  """
 
   @spec execute(String.t() | nil, term(), keyword()) :: map()
   def execute(tool, arguments, opts) do
     case tool do
       @linear_graphql_tool ->
         execute_linear_graphql(arguments, opts)
+
+      @linear_transition_tool ->
+        execute_linear_transition(arguments, opts)
 
       other ->
         failure_response(%{
@@ -49,6 +98,11 @@ defmodule SymphonyElixir.Linear.AgentTool do
         "name" => @linear_graphql_tool,
         "description" => @linear_graphql_description,
         "inputSchema" => @linear_graphql_input_schema
+      },
+      %{
+        "name" => @linear_transition_tool,
+        "description" => @linear_transition_description,
+        "inputSchema" => @linear_transition_input_schema
       }
     ]
   end
@@ -58,12 +112,156 @@ defmodule SymphonyElixir.Linear.AgentTool do
     client_opts = Keyword.take(opts, [:tracker_settings])
 
     with {:ok, query, variables} <- normalize_linear_graphql_arguments(arguments),
+         :ok <- authorize_read_only_query(query),
          {:ok, response} <- linear_client.(query, variables, client_opts) do
       graphql_response(response)
     else
       {:error, reason} ->
         failure_response(tool_error_payload(reason))
     end
+  end
+
+  defp execute_linear_transition(arguments, opts) do
+    linear_client = Keyword.get(opts, :linear_client, &Client.graphql/3)
+    client_opts = Keyword.take(opts, [:tracker_settings])
+    context = Keyword.get(opts, :agent_tool_context, %{})
+
+    with {:ok, target_state, target_state_id} <- normalize_transition_arguments(arguments),
+         {:ok, issue_id} <- normalize_issue_id(context),
+         :ok <-
+           TransitionPolicy.authorize(
+             Map.merge(context, %{
+               issue_id: issue_id,
+               target_state: target_state
+             })
+           ),
+         {:ok, state_response} <-
+           linear_client.(@transition_state_query, %{"issueId" => issue_id}, client_opts),
+         {:ok, ^target_state_id} <-
+           verify_transition_state(state_response, target_state, target_state_id),
+         {:ok, response} <-
+           linear_client.(@transition_mutation, %{"issueId" => issue_id, "stateId" => target_state_id}, client_opts) do
+      transition_response(response)
+    else
+      {:error, %{code: _code} = reason} -> failure_response(transition_error_payload(reason))
+      {:error, reason} -> failure_response(tool_error_payload(reason))
+    end
+  end
+
+  defp normalize_transition_arguments(arguments) when is_map(arguments) do
+    with {:ok, target_state} <-
+           normalize_required_string(arguments, ["targetState", "target_state", :targetState, :target_state]),
+         {:ok, target_state_id} <-
+           normalize_required_string(arguments, ["targetStateId", "target_state_id", :targetStateId, :target_state_id]) do
+      {:ok, target_state, target_state_id}
+    end
+  end
+
+  defp normalize_transition_arguments(_arguments), do: {:error, :invalid_transition_arguments}
+
+  defp normalize_required_string(arguments, keys) do
+    value = Enum.find_value(keys, &Map.get(arguments, &1))
+
+    case value do
+      value when is_binary(value) ->
+        trimmed = String.trim(value)
+        if trimmed == "", do: {:error, :invalid_transition_arguments}, else: {:ok, trimmed}
+
+      _ ->
+        {:error, :invalid_transition_arguments}
+    end
+  end
+
+  defp normalize_issue_id(context) when is_map(context) do
+    case Map.get(context, :issue_id) || Map.get(context, "issue_id") do
+      issue_id when is_binary(issue_id) ->
+        issue_id = String.trim(issue_id)
+        if issue_id == "", do: {:error, :invalid_transition_context}, else: {:ok, issue_id}
+
+      _ ->
+        {:error, :invalid_transition_context}
+    end
+  end
+
+  defp normalize_issue_id(_context), do: {:error, :invalid_transition_context}
+
+  defp authorize_read_only_query(query) do
+    if Regex.match?(~r/(?<![A-Za-z0-9_])mutation(?![A-Za-z0-9_])/i, query) do
+      {:error, :lifecycle_mutation_denied}
+    else
+      :ok
+    end
+  end
+
+  defp transition_response(response) do
+    success =
+      case response do
+        %{"errors" => errors} when is_list(errors) and errors != [] -> false
+        %{errors: errors} when is_list(errors) and errors != [] -> false
+        %{"data" => %{"issueUpdate" => %{"success" => true}}} -> true
+        %{data: %{issueUpdate: %{success: true}}} -> true
+        _ -> false
+      end
+
+    dynamic_tool_response(success, encode_payload(response))
+  end
+
+  defp verify_transition_state(response, target_state, target_state_id) do
+    cond do
+      graphql_error_response?(response) ->
+        {:error, :transition_state_unavailable}
+
+      transition_state_verified?(response, target_state, target_state_id) ->
+        {:ok, target_state_id}
+
+      true ->
+        {:error, :transition_state_unverified}
+    end
+  end
+
+  defp graphql_error_response?(%{"errors" => errors}) when is_list(errors), do: errors != []
+  defp graphql_error_response?(%{errors: errors}) when is_list(errors), do: errors != []
+  defp graphql_error_response?(_response), do: false
+
+  defp transition_state_verified?(response, target_state, target_state_id) do
+    {nodes, page_info} = transition_state_connection(response)
+
+    is_list(nodes) and page_info_complete?(page_info) and
+      Enum.any?(nodes, &transition_state_matches?(&1, target_state, target_state_id))
+  end
+
+  defp transition_state_connection(%{"data" => %{"issue" => %{"team" => %{"states" => states}}}}),
+    do: state_connection_values(states)
+
+  defp transition_state_connection(%{data: %{issue: %{team: %{states: states}}}}),
+    do: state_connection_values(states)
+
+  defp transition_state_connection(_response), do: {nil, nil}
+
+  defp state_connection_values(%{"nodes" => nodes, "pageInfo" => page_info}), do: {nodes, page_info}
+  defp state_connection_values(%{nodes: nodes, pageInfo: page_info}), do: {nodes, page_info}
+  defp state_connection_values(_states), do: {nil, nil}
+
+  defp page_info_complete?(%{"hasNextPage" => false}), do: true
+  defp page_info_complete?(%{hasNextPage: false}), do: true
+  defp page_info_complete?(_page_info), do: false
+
+  defp transition_state_matches?(state, target_state, target_state_id) when is_map(state) do
+    state_id = Map.get(state, "id") || Map.get(state, :id)
+    state_name = Map.get(state, "name") || Map.get(state, :name)
+
+    state_id == target_state_id and
+      is_binary(state_name) and normalize_state(state_name) == normalize_state(target_state)
+  end
+
+  defp transition_state_matches?(_state, _target_state, _target_state_id), do: false
+
+  defp normalize_state(state) do
+    state
+    |> String.trim()
+    |> String.downcase()
+    |> String.split(~r/\s+/, trim: true)
+    |> Enum.join(" ")
   end
 
   defp normalize_linear_graphql_arguments(arguments) when is_binary(arguments) do
@@ -153,6 +351,51 @@ defmodule SymphonyElixir.Linear.AgentTool do
     }
   end
 
+  defp tool_error_payload(:invalid_transition_arguments) do
+    %{
+      "error" => %{
+        "code" => "invalid_transition_arguments",
+        "message" => "`linear_transition` requires non-empty `targetState` and `targetStateId` strings."
+      }
+    }
+  end
+
+  defp tool_error_payload(:invalid_transition_context) do
+    %{
+      "error" => %{
+        "code" => "invalid_transition_context",
+        "message" => "`linear_transition` requires a bound current issue and agent responsibility."
+      }
+    }
+  end
+
+  defp tool_error_payload(:lifecycle_mutation_denied) do
+    %{
+      "error" => %{
+        "code" => "lifecycle_mutation_denied",
+        "message" => "Raw Linear GraphQL mutations are disabled; use linear_transition for workflow-controlled state changes."
+      }
+    }
+  end
+
+  defp tool_error_payload(:transition_state_unavailable) do
+    %{
+      "error" => %{
+        "code" => "transition_state_unavailable",
+        "message" => "The current issue workflow states could not be read safely; no transition was performed."
+      }
+    }
+  end
+
+  defp tool_error_payload(:transition_state_unverified) do
+    %{
+      "error" => %{
+        "code" => "transition_state_unverified",
+        "message" => "The requested Linear workflow state was not verified for the current issue; no transition was performed."
+      }
+    }
+  end
+
   defp tool_error_payload(:invalid_arguments) do
     %{
       "error" => %{
@@ -200,6 +443,27 @@ defmodule SymphonyElixir.Linear.AgentTool do
       "error" => %{
         "message" => "Linear GraphQL tool execution failed.",
         "reason" => inspect(reason)
+      }
+    }
+  end
+
+  defp transition_error_payload(%{code: :invalid_transition_context}),
+    do: tool_error_payload(:invalid_transition_context)
+
+  defp transition_error_payload(%{code: :unauthorized_transition}) do
+    %{
+      "error" => %{
+        "code" => "unauthorized_transition",
+        "message" => "The active responsibility is not authorized for this workflow transition."
+      }
+    }
+  end
+
+  defp transition_error_payload(%{code: :dependency_transition_denied}) do
+    %{
+      "error" => %{
+        "code" => "dependency_transition_denied",
+        "message" => "The workflow transition is denied because dependency data is not safe for this handoff."
       }
     }
   end

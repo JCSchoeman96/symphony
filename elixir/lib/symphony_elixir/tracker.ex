@@ -58,8 +58,8 @@ defmodule SymphonyElixir.Tracker do
   app-server session so tool advertisement and execution cannot drift across a
   workflow reload.
   """
-  @spec bind_agent_tools() :: map()
-  def bind_agent_tools do
+  @spec bind_agent_tools(keyword()) :: map()
+  def bind_agent_tools(opts \\ []) do
     tracker_settings = Config.settings!().tracker
     adapter = adapter_for_settings!(tracker_settings)
 
@@ -67,13 +67,14 @@ defmodule SymphonyElixir.Tracker do
       adapter: adapter,
       tracker_settings: tracker_settings,
       tool_specs: adapter_agent_tool_specs(adapter),
-      secret_environment_names: adapter_secret_environment_names(adapter, tracker_settings)
+      secret_environment_names: adapter_secret_environment_names(adapter, tracker_settings),
+      agent_tool_context: Keyword.get(opts, :agent_tool_context, %{})
     }
   end
 
   @spec execute_bound_agent_tool(map(), String.t(), term(), keyword()) :: map()
   def execute_bound_agent_tool(
-        %{adapter: adapter, tracker_settings: tracker_settings},
+        %{adapter: adapter, tracker_settings: tracker_settings} = binding,
         tool,
         arguments,
         opts \\ []
@@ -82,7 +83,9 @@ defmodule SymphonyElixir.Tracker do
       adapter,
       tool,
       arguments,
-      Keyword.put(opts, :tracker_settings, tracker_settings)
+      opts
+      |> Keyword.put(:tracker_settings, tracker_settings)
+      |> Keyword.put(:agent_tool_context, Map.get(binding, :agent_tool_context, %{}))
     )
   end
 

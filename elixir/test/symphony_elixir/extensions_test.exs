@@ -245,7 +245,8 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert {:ok, []} = Adapter.fetch_dependency_graph()
     assert_receive :fetch_dependency_graph_called
 
-    assert [%{"name" => "linear_graphql"}] = Adapter.agent_tool_specs()
+    assert [%{"name" => "linear_graphql"}, %{"name" => "linear_transition"}] =
+             Adapter.agent_tool_specs()
   end
 
   test "phoenix observability api preserves state, issue, and refresh responses" do

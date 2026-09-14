@@ -113,8 +113,10 @@ Follow-up context:
 5. Never bypass an unresolved, invalidated, cyclic, or incomplete dependency.
    Read-only planning and review may document an incomplete dependency, but
    implementation remains stopped until the graph is authoritative.
-6. Use the existing authorized tracker-tool boundary for lifecycle transitions.
-   Do not issue arbitrary merge or destructive tracker mutations.
+6. Use the existing authorized tracker-tool boundary for lifecycle transitions. With the Linear
+   adapter, use `linear_graphql` only for reads and `linear_transition` with the verified
+   `targetState`/`targetStateId` pair for state handoffs. Do not issue arbitrary merge or
+   destructive tracker mutations; raw GraphQL mutations are rejected.
 7. Stop after the role's bounded responsibility is complete. The orchestrator
    will reconcile the issue and schedule any permitted continuation or retry.
 8. Ordinary runtime/spawn failures receive at most three automatic retries.

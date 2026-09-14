@@ -291,6 +291,27 @@ defmodule SymphonyElixir.AgentRuntimeTest do
       assert turn_opts[:model] == "selected-model"
       assert turn_opts[:sandbox] == "workspace-write"
       assert turn_opts[:profile] == route.profile
+
+      assert turn_opts[:agent_tool_context] == %{
+               issue_id: "runtime-options-continuation",
+               current_issue_state: "Ready",
+               responsibility: "implementation",
+               dependency_decision: %{
+                 allowed?: true,
+                 dependency_status: :none,
+                 dependency_completeness: :complete,
+                 dependent_state: "ready",
+                 responsibility: "implementation",
+                 reason: :no_hard_dependencies,
+                 merge_permitted?: true,
+                 blockers: [],
+                 unresolved_blockers: [],
+                 invalidated_blockers: [],
+                 diagnostic: nil,
+                 issue_id: "runtime-options-continuation",
+                 identifier: "SYM-RUNTIME-OPTIONS"
+               }
+             }
     end
   end
 
