@@ -42,6 +42,13 @@ Use the explicit `agent.routing: routed` configuration and the shipped
 `elixir/prompts/` role policies when enabling this mode. Workflows without
 `agent.profiles` remain on the legacy runtime path for compatibility.
 
+The orchestrator bounds ordinary runtime/spawn retries to three per issue
+lineage. Capacity waits, normal continuations, and route changes are tracked
+separately; reviewer-to-correction loops stop after three cycles. CI
+infrastructure is not retried automatically. Attempt counters are live OTP
+state and survive workflow reloads; restart recovery remains tracker/filesystem
+driven and does not synthesize prior retry history.
+
 ---
 
 ## License

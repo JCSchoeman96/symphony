@@ -35,6 +35,11 @@ issue claimed and exposes it as blocked in the runtime state, JSON API, and dash
 entries are in memory only; restarting the orchestrator clears that blocked map, so any still-active
 tracker issue can become a dispatch candidate again after restart.
 
+Automatic retry accounting is bounded per issue lineage: ordinary runtime or spawn failures receive
+at most three retries, capacity waits do not consume that failure budget, and reviewer-to-correction
+loops stop after three cycles. Normal continuations and route changes are tracked separately. CI
+infrastructure is not retried automatically; a human or provider path must handle it.
+
 ## How to use it
 
 1. Make sure your codebase is set up to work well with agents: see
@@ -48,9 +53,9 @@ tracker issue can become a dispatch candidate again after restart.
 5. Customize the copied `WORKFLOW.md` file for your project.
    - To get your project's slug, right-click the project and copy its URL. The slug is part of the
      URL.
-   - When creating a workflow based on this repo, note that it depends on non-standard Linear
-     issue statuses: "Rework", "Human Review", and "Merging". You can customize them in
-     Team Settings → Workflow in Linear.
+   - When creating a workflow based on this repo, configure the lifecycle states used by your team.
+     The shipped routed example uses Planning, Todo, Ready, In Progress, In Review,
+     Changes Requested, and Ready to Merge; merge remains a deferred, read-only gate.
 6. Follow the instructions below to install the required runtime dependencies and start the service.
 
 ## Prerequisites

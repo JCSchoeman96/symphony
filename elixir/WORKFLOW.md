@@ -117,5 +117,13 @@ Follow-up context:
    Do not issue arbitrary merge or destructive tracker mutations.
 7. Stop after the role's bounded responsibility is complete. The orchestrator
    will reconcile the issue and schedule any permitted continuation or retry.
-8. Report exact validation commands and results. Report external blockers
+8. Ordinary runtime/spawn failures receive at most three automatic retries.
+   Capacity waits do not consume that budget, and reviewer-to-correction loops
+   stop after three review cycles. CI infrastructure is not retried
+   automatically; request human/provider intervention instead.
+9. Report exact validation commands and results. Report external blockers
    without fabricating provider, CI, or runtime evidence.
+
+Attempt counters live in the orchestrator's OTP state. Workflow reloads retain
+the counters for the current live issue lineage; a process restart performs the
+existing tracker/filesystem recovery and does not synthesize retry history.
