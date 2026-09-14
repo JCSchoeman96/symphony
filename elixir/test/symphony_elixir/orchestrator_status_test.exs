@@ -1814,6 +1814,119 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert StatusDashboard.humanize_codex_message(fallback_reasoning) == "reasoning update"
   end
 
+  test "observability projections fail closed for malformed and sensitive values" do
+    assert Orchestrator.observability_error(nil) == nil
+    assert Orchestrator.observability_error("  ") == nil
+    assert Orchestrator.observability_error("ordinary runtime failure") == "ordinary runtime failure"
+
+    assert Orchestrator.observability_error("curl https://example.invalid?token=secret") ==
+             "runtime error details redacted"
+
+    assert Orchestrator.observability_error(%{secret: "hidden"}) == "runtime error details redacted"
+
+    assert Orchestrator.observability_event(nil) == nil
+    assert Orchestrator.observability_event(:turn_completed) == :turn_completed
+    assert Orchestrator.observability_event("  turn completed  ") == "turn completed"
+    assert Orchestrator.observability_event("mutation issueUpdate") == "[redacted]"
+    assert Orchestrator.observability_event(%{}) == :unknown
+
+    assert Orchestrator.observability_codex_message(nil) == nil
+
+    assert Orchestrator.observability_codex_message(%{event: :notification, message: "safe", timestamp: nil}) ==
+             %{event: :notification, message: "safe", timestamp: nil}
+
+    assert Orchestrator.observability_codex_message(%{query: "secret"}) == %{redacted: true}
+
+    assert Orchestrator.observability_codex_message("command=rm -rf") ==
+             "codex event details redacted"
+
+    assert Orchestrator.observability_codex_message(123) == "codex event details redacted"
+
+    dependency = %{
+      issue_id: "issue-1",
+      identifier: "SYM-1",
+      dependent_state: "Ready",
+      responsibility: "implementation",
+      dependency_status: :unresolved,
+      reason: {:dependency_cycle, "cycle detail"},
+      allowed?: false,
+      merge_permitted?: false,
+      dependency_completeness: {:incomplete, {:provider_error, "token"}},
+      blockers: [%{id: "blocker-1", identifier: "SYM-BLOCKER", state: "Ready"}, :malformed],
+      unresolved_blockers: %{},
+      invalidated_blockers: [%{"id" => "blocker-2", "identifier" => "SYM-2", "state" => "Done"}],
+      diagnostic: {:malformed_blocker, %{id: "blocker-3", state: "Ready"}}
+    }
+
+    projected_dependency = Orchestrator.observability_dependency(dependency)
+    assert projected_dependency.issue_id == "issue-1"
+    assert projected_dependency.allowed? == false
+    assert projected_dependency.dependency_completeness == {:incomplete, :provider_error}
+
+    assert projected_dependency.blockers == [
+             %{id: "blocker-1", identifier: "SYM-BLOCKER", state: "Ready"},
+             %{id: nil, identifier: nil, state: nil}
+           ]
+
+    assert projected_dependency.unresolved_blockers == []
+
+    assert projected_dependency.diagnostic == %{
+             kind: :malformed_blocker,
+             blocker: %{id: "blocker-3", identifier: nil, state: "Ready"}
+           }
+
+    assert Orchestrator.observability_dependency(:malformed) == nil
+
+    timestamp = ~U[2026-01-02 03:04:05Z]
+
+    assert Orchestrator.observability_rate_limits(%{
+             "limit_id" => "codex",
+             "primary" => %{"remaining" => 9, "reset_at" => timestamp, "secret" => "drop"},
+             "credits" => %{"has_credits" => false, "balance" => "safe"},
+             "query" => "drop"
+           }) == %{
+             "limit_id" => "codex",
+             "primary" => %{"remaining" => 9, "reset_at" => "2026-01-02T03:04:05Z"},
+             "credits" => %{"has_credits" => false, "balance" => "safe"}
+           }
+
+    assert Orchestrator.observability_rate_limits("not-a-map") == nil
+    assert Orchestrator.observability_route_change(nil) == nil
+    assert Orchestrator.observability_route_change(%{}) == nil
+
+    assert Orchestrator.observability_route_change(%{
+             "previous" => %{"profile_name" => "planner", "runtime_name" => "codex"},
+             next: %{responsibility: "implementation", fingerprint: "route-2", ignored: "drop"}
+           }) == %{
+             previous: %{profile_name: "planner", runtime_name: "codex"},
+             next: %{responsibility: "implementation", fingerprint: "route-2"}
+           }
+
+    assert Orchestrator.observability_graph(nil) == %{
+             completeness: {:unavailable, :unknown},
+             cycles: [],
+             diagnostics: []
+           }
+
+    assert Orchestrator.observability_graph(%{completeness: :invalid, cycles: :invalid, diagnostics: :invalid}) == %{
+             completeness: {:incomplete, :redacted},
+             cycles: [],
+             diagnostics: []
+           }
+
+    assert Orchestrator.observability_completeness(nil) == nil
+    assert Orchestrator.observability_completeness(:complete) == :complete
+
+    assert Orchestrator.observability_completeness({:unavailable, :provider_error}) ==
+             {:unavailable, :provider_error}
+
+    assert Orchestrator.observability_completeness(:invalid) == {:incomplete, :redacted}
+
+    assert Orchestrator.observability_termination_reason(:runtime_failure) == :runtime_failure
+    assert Orchestrator.observability_termination_reason(nil) == nil
+    assert Orchestrator.observability_termination_reason("runtime_failure") == :unknown
+  end
+
   test "application stop renders offline status" do
     rendered =
       ExUnit.CaptureIO.capture_io(fn ->

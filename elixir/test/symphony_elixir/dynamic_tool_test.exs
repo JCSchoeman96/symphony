@@ -54,6 +54,16 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
            ]
   end
 
+  test "the app-server dynamic-tool facade also supports its default options" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+    binding = BoundDynamicTool.bind()
+
+    response = BoundDynamicTool.execute("not_a_real_tool", %{}, binding)
+
+    assert response["success"] == false
+    assert Jason.decode!(response["output"])["error"]["message"] =~ "Unsupported dynamic tool"
+  end
+
   test "bound tools keep the adapter and auth snapshot from session startup" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "linear",
