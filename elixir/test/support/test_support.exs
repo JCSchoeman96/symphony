@@ -89,47 +89,46 @@ defmodule SymphonyElixir.TestSupport do
 
   defp workflow_content(overrides) do
     config =
-      Keyword.merge(
-        [
-          tracker_kind: "linear",
-          tracker_endpoint: "https://api.linear.app/graphql",
-          tracker_api_token: "token",
-          tracker_project_slug: "project",
-          tracker_assignee: nil,
-          tracker_required_labels: [],
-          tracker_active_states: ["Todo", "In Progress"],
-          tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"],
-          poll_interval_ms: 30_000,
-          workspace_root: Path.join(System.tmp_dir!(), "symphony_workspaces"),
-          worker_ssh_hosts: [],
-          worker_max_concurrent_agents_per_host: nil,
-          max_concurrent_agents: 10,
-          max_turns: 20,
-          max_retry_backoff_ms: 300_000,
-          max_concurrent_agents_by_state: %{},
-          agent_routing: "routed",
-          agent_profiles: nil,
-          codex_command: "codex app-server",
-          codex_approval_policy: %{reject: %{sandbox_approval: true, rules: true, mcp_elicitations: true}},
-          codex_thread_sandbox: "workspace-write",
-          codex_turn_sandbox_policy: nil,
-          codex_turn_timeout_ms: 3_600_000,
-          codex_read_timeout_ms: 5_000,
-          codex_stall_timeout_ms: 300_000,
-          hook_after_create: nil,
-          hook_before_run: nil,
-          hook_after_run: nil,
-          hook_before_remove: nil,
-          hook_timeout_ms: 60_000,
-          observability_enabled: true,
-          observability_refresh_ms: 1_000,
-          observability_render_interval_ms: 16,
-          server_port: nil,
-          server_host: nil,
-          prompt: @workflow_prompt
-        ],
-        overrides
-      )
+      [
+        tracker_kind: "linear",
+        tracker_endpoint: "https://api.linear.app/graphql",
+        tracker_api_token: "token",
+        tracker_project_slug: "project",
+        tracker_assignee: nil,
+        tracker_required_labels: [],
+        tracker_active_states: ["Todo", "In Progress"],
+        tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"],
+        poll_interval_ms: 30_000,
+        workspace_root: Path.join(System.tmp_dir!(), "symphony_workspaces"),
+        worker_ssh_hosts: [],
+        worker_max_concurrent_agents_per_host: nil,
+        max_concurrent_agents: 10,
+        max_turns: 20,
+        max_retry_backoff_ms: 300_000,
+        max_concurrent_agents_by_state: %{},
+        agent_routing: "legacy",
+        agent_profiles: nil,
+        codex_command: "codex app-server",
+        codex_approval_policy: %{reject: %{sandbox_approval: true, rules: true, mcp_elicitations: true}},
+        codex_thread_sandbox: "workspace-write",
+        codex_turn_sandbox_policy: nil,
+        codex_turn_timeout_ms: 3_600_000,
+        codex_read_timeout_ms: 5_000,
+        codex_stall_timeout_ms: 300_000,
+        hook_after_create: nil,
+        hook_before_run: nil,
+        hook_after_run: nil,
+        hook_before_remove: nil,
+        hook_timeout_ms: 60_000,
+        observability_enabled: true,
+        observability_refresh_ms: 1_000,
+        observability_render_interval_ms: 16,
+        server_port: nil,
+        server_host: nil,
+        prompt: @workflow_prompt
+      ]
+      |> Keyword.merge(overrides)
+      |> maybe_default_agent_routing(overrides)
 
     tracker_kind = Keyword.get(config, :tracker_kind)
     tracker_endpoint = Keyword.get(config, :tracker_endpoint)
@@ -232,6 +231,15 @@ defmodule SymphonyElixir.TestSupport do
   end
 
   defp yaml_value(value), do: yaml_value(to_string(value))
+
+  defp maybe_default_agent_routing(config, overrides) do
+    if Keyword.has_key?(overrides, :agent_routing) do
+      config
+    else
+      routing = if Keyword.get(config, :tracker_kind) == "memory", do: "routed", else: "legacy"
+      Keyword.put(config, :agent_routing, routing)
+    end
+  end
 
   defp agent_profiles_yaml(nil), do: nil
   defp agent_profiles_yaml(profiles), do: "  profiles: #{yaml_value(profiles)}"

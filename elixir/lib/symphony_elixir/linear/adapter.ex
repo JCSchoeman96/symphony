@@ -8,6 +8,17 @@ defmodule SymphonyElixir.Linear.Adapter do
   alias SymphonyElixir.Linear.{AgentTool, Client}
   alias SymphonyElixir.Tracker.Issue
 
+  @spec capabilities() :: [SymphonyElixir.Tracker.Capabilities.capability()]
+  def capabilities do
+    [
+      :current_issue_refresh,
+      :dependency_graph,
+      :dependency_completeness,
+      :controlled_transition,
+      :agent_transition_tools
+    ]
+  end
+
   @spec validate_config(map()) :: :ok | {:error, term()}
   def validate_config(tracker_settings) do
     cond do

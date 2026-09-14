@@ -33,18 +33,7 @@ hooks:
 agent:
   max_concurrent_agents: 10
   max_turns: 20
-  routing: routed
-  profiles:
-    planner: {}
-    builder: {}
-    reviewer: {}
-    fixer: {}
-    merge_gatekeeper: {}
-  routes:
-    Planning: planner
-    In Review: reviewer
-    Changes Requested: fixer
-    Ready to Merge: merge_gatekeeper
+  routing: legacy
 codex:
   command: codex app-server
   approval_policy: never

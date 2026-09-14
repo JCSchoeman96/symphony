@@ -5,7 +5,90 @@ defmodule SymphonyElixir.Tracker.Memory do
 
   @behaviour SymphonyElixir.Tracker
 
+  alias SymphonyElixir.Tracker.TransitionPolicy
   alias SymphonyElixir.Tracker.Issue
+
+  @read_tool "memory_read"
+  @transition_tool "memory_transition"
+
+  @spec agent_tool_specs() :: [map()]
+  def agent_tool_specs do
+    [
+      %{
+        "name" => @read_tool,
+        "description" => "Read the configured in-memory project's issue state.",
+        "inputSchema" => %{
+          "type" => "object",
+          "additionalProperties" => false,
+          "properties" => %{"issueId" => %{"type" => "string"}}
+        }
+      },
+      %{
+        "name" => @transition_tool,
+        "description" => "Apply a responsibility-authorized workflow transition in the test project.",
+        "inputSchema" => %{
+          "type" => "object",
+          "additionalProperties" => false,
+          "required" => ["targetState"],
+          "properties" => %{"targetState" => %{"type" => "string"}}
+        }
+      }
+    ]
+  end
+
+  @spec execute_agent_tool(String.t(), term(), keyword()) :: map()
+  def execute_agent_tool(@read_tool, arguments, _opts) do
+    case issue_id_from_arguments(arguments) do
+      nil -> tool_response(true, Enum.map(issue_entries(), &issue_payload/1))
+      issue_id -> tool_response(true, issue_entries() |> Enum.find(&(&1.id == issue_id)) |> issue_payload())
+    end
+  end
+
+  def execute_agent_tool(@transition_tool, arguments, opts) do
+    context = Keyword.get(opts, :agent_tool_context, %{})
+
+    with {:ok, target_state} <- target_state_from_arguments(arguments),
+         {:ok, issue_id} <- issue_id_from_context(context),
+         %Issue{} = issue <- Enum.find(issue_entries(), &(&1.id == issue_id)),
+         :ok <-
+           TransitionPolicy.authorize(
+             Map.merge(context, %{
+               current_issue_state: issue.state,
+               target_state: target_state
+             })
+           ),
+         updated_issue = %{issue | state: target_state},
+         :ok <- replace_issue(updated_issue),
+         %Issue{state: ^target_state} <- Enum.find(issue_entries(), &(&1.id == issue_id)) do
+      tool_response(true, issue_payload(updated_issue))
+    else
+      nil -> tool_response(false, %{"error" => "memory issue was not found"})
+      {:error, reason} -> tool_response(false, %{"error" => inspect(reason)})
+      _ -> tool_response(false, %{"error" => "memory transition could not be verified"})
+    end
+  end
+
+  def execute_agent_tool(tool, _arguments, _opts) do
+    tool_response(false, %{
+      "error" => %{
+        "message" => "Unsupported dynamic tool: #{inspect(tool)}.",
+        "supportedTools" => Enum.map(agent_tool_specs(), &Map.fetch!(&1, "name"))
+      }
+    })
+  end
+
+  @spec capabilities() :: [SymphonyElixir.Tracker.Capabilities.capability()]
+  def capabilities do
+    [
+      :current_issue_refresh,
+      :dependency_graph,
+      :dependency_completeness,
+      :controlled_transition,
+      :transition_verification,
+      :agent_read_tools,
+      :agent_transition_tools
+    ]
+  end
 
   @spec fetch_issues_by_states([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_issues_by_states(state_names) do
@@ -42,6 +125,70 @@ defmodule SymphonyElixir.Tracker.Memory do
 
   defp issue_entries do
     Enum.filter(configured_issues(), &match?(%Issue{}, &1))
+  end
+
+  defp replace_issue(%Issue{id: issue_id} = updated_issue) do
+    issues =
+      Enum.map(configured_issues(), fn
+        %Issue{id: ^issue_id} -> updated_issue
+        entry -> entry
+      end)
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, issues)
+    :ok
+  end
+
+  defp issue_id_from_arguments(arguments) when is_map(arguments) do
+    case Map.get(arguments, "issueId") || Map.get(arguments, :issueId) || Map.get(arguments, :issue_id) do
+      issue_id when is_binary(issue_id) and issue_id != "" -> issue_id
+      _ -> nil
+    end
+  end
+
+  defp issue_id_from_arguments(_arguments), do: nil
+
+  defp issue_id_from_context(context) when is_map(context) do
+    case Map.get(context, :issue_id) || Map.get(context, "issue_id") do
+      issue_id when is_binary(issue_id) and issue_id != "" -> {:ok, issue_id}
+      _ -> {:error, :invalid_transition_context}
+    end
+  end
+
+  defp issue_id_from_context(_context), do: {:error, :invalid_transition_context}
+
+  defp target_state_from_arguments(arguments) when is_map(arguments) do
+    case Map.get(arguments, "targetState") || Map.get(arguments, :targetState) || Map.get(arguments, :target_state) do
+      target when is_binary(target) ->
+        target = String.trim(target)
+        if target == "", do: {:error, :invalid_transition_arguments}, else: {:ok, target}
+
+      _ ->
+        {:error, :invalid_transition_arguments}
+    end
+  end
+
+  defp target_state_from_arguments(_arguments), do: {:error, :invalid_transition_arguments}
+
+  defp issue_payload(nil), do: nil
+
+  defp issue_payload(%Issue{} = issue) do
+    %{
+      "id" => issue.id,
+      "identifier" => issue.identifier,
+      "title" => issue.title,
+      "state" => issue.state,
+      "url" => issue.url
+    }
+  end
+
+  defp tool_response(success, payload) when is_boolean(success) do
+    output = Jason.encode!(payload, pretty: true)
+
+    %{
+      "success" => success,
+      "output" => output,
+      "contentItems" => [%{"type" => "inputText", "text" => output}]
+    }
   end
 
   defp normalize_state(state) when is_binary(state) do

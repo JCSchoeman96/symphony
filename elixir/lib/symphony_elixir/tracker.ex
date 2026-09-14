@@ -8,6 +8,7 @@ defmodule SymphonyElixir.Tracker do
   """
 
   alias SymphonyElixir.Config
+  alias SymphonyElixir.Tracker.Capabilities
   alias SymphonyElixir.Tracker.Issue
 
   @adapters %{
@@ -26,11 +27,13 @@ defmodule SymphonyElixir.Tracker do
   @callback execute_agent_tool(String.t(), term(), keyword()) :: map()
   @callback secret_environment_names(map()) :: [String.t()]
   @callback validate_config(map()) :: :ok | {:error, term()}
+  @callback capabilities() :: [Capabilities.capability()]
 
   @optional_callbacks agent_tool_specs: 0,
                       execute_agent_tool: 3,
                       fetch_dependency_graph: 0,
-                      validate_config: 1
+                      validate_config: 1,
+                      capabilities: 0
 
   @spec fetch_issues_by_states([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_issues_by_states(states) do
@@ -101,6 +104,42 @@ defmodule SymphonyElixir.Tracker do
       end
     end
   end
+
+  @spec capabilities() :: {:ok, [Capabilities.capability()]} | {:error, term()}
+  def capabilities do
+    Config.settings!().tracker.kind
+    |> capabilities_for_kind()
+  end
+
+  @spec capabilities_for_kind(String.t()) ::
+          {:ok, [Capabilities.capability()]} | {:error, term()}
+  def capabilities_for_kind(kind) when is_binary(kind) do
+    with {:ok, adapter} <- adapter_for_kind(kind),
+         {:ok, declared} <- Capabilities.validate_adapter(adapter) do
+      {:ok, declared}
+    else
+      {:error, {:invalid_provider_capability_declaration, _adapter, reason}} ->
+        {:error, {:invalid_provider_capability_declaration, kind, reason}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  @spec validate_routed_capabilities(map()) :: :ok | {:error, term()}
+  def validate_routed_capabilities(%{agent: %{routing: "legacy"}}), do: :ok
+
+  def validate_routed_capabilities(%{agent: %{routing: "routed"}, tracker: %{kind: kind}})
+      when is_binary(kind) do
+    with {:ok, declared} <- capabilities_for_kind(kind) do
+      case Capabilities.missing(declared) do
+        [] -> :ok
+        missing -> {:error, {:routed_provider_capabilities_missing, kind, missing}}
+      end
+    end
+  end
+
+  def validate_routed_capabilities(_settings), do: :ok
 
   @spec adapter() :: module()
   def adapter do

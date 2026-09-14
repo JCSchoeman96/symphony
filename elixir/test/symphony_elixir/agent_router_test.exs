@@ -510,6 +510,7 @@ defmodule SymphonyElixir.AgentRouterTest do
 
   test "workflow reload retains the last valid routed policy after an invalid override" do
     write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
       agent_routing: "routed"
     )
 
