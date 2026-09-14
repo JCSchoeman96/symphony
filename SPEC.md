@@ -460,6 +460,10 @@ Fields:
   - State keys are normalized (`trim + lowercase`) for lookup.
   - Invalid entries (non-positive or non-numeric) are ignored.
 
+The reference Elixir routed-profile extension also accepts an optional `concurrency_class` field.
+It is preserved in route identity and observability only; it does not create a separate scheduler
+capacity pool. Implementations must document whether an equivalent field is enforced or reserved.
+
 #### 5.3.6 `codex` (object)
 
 Fields:

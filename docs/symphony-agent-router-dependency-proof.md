@@ -1,7 +1,9 @@
 # Symphony Agent Router and Dependency Proof
 
-Status: local deterministic proof complete for SYM-14 and SYM-15. Automatic
-merge remains disabled. No Cursor runtime or second scheduler is included.
+Status: deterministic component proof is current through the remediation
+implementation. Optional live proof remains externally blocked until named
+disposable resources and explicit consent are supplied. Automatic merge
+remains disabled. No Cursor runtime or second scheduler is included.
 
 ## Executable proof
 
@@ -78,6 +80,93 @@ Native Linear relation normalization is separately covered by the Linear
 adapter tests. This proof intentionally does not create or mutate a live
 Linear/GitHub project: no external credentials or disposable project identity
 were supplied, so the result makes no unverified live-integration claim.
+
+## Deterministic proof inventory
+
+The local evidence is deliberately split by invariant and uses production code
+with in-memory/provider-shaped fixtures:
+
+- `agent_router_dependency_proof_test.exs` covers the routed lifecycle,
+  dependency fan-out/fan-in, canceled blockers, cyclic components, independent
+  progress, claims, and final diagnostics.
+- `dependency_completeness_test.exs` and `dependency_graph_test.exs` cover
+  complete graph acquisition, pagination, missing/malformed data, and cycle
+  handling.
+- `agent_router_orchestrator_test.exs` and `core_test.exs` cover poll
+  interruption, stale process messages, capacity accounting, and retry/review
+  limits using real OTP process boundaries.
+- `role_prompt_test.exs`, `profile_runtime_test.exs`, and
+  `agent_runtime_test.exs` cover role policy, reload/LKG behavior, active-attempt
+  stability, and model/runtime propagation across turns.
+- `transition_policy_test.exs` and `dynamic_tool_test.exs` cover the
+  workflow-controlled Linear transition boundary and safe failure payloads.
+- `observability_contract_test.exs` and the status/API/dashboard tests cover
+  termination reasons, dependency/capacity distinctions, and redaction.
+- `live_proof_gate_test.exs` covers the consent/configuration refusal path for
+  optional external tests.
+
+Run the complete deterministic gate from `elixir`:
+
+```bash
+mise exec -- make all
+```
+
+The validation matrix records the exact focused commands, test counts, and
+remediation commits. These tests prove component behavior only; they do not
+prove access to a real provider, a real Codex account, or a deployed topology.
+
+## Opt-in live-proof procedure
+
+Every provider live test is skipped unless all of the following are true at
+test compilation time:
+
+1. Its provider-specific run flag is `1`.
+2. `SYMPHONY_LIVE_PROOF_CONSENT` is exactly
+   `I_UNDERSTAND_THIS_MUTATES_NAMED_DISPOSABLE_RESOURCES`.
+3. The provider credential is present.
+4. The disposable provider scope is explicitly named.
+5. `SYMPHONY_LIVE_CODEX_HOME` names a Codex home containing `auth.json`.
+
+The gate reports only missing variable names and safe reasons; it never prints
+credential values. It does not infer that a resource is disposable from its
+name, so the operator remains responsible for supplying a scratch scope.
+
+For the Linear proof, configure a disposable team and run:
+
+```bash
+cd elixir
+export SYMPHONY_LIVE_PROOF_CONSENT=I_UNDERSTAND_THIS_MUTATES_NAMED_DISPOSABLE_RESOURCES
+export SYMPHONY_RUN_LIVE_E2E=1
+export LINEAR_API_KEY='[secret omitted]'
+export SYMPHONY_LIVE_LINEAR_TEAM_KEY='[named disposable team key]'
+export SYMPHONY_LIVE_CODEX_HOME='/absolute/path/to/disposable-codex-home'
+mise exec -- mix test test/symphony_elixir/live_e2e_test.exs --seed 0
+```
+
+The Linear test creates a uniquely named disposable project and issue, runs a
+real local and SSH worker scenario, reads issue context through read-only
+`linear_graphql`, and asks Codex to use `linear_transition` to move the issue
+to `In Review`. Its harness-only cleanup may use the direct API afterward; the
+agent boundary still rejects raw Linear GraphQL mutations. The issue and
+project cleanup are best-effort and should be checked in the named scratch
+team.
+
+For the GitHub proof, configure a scratch repository and run:
+
+```bash
+cd elixir
+export SYMPHONY_LIVE_PROOF_CONSENT=I_UNDERSTAND_THIS_MUTATES_NAMED_DISPOSABLE_RESOURCES
+export SYMPHONY_RUN_GITHUB_LIVE_E2E=1
+export GITHUB_TOKEN='[secret omitted]'
+export SYMPHONY_LIVE_GITHUB_REPO='owner/named-disposable-repository'
+export SYMPHONY_LIVE_CODEX_HOME='/absolute/path/to/disposable-codex-home'
+mise exec -- mix test test/symphony_elixir/github_live_e2e_test.exs --seed 0
+```
+
+The other optional provider smoke tests use the same consent and explicit
+Codex-home gate plus their provider-specific named scope and credential. The
+default `make all` run skips all six external tests; skipped is not passed and
+no live Linear/GitHub/Codex claim is made without captured external artifacts.
 
 ## Observability and safety evidence
 

@@ -55,6 +55,14 @@ handoffs and denies implementation/correction or merge handoffs when dependency 
 Raw Linear GraphQL mutations are rejected at this boundary; provider-native mutation tools for
 other adapters remain provider-specific permission boundaries.
 
+## Live proof
+
+Provider live tests are skipped unless the operator explicitly enables the test, names a disposable
+provider resource, supplies the provider credential and an explicit Codex home, and sets
+`SYMPHONY_LIVE_PROOF_CONSENT` to the documented exact token. A skipped test is not live proof.
+See [the proof procedure](docs/symphony-agent-router-dependency-proof.md) for the required variables,
+cleanup behavior, and the remaining external-proof limits.
+
 ---
 
 ## License

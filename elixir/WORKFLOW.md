@@ -62,6 +62,11 @@ the tracker state and the configured profile. Role prompts are packaged under
 elixir/prompts/ and may be updated at runtime; the active attempt keeps the
 prompt captured when it starts.
 
+The repository's optional live-proof tests are separate from this workflow. They require named
+disposable provider resources, an explicitly configured Codex home, provider credentials, and the
+exact `SYMPHONY_LIVE_PROOF_CONSENT` token before they can run. Missing consent or configuration
+keeps those tests skipped; it is never treated as live evidence.
+
 You are working on a Linear ticket `{{ issue.identifier }}`.
 
 ## Issue context

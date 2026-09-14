@@ -334,13 +334,27 @@ resources and launch a real `codex app-server` session:
 
 ```bash
 cd elixir
-export LINEAR_API_KEY=...
-make e2e
+export SYMPHONY_LIVE_PROOF_CONSENT=I_UNDERSTAND_THIS_MUTATES_NAMED_DISPOSABLE_RESOURCES
+export SYMPHONY_RUN_LIVE_E2E=1
+export LINEAR_API_KEY='[secret omitted]'
+export SYMPHONY_LIVE_LINEAR_TEAM_KEY='[named disposable team key]'
+export SYMPHONY_LIVE_CODEX_HOME=/absolute/path/to/disposable-codex-home
+mise exec -- make e2e
 ```
 
-Optional environment variables:
+The consent/configuration gate is mandatory. It requires the exact consent token above, the
+provider credential, a named disposable provider scope, and an explicitly configured Codex home
+containing `auth.json`; it never falls back to the operator's default `CODEX_HOME`. Missing consent
+or configuration leaves the test skipped, not passed. The gate reports only safe variable names and
+is covered by `live_proof_gate_test.exs`.
 
-- `SYMPHONY_LIVE_LINEAR_TEAM_KEY` defaults to `SYME2E`
+Linear live-proof variables:
+
+- `SYMPHONY_LIVE_LINEAR_TEAM_KEY` names the disposable parent team; there is no default.
+- `SYMPHONY_LIVE_PROOF_CONSENT` must equal `I_UNDERSTAND_THIS_MUTATES_NAMED_DISPOSABLE_RESOURCES`.
+- `SYMPHONY_RUN_LIVE_E2E=1` enables the two Linear scenarios.
+- `LINEAR_API_KEY` supplies the Linear credential without printing it.
+- `SYMPHONY_LIVE_CODEX_HOME` names the Codex home copied into the temporary worker environment.
 - `SYMPHONY_LIVE_SSH_WORKER_HOSTS` uses those SSH hosts when set, as a comma-separated list
 
 `make e2e` runs two live scenarios:
@@ -349,23 +363,26 @@ Optional environment variables:
 
 If `SYMPHONY_LIVE_SSH_WORKER_HOSTS` is unset, the SSH scenario uses `docker compose` to start two
 disposable SSH workers on `localhost:<port>`. The live test generates a temporary SSH keypair,
-mounts the host `~/.codex/auth.json` into each worker, verifies that Symphony can talk to them
+copies the explicitly configured Codex home auth into each worker, verifies that Symphony can talk to them
 over real SSH, then runs the same orchestration flow against those worker addresses. This keeps
 the transport representative without depending on long-lived external machines.
 
 Set `SYMPHONY_LIVE_SSH_WORKER_HOSTS` if you want `make e2e` to target real SSH hosts instead.
 
-The live test creates a temporary Linear project and issue, writes a temporary `WORKFLOW.md`, runs
-a real agent turn, verifies the workspace side effect, requires Codex to comment on and close the
-Linear issue, then marks the project completed so the run remains visible in Linear.
+The Linear live test creates a temporary project and issue in the named team, writes a temporary
+`WORKFLOW.md`, runs a real agent turn, verifies the workspace side effect, and requires Codex to
+read issue context through `linear_graphql` and use `linear_transition` to move the issue to `In
+Review`. The harness then cleans up the issue and project directly through the provider API.
 
 Run the opt-in GitHub Issues live test with a disposable/scratch repository:
 
 ```bash
 cd elixir
 export SYMPHONY_LIVE_GITHUB_REPO=owner/scratch-repo
-export GITHUB_TOKEN=...
-SYMPHONY_RUN_GITHUB_LIVE_E2E=1 mix test test/symphony_elixir/github_live_e2e_test.exs
+export GITHUB_TOKEN='[secret omitted]'
+export SYMPHONY_LIVE_PROOF_CONSENT=I_UNDERSTAND_THIS_MUTATES_NAMED_DISPOSABLE_RESOURCES
+export SYMPHONY_LIVE_CODEX_HOME=/absolute/path/to/disposable-codex-home
+SYMPHONY_RUN_GITHUB_LIVE_E2E=1 mise exec -- mix test test/symphony_elixir/github_live_e2e_test.exs --seed 0
 ```
 
 Run the opt-in Jira Cloud live test against a disposable project whose credential can browse,
@@ -377,7 +394,9 @@ export JIRA_BASE_URL=https://your-site.atlassian.net
 export JIRA_EMAIL=...
 export JIRA_API_TOKEN=...
 export SYMPHONY_LIVE_JIRA_PROJECT_KEY=TEST
-SYMPHONY_RUN_JIRA_LIVE_E2E=1 mix test test/symphony_elixir/jira_live_e2e_test.exs
+export SYMPHONY_LIVE_PROOF_CONSENT=I_UNDERSTAND_THIS_MUTATES_NAMED_DISPOSABLE_RESOURCES
+export SYMPHONY_LIVE_CODEX_HOME=/absolute/path/to/disposable-codex-home
+SYMPHONY_RUN_JIRA_LIVE_E2E=1 mise exec -- mix test test/symphony_elixir/jira_live_e2e_test.exs --seed 0
 ```
 
 Run the opt-in Asana live E2E against disposable Asana resources:
@@ -386,9 +405,11 @@ Run the opt-in Asana live E2E against disposable Asana resources:
 cd elixir
 export ASANA_PAT=...
 export SYMPHONY_LIVE_ASANA_WORKSPACE_GID=...
+export SYMPHONY_LIVE_PROOF_CONSENT=I_UNDERSTAND_THIS_MUTATES_NAMED_DISPOSABLE_RESOURCES
+export SYMPHONY_LIVE_CODEX_HOME=/absolute/path/to/disposable-codex-home
 # Required only when the workspace is an organization:
 # export SYMPHONY_LIVE_ASANA_TEAM_GID=...
-SYMPHONY_RUN_ASANA_LIVE_E2E=1 mix test test/symphony_elixir/asana_live_e2e_test.exs
+SYMPHONY_RUN_ASANA_LIVE_E2E=1 mise exec -- mix test test/symphony_elixir/asana_live_e2e_test.exs --seed 0
 ```
 
 Run the opt-in GitLab live E2E against a disposable project:
@@ -397,8 +418,13 @@ Run the opt-in GitLab live E2E against a disposable project:
 cd elixir
 export GITLAB_PAT=...
 export SYMPHONY_LIVE_GITLAB_PROJECT_ID=...
-SYMPHONY_RUN_GITLAB_LIVE_E2E=1 mix test test/symphony_elixir/gitlab_live_e2e_test.exs
+export SYMPHONY_LIVE_PROOF_CONSENT=I_UNDERSTAND_THIS_MUTATES_NAMED_DISPOSABLE_RESOURCES
+export SYMPHONY_LIVE_CODEX_HOME=/absolute/path/to/disposable-codex-home
+SYMPHONY_RUN_GITLAB_LIVE_E2E=1 mise exec -- mix test test/symphony_elixir/gitlab_live_e2e_test.exs --seed 0
 ```
+
+The complete deterministic proof and the external-proof boundary are recorded in
+[`../docs/symphony-agent-router-dependency-proof.md`](../docs/symphony-agent-router-dependency-proof.md).
 
 ## FAQ
 

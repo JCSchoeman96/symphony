@@ -7,14 +7,11 @@ defmodule SymphonyElixir.LiveE2ETest do
   @moduletag :live_e2e
   @moduletag timeout: 300_000
 
-  @default_team_key "SYME2E"
   @docker_worker_count 2
   @docker_support_dir Path.expand("../support/live_e2e_docker", __DIR__)
   @docker_compose_file Path.join(@docker_support_dir, "docker-compose.yml")
   @result_file "LIVE_E2E_RESULT.txt"
-  @live_e2e_skip_reason if(System.get_env("SYMPHONY_RUN_LIVE_E2E") != "1",
-                          do: "set SYMPHONY_RUN_LIVE_E2E=1 to enable the real Linear/Codex end-to-end test"
-                        )
+  @live_e2e_skip_reason SymphonyElixir.LiveProofGate.skip_reason(:linear, System.get_env())
 
   @team_query """
   query SymphonyLiveE2ETeam($key: String!) {
@@ -102,11 +99,14 @@ defmodule SymphonyElixir.LiveE2ETest do
         name
         type
       }
-      comments(first: 20) {
-        nodes {
-          body
-        }
-      }
+    }
+  }
+  """
+
+  @cleanup_issue_mutation """
+  mutation SymphonyLiveE2ECleanupIssue($id: String!, $stateId: String!) {
+    issueUpdate(id: $id, input: {stateId: $stateId}) {
+      success
     }
   }
   """
@@ -143,10 +143,28 @@ defmodule SymphonyElixir.LiveE2ETest do
   end
 
   defp active_state!(%{"states" => %{"nodes" => states}}) when is_list(states) do
-    Enum.find(states, &(&1["type"] == "started")) ||
-      Enum.find(states, &(&1["type"] == "unstarted")) ||
-      Enum.find(states, &(&1["type"] not in ["completed", "canceled"])) ||
-      flunk("expected team to expose at least one non-terminal workflow state")
+    Enum.find(states, fn state ->
+      normalize_state(state["name"]) in [
+        "todo",
+        "open",
+        "opened",
+        "pending",
+        "started",
+        "ready",
+        "in development",
+        "in progress"
+      ]
+    end) || flunk("expected team to expose a supported implementation workflow state")
+  end
+
+  defp review_state!(%{"states" => %{"nodes" => states}}) when is_list(states) do
+    Enum.find(states, &(normalize_state(&1["name"]) == "in review")) ||
+      flunk("expected team to expose an In Review workflow state")
+  end
+
+  defp terminal_state!(%{"states" => %{"nodes" => states}}) when is_list(states) do
+    Enum.find(states, &(&1["type"] == "completed")) ||
+      flunk("expected team to expose a completed workflow state")
   end
 
   defp terminal_state_names(%{"states" => %{"nodes" => states}}) when is_list(states) do
@@ -240,11 +258,17 @@ defmodule SymphonyElixir.LiveE2ETest do
   defp issue_completed?(%{"state" => %{"type" => type}}), do: type in ["completed", "canceled"]
   defp issue_completed?(_issue), do: false
 
-  defp issue_has_comment?(%{"comments" => %{"nodes" => comments}}, expected_body) when is_list(comments) do
-    Enum.any?(comments, &(&1["body"] == expected_body))
-  end
+  defp issue_in_review?(%{"state" => %{"name" => name}}), do: normalize_state(name) == "in review"
+  defp issue_in_review?(_issue), do: false
 
-  defp issue_has_comment?(_issue, _expected_body), do: false
+  defp cleanup_issue(issue_id, state_id) when is_binary(issue_id) and is_binary(state_id) do
+    update_entity(
+      @cleanup_issue_mutation,
+      %{id: issue_id, stateId: state_id},
+      "issueUpdate",
+      "issue"
+    )
+  end
 
   defp update_entity(mutation, variables, mutation_name, entity_name) do
     case Client.graphql(mutation, variables) do
@@ -295,7 +319,7 @@ defmodule SymphonyElixir.LiveE2ETest do
     end
   end
 
-  defp live_prompt(project_slug) do
+  defp live_prompt(project_slug, review_state_id) do
     """
     You are running a real Symphony end-to-end test.
 
@@ -322,24 +346,20 @@ defmodule SymphonyElixir.LiveE2ETest do
     project_slug=#{project_slug}
 
     Step 2:
-    You must use the `linear_graphql` tool to query the current issue by `{{ issue.id }}` and read:
-    - existing comments
+    You must use the read-only `linear_graphql` tool to query the current issue by `{{ issue.id }}` and read:
+    - the current issue state
     - team workflow states
 
     A turn that only creates the file is incomplete. Do not stop after Step 1.
-
-    If the exact comment body below is not already present, post exactly one comment on the current issue with this exact body:
-    #{expected_comment("{{ issue.identifier }}", project_slug)}
 
     Use these exact GraphQL operations:
 
     ```graphql
     query IssueContext($id: String!) {
       issue(id: $id) {
-        comments(first: 20) {
-          nodes {
-            body
-          }
+        state {
+          name
+          type
         }
         team {
           states(first: 50) {
@@ -354,36 +374,20 @@ defmodule SymphonyElixir.LiveE2ETest do
     }
     ```
 
-    ```graphql
-    mutation AddComment($issueId: String!, $body: String!) {
-      commentCreate(input: {issueId: $issueId, body: $body}) {
-        success
-      }
-    }
-    ```
-
     Step 3:
-    Use the same issue-context query result to choose a workflow state whose `type` is `completed`.
-    Then move the current issue to that state with this exact mutation:
-
-    ```graphql
-    mutation CompleteIssue($id: String!, $stateId: String!) {
-      issueUpdate(id: $id, input: {stateId: $stateId}) {
-        success
-      }
-    }
-    ```
+    Use the structured `linear_transition` tool exactly once with:
+    - `targetState`: `In Review`
+    - `targetStateId`: `#{review_state_id}`
+    Raw Linear GraphQL mutations are not available.
 
     Step 4:
     Verify all outcomes with one final `linear_graphql` query against `{{ issue.id }}`:
-    - the exact comment body is present
-    - the issue state type is `completed`
+    - the issue state name is `In Review`
 
     Do not ask for approval.
-    Stop only after all three conditions are true:
+    Stop only after both conditions are true:
     1. the file exists with the exact contents above
-    2. the Linear comment exists with the exact body above
-    3. the Linear issue is in a completed terminal state
+    2. the Linear issue is in `In Review`
     """
   end
 
@@ -391,9 +395,8 @@ defmodule SymphonyElixir.LiveE2ETest do
     "identifier=#{issue_identifier}\nproject_slug=#{project_slug}\n"
   end
 
-  defp expected_comment(issue_identifier, project_slug) do
-    "Symphony live e2e comment\nidentifier=#{issue_identifier}\nproject_slug=#{project_slug}"
-  end
+  defp normalize_state(state) when is_binary(state), do: state |> String.trim() |> String.downcase() |> String.replace(~r/\s+/, " ")
+  defp normalize_state(_state), do: ""
 
   defp receive_runtime_info!(issue_id) do
     receive do
@@ -440,7 +443,7 @@ defmodule SymphonyElixir.LiveE2ETest do
     workflow_root = Path.join(test_root, "workflow")
     workflow_file = Path.join(workflow_root, "WORKFLOW.md")
     worker_setup = live_worker_setup!(backend, run_id, test_root)
-    team_key = System.get_env("SYMPHONY_LIVE_LINEAR_TEAM_KEY") || @default_team_key
+    team_key = System.fetch_env!("SYMPHONY_LIVE_LINEAR_TEAM_KEY")
     original_workflow_path = Workflow.workflow_file_path()
     runtime_pid = Process.whereis(SymphonyElixir.AgentRuntimeSupervisor)
 
@@ -469,6 +472,8 @@ defmodule SymphonyElixir.LiveE2ETest do
 
       team = fetch_team!(team_key)
       active_state = active_state!(team)
+      review_state = review_state!(team)
+      terminal_state = terminal_state!(team)
       completed_project_status = completed_project_status!()
       terminal_states = terminal_state_names(team)
 
@@ -478,15 +483,15 @@ defmodule SymphonyElixir.LiveE2ETest do
           "Symphony Live E2E #{backend} #{System.unique_integer([:positive])}"
         )
 
-      try do
-        issue =
-          create_issue!(
-            team["id"],
-            project["id"],
-            active_state["id"],
-            "Symphony live e2e #{backend} issue for #{project["name"]}"
-          )
+      issue =
+        create_issue!(
+          team["id"],
+          project["id"],
+          active_state["id"],
+          "Symphony live e2e #{backend} issue for #{project["name"]}"
+        )
 
+      try do
         write_workflow_file!(workflow_file,
           tracker_api_token: "$LINEAR_API_KEY",
           tracker_project_slug: project["slugId"],
@@ -501,7 +506,7 @@ defmodule SymphonyElixir.LiveE2ETest do
           codex_turn_timeout_ms: 600_000,
           codex_stall_timeout_ms: 600_000,
           observability_enabled: false,
-          prompt: live_prompt(project["slugId"])
+          prompt: live_prompt(project["slugId"], review_state["id"])
         )
 
         assert :ok = AgentRunner.run(issue, self(), max_turns: 3)
@@ -512,9 +517,10 @@ defmodule SymphonyElixir.LiveE2ETest do
                  expected_result(issue.identifier, project["slugId"])
 
         issue_snapshot = fetch_issue_details!(issue.id)
-        assert issue_completed?(issue_snapshot)
-        assert issue_has_comment?(issue_snapshot, expected_comment(issue.identifier, project["slugId"]))
+        refute issue_completed?(issue_snapshot)
+        assert issue_in_review?(issue_snapshot)
       after
+        assert :ok = cleanup_issue(issue.id, terminal_state["id"])
         assert :ok = complete_project(project["id"], completed_project_status["id"])
       end
     after
@@ -558,13 +564,13 @@ defmodule SymphonyElixir.LiveE2ETest do
   end
 
   defp source_codex_auth_json! do
-    codex_home = System.get_env("CODEX_HOME") || Path.join(System.user_home!(), ".codex")
-    auth_json_path = Path.join(codex_home, "auth.json")
+    codex_home = System.get_env("SYMPHONY_LIVE_CODEX_HOME")
+    auth_json_path = if is_binary(codex_home), do: Path.join(codex_home, "auth.json"), else: nil
 
-    if File.regular?(auth_json_path) do
+    if is_binary(codex_home) and String.trim(codex_home) != "" and File.regular?(auth_json_path) do
       auth_json_path
     else
-      flunk("live e2e requires Codex auth at #{auth_json_path}")
+      flunk("live e2e requires Codex auth in the explicitly configured SYMPHONY_LIVE_CODEX_HOME")
     end
   end
 

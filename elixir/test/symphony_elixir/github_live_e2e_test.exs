@@ -9,9 +9,7 @@ defmodule SymphonyElixir.GitHub.LiveE2ETest do
   @api_url "https://api.github.com"
   @api_version "2022-11-28"
   @result_file "LIVE_GITHUB_E2E_RESULT.txt"
-  @live_e2e_skip_reason if(System.get_env("SYMPHONY_RUN_GITHUB_LIVE_E2E") != "1",
-                          do: "set SYMPHONY_RUN_GITHUB_LIVE_E2E=1 to enable the real GitHub/Codex end-to-end test"
-                        )
+  @live_e2e_skip_reason SymphonyElixir.LiveProofGate.skip_reason(:github, System.get_env())
 
   @tag skip: @live_e2e_skip_reason
   test "creates a real GitHub issue and closes it through github_api" do
@@ -343,14 +341,11 @@ defmodule SymphonyElixir.GitHub.LiveE2ETest do
     codex_home = Path.join(test_root, "codex-home")
     auth_json_path = Path.join(codex_home, "auth.json")
 
-    source_auth_json =
-      Path.join(
-        System.get_env("CODEX_HOME") || Path.join(System.user_home!(), ".codex"),
-        "auth.json"
-      )
+    codex_home = System.get_env("SYMPHONY_LIVE_CODEX_HOME")
+    source_auth_json = if is_binary(codex_home), do: Path.join(codex_home, "auth.json"), else: nil
 
-    unless File.regular?(source_auth_json) do
-      flunk("live GitHub e2e requires Codex auth")
+    unless is_binary(codex_home) and String.trim(codex_home) != "" and File.regular?(source_auth_json) do
+      flunk("live GitHub e2e requires Codex auth in the explicitly configured SYMPHONY_LIVE_CODEX_HOME")
     end
 
     File.mkdir_p!(codex_home)
