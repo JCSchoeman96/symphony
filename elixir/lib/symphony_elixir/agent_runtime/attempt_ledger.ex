@@ -11,7 +11,6 @@ defmodule SymphonyElixir.AgentRuntime.AttemptLedger do
   alias SymphonyElixir.Config.Schema
 
   @schema_version 1
-  @table :symphony_attempt_ledger
   @durable_counter_keys [:ordinary_failures, :ordinary_retries, :review_cycles]
   @base_record_keys [
     :schema_version,
@@ -31,7 +30,7 @@ defmodule SymphonyElixir.AgentRuntime.AttemptLedger do
   defstruct [:table, :path, :project_id, :tracker_identity, :write_fun, :sync_fun]
 
   @type t :: %__MODULE__{
-          table: atom(),
+          table: term(),
           path: Path.t(),
           project_id: String.t(),
           tracker_identity: map(),
@@ -67,25 +66,27 @@ defmodule SymphonyElixir.AgentRuntime.AttemptLedger do
          :ok <- validate_tracker_identity(tracker_identity),
          path <- path_for(project_id, opts),
          :ok <- ensure_parent_directory(path),
-         {:ok, table} <- open_table(path),
-         {:ok, ledger} <- build_ledger(table, path, project_id, tracker_identity, opts),
-         :ok <- initialize_or_validate(ledger) do
-      {:ok, ledger}
-    else
-      {:error, _reason} = error ->
-        close_table_if_open()
-        error
+         {:ok, table} <- open_table(path) do
+      result =
+        with {:ok, ledger} <- build_ledger(table, path, project_id, tracker_identity, opts),
+             :ok <- initialize_or_validate(ledger) do
+          {:ok, ledger}
+        end
+
+      case result do
+        {:ok, _ledger} ->
+          result
+
+        {:error, _reason} = error ->
+          _ = close_table(table)
+          error
+      end
     end
   end
 
   @spec close(t()) :: :ok | {:error, term()}
   def close(%__MODULE__{table: table}) do
-    case :dets.info(table) do
-      :undefined -> :ok
-      _ -> :dets.close(table)
-    end
-  catch
-    :exit, reason -> {:error, {:ledger_close_failed, reason}}
+    close_table(table)
   end
 
   @spec current(t(), String.t()) :: {:ok, record()} | :not_found | {:error, term()}
@@ -565,14 +566,16 @@ defmodule SymphonyElixir.AgentRuntime.AttemptLedger do
   end
 
   defp open_table(path) do
-    case :dets.open_file(@table, type: :set, file: String.to_charlist(path), auto_save: :infinity) do
-      {:ok, @table} ->
+    table = path
+
+    case :dets.open_file(table, type: :set, file: String.to_charlist(path), auto_save: :infinity) do
+      {:ok, ^table} ->
         case File.chmod(path, 0o600) do
           :ok ->
-            {:ok, @table}
+            {:ok, table}
 
           {:error, reason} ->
-            :dets.close(@table)
+            _ = close_table(table)
             {:error, {:ledger_permissions_failed, reason}}
         end
 
@@ -584,13 +587,13 @@ defmodule SymphonyElixir.AgentRuntime.AttemptLedger do
     end
   end
 
-  defp close_table_if_open do
-    case :dets.info(@table) do
+  defp close_table(table) do
+    case :dets.info(table) do
       :undefined -> :ok
-      _ -> :dets.close(@table)
+      _ -> :dets.close(table)
     end
   catch
-    :exit, _reason -> :ok
+    :exit, reason -> {:error, {:ledger_close_failed, reason}}
   end
 
   defp ensure_parent_directory(path), do: path |> Path.dirname() |> File.mkdir_p()
