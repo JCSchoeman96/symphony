@@ -1,6 +1,7 @@
 # Agent-router remediation requirement/evidence matrix
 
-Status: active remediation ledger. The code in this worktree is based on the
+Status: deterministic remediation complete; live provider proof remains
+explicitly pending authorization. The code in this worktree is based on the
 merged PR #2 commit `af74d10` (2026-09-14). This file deliberately separates
 deterministic component evidence from live Linear/GitHub/Codex proof.
 
@@ -17,8 +18,9 @@ deterministic component evidence from live Linear/GitHub/Codex proof.
 
 ## Review findings
 
-The implementation and evidence columns are updated as each bounded task is
-completed. “Pending” is intentional until a test and validation command exist.
+The implementation and evidence columns were updated as each bounded task was
+completed. Historical baseline rows retain their original scope; no live claim
+is implied by a skipped test.
 
 | ID | Requirement / risk | Regression test | Implementation evidence | Commit evidence | Validation evidence | Live-proof status / limitation |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -68,13 +70,13 @@ completed. “Pending” is intentional until a test and validation command exis
 
 ## Validation ledger
 
-Each completed task must add its focused command/result here and retain the
-full-suite result in the handoff. Until then, no row above is a completion
-claim.
+Each bounded task records its focused command/result here and retains the
+full-suite result in the handoff. Historical baseline evidence is not a
+post-remediation validation claim.
 
 | Task | Focused/affected result | `mise exec -- make all` | `git diff --check` | Commit |
 | --- | --- | --- | --- | --- |
-| Baseline | `351 tests, 0 failures, 6 skipped` | Pending after remediation | Clean at base | `af74d10` |
+| Baseline | `351 tests, 0 failures, 6 skipped` | Not applicable; baseline captured before remediation | Clean at base | `af74d10` |
 | Task 1 | 361 full tests, 0 failures, 6 skipped; 100% coverage | `mise exec -- make all`: passed; Credo clean; Dialyzer 0 errors | Clean | `df419fb` |
 | Task 2 | `362 tests, 0 failures, 6 skipped`; 100% coverage | `mise exec -- make all`: passed; Credo clean; Dialyzer 0 errors | Clean | `df8db00` |
 | Task 3 | `dependency_completeness_test.exs` plus affected graph/policy/adapter/orchestrator suite; full run: `374 tests, 0 failures, 6 skipped`; 100% total coverage | `mise exec -- make all`: passed; Credo clean; Dialyzer 0 errors | Clean | `30e0edb` |
@@ -84,7 +86,7 @@ claim.
 | Task 7 | `observability_contract_test.exs`: `9 tests, 0 failures`; affected status/presenter/API/dashboard/orchestrator/core set: `138 tests, 0 failures`; full run: `398 tests, 0 failures, 6 skipped`; 100% total coverage | `mise exec -- make all`: passed; Credo clean; Dialyzer 0 errors | Clean | `d45d8c3` |
 | Task 8 | `transition_policy_test.exs` + `dynamic_tool_test.exs`: `31 tests, 0 failures`; affected runtime/tool/app-server/provider set: `75 tests, 0 failures`; full run: `413 tests, 0 failures, 6 skipped`; 100% total coverage | `mise exec -- make all`: passed; Credo clean; Dialyzer 0 errors | Clean | `8a28391` |
 | Task 9 | `live_proof_gate_test.exs` + live provider set: `11 tests, 0 failures, 6 skipped`; full run: `418 tests, 0 failures, 6 skipped`; 100% total coverage | `mise exec -- make all`: passed; Credo clean; Dialyzer 0 errors | Clean | `d482e36` |
-| Task 10 | Final fresh verification and matrix audit | Pending | Pending | Pending |
+| Task 10 | Fresh `mise exec -- mix test --seed 0`: `418 tests, 0 failures, 6 skipped`; final matrix audit completed | `mise exec -- make all`: passed; build, format check, specs/Credo, coverage at 100% total, Dialyzer 0 errors | Clean | `b56d2dc` |
 
 ## External-proof boundary
 
