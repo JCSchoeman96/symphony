@@ -110,7 +110,14 @@ defmodule SymphonyElixir.AgentRunner do
     max_turns = max_turns_for_run(route, opts)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issues_by_ids/1)
     runtime = Keyword.get(opts, :runtime, AgentRuntime.Codex)
-    runtime_opts = opts |> Keyword.put(:worker_host, worker_host) |> profile_runtime_options(route)
+
+    runtime_opts =
+      opts
+      |> Keyword.put(:worker_host, worker_host)
+      |> profile_runtime_options(route)
+      |> Keyword.put(:agent_tool_context, agent_tool_context(issue, route, opts))
+
+    role_prompt = PromptBuilder.role_prompt(route)
 
     with {:ok, session} <- runtime.start_session(workspace, runtime_opts) do
       context = %{
@@ -119,9 +126,10 @@ defmodule SymphonyElixir.AgentRunner do
         workspace: workspace,
         issue: issue,
         codex_update_recipient: codex_update_recipient,
-        opts: opts,
+        opts: runtime_opts,
         issue_state_fetcher: issue_state_fetcher,
-        route: route
+        route: route,
+        role_prompt: role_prompt
       }
 
       run_runtime_session(runtime, session, fn ->
@@ -131,7 +139,8 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp do_run_codex_turns(context, turn_number, max_turns) do
-    prompt = build_turn_prompt(context.issue, context.opts, turn_number, max_turns)
+    prompt_opts = Keyword.put(context.opts, :role_prompt, context.role_prompt)
+    prompt = build_turn_prompt(context.issue, prompt_opts, turn_number, max_turns)
 
     with {:ok, _turn_result} <-
            context.runtime.run_turn(
@@ -251,7 +260,7 @@ defmodule SymphonyElixir.AgentRunner do
   defp continue_with_issue_and_route(issue, issue_state_fetcher, %Route{}) do
     case continue_with_issue?(issue, issue_state_fetcher) do
       {:continue, %Issue{} = refreshed_issue} ->
-        case Router.resolve(refreshed_issue, Config.settings!().agent.profiles) do
+        case resolve_route(refreshed_issue) do
           {:ok, %Route{} = refreshed_route} ->
             {:continue, refreshed_issue, refreshed_route}
 
@@ -261,6 +270,16 @@ defmodule SymphonyElixir.AgentRunner do
 
       other ->
         other
+    end
+  end
+
+  defp resolve_route(%Issue{} = issue) do
+    settings = Config.settings!()
+
+    if settings.agent.routing == "legacy" do
+      {:ok, Route.legacy(issue)}
+    else
+      Router.resolve(issue, settings.agent.profiles, settings.agent.routes)
     end
   end
 
@@ -291,6 +310,9 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp dependency_metadata(decision) when is_map(decision) do
     Map.take(decision, [
+      :allowed?,
+      :dependency_completeness,
+      :merge_permitted?,
       :dependency_status,
       :dependent_state,
       :responsibility,
@@ -307,6 +329,31 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp dependency_decision(_issue, _route), do: %{allowed?: true}
+
+  defp agent_tool_context(%Issue{} = issue, %Route{} = route, opts) do
+    %{
+      issue_id: issue.id,
+      current_issue_state: issue.state,
+      responsibility: route.responsibility,
+      dependency_decision: dependency_decision_from_options(issue, route, opts)
+    }
+  end
+
+  defp agent_tool_context(%Issue{} = issue, _route, _opts) do
+    %{
+      issue_id: issue.id,
+      current_issue_state: issue.state,
+      responsibility: nil,
+      dependency_decision: %{allowed?: false, dependency_completeness: :unavailable}
+    }
+  end
+
+  defp dependency_decision_from_options(issue, route, opts) do
+    case Keyword.get(opts, :dependency_decision) do
+      %{allowed?: _} = decision -> decision
+      _ -> dependency_decision(issue, route)
+    end
+  end
 
   defp dependency_policy_options do
     settings = Config.settings!()
@@ -359,7 +406,13 @@ defmodule SymphonyElixir.AgentRunner do
     - Focus on the remaining ticket work and do not end the turn while the issue stays active unless you are truly blocked.
     """
 
-    PromptBuilder.with_role_prompt(continuation, Keyword.get(opts, :route))
+    case Keyword.fetch(opts, :role_prompt) do
+      {:ok, role_prompt} ->
+        PromptBuilder.with_role_prompt(continuation, Keyword.get(opts, :route), role_prompt)
+
+      :error ->
+        PromptBuilder.with_role_prompt(continuation, Keyword.get(opts, :route))
+    end
   end
 
   defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher) when is_binary(issue_id) do

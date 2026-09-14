@@ -515,7 +515,17 @@ defmodule SymphonyElixir.CoreTest do
         },
         claimed: MapSet.new([issue_id]),
         codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
-        retry_attempts: %{}
+        retry_attempts: %{},
+        attempt_counters: %{
+          issue_id => %{
+            ordinary_failures: 2,
+            ordinary_retries: 2,
+            review_cycles: 1,
+            capacity_waits: 0,
+            continuations: 0,
+            route_changes: 1
+          }
+        }
       }
 
       issue = %Issue{
@@ -533,6 +543,7 @@ defmodule SymphonyElixir.CoreTest do
       refute MapSet.member?(updated_state.claimed, issue_id)
       refute Process.alive?(agent_pid)
       assert File.exists?(workspace)
+      assert updated_state.attempt_counters[issue_id].ordinary_failures == 2
     after
       File.rm_rf(test_root)
     end
@@ -591,7 +602,17 @@ defmodule SymphonyElixir.CoreTest do
         },
         claimed: MapSet.new([issue_id]),
         codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
-        retry_attempts: %{}
+        retry_attempts: %{},
+        attempt_counters: %{
+          issue_id => %{
+            ordinary_failures: 2,
+            ordinary_retries: 2,
+            review_cycles: 1,
+            capacity_waits: 0,
+            continuations: 0,
+            route_changes: 1
+          }
+        }
       }
 
       issue = %Issue{
@@ -610,6 +631,7 @@ defmodule SymphonyElixir.CoreTest do
       refute Process.alive?(agent_pid)
       assert File.read!(cleanup_marker) == "stopped"
       refute File.exists?(workspace)
+      refute Map.has_key?(updated_state.attempt_counters, issue_id)
     after
       File.rm_rf(test_root)
     end
@@ -1056,6 +1078,7 @@ defmodule SymphonyElixir.CoreTest do
     refute Map.has_key?(state.running, issue_id)
     assert MapSet.member?(state.completed, issue_id)
     assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
+    assert state.attempt_counters[issue_id].continuations == 1
     assert is_integer(due_at_ms)
     assert_due_at_uses_delay(due_at_ms, before_ms, after_ms, 1_000)
   end
@@ -1140,6 +1163,132 @@ defmodule SymphonyElixir.CoreTest do
     assert_due_in_range(due_at_ms, 9_000, 10_500)
   end
 
+  test "ordinary failures stop after three retries and retain a human-attention record" do
+    issue_id = "issue-retry-limit"
+    issue = %Issue{id: issue_id, identifier: "MT-567", state: "In Progress"}
+    orchestrator_name = Module.concat(__MODULE__, :RetryLimitOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    Enum.each(0..2, fn retry_attempt ->
+      state = simulate_worker_down(pid, issue, retry_attempt, :boom)
+
+      assert state.retry_attempts[issue_id].attempt == retry_attempt + 1
+      assert state.attempt_counters[issue_id].ordinary_retries == retry_attempt + 1
+    end)
+
+    state = simulate_worker_down(pid, issue, 3, :boom)
+
+    refute Map.has_key?(state.retry_attempts, issue_id)
+    assert %{retry_attempt: 3, error: error} = state.blocked[issue_id]
+    assert error =~ "ordinary retry limit"
+    assert state.attempt_counters[issue_id].ordinary_failures == 4
+    assert state.attempt_counters[issue_id].ordinary_retries == 3
+    assert MapSet.member?(state.claimed, issue_id)
+  end
+
+  test "review correction cycles stop after three independent failures" do
+    issue_id = "issue-review-limit"
+    issue = %Issue{id: issue_id, identifier: "MT-568", state: "In Review"}
+    orchestrator_name = Module.concat(__MODULE__, :ReviewLimitOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    Enum.each(1..3, fn _cycle ->
+      state = simulate_route_change_down(pid, issue)
+
+      assert state.retry_attempts[issue_id].attempt == 1
+      assert state.attempt_counters[issue_id].review_cycles in 1..3
+    end)
+
+    state = simulate_route_change_down(pid, issue)
+
+    refute Map.has_key?(state.retry_attempts, issue_id)
+    assert %{error: error} = state.blocked[issue_id]
+    assert error =~ "review cycle limit"
+    assert state.attempt_counters[issue_id].review_cycles == 3
+    assert state.attempt_counters[issue_id].route_changes == 4
+  end
+
+  test "capacity pressure keeps the retry attempt and does not charge failure budget" do
+    issue_id = "issue-capacity-wait"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-569",
+      title: "Wait for a slot",
+      state: "In Progress",
+      dispatchable: true
+    }
+
+    occupied_issue = %Issue{
+      id: "occupied-slot",
+      identifier: "MT-OCCUPIED",
+      title: "Occupy slot",
+      state: "In Progress"
+    }
+
+    counters = %{
+      ordinary_failures: 2,
+      ordinary_retries: 2,
+      review_cycles: 1,
+      capacity_waits: 0,
+      continuations: 0,
+      route_changes: 1
+    }
+
+    state = %Orchestrator.State{
+      max_concurrent_agents: 1,
+      running: %{"occupied-slot" => %{issue: occupied_issue}},
+      claimed: MapSet.new([issue_id]),
+      retry_attempts: %{},
+      attempt_counters: %{issue_id => counters}
+    }
+
+    updated_state =
+      Orchestrator.handle_retry_issue_lookup_for_test(issue, state, issue_id, 2, %{
+        identifier: issue.identifier,
+        error: "agent exited"
+      })
+
+    assert %{attempt: 2, delay_type: :capacity_wait, error: "no available orchestrator slots"} =
+             updated_state.retry_attempts[issue_id]
+
+    assert updated_state.attempt_counters[issue_id] == %{counters | capacity_waits: 1}
+  end
+
+  test "workflow reload retains attempt counters for the live issue lineage" do
+    issue_id = "issue-reload-counters"
+
+    counters = %{
+      ordinary_failures: 2,
+      ordinary_retries: 2,
+      review_cycles: 1,
+      capacity_waits: 4,
+      continuations: 2,
+      route_changes: 1
+    }
+
+    state = %Orchestrator.State{attempt_counters: %{issue_id => counters}}
+
+    write_workflow_file!(Workflow.workflow_file_path(), max_concurrent_agents: 1)
+
+    assert {:reply, _snapshot, reloaded_state} =
+             Orchestrator.handle_call(:snapshot, {self(), make_ref()}, state)
+
+    assert reloaded_state.attempt_counters[issue_id] == counters
+  end
+
   test "stale retry timer messages do not consume newer retry entries" do
     issue_id = "issue-stale-retry"
     orchestrator_name = Module.concat(__MODULE__, :StaleRetryOrchestrator)
@@ -1178,6 +1327,57 @@ defmodule SymphonyElixir.CoreTest do
              identifier: "MT-561",
              error: "agent exited: :boom"
            } = :sys.get_state(pid).retry_attempts[issue_id]
+  end
+
+  defp simulate_worker_down(pid, issue, retry_attempt, reason) do
+    ref = make_ref()
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: issue.identifier,
+      issue: issue,
+      retry_attempt: retry_attempt,
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn state ->
+      state
+      |> Map.put(:running, %{issue.id => running_entry})
+      |> Map.put(:claimed, MapSet.put(state.claimed, issue.id))
+      |> Map.put(:retry_attempts, %{})
+    end)
+
+    send(pid, {:DOWN, ref, :process, self(), reason})
+    :sys.get_state(pid)
+  end
+
+  defp simulate_route_change_down(pid, issue) do
+    ref = make_ref()
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: issue.identifier,
+      issue: issue,
+      retry_attempt: 0,
+      route_change_termination: true,
+      route_change: %{
+        previous: %{profile_name: "reviewer", responsibility: "review"},
+        next: %{profile_name: "fixer", responsibility: "correction"}
+      },
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn state ->
+      state
+      |> Map.put(:running, %{issue.id => running_entry})
+      |> Map.put(:claimed, MapSet.put(state.claimed, issue.id))
+      |> Map.put(:retry_attempts, %{})
+    end)
+
+    send(pid, {:DOWN, ref, :process, self(), :normal})
+    :sys.get_state(pid)
   end
 
   test "manual refresh coalesces repeated requests and ignores superseded ticks" do
@@ -1510,16 +1710,15 @@ defmodule SymphonyElixir.CoreTest do
     prompt = PromptBuilder.build_prompt(issue, attempt: 2)
 
     assert prompt =~ "You are working on a Linear ticket `MT-616`"
-    assert prompt =~ "Issue context:"
+    assert prompt =~ "## Issue context"
     assert prompt =~ "Identifier: MT-616"
     assert prompt =~ "Title: Use rich templates for WORKFLOW.md"
     assert prompt =~ "Current status: In Progress"
     assert prompt =~ "https://example.org/issues/MT-616/use-rich-templates-for-workflowmd"
-    assert prompt =~ "This is an unattended orchestration session."
-    assert prompt =~ "Only stop early for a true external blocker"
-    assert prompt =~ "Do not include \"next steps for user\""
-    assert prompt =~ "open and follow `.codex/skills/land/SKILL.md`"
-    assert prompt =~ "Do not call `gh pr merge` directly"
+    assert prompt =~ "role policy"
+    assert prompt =~ "The orchestrator owns polling"
+    assert prompt =~ "Do not invent completion"
+    refute prompt =~ "Do not call `gh pr merge` directly"
     assert prompt =~ "Follow-up context:"
     assert prompt =~ "follow-up attempt #2"
   end
@@ -2088,6 +2287,7 @@ defmodule SymphonyElixir.CoreTest do
       }
 
       assert {:ok, _result} = AppServer.run(workspace, "Fix workspace start args", issue)
+
       assert {:ok, canonical_workspace} = SymphonyElixir.PathSafety.canonicalize(workspace)
 
       trace = File.read!(trace_file)
@@ -2326,7 +2526,8 @@ defmodule SymphonyElixir.CoreTest do
         labels: ["backend"]
       }
 
-      assert {:ok, _result} = AppServer.run(workspace, "Fix workspace start args", issue)
+      assert {:ok, _result} =
+               AppServer.run(workspace, "Fix workspace start args", issue, model: "selected-model")
 
       lines = File.read!(trace_file) |> String.split("\n", trim: true)
 
@@ -2358,6 +2559,7 @@ defmodule SymphonyElixir.CoreTest do
                  |> then(fn payload ->
                    payload["method"] == "turn/start" &&
                      get_in(payload, ["params", "approvalPolicy"]) == "on-request" &&
+                     get_in(payload, ["params", "model"]) == "selected-model" &&
                      get_in(payload, ["params", "sandboxPolicy"]) == expected_turn_policy
                  end)
                else

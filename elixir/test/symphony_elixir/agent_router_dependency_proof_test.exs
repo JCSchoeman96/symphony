@@ -167,7 +167,7 @@ defmodule SymphonyElixir.AgentRouterDependencyProofTest do
 
     assert planner_prompt =~ "Do not modify production source"
     assert builder_prompt =~ "Do not self-review, approve, or merge"
-    assert reviewer_prompt =~ "Do not modify source, push fixes, or merge"
+    assert reviewer_prompt =~ "Do not modify source, push fixes, approve work, or merge"
     assert fixer_prompt =~ "Do not approve your own changes or merge"
 
     merge_issue = %{issue | state: "Ready to Merge"}

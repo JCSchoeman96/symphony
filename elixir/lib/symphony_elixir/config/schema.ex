@@ -6,6 +6,7 @@ defmodule SymphonyElixir.Config.Schema do
   import Ecto.Changeset
 
   alias SymphonyElixir.AgentRuntime.Profile
+  alias SymphonyElixir.AgentRuntime.Router
   alias SymphonyElixir.PathSafety
 
   @primary_key false
@@ -154,7 +155,11 @@ defmodule SymphonyElixir.Config.Schema do
       field(:max_turns, :integer, default: 20)
       field(:max_retry_backoff_ms, :integer, default: 300_000)
       field(:max_concurrent_agents_by_state, :map, default: %{})
-      field(:profiles, :map, default: %{})
+      # Legacy workflows remain outside the routed permission model unless the
+      # operator opts in explicitly with `routing: routed`.
+      field(:routing, :string, default: "legacy")
+      field(:profiles, :map)
+      field(:routes, :map, default: %{})
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
@@ -167,13 +172,17 @@ defmodule SymphonyElixir.Config.Schema do
           :max_turns,
           :max_retry_backoff_ms,
           :max_concurrent_agents_by_state,
-          :profiles
+          :routing,
+          :profiles,
+          :routes
         ],
         empty_values: []
       )
       |> validate_number(:max_concurrent_agents, greater_than: 0)
       |> validate_number(:max_turns, greater_than: 0)
       |> validate_number(:max_retry_backoff_ms, greater_than: 0)
+      |> update_change(:routing, &Schema.normalize_routing/1)
+      |> validate_inclusion(:routing, ["legacy", "routed"])
       |> update_change(:max_concurrent_agents_by_state, &Schema.normalize_state_limits/1)
       |> Schema.validate_state_limits(:max_concurrent_agents_by_state)
     end
@@ -366,6 +375,14 @@ defmodule SymphonyElixir.Config.Schema do
   end
 
   @doc false
+  @spec normalize_routing(String.t()) :: String.t()
+  def normalize_routing(routing) when is_binary(routing) do
+    routing
+    |> String.trim()
+    |> String.downcase()
+  end
+
+  @doc false
   @spec normalize_state_limits(nil | map()) :: map()
   def normalize_state_limits(nil), do: %{}
 
@@ -483,18 +500,60 @@ defmodule SymphonyElixir.Config.Schema do
   end
 
   defp finalize_agent_profiles(settings) do
-    case Profile.resolve_profiles(
-           settings.agent.profiles,
-           settings.codex.command,
-           settings.agent.max_turns
-         ) do
-      {:ok, profiles} ->
-        {:ok, %{settings | agent: %{settings.agent | profiles: profiles}}}
+    case {settings.agent.routing, settings.agent.profiles} do
+      {"legacy", nil} ->
+        {:ok, settings}
 
-      {:error, {:invalid_profile, name, message}} ->
-        {:error, {:invalid_workflow_config, "agent.profiles.#{name} #{message}"}}
+      {"legacy", _profiles} ->
+        {:error, {:invalid_workflow_config, "agent.profiles requires explicit agent.routing: routed"}}
+
+      {"routed", profiles} ->
+        resolve_routed_profiles(settings, profiles)
     end
   end
+
+  defp resolve_routed_profiles(settings, profiles) do
+    case Profile.resolve_profiles(profiles, settings.codex.command, settings.agent.max_turns) do
+      {:ok, resolved_profiles} -> validate_routed_profiles(settings, resolved_profiles)
+      {:error, reason} -> format_profile_error(reason)
+    end
+  end
+
+  defp validate_routed_profiles(settings, resolved_profiles) do
+    case Router.validate_routes(settings.agent.routes, resolved_profiles) do
+      :ok ->
+        {:ok, %{settings | agent: %{settings.agent | profiles: resolved_profiles}}}
+
+      {:error, {:unreferenced_profile, name}} ->
+        {:error, {:invalid_workflow_config, "agent.profiles.#{name} must be selected by agent.routes"}}
+
+      {:error, reason} ->
+        {:error, {:invalid_workflow_config, "agent.routes #{format_route_error(reason)}"}}
+    end
+  end
+
+  defp format_profile_error({:invalid_profile, name, message}),
+    do: {:error, {:invalid_workflow_config, "agent.profiles.#{name} #{message}"}}
+
+  defp format_profile_error({:profile_name_collision, name, raw_names}),
+    do: {:error, {:invalid_workflow_config, "agent.profiles name collision for #{name}: #{Enum.join(raw_names, ", ")}"}}
+
+  defp format_profile_error({:invalid_profile_name, raw_name}),
+    do: {:error, {:invalid_workflow_config, "agent.profiles contains an invalid name #{inspect(raw_name)}"}}
+
+  defp format_route_error({:missing_profile, name}), do: "references missing profile #{name}"
+
+  defp format_route_error({:route_responsibility_mismatch, state, responsibility}),
+    do: "state #{state} cannot use #{responsibility} responsibility"
+
+  defp format_route_error({:route_state_collision, state}),
+    do: "contains duplicate normalized state #{state}"
+
+  defp format_route_error({:invalid_route_state, state}),
+    do: "contains invalid state #{inspect(state)}"
+
+  defp format_route_error({:invalid_route_profile, state, profile}),
+    do: "state #{state} references invalid profile #{inspect(profile)}"
 
   defp normalize_keys(value) when is_map(value) do
     Enum.reduce(value, %{}, fn {key, raw_value}, normalized ->

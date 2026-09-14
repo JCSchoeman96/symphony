@@ -22,7 +22,8 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 5. Keeps Codex working on the issue until the work is done
 
 During app-server sessions, the selected tracker adapter may advertise provider-native tools. The
-Linear serves `linear_graphql`, GitHub Issues serves `github_api`, Jira Cloud serves
+Linear adapter serves read-only `linear_graphql` plus the workflow-controlled `linear_transition`,
+GitHub Issues serves `github_api`, Jira Cloud serves
 `jira_rest`, Asana serves `asana_api`, and GitLab serves `gitlab_api`. Symphony executes those
 tools with configured host-side auth and removes declared tracker-token environment variables from
 the Codex child, so the agent does not need a second tracker login.
@@ -35,6 +36,21 @@ issue claimed and exposes it as blocked in the runtime state, JSON API, and dash
 entries are in memory only; restarting the orchestrator clears that blocked map, so any still-active
 tracker issue can become a dispatch candidate again after restart.
 
+Automatic retry accounting is bounded per issue lineage: ordinary runtime or spawn failures receive
+at most three retries, capacity waits do not consume that failure budget, and reviewer-to-correction
+loops stop after three cycles. Normal continuations and route changes are tracked separately. CI
+infrastructure is not retried automatically; a human or provider path must handle it.
+
+Retry dispatch rechecks eligibility, capacity, and the selected role after the final graph read.
+Review-to-correction transitions count even if observed during retry wait or denied by dependencies.
+Previously counted route changes are not charged again when the retry starts.
+
+Legacy routing preserves per-issue dependency checks for adapters that do not implement a graph
+read, without reporting a complete graph. Routed implementation/correction remain disabled for
+those adapters. A graph fetch failure from a supported adapter still fails closed in either mode.
+Built-in role prompt names must match the profile responsibility, including `.md` names. Custom
+prompt text and files are trusted operator configuration and require manual role-policy review.
+
 ## How to use it
 
 1. Make sure your codebase is set up to work well with agents: see
@@ -43,14 +59,15 @@ tracker issue can become a dispatch candidate again after restart.
    set it as the `LINEAR_API_KEY` environment variable.
 3. Copy this directory's `WORKFLOW.md` to your repo.
 4. Optionally copy the `commit`, `push`, `pull`, `land`, and `linear` skills to your repo.
-   - The `linear` skill expects Symphony's `linear_graphql` app-server tool for raw Linear GraphQL
-     operations such as comment editing or upload flows.
+   - The `linear` skill can use Symphony's `linear_graphql` app-server tool for read-only Linear
+     GraphQL queries. Workflow state changes must use `linear_transition`; raw GraphQL mutations
+     are rejected at the Linear boundary.
 5. Customize the copied `WORKFLOW.md` file for your project.
    - To get your project's slug, right-click the project and copy its URL. The slug is part of the
      URL.
-   - When creating a workflow based on this repo, note that it depends on non-standard Linear
-     issue statuses: "Rework", "Human Review", and "Merging". You can customize them in
-     Team Settings → Workflow in Linear.
+   - When creating a workflow based on this repo, configure the lifecycle states used by your team.
+     The shipped routed example uses Planning, Todo, Ready, In Progress, In Review,
+     Changes Requested, and Ready to Merge; merge remains a deferred, read-only gate.
 6. Follow the instructions below to install the required runtime dependencies and start the service.
 
 ## Prerequisites
@@ -143,6 +160,13 @@ Title: {{ issue.title }} Body: {{ issue.description }}
 Notes:
 
 - If a value is missing, defaults are used.
+- `agent.routing: routed` opts into explicit responsibility-aware profiles and
+  state routes. The shipped `WORKFLOW.md` shows the complete sample; workflows
+  without `agent.profiles` retain the legacy compatibility path.
+- Routed role policies are shipped in `prompts/`. Symphony reads those files
+  at runtime and uses the packaged copy when a file is unavailable. An active
+  attempt captures its role prompt when it starts, so a later file edit applies
+  to future attempts only.
 - `tracker.kind` selects an adapter. Adapter-owned endpoint, scope, and auth settings belong under
   `tracker.provider`; the current Linear adapter still accepts the older flat `endpoint`,
   `api_key`, `project_slug`, and `assignee` aliases for compatibility.
@@ -220,14 +244,23 @@ codex:
 - Dispatchability: the adapter marks an issue dispatchable only when optional assignee routing
   matches and a `Todo` issue has no non-terminal blocker. The generic scheduler then applies
   active/terminal states, required labels, claims, retries, and concurrency.
-- Tool: the Linear adapter advertises `linear_graphql`, accepting either a raw query string or an
-  object with nonblank `query` and optional object `variables`. Symphony executes it host-side
-  with the session-bound endpoint/token and strips declared token environment variables from the
-  Codex child. `project_slug` scopes scheduler reads, not raw tool calls; the tool can access
-  whatever the configured Linear token can access.
-- Responsibility and errors: `linear_graphql` adds no idempotency key, retry, scope guard, or
-  rate-limit policy, so workflows own idempotent mutations and handling provider errors. Read/config
-  failures use `{:error, :missing_linear_api_token}`, `{:error, :missing_linear_project_slug}`,
+- Tools: the Linear adapter advertises read-only `linear_graphql`, accepting either a raw query
+  string or an object with nonblank `query` and optional object `variables`, and
+  `linear_transition`, which accepts `targetState` plus a verified `targetStateId` for the
+  bound current issue. The transition tool authorizes only the handoff owned by the bound
+  responsibility; implementation/correction require a complete, allowed dependency decision,
+  and `In Review` → `Ready to Merge` additionally requires `merge_permitted?`. Raw GraphQL
+  mutations are rejected. Both tools execute host-side with the session-bound endpoint/token and
+  strip declared token environment variables from the Codex child. `project_slug` scopes scheduler
+  reads, while the configured Linear credential remains the provider permission boundary.
+- Responsibility and errors: `linear_transition` is the only lifecycle write path exposed by the
+  Linear adapter. It verifies the requested state name/ID against the current issue's team before
+  issuing the fixed `issueUpdate` mutation. Each handoff refreshes the project dependency graph
+  with bound provider settings and authorizes against current state, completeness, and cycles.
+  Each bound session may attempt one mutation, including uncertain transport outcomes. A new
+  session is required for another handoff. Concurrent tracker edits can still race between the
+  final read and mutation; this is not provider-side atomic authorization. Read/config failures use
+  `{:error, :missing_linear_api_token}`, `{:error, :missing_linear_project_slug}`,
   `{:error, :invalid_linear_endpoint}`, `{:error, :invalid_linear_assignee}`,
   `{:error, :missing_linear_viewer_identity}`, `{:error, {:linear_api_status, status}}`,
   `{:error, {:linear_api_request, reason}}`, `{:error, {:linear_graphql_errors, errors}}`,
@@ -315,13 +348,27 @@ resources and launch a real `codex app-server` session:
 
 ```bash
 cd elixir
-export LINEAR_API_KEY=...
-make e2e
+export SYMPHONY_LIVE_PROOF_CONSENT=I_UNDERSTAND_THIS_MUTATES_NAMED_DISPOSABLE_RESOURCES
+export SYMPHONY_RUN_LIVE_E2E=1
+export LINEAR_API_KEY='[secret omitted]'
+export SYMPHONY_LIVE_LINEAR_TEAM_KEY='[named disposable team key]'
+export SYMPHONY_LIVE_CODEX_HOME=/absolute/path/to/disposable-codex-home
+mise exec -- make e2e
 ```
 
-Optional environment variables:
+The consent/configuration gate is mandatory. It requires the exact consent token above, the
+provider credential, a named disposable provider scope, and an explicitly configured Codex home
+containing `auth.json`; it never falls back to the operator's default `CODEX_HOME`. Missing consent
+or configuration leaves the test skipped, not passed. The gate reports only safe variable names and
+is covered by `live_proof_gate_test.exs`.
 
-- `SYMPHONY_LIVE_LINEAR_TEAM_KEY` defaults to `SYME2E`
+Linear live-proof variables:
+
+- `SYMPHONY_LIVE_LINEAR_TEAM_KEY` names the disposable parent team; there is no default.
+- `SYMPHONY_LIVE_PROOF_CONSENT` must equal `I_UNDERSTAND_THIS_MUTATES_NAMED_DISPOSABLE_RESOURCES`.
+- `SYMPHONY_RUN_LIVE_E2E=1` enables the two Linear scenarios.
+- `LINEAR_API_KEY` supplies the Linear credential without printing it.
+- `SYMPHONY_LIVE_CODEX_HOME` names the Codex home copied into the temporary worker environment.
 - `SYMPHONY_LIVE_SSH_WORKER_HOSTS` uses those SSH hosts when set, as a comma-separated list
 
 `make e2e` runs two live scenarios:
@@ -330,23 +377,26 @@ Optional environment variables:
 
 If `SYMPHONY_LIVE_SSH_WORKER_HOSTS` is unset, the SSH scenario uses `docker compose` to start two
 disposable SSH workers on `localhost:<port>`. The live test generates a temporary SSH keypair,
-mounts the host `~/.codex/auth.json` into each worker, verifies that Symphony can talk to them
+copies the explicitly configured Codex home auth into each worker, verifies that Symphony can talk to them
 over real SSH, then runs the same orchestration flow against those worker addresses. This keeps
 the transport representative without depending on long-lived external machines.
 
 Set `SYMPHONY_LIVE_SSH_WORKER_HOSTS` if you want `make e2e` to target real SSH hosts instead.
 
-The live test creates a temporary Linear project and issue, writes a temporary `WORKFLOW.md`, runs
-a real agent turn, verifies the workspace side effect, requires Codex to comment on and close the
-Linear issue, then marks the project completed so the run remains visible in Linear.
+The Linear live test creates a temporary project and issue in the named team, writes a temporary
+`WORKFLOW.md`, runs a real agent turn, verifies the workspace side effect, and requires Codex to
+read issue context through `linear_graphql` and use `linear_transition` to move the issue to `In
+Review`. The harness then cleans up the issue and project directly through the provider API.
 
 Run the opt-in GitHub Issues live test with a disposable/scratch repository:
 
 ```bash
 cd elixir
 export SYMPHONY_LIVE_GITHUB_REPO=owner/scratch-repo
-export GITHUB_TOKEN=...
-SYMPHONY_RUN_GITHUB_LIVE_E2E=1 mix test test/symphony_elixir/github_live_e2e_test.exs
+export GITHUB_TOKEN='[secret omitted]'
+export SYMPHONY_LIVE_PROOF_CONSENT=I_UNDERSTAND_THIS_MUTATES_NAMED_DISPOSABLE_RESOURCES
+export SYMPHONY_LIVE_CODEX_HOME=/absolute/path/to/disposable-codex-home
+SYMPHONY_RUN_GITHUB_LIVE_E2E=1 mise exec -- mix test test/symphony_elixir/github_live_e2e_test.exs --seed 0
 ```
 
 Run the opt-in Jira Cloud live test against a disposable project whose credential can browse,
@@ -358,7 +408,9 @@ export JIRA_BASE_URL=https://your-site.atlassian.net
 export JIRA_EMAIL=...
 export JIRA_API_TOKEN=...
 export SYMPHONY_LIVE_JIRA_PROJECT_KEY=TEST
-SYMPHONY_RUN_JIRA_LIVE_E2E=1 mix test test/symphony_elixir/jira_live_e2e_test.exs
+export SYMPHONY_LIVE_PROOF_CONSENT=I_UNDERSTAND_THIS_MUTATES_NAMED_DISPOSABLE_RESOURCES
+export SYMPHONY_LIVE_CODEX_HOME=/absolute/path/to/disposable-codex-home
+SYMPHONY_RUN_JIRA_LIVE_E2E=1 mise exec -- mix test test/symphony_elixir/jira_live_e2e_test.exs --seed 0
 ```
 
 Run the opt-in Asana live E2E against disposable Asana resources:
@@ -367,9 +419,11 @@ Run the opt-in Asana live E2E against disposable Asana resources:
 cd elixir
 export ASANA_PAT=...
 export SYMPHONY_LIVE_ASANA_WORKSPACE_GID=...
+export SYMPHONY_LIVE_PROOF_CONSENT=I_UNDERSTAND_THIS_MUTATES_NAMED_DISPOSABLE_RESOURCES
+export SYMPHONY_LIVE_CODEX_HOME=/absolute/path/to/disposable-codex-home
 # Required only when the workspace is an organization:
 # export SYMPHONY_LIVE_ASANA_TEAM_GID=...
-SYMPHONY_RUN_ASANA_LIVE_E2E=1 mix test test/symphony_elixir/asana_live_e2e_test.exs
+SYMPHONY_RUN_ASANA_LIVE_E2E=1 mise exec -- mix test test/symphony_elixir/asana_live_e2e_test.exs --seed 0
 ```
 
 Run the opt-in GitLab live E2E against a disposable project:
@@ -378,8 +432,13 @@ Run the opt-in GitLab live E2E against a disposable project:
 cd elixir
 export GITLAB_PAT=...
 export SYMPHONY_LIVE_GITLAB_PROJECT_ID=...
-SYMPHONY_RUN_GITLAB_LIVE_E2E=1 mix test test/symphony_elixir/gitlab_live_e2e_test.exs
+export SYMPHONY_LIVE_PROOF_CONSENT=I_UNDERSTAND_THIS_MUTATES_NAMED_DISPOSABLE_RESOURCES
+export SYMPHONY_LIVE_CODEX_HOME=/absolute/path/to/disposable-codex-home
+SYMPHONY_RUN_GITLAB_LIVE_E2E=1 mise exec -- mix test test/symphony_elixir/gitlab_live_e2e_test.exs --seed 0
 ```
+
+The complete deterministic proof and the external-proof boundary are recorded in
+[`../docs/symphony-agent-router-dependency-proof.md`](../docs/symphony-agent-router-dependency-proof.md).
 
 ## FAQ
 

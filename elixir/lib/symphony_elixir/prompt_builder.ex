@@ -43,20 +43,30 @@ defmodule SymphonyElixir.PromptBuilder do
       )
       |> IO.iodata_to_binary()
 
-    with_role_prompt(rendered_prompt, Keyword.get(opts, :route))
+    case Keyword.fetch(opts, :role_prompt) do
+      {:ok, captured_role_prompt} ->
+        with_role_prompt(rendered_prompt, Keyword.get(opts, :route), captured_role_prompt)
+
+      :error ->
+        with_role_prompt(rendered_prompt, Keyword.get(opts, :route))
+    end
   end
 
   @spec with_role_prompt(String.t(), Route.t() | nil) :: String.t()
   def with_role_prompt(prompt, %Route{} = route) when is_binary(prompt) do
-    case role_prompt(route) do
-      nil -> prompt
-      role_prompt -> String.trim(role_prompt) <> "\n\n--- Workflow task ---\n" <> prompt
-    end
+    with_role_prompt(prompt, route, role_prompt(route))
   end
 
   def with_role_prompt(prompt, _route), do: prompt
 
-  @spec role_prompt(Route.t()) :: String.t() | nil
+  @spec with_role_prompt(String.t(), Route.t() | nil, String.t() | nil) :: String.t()
+  def with_role_prompt(prompt, %Route{}, captured_role_prompt) when is_binary(prompt) do
+    append_role_prompt(prompt, captured_role_prompt)
+  end
+
+  def with_role_prompt(prompt, _route, _captured_role_prompt), do: prompt
+
+  @spec role_prompt(Route.t() | nil) :: String.t() | nil
   def role_prompt(%Route{profile: %Profile{} = profile, profile_name: profile_name}) do
     prompt_name = profile.prompt || profile_name
 
@@ -126,9 +136,9 @@ defmodule SymphonyElixir.PromptBuilder do
   end
 
   defp fetch_role_prompt(normalized_name) do
-    case Map.fetch(@embedded_role_prompts, Path.rootname(normalized_name)) do
+    case read_role_prompt_file(normalized_name) do
       {:ok, prompt} -> {:ok, prompt}
-      :error -> read_role_prompt_file(normalized_name)
+      :error -> Map.fetch(@embedded_role_prompts, Path.rootname(normalized_name))
     end
   end
 
@@ -149,8 +159,18 @@ defmodule SymphonyElixir.PromptBuilder do
         _ -> normalized_name <> ".md"
       end
 
-    Path.join(@role_prompt_root, filename)
+    Path.join(role_prompt_root(), filename)
   end
+
+  defp role_prompt_root do
+    Application.get_env(:symphony_elixir, :role_prompt_root, @role_prompt_root)
+  end
+
+  defp append_role_prompt(prompt, role_prompt) when is_binary(prompt) and is_binary(role_prompt) do
+    String.trim(role_prompt) <> "\n\n--- Workflow task ---\n" <> prompt
+  end
+
+  defp append_role_prompt(prompt, _role_prompt), do: prompt
 
   defp inline_role_prompt(prompt_name, profile_name) when is_binary(prompt_name) do
     prompt_name = String.trim(prompt_name)

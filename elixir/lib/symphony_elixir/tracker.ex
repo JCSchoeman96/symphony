@@ -21,6 +21,7 @@ defmodule SymphonyElixir.Tracker do
 
   @callback fetch_issues_by_states([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
   @callback fetch_issues_by_ids([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
+  @callback fetch_dependency_graph() :: {:ok, term()} | {:error, term()}
   @callback agent_tool_specs() :: [map()]
   @callback execute_agent_tool(String.t(), term(), keyword()) :: map()
   @callback secret_environment_names(map()) :: [String.t()]
@@ -28,6 +29,7 @@ defmodule SymphonyElixir.Tracker do
 
   @optional_callbacks agent_tool_specs: 0,
                       execute_agent_tool: 3,
+                      fetch_dependency_graph: 0,
                       validate_config: 1
 
   @spec fetch_issues_by_states([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
@@ -40,13 +42,24 @@ defmodule SymphonyElixir.Tracker do
     adapter().fetch_issues_by_ids(issue_ids)
   end
 
+  @spec fetch_dependency_graph() :: {:ok, term()} | {:error, term()}
+  def fetch_dependency_graph do
+    adapter = adapter()
+
+    if Code.ensure_loaded?(adapter) and function_exported?(adapter, :fetch_dependency_graph, 0) do
+      adapter.fetch_dependency_graph()
+    else
+      {:error, :dependency_graph_unsupported}
+    end
+  end
+
   @doc """
   Captures the selected adapter and effective tracker settings for one
   app-server session so tool advertisement and execution cannot drift across a
   workflow reload.
   """
-  @spec bind_agent_tools() :: map()
-  def bind_agent_tools do
+  @spec bind_agent_tools(keyword()) :: map()
+  def bind_agent_tools(opts \\ []) do
     tracker_settings = Config.settings!().tracker
     adapter = adapter_for_settings!(tracker_settings)
 
@@ -54,13 +67,15 @@ defmodule SymphonyElixir.Tracker do
       adapter: adapter,
       tracker_settings: tracker_settings,
       tool_specs: adapter_agent_tool_specs(adapter),
-      secret_environment_names: adapter_secret_environment_names(adapter, tracker_settings)
+      secret_environment_names: adapter_secret_environment_names(adapter, tracker_settings),
+      transition_guard: :atomics.new(1, []),
+      agent_tool_context: Keyword.get(opts, :agent_tool_context, %{})
     }
   end
 
   @spec execute_bound_agent_tool(map(), String.t(), term(), keyword()) :: map()
   def execute_bound_agent_tool(
-        %{adapter: adapter, tracker_settings: tracker_settings},
+        %{adapter: adapter, tracker_settings: tracker_settings} = binding,
         tool,
         arguments,
         opts \\ []
@@ -69,7 +84,10 @@ defmodule SymphonyElixir.Tracker do
       adapter,
       tool,
       arguments,
-      Keyword.put(opts, :tracker_settings, tracker_settings)
+      opts
+      |> Keyword.put(:tracker_settings, tracker_settings)
+      |> Keyword.put(:transition_guard, Map.get(binding, :transition_guard))
+      |> Keyword.put(:agent_tool_context, Map.get(binding, :agent_tool_context, %{}))
     )
   end
 

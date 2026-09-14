@@ -43,6 +43,10 @@ defmodule SymphonyElixir.Linear.Client do
               }
             }
           }
+          pageInfo {
+            hasNextPage
+            endCursor
+          }
         }
         createdAt
         updatedAt
@@ -88,9 +92,85 @@ defmodule SymphonyElixir.Linear.Client do
               }
             }
           }
+          pageInfo {
+            hasNextPage
+            endCursor
+          }
         }
         createdAt
         updatedAt
+      }
+    }
+  }
+  """
+
+  @relation_page_query """
+  query SymphonyLinearIssueRelations($issueId: ID!, $relationFirst: Int!, $after: String) {
+    issue(id: $issueId) {
+      inverseRelations(first: $relationFirst, after: $after) {
+        nodes {
+          type
+          issue {
+            id
+            identifier
+            state {
+              name
+            }
+          }
+        }
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+      }
+    }
+  }
+  """
+
+  @dependency_graph_query """
+  query SymphonyLinearDependencyGraph($projectSlug: String!, $first: Int!, $relationFirst: Int!, $after: String) {
+    issues(filter: {project: {slugId: {eq: $projectSlug}}}, first: $first, after: $after) {
+      nodes {
+        id
+        identifier
+        title
+        description
+        priority
+        state {
+          name
+        }
+        branchName
+        url
+        assignee {
+          id
+        }
+        labels {
+          nodes {
+            name
+          }
+        }
+        inverseRelations(first: $relationFirst) {
+          nodes {
+            type
+            issue {
+              id
+              identifier
+              state {
+                name
+              }
+            }
+          }
+          pageInfo {
+            hasNextPage
+            endCursor
+          }
+        }
+        createdAt
+        updatedAt
+      }
+      pageInfo {
+        hasNextPage
+        endCursor
       }
     }
   }
@@ -134,6 +214,22 @@ defmodule SymphonyElixir.Linear.Client do
           do_fetch_issue_states(ids, tracker.project_slug, assignee_filter)
         end
     end
+  end
+
+  @spec fetch_dependency_graph() :: {:ok, [Issue.t()]} | {:error, term()}
+  def fetch_dependency_graph do
+    with {:ok, tracker} <- configured_tracker_for_read(),
+         {:ok, assignee_filter} <- routing_assignee_filter() do
+      do_fetch_dependency_graph(tracker.project_slug, assignee_filter)
+    end
+  end
+
+  @doc "Reads the full graph using the provider settings captured by a bound tool session."
+  @spec fetch_dependency_graph(keyword()) :: {:ok, [Issue.t()]} | {:error, term()}
+  def fetch_dependency_graph(opts) when is_list(opts) do
+    tracker = Keyword.fetch!(opts, :tracker_settings)
+    graphql_fun = Keyword.get(opts, :graphql_fun, fn query, variables -> graphql(query, variables, opts) end)
+    do_fetch_dependency_graph(tracker.project_slug, nil, graphql_fun)
   end
 
   @spec graphql(String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
@@ -217,6 +313,14 @@ defmodule SymphonyElixir.Linear.Client do
     end
   end
 
+  @doc false
+  @spec fetch_dependency_graph_for_test(String.t(), (String.t(), map() -> {:ok, map()} | {:error, term()})) ::
+          {:ok, [Issue.t()]} | {:error, term()}
+  def fetch_dependency_graph_for_test(project_slug, graphql_fun)
+      when is_binary(project_slug) and is_function(graphql_fun, 2) do
+    do_fetch_dependency_graph(project_slug, nil, graphql_fun)
+  end
+
   defp do_fetch_by_states(project_slug, state_names, assignee_filter) do
     do_fetch_by_states_page(project_slug, state_names, assignee_filter, nil, [])
   end
@@ -230,7 +334,7 @@ defmodule SymphonyElixir.Linear.Client do
              relationFirst: @issue_page_size,
              after: after_cursor
            }),
-         {:ok, issues, page_info} <- decode_linear_page_response(body, assignee_filter) do
+         {:ok, issues, page_info} <- decode_linear_page_response(body, assignee_filter, &graphql/2) do
       updated_acc = prepend_page_issues(issues, acc_issues)
 
       case next_page_cursor(page_info) do
@@ -243,6 +347,80 @@ defmodule SymphonyElixir.Linear.Client do
         {:error, reason} ->
           {:error, reason}
       end
+    end
+  end
+
+  defp do_fetch_dependency_graph(project_slug, assignee_filter),
+    do: do_fetch_dependency_graph(project_slug, assignee_filter, &graphql/2)
+
+  defp do_fetch_dependency_graph(project_slug, assignee_filter, graphql_fun)
+       when is_binary(project_slug) and is_function(graphql_fun, 2) do
+    do_fetch_dependency_graph_page(project_slug, assignee_filter, graphql_fun, nil, [])
+  end
+
+  defp do_fetch_dependency_graph_page(
+         project_slug,
+         assignee_filter,
+         graphql_fun,
+         after_cursor,
+         acc_issues
+       ) do
+    case graphql_fun.(@dependency_graph_query, %{
+           projectSlug: project_slug,
+           first: @issue_page_size,
+           relationFirst: @issue_page_size,
+           after: after_cursor
+         }) do
+      {:ok, body} ->
+        decode_dependency_graph_page(
+          body,
+          project_slug,
+          assignee_filter,
+          graphql_fun,
+          acc_issues
+        )
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp decode_dependency_graph_page(
+         body,
+         project_slug,
+         assignee_filter,
+         graphql_fun,
+         acc_issues
+       ) do
+    with {:ok, issues, page_info} <-
+           decode_linear_page_response(body, assignee_filter, graphql_fun) do
+      updated_acc = prepend_page_issues(issues, acc_issues)
+      continue_dependency_graph_page(project_slug, assignee_filter, graphql_fun, page_info, updated_acc)
+    end
+  end
+
+  defp continue_dependency_graph_page(
+         project_slug,
+         assignee_filter,
+         graphql_fun,
+         page_info,
+         acc_issues
+       ) do
+    case next_page_cursor(page_info) do
+      {:ok, next_cursor} ->
+        do_fetch_dependency_graph_page(
+          project_slug,
+          assignee_filter,
+          graphql_fun,
+          next_cursor,
+          acc_issues
+        )
+
+      :done ->
+        {:ok, finalize_paginated_issues(acc_issues)}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -279,7 +457,7 @@ defmodule SymphonyElixir.Linear.Client do
            relationFirst: @issue_page_size
          }) do
       {:ok, body} ->
-        with {:ok, issues} <- decode_linear_response_strict(body, assignee_filter) do
+        with {:ok, issues} <- decode_linear_response_strict(body, assignee_filter, graphql_fun) do
           updated_acc = prepend_page_issues(issues, acc_issues)
 
           do_fetch_issue_states_page(
@@ -392,48 +570,64 @@ defmodule SymphonyElixir.Linear.Client do
     )
   end
 
-  defp decode_linear_response(response, assignee_filter) do
-    decode_linear_response(response, assignee_filter, :drop_malformed)
+  defp decode_linear_response_strict(response, assignee_filter, graphql_fun) do
+    decode_linear_response(response, assignee_filter, :error_on_malformed, graphql_fun)
   end
 
-  defp decode_linear_response_strict(response, assignee_filter) do
-    decode_linear_response(response, assignee_filter, :error_on_malformed)
+  defp decode_linear_response(
+         %{"errors" => _errors},
+         _assignee_filter,
+         _malformed_policy,
+         _graphql_fun
+       ) do
+    {:error, :linear_graphql_errors}
   end
 
   defp decode_linear_response(
          %{"data" => %{"issues" => %{"nodes" => nodes}}},
          assignee_filter,
-         malformed_policy
+         malformed_policy,
+         graphql_fun
        )
-       when is_list(nodes) do
-    issues =
-      nodes
-      |> Enum.map(&normalize_issue(&1, assignee_filter))
+       when is_list(nodes) and is_function(graphql_fun, 2) do
+    with {:ok, normalized_nodes} <- normalize_issue_nodes(nodes, assignee_filter, graphql_fun) do
+      malformed_count = Enum.count(normalized_nodes, &is_nil/1)
 
-    malformed_count = Enum.count(issues, &is_nil/1)
+      case {malformed_policy, malformed_count > 0} do
+        {:error_on_malformed, true} ->
+          {:error, :linear_unknown_payload}
 
-    case {malformed_policy, malformed_count > 0} do
-      {:error_on_malformed, true} ->
-        {:error, :linear_unknown_payload}
+        {:drop_malformed, true} ->
+          Logger.warning("Dropping malformed Linear issue records count=#{malformed_count}")
+          {:ok, Enum.reject(normalized_nodes, &is_nil/1)}
 
-      {:drop_malformed, true} ->
-        Logger.warning("Dropping malformed Linear issue records count=#{malformed_count}")
-        {:ok, Enum.reject(issues, &is_nil/1)}
+        {:drop_malformed, false} ->
+          {:ok, normalized_nodes}
 
-      {:drop_malformed, false} ->
-        {:ok, issues}
-
-      {_, false} ->
-        {:ok, issues}
+        {_, false} ->
+          {:ok, normalized_nodes}
+      end
     end
   end
 
-  defp decode_linear_response(%{"errors" => errors}, _assignee_filter, _malformed_policy) do
-    {:error, {:linear_graphql_errors, errors}}
+  defp decode_linear_response(_unknown, _assignee_filter, _malformed_policy, _graphql_fun) do
+    {:error, :linear_unknown_payload}
   end
 
-  defp decode_linear_response(_unknown, _assignee_filter, _malformed_policy) do
-    {:error, :linear_unknown_payload}
+  defp normalize_issue_nodes(nodes, assignee_filter, graphql_fun) do
+    Enum.reduce_while(nodes, {:ok, []}, fn node, {:ok, acc} ->
+      case complete_issue_relations(node, graphql_fun) do
+        {:ok, complete_node} ->
+          {:cont, {:ok, [normalize_issue(complete_node, assignee_filter) | acc]}}
+
+        {:error, reason} ->
+          {:halt, {:error, reason}}
+      end
+    end)
+    |> case do
+      {:ok, issues} -> {:ok, Enum.reverse(issues)}
+      {:error, reason} -> {:error, reason}
+    end
   end
 
   defp decode_linear_page_response(
@@ -441,18 +635,51 @@ defmodule SymphonyElixir.Linear.Client do
            "data" => %{
              "issues" => %{
                "nodes" => nodes,
-               "pageInfo" => %{"hasNextPage" => has_next_page, "endCursor" => end_cursor}
+               "pageInfo" => page_info
              }
            }
          },
-         assignee_filter
+         assignee_filter,
+         graphql_fun
        ) do
-    with {:ok, issues} <- decode_linear_response(%{"data" => %{"issues" => %{"nodes" => nodes}}}, assignee_filter) do
-      {:ok, issues, %{has_next_page: has_next_page == true, end_cursor: end_cursor}}
+    with {:ok, page_info} <- decode_issue_page_info(page_info),
+         {:ok, issues} <-
+           decode_linear_response(
+             %{"data" => %{"issues" => %{"nodes" => nodes}}},
+             assignee_filter,
+             :drop_malformed,
+             graphql_fun
+           ) do
+      {:ok, issues, page_info}
     end
   end
 
-  defp decode_linear_page_response(response, assignee_filter), do: decode_linear_response(response, assignee_filter)
+  defp decode_linear_page_response(response, _assignee_filter, graphql_fun)
+       when is_function(graphql_fun, 2) do
+    case response do
+      %{"errors" => _errors} ->
+        {:error, :linear_graphql_errors}
+
+      _ ->
+        {:error, :linear_missing_page_info}
+    end
+  end
+
+  defp decode_issue_page_info(%{"hasNextPage" => has_next_page, "endCursor" => end_cursor})
+       when is_boolean(has_next_page) do
+    case next_page_cursor(%{has_next_page: has_next_page, end_cursor: end_cursor}) do
+      {:ok, _cursor} ->
+        {:ok, %{has_next_page: true, end_cursor: end_cursor}}
+
+      :done ->
+        {:ok, %{has_next_page: false, end_cursor: end_cursor}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp decode_issue_page_info(_page_info), do: {:error, :linear_missing_page_info}
 
   defp next_page_cursor(%{has_next_page: true, end_cursor: end_cursor})
        when is_binary(end_cursor) and byte_size(end_cursor) > 0 do
@@ -462,12 +689,148 @@ defmodule SymphonyElixir.Linear.Client do
   defp next_page_cursor(%{has_next_page: true}), do: {:error, :linear_missing_end_cursor}
   defp next_page_cursor(_), do: :done
 
+  defp complete_issue_relations(%{"id" => issue_id, "inverseRelations" => relation_connection} = issue, graphql_fun)
+       when is_binary(issue_id) and is_function(graphql_fun, 2) do
+    case relation_connection_page(relation_connection) do
+      {:ok, %{has_next_page: true, end_cursor: end_cursor, nodes: nodes}} ->
+        fetch_relation_pages(issue, nodes, end_cursor, graphql_fun)
+
+      {:ok, _page} ->
+        {:ok, issue}
+
+      {:error, _reason} ->
+        {:ok, issue}
+    end
+  end
+
+  defp complete_issue_relations(issue, _graphql_fun), do: {:ok, issue}
+
+  defp fetch_relation_pages(issue, nodes, after_cursor, graphql_fun) do
+    case graphql_fun.(@relation_page_query, %{
+           issueId: issue["id"],
+           relationFirst: @issue_page_size,
+           after: after_cursor
+         }) do
+      {:ok, %{"data" => %{"issue" => %{"inverseRelations" => relation_connection}}}} ->
+        case relation_connection_page(relation_connection) do
+          {:ok, %{has_next_page: true, end_cursor: next_cursor, nodes: next_nodes}} ->
+            fetch_relation_pages(issue, nodes ++ next_nodes, next_cursor, graphql_fun)
+
+          {:ok, %{has_next_page: false, nodes: final_nodes}} ->
+            {:ok,
+             Map.put(issue, "inverseRelations", %{
+               "nodes" => nodes ++ final_nodes,
+               "pageInfo" => %{"hasNextPage" => false, "endCursor" => nil}
+             })}
+
+          {:error, reason} ->
+            {:error, {:linear_relation_response, reason}}
+        end
+
+      {:ok, %{"errors" => _errors}} ->
+        {:error, {:linear_relation_response, :linear_graphql_errors}}
+
+      {:ok, _body} ->
+        {:error, {:linear_relation_response, :linear_unknown_payload}}
+
+      {:error, reason} ->
+        {:error, {:linear_relation_request, reason}}
+    end
+  end
+
+  defp relation_connection_page(%{"nodes" => nodes, "pageInfo" => page_info}) when is_list(nodes) do
+    with {:ok, %{has_next_page: has_next_page, end_cursor: end_cursor}} <-
+           decode_relation_page_info(page_info) do
+      {:ok,
+       %{
+         nodes: nodes,
+         has_next_page: has_next_page,
+         end_cursor: end_cursor
+       }}
+    end
+  end
+
+  defp relation_connection_page(%{"nodes" => _nodes}),
+    do: {:error, :missing_relation_page_info}
+
+  defp relation_connection_page(%{"pageInfo" => _page_info}),
+    do: {:error, :missing_relation_nodes}
+
+  defp relation_connection_page(_connection), do: {:error, :missing_relation_connection}
+
+  defp decode_relation_page_info(%{"hasNextPage" => has_next_page, "endCursor" => end_cursor})
+       when is_boolean(has_next_page) do
+    case next_page_cursor(%{has_next_page: has_next_page, end_cursor: end_cursor}) do
+      {:ok, _cursor} ->
+        {:ok, %{has_next_page: true, end_cursor: end_cursor}}
+
+      :done ->
+        {:ok, %{has_next_page: false, end_cursor: end_cursor}}
+
+      {:error, reason} ->
+        {:error, relation_completeness_reason(reason)}
+    end
+  end
+
+  defp decode_relation_page_info(_page_info), do: {:error, :missing_relation_page_info}
+
+  defp relation_completeness(%{"inverseRelations" => %{"nodes" => nodes, "pageInfo" => page_info}})
+       when is_list(nodes) do
+    with {:ok, %{has_next_page: false}} <- decode_relation_page_info(page_info),
+         :ok <- validate_relation_nodes(nodes) do
+      :complete
+    else
+      {:ok, %{has_next_page: true}} -> {:incomplete, :relation_page_truncated}
+      {:error, reason} -> {:incomplete, relation_completeness_reason(reason)}
+      {:incomplete, reason} -> {:incomplete, reason}
+    end
+  end
+
+  defp relation_completeness(%{"inverseRelations" => %{"nodes" => _nodes}}),
+    do: {:incomplete, :missing_relation_page_info}
+
+  defp relation_completeness(%{"inverseRelations" => %{"pageInfo" => _page_info}}),
+    do: {:incomplete, :missing_relation_nodes}
+
+  defp relation_completeness(%{"inverseRelations" => _connection}),
+    do: {:incomplete, :malformed_relation_connection}
+
+  defp relation_completeness(_issue), do: {:incomplete, :missing_relation_connection}
+
+  defp relation_completeness_reason(:linear_missing_end_cursor), do: :missing_relation_end_cursor
+  defp relation_completeness_reason(:missing_relation_page_info), do: :missing_relation_page_info
+  defp relation_completeness_reason(:missing_relation_nodes), do: :missing_relation_nodes
+  defp relation_completeness_reason(reason), do: reason
+
+  defp validate_relation_nodes(nodes) when is_list(nodes) do
+    Enum.reduce_while(nodes, :ok, fn
+      %{"type" => relation_type, "issue" => issue}, :ok
+      when is_binary(relation_type) and is_map(issue) ->
+        if valid_relation_issue?(issue) do
+          {:cont, :ok}
+        else
+          {:halt, {:error, :malformed_relation}}
+        end
+
+      _relation, :ok ->
+        {:halt, {:error, :malformed_relation}}
+    end)
+  end
+
+  defp validate_relation_nodes(_nodes), do: {:error, :missing_relation_nodes}
+
+  defp valid_relation_issue?(issue) when is_map(issue) do
+    present_string?(issue["id"]) and
+      present_string?(issue["identifier"]) and
+      present_string?(get_in(issue, ["state", "name"]))
+  end
+
   defp normalize_issue(issue, assignee_filter) when is_map(issue) do
     state_name = get_in(issue, ["state", "name"])
 
     if Enum.all?([issue["id"], issue["identifier"], issue["title"], state_name], &present_string?/1) do
       assignee = issue["assignee"]
-      blockers = extract_blockers(issue)
+      {blockers, dependency_completeness} = extract_relation_data(issue)
 
       %Issue{
         id: issue["id"],
@@ -480,6 +843,7 @@ defmodule SymphonyElixir.Linear.Client do
         url: issue["url"],
         assignee_id: assignee_field(assignee, "id"),
         blocked_by: blockers,
+        dependency_completeness: dependency_completeness,
         labels: extract_labels(issue),
         dispatchable: dispatchable?(state_name, blockers, assignee, assignee_filter),
         created_at: parse_datetime(issue["createdAt"]),
@@ -489,6 +853,15 @@ defmodule SymphonyElixir.Linear.Client do
   end
 
   defp normalize_issue(_issue, _assignee_filter), do: nil
+
+  defp extract_relation_data(issue) do
+    blockers = extract_blockers(issue)
+
+    case relation_completeness(issue) do
+      :complete -> {blockers, :complete}
+      {:incomplete, reason} -> {blockers, {:incomplete, reason}}
+    end
+  end
 
   defp assignee_field(%{} = assignee, field) when is_binary(field), do: assignee[field]
   defp assignee_field(_assignee, _field), do: nil
@@ -591,7 +964,8 @@ defmodule SymphonyElixir.Linear.Client do
     |> Enum.flat_map(fn
       %{"type" => relation_type, "issue" => blocker_issue}
       when is_binary(relation_type) and is_map(blocker_issue) ->
-        if String.downcase(String.trim(relation_type)) == "blocks" do
+        if String.downcase(String.trim(relation_type)) == "blocks" and
+             valid_relation_issue?(blocker_issue) do
           [
             %{
               id: blocker_issue["id"],

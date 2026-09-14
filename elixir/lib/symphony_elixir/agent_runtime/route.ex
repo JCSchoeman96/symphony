@@ -22,7 +22,7 @@ defmodule SymphonyElixir.AgentRuntime.Route do
           profile_name: String.t(),
           runtime_name: String.t(),
           responsibility: String.t(),
-          profile: Profile.t(),
+          profile: Profile.t() | nil,
           fingerprint: String.t()
         }
 
@@ -36,6 +36,23 @@ defmodule SymphonyElixir.AgentRuntime.Route do
       runtime_name: profile.runtime,
       responsibility: profile.responsibility,
       profile: profile,
+      fingerprint: ""
+    }
+
+    %{route | fingerprint: fingerprint(route)}
+  end
+
+  @doc false
+  @spec legacy(Issue.t()) :: t()
+  def legacy(%Issue{id: issue_id, state: state})
+      when is_binary(issue_id) and is_binary(state) do
+    route = %__MODULE__{
+      issue_id: issue_id,
+      starting_state: normalize_state(state),
+      profile_name: "legacy",
+      runtime_name: "codex",
+      responsibility: "implementation",
+      profile: nil,
       fingerprint: ""
     }
 
@@ -82,4 +99,6 @@ defmodule SymphonyElixir.AgentRuntime.Route do
       profile.concurrency_class
     }
   end
+
+  defp profile_fingerprint(nil), do: :legacy
 end

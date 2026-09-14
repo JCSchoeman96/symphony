@@ -143,6 +143,23 @@ defmodule SymphonyElixir.DependencyPolicyTest do
     assert invalid_policy.dependent_state == nil
   end
 
+  test "guard preserves read-only planning for unavailable data and rejects malformed metadata" do
+    unavailable =
+      %Issue{id: "unavailable", state: "Planning", blocked_by: []}
+      |> Map.put(:dependency_completeness, {:unavailable, :provider_error})
+
+    planning = Guard.evaluate(unavailable, "planning")
+    assert planning.allowed?
+    assert planning.dependency_status == :unavailable
+    assert planning.reason == :dependency_data_incomplete
+
+    malformed =
+      Map.put(%Issue{id: "malformed", state: "Ready", blocked_by: []}, :dependency_completeness, :invalid)
+
+    refute Guard.evaluate(malformed, "implementation").allowed?
+    refute Guard.evaluate(unavailable, :implementation).allowed?
+  end
+
   test "policy supports its direct arities and rejects malformed inputs" do
     assert {:ok, %{dependency_status: :none}} = Policy.evaluate("Ready", "implementation", [])
     assert {:error, :invalid_blockers} = Policy.evaluate("Ready", "implementation", :not_a_list, [])

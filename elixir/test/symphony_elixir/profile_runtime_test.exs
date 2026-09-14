@@ -4,8 +4,8 @@ defmodule SymphonyElixir.ProfileRuntimeTestFake do
     {:ok, %{test_pid: Keyword.fetch!(opts, :test_pid)}}
   end
 
-  def run_turn(session, _prompt, issue, _opts) do
-    send(session.test_pid, {:profile_runtime_turn, issue})
+  def run_turn(session, _prompt, issue, opts) do
+    send(session.test_pid, {:profile_runtime_turn, issue, opts})
     {:ok, %{session_id: "profile-runtime-turn"}}
   end
 
@@ -32,6 +32,28 @@ defmodule SymphonyElixir.ProfileRuntimeTest do
       assert settings.thread_sandbox == "read-only"
       assert settings.turn_sandbox_policy["type"] == "readOnly"
       refute Map.has_key?(settings.turn_sandbox_policy, "writableRoots")
+    after
+      File.rm_rf(root)
+    end
+  end
+
+  test "legacy runtime settings preserve the workflow sandbox without a routed profile" do
+    root = Path.join(System.tmp_dir!(), "symphony-legacy-runtime-#{System.unique_integer([:positive])}")
+    workspace = Path.join(root, "SYM-LEGACY")
+    File.mkdir_p!(workspace)
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: root,
+        agent_routing: "legacy",
+        codex_thread_sandbox: "read-only",
+        codex_turn_sandbox_policy: %{type: "readOnly"}
+      )
+
+      assert Config.settings!().agent.profiles == nil
+      assert {:ok, settings} = Config.codex_runtime_settings(workspace)
+      assert settings.thread_sandbox == "read-only"
+      assert settings.turn_sandbox_policy == %{"type" => "readOnly"}
     after
       File.rm_rf(root)
     end
@@ -103,6 +125,10 @@ defmodule SymphonyElixir.ProfileRuntimeTest do
     assert opts[:model] == "custom-model"
     assert opts[:sandbox] == "read-only"
     assert opts[:profile] == profile
+    assert_receive {:profile_runtime_turn, ^issue, turn_opts}
+    assert turn_opts[:model] == "custom-model"
+    assert turn_opts[:sandbox] == "read-only"
+    assert turn_opts[:profile] == profile
     assert_receive {:profile_runtime_stopped, _session}
   end
 end

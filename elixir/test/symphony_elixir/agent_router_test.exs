@@ -4,6 +4,13 @@ defmodule SymphonyElixir.AgentRouterTest do
   alias SymphonyElixir.AgentRuntime.{Profile, Route, Router}
   alias SymphonyElixir.Config.Schema
 
+  test "profiles cannot select another built-in responsibility prompt" do
+    for prompt <- ["builder", "builder.md", "fixer", "reviewer"] do
+      assert {:error, {:invalid_profile, "planner", _}} =
+               Profile.resolve_profiles(%{"planner" => %{"prompt" => prompt}}, "codex app-server", 2)
+    end
+  end
+
   test "default profiles provide isolated responsibility and sandbox settings" do
     profiles = Profile.default_profiles("codex app-server", 7)
 
@@ -106,6 +113,67 @@ defmodule SymphonyElixir.AgentRouterTest do
     assert message =~ "sandbox"
   end
 
+  test "profile validation rejects responsibility and capability mismatches" do
+    assert {:error, {:invalid_profile, "reviewer", message}} =
+             Profile.resolve_profiles(
+               %{
+                 "reviewer" => %{
+                   "runtime" => "codex",
+                   "command" => "codex app-server",
+                   "sandbox" => "workspace-write"
+                 }
+               },
+               "codex app-server",
+               20
+             )
+
+    assert message =~ "review"
+    assert message =~ "read-only"
+
+    assert {:error, {:invalid_profile, "merge_gatekeeper", merge_message}} =
+             Profile.resolve_profiles(
+               %{
+                 "merge_gatekeeper" => %{
+                   "runtime" => "codex",
+                   "command" => "codex app-server",
+                   "sandbox" => "workspace-write"
+                 }
+               },
+               "codex app-server",
+               20
+             )
+
+    assert merge_message =~ "merge"
+    assert merge_message =~ "deferred"
+
+    assert {:error, {:invalid_profile, "planner", planner_message}} =
+             Profile.resolve_profiles(
+               %{
+                 "planner" => %{
+                   "responsibility" => "implementation",
+                   "sandbox" => "workspace-write"
+                 }
+               },
+               "codex app-server",
+               20
+             )
+
+    assert planner_message =~ "planner"
+    assert planner_message =~ "planning"
+  end
+
+  test "profile validation rejects normalized name collisions" do
+    assert {:error, {:profile_name_collision, "reviewer", _names}} =
+             Profile.resolve_profiles(
+               %{
+                 "Reviewer" => %{"sandbox" => "read-only"},
+                 "reviewer" => %{"sandbox" => "read-only"}
+               },
+               "codex app-server",
+               20
+             )
+  end
+
   test "custom profiles and profile predicates cover normalized runtime settings" do
     assert {:ok, profiles} =
              Profile.resolve_profiles(
@@ -146,6 +214,30 @@ defmodule SymphonyElixir.AgentRouterTest do
     assert Profile.normalize_name("  Custom  Name ") == "custom_name"
   end
 
+  test "explicit state routes can select a custom profile only within its responsibility class" do
+    assert {:ok, profiles} =
+             Profile.resolve_profiles(
+               %{
+                 "custom builder" => %{
+                   "responsibility" => "implementation",
+                   "runtime" => "codex",
+                   "command" => "custom-codex",
+                   "sandbox" => "workspace-write"
+                 }
+               },
+               "codex app-server",
+               20
+             )
+
+    issue = %Issue{id: "custom-route", state: "Ready"}
+
+    assert {:ok, %Route{profile_name: "custom_builder", responsibility: "implementation"}} =
+             Router.resolve(issue, profiles, %{"ready" => "custom builder"})
+
+    assert {:error, {:route_responsibility_mismatch, "ready", "review"}} =
+             Router.resolve(issue, profiles, %{"ready" => "reviewer"})
+  end
+
   test "profile normalization rejects malformed values and supports deferred commands" do
     assert {:error, {:invalid_profile, "builder", "must be a map"}} =
              Profile.resolve_profiles(%{"builder" => "invalid"}, "codex", 20)
@@ -163,10 +255,10 @@ defmodule SymphonyElixir.AgentRouterTest do
 
     assert profiles["merge_gatekeeper"].command == nil
 
-    assert {:ok, profiles} =
+    assert {:error, {:invalid_profile, "merge_gatekeeper", message}} =
              Profile.resolve_profiles(%{"merge_gatekeeper" => %{"command" => "gatekeeper"}}, "codex", 20)
 
-    assert profiles["merge_gatekeeper"].command == "gatekeeper"
+    assert message =~ "deferred"
 
     assert {:error, {:invalid_profile, "merge_gatekeeper", message}} =
              Profile.resolve_profiles(%{"merge_gatekeeper" => %{"command" => " "}}, "codex", 20)
@@ -202,6 +294,53 @@ defmodule SymphonyElixir.AgentRouterTest do
              Profile.resolve_profiles(%{"builder" => %{"max_turns" => 0}}, "codex", 20)
 
     assert message =~ "max_turns must be a positive integer"
+
+    invalid_struct = %{Profile.default_profiles("codex", 20)["reviewer"] | sandbox: "workspace-write"}
+
+    assert {:error, {:invalid_profile, "reviewer", struct_message}} =
+             Profile.resolve_profiles(%{"reviewer" => invalid_struct}, "codex", 20)
+
+    assert struct_message =~ "read-only"
+
+    builder_struct = Profile.default_profiles("codex", 20)["builder"]
+    assert {:ok, resolved_struct_profiles} = Profile.resolve_profiles(%{"builder" => builder_struct}, "codex", 20)
+    assert resolved_struct_profiles["builder"] == builder_struct
+
+    assert {:error, {:invalid_profile_name, "   "}} =
+             Profile.resolve_profiles(%{"   " => %{}}, "codex", 20)
+
+    assert :ok = Profile.validate_effective_policy(Profile.default_profiles("codex", 20)["builder"])
+
+    unsupported = %Profile{
+      name: "custom",
+      responsibility: "unsupported",
+      runtime: "codex",
+      command: "codex",
+      model: nil,
+      prompt: "custom",
+      sandbox: "workspace-write",
+      max_turns: 20,
+      concurrency_class: nil
+    }
+
+    assert {:error, "unsupported responsibility \"unsupported\""} =
+             Profile.validate_effective_policy(unsupported)
+
+    assert {:error, {:invalid_profile, "custom_reviewer", custom_message}} =
+             Profile.resolve_profiles(
+               %{
+                 "custom reviewer" => %{
+                   "responsibility" => "review",
+                   "runtime" => "codex",
+                   "command" => "codex",
+                   "sandbox" => "workspace-write"
+                 }
+               },
+               "codex",
+               20
+             )
+
+    assert custom_message =~ "read-only"
   end
 
   test "workflow schema materializes default profiles and validates overrides" do
@@ -209,6 +348,7 @@ defmodule SymphonyElixir.AgentRouterTest do
              Schema.parse(%{
                "tracker" => %{"kind" => "memory"},
                "agent" => %{
+                 "routing" => "routed",
                  "profiles" => %{
                    "builder" => %{"model" => "configured-model"}
                  }
@@ -221,10 +361,181 @@ defmodule SymphonyElixir.AgentRouterTest do
     assert {:error, {:invalid_workflow_config, message}} =
              Schema.parse(%{
                "tracker" => %{"kind" => "memory"},
-               "agent" => %{"profiles" => %{"reviewer" => %{"runtime" => "cursor"}}}
+               "agent" => %{
+                 "routing" => "routed",
+                 "profiles" => %{"reviewer" => %{"runtime" => "cursor"}}
+               }
              })
 
     assert message =~ "agent.profiles.reviewer"
     assert message =~ "runtime"
+  end
+
+  test "workflow schema keeps legacy workflows out of routed permissions" do
+    assert {:ok, settings} =
+             Schema.parse(%{
+               "tracker" => %{"kind" => "memory"},
+               "codex" => %{
+                 "thread_sandbox" => "read-only",
+                 "turn_sandbox_policy" => %{"type" => "readOnly"}
+               }
+             })
+
+    assert settings.agent.routing == "legacy"
+    assert settings.agent.profiles == nil
+    assert settings.codex.thread_sandbox == "read-only"
+    assert settings.codex.turn_sandbox_policy == %{"type" => "readOnly"}
+  end
+
+  test "workflow schema requires custom routed profiles to be explicitly selectable" do
+    custom_profile = %{
+      "responsibility" => "implementation",
+      "runtime" => "codex",
+      "command" => "custom-codex",
+      "sandbox" => "workspace-write"
+    }
+
+    assert {:error, {:invalid_workflow_config, message}} =
+             Schema.parse(%{
+               "tracker" => %{"kind" => "memory"},
+               "agent" => %{
+                 "routing" => "routed",
+                 "profiles" => %{"custom builder" => custom_profile}
+               }
+             })
+
+    assert message =~ "custom_builder"
+    assert message =~ "agent.routes"
+
+    assert {:ok, settings} =
+             Schema.parse(%{
+               "tracker" => %{"kind" => "memory"},
+               "agent" => %{
+                 "routing" => "routed",
+                 "profiles" => %{"custom builder" => custom_profile},
+                 "routes" => %{"ready" => "custom builder"}
+               }
+             })
+
+    assert settings.agent.routes == %{"ready" => "custom builder"}
+
+    assert {:error, {:invalid_workflow_config, legacy_message}} =
+             Schema.parse(%{
+               "tracker" => %{"kind" => "memory"},
+               "agent" => %{
+                 "profiles" => %{"builder" => %{}}
+               }
+             })
+
+    assert legacy_message =~ "agent.profiles requires explicit agent.routing"
+  end
+
+  test "router rejects malformed route maps and exposes state responsibility classes" do
+    profiles = Profile.default_profiles("codex app-server", 20)
+    issue = %Issue{id: "route-errors", state: "Ready"}
+
+    assert {:error, {:invalid_route_state, "  "}} =
+             Router.resolve(issue, profiles, %{"  " => "builder"})
+
+    assert {:error, {:invalid_route_profile, "ready", 42}} =
+             Router.resolve(issue, profiles, %{"ready" => 42})
+
+    assert {:error, {:route_state_collision, "ready"}} =
+             Router.validate_routes(%{"Ready" => "builder", "ready" => "builder"}, profiles)
+
+    assert {:error, {:missing_profile, "missing"}} =
+             Router.validate_routes(%{"ready" => "missing"}, profiles)
+
+    assert {:error, {:route_responsibility_mismatch, "ready", "review"}} =
+             Router.validate_routes(%{"ready" => "reviewer"}, profiles)
+
+    invalid_policy = %{profiles["reviewer"] | sandbox: "workspace-write"}
+
+    assert {:error, {:invalid_profile, "reviewer", policy_message}} =
+             Router.resolve(%{issue | state: "In Review"}, Map.put(profiles, "reviewer", invalid_policy))
+
+    assert policy_message =~ "read-only"
+
+    assert Router.expected_responsibility("In Review") == "review"
+    assert Router.expected_responsibility("unknown") == nil
+    assert Router.validate_routes(:invalid, profiles) == {:error, :invalid_routes}
+
+    assert Router.resolve(issue, profiles, :invalid) == {:error, :invalid_issue}
+    assert Router.resolve(issue, :invalid, %{}) == {:error, :invalid_profiles}
+  end
+
+  test "schema formats routed profile and route validation errors" do
+    base = %{"tracker" => %{"kind" => "memory"}, "agent" => %{"routing" => "routed"}}
+
+    assert {:error, {:invalid_workflow_config, collision_message}} =
+             Schema.parse(
+               put_in(base, ["agent", "profiles"], %{
+                 "Reviewer" => %{},
+                 "reviewer" => %{}
+               })
+             )
+
+    assert collision_message =~ "name collision"
+
+    assert {:error, {:invalid_workflow_config, route_message}} =
+             Schema.parse(put_in(base, ["agent", "routes"], %{"ready" => "missing"}))
+
+    assert route_message =~ "references missing profile"
+
+    assert {:error, {:invalid_workflow_config, bad_state_message}} =
+             Schema.parse(put_in(base, ["agent", "routes"], %{" " => "builder"}))
+
+    assert bad_state_message =~ "invalid state"
+
+    assert {:error, {:invalid_workflow_config, mismatch_message}} =
+             Schema.parse(put_in(base, ["agent", "routes"], %{"ready" => "reviewer"}))
+
+    assert mismatch_message =~ "cannot use review responsibility"
+
+    assert {:error, {:invalid_workflow_config, collision_message}} =
+             Schema.parse(put_in(base, ["agent", "routes"], %{"Ready" => "builder", "ready" => "builder"}))
+
+    assert collision_message =~ "duplicate normalized state"
+
+    assert {:error, {:invalid_workflow_config, invalid_profile_message}} =
+             Schema.parse(put_in(base, ["agent", "routes"], %{"ready" => 42}))
+
+    assert invalid_profile_message =~ "references invalid profile"
+
+    assert {:error, {:invalid_workflow_config, invalid_name_message}} =
+             Schema.parse(put_in(base, ["agent", "profiles"], %{"   " => %{}}))
+
+    assert invalid_name_message =~ "invalid name"
+  end
+
+  test "workflow reload retains the last valid routed policy after an invalid override" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      agent_routing: "routed"
+    )
+
+    assert {:ok, valid_settings} = WorkflowStore.settings()
+    assert valid_settings.agent.routing == "routed"
+
+    File.write!(
+      Workflow.workflow_file_path(),
+      """
+      ---
+      tracker:
+        kind: memory
+      agent:
+        routing: routed
+        profiles:
+          reviewer:
+            runtime: codex
+            command: codex app-server
+            sandbox: workspace-write
+      ---
+      valid workflow body
+      """
+    )
+
+    assert {:error, {:invalid_workflow_config, _message}} = WorkflowStore.force_reload()
+    assert {:ok, retained_settings} = WorkflowStore.settings()
+    assert retained_settings == valid_settings
   end
 end

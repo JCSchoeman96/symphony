@@ -21,6 +21,7 @@ defmodule SymphonyElixir.Tracker.Issue do
     :url,
     :assignee_id,
     blocked_by: [],
+    dependency_completeness: :complete,
     labels: [],
     dispatchable: false,
     created_at: nil,
@@ -40,6 +41,7 @@ defmodule SymphonyElixir.Tracker.Issue do
           assignee_id: String.t() | nil,
           labels: [String.t()],
           blocked_by: [map()],
+          dependency_completeness: :complete | {:incomplete, atom()} | {:unavailable, atom()},
           dispatchable: boolean(),
           created_at: DateTime.t() | nil,
           updated_at: DateTime.t() | nil

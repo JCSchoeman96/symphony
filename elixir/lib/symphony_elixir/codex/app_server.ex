@@ -38,7 +38,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   @spec start_session(Path.t(), keyword()) :: {:ok, session()} | {:error, term()}
   def start_session(workspace, opts \\ []) do
     worker_host = Keyword.get(opts, :worker_host)
-    dynamic_tool_binding = DynamicTool.bind()
+    dynamic_tool_binding = DynamicTool.bind(opts)
 
     with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
          {:ok, port} <- start_port(expanded_workspace, worker_host, dynamic_tool_binding, opts) do
@@ -999,13 +999,18 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp stop_port(port) when is_port(port) do
-    case :erlang.port_info(port) do
-      :undefined ->
-        {:error, {:stop_failed, :session_stopped}}
+    ref = :erlang.monitor(:port, port)
 
-      _ ->
+    result =
+      try do
         Port.close(port)
         :ok
+      rescue
+        ArgumentError -> {:error, {:stop_failed, :session_stopped}}
+      end
+
+    receive do
+      {:DOWN, ^ref, :port, ^port, _reason} -> result
     end
   end
 

@@ -34,6 +34,45 @@ help with the setup:
 > Set up Symphony for my repository based on
 > https://github.com/openai/symphony/blob/main/elixir/README.md
 
+## Routed agent lifecycle
+
+The reference Elixir implementation can route each tracker state to a bounded
+role: planning, implementation, review, correction, or a deferred merge gate.
+Use the explicit `agent.routing: routed` configuration and the shipped
+`elixir/prompts/` role policies when enabling this mode. Workflows without
+`agent.profiles` remain on the legacy runtime path for compatibility.
+
+The orchestrator bounds ordinary runtime/spawn retries to three per issue
+lineage. Capacity waits, normal continuations, and route changes are tracked
+separately; reviewer-to-correction loops stop after three cycles. CI
+infrastructure is not retried automatically. Attempt counters are live OTP
+state and survive workflow reloads; restart recovery remains tracker/filesystem
+driven and does not synthesize prior retry history.
+
+For Linear workflows, read-only `linear_graphql` queries remain available to every role. Lifecycle
+state changes use the session-bound `linear_transition` tool, which authorizes only role-owned
+handoffs and denies implementation/correction or merge handoffs when dependency data is unsafe.
+Raw Linear GraphQL mutations are rejected at this boundary; provider-native mutation tools for
+other adapters remain provider-specific permission boundaries.
+
+Linear handoffs revalidate current issue state and the dependency graph with the session's bound
+provider settings. A session may attempt one handoff; an uncertain mutation response requires a
+fresh attempt. This is a fresh authorization check, not an atomic transaction with concurrent
+tracker edits. Retry dispatch also rechecks eligibility, capacity, and role after its final graph
+refresh, and counts review-to-correction transitions observed while waiting for retry.
+
+Legacy adapters without graph support retain their per-issue dependency checks. Explicit routed
+work still requires authoritative graph support for implementation and correction. Built-in prompt
+names must match the configured responsibility; custom prompt content remains operator-controlled.
+
+## Live proof
+
+Provider live tests are skipped unless the operator explicitly enables the test, names a disposable
+provider resource, supplies the provider credential and an explicit Codex home, and sets
+`SYMPHONY_LIVE_PROOF_CONSENT` to the documented exact token. A skipped test is not live proof.
+See [the proof procedure](docs/symphony-agent-router-dependency-proof.md) for the required variables,
+cleanup behavior, and the remaining external-proof limits.
+
 ---
 
 ## License

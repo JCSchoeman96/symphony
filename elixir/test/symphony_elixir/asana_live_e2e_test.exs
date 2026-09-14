@@ -9,9 +9,7 @@ defmodule SymphonyElixir.Asana.LiveE2ETest do
   @api_url "https://app.asana.com/api/1.0"
   @result_file "LIVE_ASANA_E2E_RESULT.txt"
   @task_fields "gid,name,notes,completed,resource_subtype,memberships.project.gid,memberships.section.gid,memberships.section.name,permalink_url,created_at,modified_at"
-  @live_e2e_skip_reason if(System.get_env("SYMPHONY_RUN_ASANA_LIVE_E2E") != "1",
-                          do: "set SYMPHONY_RUN_ASANA_LIVE_E2E=1 to enable the real Asana/Codex end-to-end test"
-                        )
+  @live_e2e_skip_reason SymphonyElixir.LiveProofGate.skip_reason(:asana, System.get_env())
 
   @tag skip: @live_e2e_skip_reason
   test "creates a real Asana project and completes a task through asana_api" do
@@ -423,14 +421,11 @@ defmodule SymphonyElixir.Asana.LiveE2ETest do
     codex_home = Path.join(test_root, "codex-home")
     auth_json_path = Path.join(codex_home, "auth.json")
 
-    source_auth_json =
-      Path.join(
-        System.get_env("CODEX_HOME") || Path.join(System.user_home!(), ".codex"),
-        "auth.json"
-      )
+    codex_home = System.get_env("SYMPHONY_LIVE_CODEX_HOME")
+    source_auth_json = if is_binary(codex_home), do: Path.join(codex_home, "auth.json"), else: nil
 
-    unless File.regular?(source_auth_json) do
-      flunk("live Asana e2e requires Codex auth")
+    unless is_binary(codex_home) and String.trim(codex_home) != "" and File.regular?(source_auth_json) do
+      flunk("live Asana e2e requires Codex auth in the explicitly configured SYMPHONY_LIVE_CODEX_HOME")
     end
 
     File.mkdir_p!(codex_home)

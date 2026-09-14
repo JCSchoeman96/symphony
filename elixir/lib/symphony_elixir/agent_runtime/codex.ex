@@ -65,16 +65,29 @@ defmodule SymphonyElixir.AgentRuntime.Codex do
 
   defp session_state(%{port: port} = session) when is_port(port) do
     if valid_session_shape?(session) do
-      case :erlang.port_info(port) do
-        :undefined -> :stopped
-        _ -> :active
-      end
+      port_state(port)
     else
       :not_started
     end
   end
 
   defp session_state(_session), do: :not_started
+
+  # port_info can retain metadata while a closed port is being deallocated.
+  # A monitor reports its lifecycle rather than the presence of that metadata.
+  defp port_state(port) do
+    ref = :erlang.monitor(:port, port)
+
+    try do
+      receive do
+        {:DOWN, ^ref, :port, ^port, _reason} -> :stopped
+      after
+        0 -> :active
+      end
+    after
+      Process.demonitor(ref, [:flush])
+    end
+  end
 
   defp valid_session_shape?(session) do
     Enum.all?(

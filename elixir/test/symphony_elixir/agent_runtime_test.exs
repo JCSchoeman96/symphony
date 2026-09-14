@@ -8,6 +8,7 @@ defmodule SymphonyElixir.AgentRuntimeTestFake do
   @spec run_turn(map(), String.t(), map(), keyword()) :: {:ok, map()}
   def run_turn(session, prompt, issue, opts) do
     send(Keyword.fetch!(opts, :test_pid), {:runtime_turn, session, prompt, issue})
+    send(Keyword.fetch!(opts, :test_pid), {:runtime_turn_options, opts})
     {:ok, %{session_id: session.session_id, thread_id: "fake-thread", turn_id: "fake-turn"}}
   end
 
@@ -254,6 +255,66 @@ defmodule SymphonyElixir.AgentRuntimeTest do
     assert_receive {:runtime_stopped, %{session_id: "fake-session"}}
   end
 
+  test "AgentRunner keeps effective profile options on continuation turns" do
+    test_pid = self()
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_active_states: ["Ready", "In Progress"],
+      agent_profiles: %{"builder" => %{"model" => "selected-model"}},
+      max_turns: 2
+    )
+
+    issue = %Issue{
+      id: "runtime-options-continuation",
+      identifier: "SYM-RUNTIME-OPTIONS",
+      title: "Keep runtime options",
+      state: "Ready",
+      dispatchable: true
+    }
+
+    profiles = Config.settings!().agent.profiles
+    assert {:ok, route} = Router.resolve(issue, profiles)
+
+    assert :ok =
+             AgentRunner.run(issue, test_pid,
+               runtime: SymphonyElixir.AgentRuntimeTestFake,
+               test_pid: test_pid,
+               route: route,
+               issue_state_fetcher: fn [_issue_id] -> {:ok, [%{issue | state: "In Progress"}]} end
+             )
+
+    assert_receive {:runtime_turn_options, first_turn_opts}
+    assert_receive {:runtime_turn_options, second_turn_opts}
+
+    for turn_opts <- [first_turn_opts, second_turn_opts] do
+      assert turn_opts[:model] == "selected-model"
+      assert turn_opts[:sandbox] == "workspace-write"
+      assert turn_opts[:profile] == route.profile
+
+      assert turn_opts[:agent_tool_context] == %{
+               issue_id: "runtime-options-continuation",
+               current_issue_state: "Ready",
+               responsibility: "implementation",
+               dependency_decision: %{
+                 allowed?: true,
+                 dependency_status: :none,
+                 dependency_completeness: :complete,
+                 dependent_state: "ready",
+                 responsibility: "implementation",
+                 reason: :no_hard_dependencies,
+                 merge_permitted?: true,
+                 blockers: [],
+                 unresolved_blockers: [],
+                 invalidated_blockers: [],
+                 diagnostic: nil,
+                 issue_id: "runtime-options-continuation",
+                 identifier: "SYM-RUNTIME-OPTIONS"
+               }
+             }
+    end
+  end
+
   test "AgentRunner stops when a refreshed implementation becomes dependency-blocked" do
     test_pid = self()
 
@@ -292,6 +353,9 @@ defmodule SymphonyElixir.AgentRuntimeTest do
 
     assert_receive {:runtime_turn, _session, _prompt, ^issue}
     assert_receive {:agent_dependency_blocked, "dependency-change", decision}
+    assert decision.allowed? == false
+    assert decision.dependency_completeness == :complete
+    assert decision.merge_permitted? == false
     assert decision.reason == :unresolved_hard_dependency
     assert_receive {:runtime_stopped, %{session_id: "fake-session"}}
     refute_receive {:runtime_turn, _session, _prompt, _issue}, 50

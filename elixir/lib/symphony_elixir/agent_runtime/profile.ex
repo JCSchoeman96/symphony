@@ -31,6 +31,13 @@ defmodule SymphonyElixir.AgentRuntime.Profile do
   @responsibilities ~w(planning implementation review correction merge)
   @runtimes ~w(codex deferred)
   @sandboxes ~w(read-only workspace-write)
+  @standard_responsibilities %{
+    "planner" => "planning",
+    "builder" => "implementation",
+    "reviewer" => "review",
+    "fixer" => "correction",
+    "merge_gatekeeper" => "merge"
+  }
 
   @spec default_profiles(String.t(), pos_integer()) :: %{String.t() => t()}
   def default_profiles(command, max_turns) when is_binary(command) and is_integer(max_turns) do
@@ -65,12 +72,23 @@ defmodule SymphonyElixir.AgentRuntime.Profile do
     defaults = default_profiles(command, max_turns)
     raw_profiles = raw_profiles || %{}
 
+    case validate_profile_names(raw_profiles) do
+      :ok -> resolve_profile_entries(raw_profiles, defaults, command, max_turns)
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp resolve_profile_entries(raw_profiles, defaults, command, max_turns) do
     Enum.reduce_while(raw_profiles, {:ok, defaults}, fn {raw_name, raw_profile}, {:ok, profiles} ->
-      case resolve_profile_entry(raw_name, raw_profile, defaults, command, max_turns) do
-        {:ok, name, profile} -> {:cont, {:ok, Map.put(profiles, name, profile)}}
-        {:error, name, message} -> {:halt, {:error, {:invalid_profile, name, message}}}
-      end
+      resolve_profile_entry_result(raw_name, raw_profile, profiles, defaults, command, max_turns)
     end)
+  end
+
+  defp resolve_profile_entry_result(raw_name, raw_profile, profiles, defaults, command, max_turns) do
+    case resolve_profile_entry(raw_name, raw_profile, defaults, command, max_turns) do
+      {:ok, name, profile} -> {:cont, {:ok, Map.put(profiles, name, profile)}}
+      {:error, name, message} -> {:halt, {:error, {:invalid_profile, name, message}}}
+    end
   end
 
   defp resolve_profile_entry(raw_name, raw_profile, defaults, command, max_turns) do
@@ -116,9 +134,76 @@ defmodule SymphonyElixir.AgentRuntime.Profile do
   @spec sandbox?(term()) :: boolean()
   def sandbox?(sandbox), do: normalize_token(sandbox) in @sandboxes
 
+  @spec validate_effective_policy(t()) :: :ok | {:error, String.t()}
+  def validate_effective_policy(%__MODULE__{} = profile) do
+    with :ok <- validate_standard_responsibility(profile),
+         :ok <- validate_responsibility_capabilities(profile) do
+      validate_prompt_responsibility(profile)
+    end
+  end
+
+  defp validate_prompt_responsibility(%__MODULE__{prompt: prompt, responsibility: responsibility})
+       when is_binary(prompt) do
+    prompt_role = prompt |> String.trim() |> String.downcase() |> Path.rootname(".md")
+
+    case Map.get(@standard_responsibilities, prompt_role) do
+      nil -> :ok
+      ^responsibility -> :ok
+      _other -> {:error, "built-in role prompt must match the profile responsibility"}
+    end
+  end
+
+  defp validate_prompt_responsibility(_profile), do: :ok
+
+  defp validate_responsibility_capabilities(%__MODULE__{responsibility: responsibility} = profile)
+       when responsibility in ["planning", "review"] do
+    validate_codex_sandbox(profile, "read-only", responsibility)
+  end
+
+  defp validate_responsibility_capabilities(%__MODULE__{responsibility: responsibility} = profile)
+       when responsibility in ["implementation", "correction"] do
+    validate_codex_sandbox(profile, "workspace-write", responsibility)
+  end
+
+  defp validate_responsibility_capabilities(%__MODULE__{responsibility: "merge"} = profile) do
+    if profile.runtime == "deferred" and profile.command == nil and profile.sandbox == "read-only" do
+      :ok
+    else
+      {:error, "merge profiles are deferred, non-executable, and must use the read-only sandbox"}
+    end
+  end
+
+  defp validate_responsibility_capabilities(%__MODULE__{responsibility: responsibility}),
+    do: {:error, "unsupported responsibility #{inspect(responsibility)}"}
+
+  defp validate_codex_sandbox(%__MODULE__{} = profile, expected_sandbox, responsibility) do
+    if profile.runtime == "codex" and profile.sandbox == expected_sandbox and
+         is_binary(profile.command) and String.trim(profile.command) != "" do
+      :ok
+    else
+      {:error, "#{responsibility} profiles must use the codex runtime, a non-empty command, and the #{expected_sandbox} sandbox"}
+    end
+  end
+
+  defp validate_standard_responsibility(%__MODULE__{name: name, responsibility: responsibility}) do
+    case Map.get(@standard_responsibilities, name) do
+      nil ->
+        :ok
+
+      ^responsibility ->
+        :ok
+
+      expected ->
+        {:error, "#{name} profile must retain the #{expected} responsibility"}
+    end
+  end
+
   defp normalize_profile(name, %__MODULE__{} = profile, _default) do
     if profile.name == name do
-      {:ok, profile}
+      case validate_effective_policy(profile) do
+        :ok -> {:ok, profile}
+        {:error, message} -> {:error, message}
+      end
     else
       {:error, "name must match profile key"}
     end
@@ -135,18 +220,22 @@ defmodule SymphonyElixir.AgentRuntime.Profile do
          {:ok, sandbox} <- required_token(attrs, "sandbox", default.sandbox, @sandboxes),
          {:ok, max_turns} <- positive_integer(attrs, "max_turns", default.max_turns),
          {:ok, concurrency_class} <- optional_string(attrs, "concurrency_class") do
-      {:ok,
-       %__MODULE__{
-         name: name,
-         responsibility: responsibility,
-         runtime: runtime,
-         command: command,
-         model: model,
-         prompt: prompt,
-         sandbox: sandbox,
-         max_turns: max_turns,
-         concurrency_class: concurrency_class
-       }}
+      profile = %__MODULE__{
+        name: name,
+        responsibility: responsibility,
+        runtime: runtime,
+        command: command,
+        model: model,
+        prompt: prompt,
+        sandbox: sandbox,
+        max_turns: max_turns,
+        concurrency_class: concurrency_class
+      }
+
+      case validate_effective_policy(profile) do
+        :ok -> {:ok, profile}
+        {:error, message} -> {:error, message}
+      end
     end
   end
 
@@ -163,23 +252,44 @@ defmodule SymphonyElixir.AgentRuntime.Profile do
          {:ok, sandbox} <- required_token(attrs, "sandbox", "workspace-write", @sandboxes),
          {:ok, profile_max_turns} <- positive_integer(attrs, "max_turns", max_turns),
          {:ok, concurrency_class} <- optional_string(attrs, "concurrency_class") do
-      {:ok,
-       %__MODULE__{
-         name: name,
-         responsibility: responsibility,
-         runtime: runtime,
-         command: profile_command,
-         model: model,
-         prompt: prompt,
-         sandbox: sandbox,
-         max_turns: profile_max_turns,
-         concurrency_class: concurrency_class
-       }}
+      profile = %__MODULE__{
+        name: name,
+        responsibility: responsibility,
+        runtime: runtime,
+        command: profile_command,
+        model: model,
+        prompt: prompt,
+        sandbox: sandbox,
+        max_turns: profile_max_turns,
+        concurrency_class: concurrency_class
+      }
+
+      case validate_effective_policy(profile) do
+        :ok -> {:ok, profile}
+        {:error, message} -> {:error, message}
+      end
     end
   end
 
   defp normalize_custom_profile(_name, _raw_profile, _command, _max_turns),
     do: {:error, "must be a map"}
+
+  defp validate_profile_names(raw_profiles) do
+    raw_profiles
+    |> Enum.group_by(fn {raw_name, _raw_profile} -> normalize_name(raw_name) end, fn {raw_name, _raw_profile} ->
+      raw_name
+    end)
+    |> Enum.find_value(:ok, fn
+      {"", [raw_name | _]} ->
+        {:error, {:invalid_profile_name, raw_name}}
+
+      {name, raw_names} when length(raw_names) > 1 ->
+        {:error, {:profile_name_collision, name, Enum.map(raw_names, &to_string/1)}}
+
+      _ ->
+        false
+    end)
+  end
 
   defp required_token(attrs, key, default, allowed) do
     value = Map.get(attrs, key, default)
