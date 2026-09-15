@@ -115,6 +115,30 @@ defmodule SymphonyElixir.TrackerCapabilitiesTest do
     assert {:error, {:invalid_provider_capability_declaration, _, :capabilities_callback_failed}} =
              Capabilities.validate_adapter(SymphonyElixir.TrackerCapabilitiesThrowingAdapter)
   end
+
+  test "tracker capability facade follows the configured adapter" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+    assert {:ok, declared} = Tracker.capabilities()
+    assert :agent_read_tools in declared
+
+    assert {:error, {:unsupported_tracker_kind, "future-tracker"}} =
+             Tracker.capabilities_for_kind("future-tracker")
+
+    assert :ok = Tracker.validate_routed_capabilities(%{agent: %{routing: "legacy"}})
+    assert :ok = Tracker.validate_routed_capabilities(%{})
+  end
+
+  test "tracker rejects bound tools when the adapter lacks an executor" do
+    response =
+      Tracker.execute_bound_agent_tool(
+        %{adapter: SymphonyElixir.TrackerCapabilitiesUnknownAdapter, tracker_settings: %{}},
+        "unsupported",
+        %{}
+      )
+
+    assert response["success"] == false
+    assert Jason.decode!(response["output"])["error"]["supportedTools"] == []
+  end
 end
 
 defmodule SymphonyElixir.TrackerCapabilitiesProbeClient do
