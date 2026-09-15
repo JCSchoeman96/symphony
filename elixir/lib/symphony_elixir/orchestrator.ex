@@ -787,17 +787,41 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp reconcile_blocked_ledger(%State{} = state, %AttemptLedger{} = ledger) do
-    case reconcile_attempt_ledger(state, ledger) do
+    case resync_sync_failed_ledger(state, ledger) do
       {:ok, state} ->
-        state = %{state | attempt_ledger_status: :ready}
-        state = reschedule_pending_retries(state)
-        maybe_dispatch_ready(state)
+        case reconcile_attempt_ledger(state, ledger) do
+          {:ok, state} ->
+            state = %{state | attempt_ledger_status: :ready}
+            state = reschedule_pending_retries(state)
+            maybe_dispatch_ready(state)
 
-      {:blocked, state, reason} ->
-        Logger.debug("Attempt ledger reconciliation remains blocked: #{inspect(reason)}")
-        %{state | attempt_ledger_status: {:blocked, reason}}
+          {:blocked, state, reason} ->
+            Logger.debug("Attempt ledger reconciliation remains blocked: #{inspect(reason)}")
+            %{state | attempt_ledger_status: {:blocked, reason}}
+        end
+
+      {:blocked, state} ->
+        state
     end
   end
+
+  defp resync_sync_failed_ledger(
+         %State{
+           attempt_ledger_status: {:blocked, {:attempt_ledger_unavailable, {:ledger_sync_failed, _reason}}}
+         } = state,
+         %AttemptLedger{} = ledger
+       ) do
+    case AttemptLedger.sync(ledger) do
+      :ok ->
+        {:ok, state}
+
+      {:error, reason} ->
+        Logger.debug("Attempt ledger durable resync remains blocked: #{inspect(reason)}")
+        {:blocked, state}
+    end
+  end
+
+  defp resync_sync_failed_ledger(%State{} = state, %AttemptLedger{}), do: {:ok, state}
 
   defp blocked_ledger_state(%State{} = state, reason) do
     Logger.debug("Skipping autonomous dispatch while attempt ledger is blocked: #{inspect(reason)}")

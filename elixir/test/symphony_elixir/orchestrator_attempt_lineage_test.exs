@@ -573,6 +573,118 @@ defmodule SymphonyElixir.OrchestratorAttemptLineageTest do
            end)
   end
 
+  test "keeps a sync-failed ledger blocked when recovery resync fails again" do
+    project_id = "recovery-sync-failure-#{System.unique_integer([:positive])}"
+    issue = %{active_issue("recovery-sync-failure-issue") | dispatchable: false}
+    ledger_root = temporary_ledger_root()
+    path = AttemptLedger.path_for(project_id, root: ledger_root)
+    {sync_fun, sync_count} = controlled_sync_fun(self(), :always_fail)
+
+    configure_sync_recovery_test(project_id, issue)
+
+    ledger = open_controlled_ledger(project_id, path, sync_fun)
+
+    assert {:error, {:ledger_sync_failed, :injected_sync_failure}} =
+             AttemptLedger.persist_safety(ledger, issue.id, %{
+               ordinary_failures: 1,
+               ordinary_retries: 1,
+               review_cycles: 0
+             })
+
+    state = blocked_sync_failure_state(ledger, path)
+    {:noreply, updated} = Orchestrator.handle_info(:run_poll_cycle, state)
+
+    assert updated.attempt_ledger_status == state.attempt_ledger_status
+    assert :atomics.get(sync_count, 1) == 2
+    assert updated.retry_attempts == %{}
+    assert updated.running == %{}
+    issue_id = issue.id
+    refute_receive {:attempt_ledger_runner_started, ^issue_id, _opts}, 100
+
+    cancel_tick(updated)
+    assert :ok = AttemptLedger.close(ledger)
+  end
+
+  test "performs a successful recovery resync before reconciliation and ready state" do
+    project_id = "recovery-sync-success-#{System.unique_integer([:positive])}"
+    issue = %{active_issue("recovery-sync-success-issue") | dispatchable: false}
+    ledger_root = temporary_ledger_root()
+    path = AttemptLedger.path_for(project_id, root: ledger_root)
+    {sync_fun, sync_count} = controlled_sync_fun(self(), :fail_then_succeed)
+
+    configure_sync_recovery_test(project_id, issue)
+
+    ledger = open_controlled_ledger(project_id, path, sync_fun)
+
+    assert {:error, {:ledger_sync_failed, :injected_sync_failure}} =
+             AttemptLedger.persist_safety(ledger, issue.id, %{
+               ordinary_failures: 1,
+               ordinary_retries: 1,
+               review_cycles: 0
+             })
+
+    state = blocked_sync_failure_state(ledger, path)
+    {:noreply, updated} = Orchestrator.handle_info(:run_poll_cycle, state)
+
+    assert_receive {:h030g_sync, 1}, 100
+    assert_receive {:h030g_sync, 2}, 100
+    assert :atomics.get(sync_count, 1) == 2
+    assert updated.attempt_ledger_status == :ready
+    assert updated.retry_attempts == %{}
+    assert updated.running == %{}
+    issue_id = issue.id
+    refute_receive {:attempt_ledger_runner_started, ^issue_id, _opts}, 100
+
+    assert {:ok, snapshot} = reopen_snapshot(path, project_id, issue.id)
+    assert snapshot.safety_counters.ordinary_failures == 1
+    assert snapshot.safety_counters.ordinary_retries == 1
+    assert snapshot.in_flight == false
+    assert snapshot.close_pending == false
+  end
+
+  test "recovers and preserves ordinary exhaustion only after a durable resync" do
+    project_id = "recovery-exhaustion-#{System.unique_integer([:positive])}"
+    issue = %{active_issue("recovery-exhaustion-issue") | dispatchable: false}
+    ledger_root = temporary_ledger_root()
+    path = AttemptLedger.path_for(project_id, root: ledger_root)
+    {sync_fun, sync_count} = controlled_sync_fun(self(), :fail_then_succeed)
+
+    configure_sync_recovery_test(project_id, issue)
+
+    ledger = open_controlled_ledger(project_id, path, sync_fun)
+
+    assert {:error, {:ledger_sync_failed, :injected_sync_failure}} =
+             AttemptLedger.persist_safety(
+               ledger,
+               issue.id,
+               %{
+                 ordinary_failures: 4,
+                 ordinary_retries: 3,
+                 review_cycles: 0
+               },
+               status: :exhausted,
+               stop_reason: :ordinary_retry_limit
+             )
+
+    state = blocked_sync_failure_state(ledger, path)
+    {:noreply, updated} = Orchestrator.handle_info(:run_poll_cycle, state)
+
+    assert_receive {:h030g_sync, 1}, 100
+    assert_receive {:h030g_sync, 2}, 100
+    assert :atomics.get(sync_count, 1) == 2
+    assert updated.attempt_ledger_status == :ready
+    assert updated.durable_exhausted[issue.id].status == :exhausted
+    issue_id = issue.id
+    refute_receive {:attempt_ledger_runner_started, ^issue_id, _opts}, 100
+
+    assert {:ok, snapshot} = reopen_snapshot(path, project_id, issue.id)
+    assert snapshot.status == :exhausted
+    assert snapshot.stop_reason == :ordinary_retry_limit
+    assert snapshot.safety_counters.ordinary_failures == 4
+    assert snapshot.safety_counters.ordinary_retries == 3
+    assert {:error, :lineage_exhausted} = begin_attempt_after_reopen(path, project_id, issue.id)
+  end
+
   test "does not dispatch a queued retry while the ledger is blocked" do
     project_id = "blocked-fence-#{System.unique_integer([:positive])}"
     issue = active_issue("blocked-fence-issue")
@@ -1163,6 +1275,90 @@ defmodule SymphonyElixir.OrchestratorAttemptLineageTest do
     :ok = :dets.insert(table, {key, Map.delete(record, field)})
     :ok = :dets.sync(table)
     :ok = :dets.close(table)
+  end
+
+  defp configure_sync_recovery_test(project_id, issue) do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      symphony_project_id: project_id,
+      tracker_active_states: ["In Progress"],
+      poll_interval_ms: 60_000
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+    Application.put_env(:symphony_elixir, :attempt_ledger_test_pid, self())
+
+    on_exit(fn -> Application.delete_env(:symphony_elixir, :attempt_ledger_test_pid) end)
+  end
+
+  defp controlled_sync_fun(test_pid, :always_fail) do
+    sync_count = :atomics.new(1, [])
+
+    sync_fun = fn _table ->
+      count = :atomics.add_get(sync_count, 1, 1)
+      send(test_pid, {:h030g_sync, count})
+      {:error, :injected_sync_failure}
+    end
+
+    {sync_fun, sync_count}
+  end
+
+  defp controlled_sync_fun(test_pid, :fail_then_succeed) do
+    sync_count = :atomics.new(1, [])
+
+    sync_fun = fn table ->
+      count = :atomics.add_get(sync_count, 1, 1)
+      send(test_pid, {:h030g_sync, count})
+
+      if count == 1 do
+        {:error, :injected_sync_failure}
+      else
+        :dets.sync(table)
+      end
+    end
+
+    {sync_fun, sync_count}
+  end
+
+  defp open_controlled_ledger(project_id, path, sync_fun) do
+    identity = Tracker.identity(Config.settings!().tracker)
+    {:ok, initial_ledger} = AttemptLedger.open(project_id, identity, path: path)
+    :ok = AttemptLedger.close(initial_ledger)
+    {:ok, ledger} = AttemptLedger.open(project_id, identity, path: path, sync_fun: sync_fun)
+    ledger
+  end
+
+  defp blocked_sync_failure_state(ledger, path) do
+    %Orchestrator.State{
+      attempt_ledger: ledger,
+      attempt_ledger_status: {:blocked, {:attempt_ledger_unavailable, {:ledger_sync_failed, :injected_sync_failure}}},
+      attempt_ledger_opts: [path: path],
+      poll_interval_ms: 60_000,
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+  end
+
+  defp cancel_tick(%{tick_timer_ref: timer_ref}) when is_reference(timer_ref) do
+    Process.cancel_timer(timer_ref)
+    :ok
+  end
+
+  defp cancel_tick(_state), do: :ok
+
+  defp reopen_snapshot(path, project_id, issue_id) do
+    identity = Tracker.identity(Config.settings!().tracker)
+    {:ok, ledger} = AttemptLedger.open(project_id, identity, path: path)
+    result = AttemptLedger.current(ledger, issue_id)
+    :ok = AttemptLedger.close(ledger)
+    result
+  end
+
+  defp begin_attempt_after_reopen(path, project_id, issue_id) do
+    identity = Tracker.identity(Config.settings!().tracker)
+    {:ok, ledger} = AttemptLedger.open(project_id, identity, path: path)
+    result = AttemptLedger.begin_attempt(ledger, issue_id)
+    :ok = AttemptLedger.close(ledger)
+    result
   end
 
   defp read_snapshot(path, project_id, issue_id) do
