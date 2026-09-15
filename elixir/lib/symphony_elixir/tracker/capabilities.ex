@@ -61,14 +61,17 @@ defmodule SymphonyElixir.Tracker.Capabilities do
   end
 
   defp declared_by(adapter) do
-    declared =
-      if Code.ensure_loaded?(adapter) and function_exported?(adapter, :capabilities, 0) do
-        adapter.capabilities()
-      else
-        []
+    if Code.ensure_loaded?(adapter) and function_exported?(adapter, :capabilities, 0) do
+      try do
+        normalize_declaration(adapter.capabilities())
+      rescue
+        _error -> {:error, :capabilities_callback_failed}
+      catch
+        _kind, _reason -> {:error, :capabilities_callback_failed}
       end
-
-    normalize_declaration(declared)
+    else
+      {:ok, []}
+    end
   end
 
   defp normalize_declaration(declared) when is_list(declared) do

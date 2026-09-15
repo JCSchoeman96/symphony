@@ -10,6 +10,18 @@ defmodule SymphonyElixir.TrackerCapabilitiesDuplicateAdapter do
   def capabilities, do: [:current_issue_refresh, :current_issue_refresh]
 end
 
+defmodule SymphonyElixir.TrackerCapabilitiesInvalidListAdapter do
+  def capabilities, do: :not_a_list
+end
+
+defmodule SymphonyElixir.TrackerCapabilitiesRaisingAdapter do
+  def capabilities, do: raise("capability declaration failed")
+end
+
+defmodule SymphonyElixir.TrackerCapabilitiesThrowingAdapter do
+  def capabilities, do: throw(:capability_declaration_failed)
+end
+
 defmodule SymphonyElixir.TrackerCapabilitiesTest do
   use SymphonyElixir.TestSupport
 
@@ -90,6 +102,17 @@ defmodule SymphonyElixir.TrackerCapabilitiesTest do
 
     assert {:error, {:invalid_provider_capability_declaration, _, {:duplicate_capability, :current_issue_refresh}}} =
              Capabilities.validate_adapter(SymphonyElixir.TrackerCapabilitiesDuplicateAdapter)
+
+    assert {:error, {:invalid_provider_capability_declaration, _, {:invalid_capability_list, :not_a_list}}} =
+             Capabilities.validate_adapter(SymphonyElixir.TrackerCapabilitiesInvalidListAdapter)
+  end
+
+  test "a failing capability callback is rejected without escaping validation" do
+    assert {:error, {:invalid_provider_capability_declaration, _, :capabilities_callback_failed}} =
+             Capabilities.validate_adapter(SymphonyElixir.TrackerCapabilitiesRaisingAdapter)
+
+    assert {:error, {:invalid_provider_capability_declaration, _, :capabilities_callback_failed}} =
+             Capabilities.validate_adapter(SymphonyElixir.TrackerCapabilitiesThrowingAdapter)
   end
 end
 
