@@ -114,6 +114,14 @@ defmodule SymphonyElixir.OrchestratorAttemptLineageTest do
     assert Map.has_key?(Map.get(state, :durable_exhausted, %{}), issue.id)
   end
 
+  test "blocks autonomous recovery when a reopened record is missing in_flight" do
+    assert_corrupt_record_blocks_autonomy(:in_flight)
+  end
+
+  test "blocks autonomous recovery when a reopened record is missing close_pending" do
+    assert_corrupt_record_blocks_autonomy(:close_pending)
+  end
+
   test "retains a lineage and fences the affected issue when startup reconciliation cannot find it" do
     project_id = "missing-#{System.unique_integer([:positive])}"
     issue_id = "missing-issue"
@@ -1102,6 +1110,59 @@ defmodule SymphonyElixir.OrchestratorAttemptLineageTest do
              )
 
     assert :ok = AttemptLedger.close(ledger)
+  end
+
+  defp assert_corrupt_record_blocks_autonomy(field) do
+    project_id = "corrupt-#{field}-#{System.unique_integer([:positive])}"
+    issue = active_issue("corrupt-#{field}-issue")
+    ledger_root = temporary_ledger_root()
+    path = AttemptLedger.path_for(project_id, root: ledger_root)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      symphony_project_id: project_id,
+      tracker_active_states: ["In Progress"],
+      poll_interval_ms: 60_000
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+    Application.put_env(:symphony_elixir, :attempt_ledger_test_pid, self())
+    seed_snapshot(path, project_id, issue.id, %{})
+    remove_snapshot_field(path, issue.id, field)
+
+    name = Module.concat(__MODULE__, "Corrupt#{field}#{System.unique_integer([:positive])}")
+    {:ok, pid} = start_orchestrator(name, attempt_ledger_opts: [path: path])
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: GenServer.stop(pid)
+      Application.delete_env(:symphony_elixir, :attempt_ledger_test_pid)
+    end)
+
+    issue_id = issue.id
+
+    assert eventually(fn ->
+             case :sys.get_state(pid).attempt_ledger_status do
+               {:blocked, {:attempt_ledger_unavailable, {:corrupt_attempt_record, key, :invalid_record}}} ->
+                 key == {:current, issue_id}
+
+               _ ->
+                 false
+             end
+           end)
+
+    state = :sys.get_state(pid)
+    assert state.running == %{}
+    assert state.retry_attempts == %{}
+    assert state.attempt_counters == %{}
+    refute_receive {:attempt_ledger_runner_started, ^issue_id, _opts}, 300
+  end
+
+  defp remove_snapshot_field(path, issue_id, field) do
+    {:ok, table} = :dets.open_file(path, type: :set, file: String.to_charlist(path))
+    [{key, record}] = :dets.lookup(table, {:current, issue_id})
+    :ok = :dets.insert(table, {key, Map.delete(record, field)})
+    :ok = :dets.sync(table)
+    :ok = :dets.close(table)
   end
 
   defp read_snapshot(path, project_id, issue_id) do

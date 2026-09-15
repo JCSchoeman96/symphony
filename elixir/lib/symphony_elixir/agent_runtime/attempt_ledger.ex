@@ -547,6 +547,7 @@ defmodule SymphonyElixir.AgentRuntime.AttemptLedger do
   defp validate_record(record, ledger, issue_id, allowed_keys)
        when is_map(record) and is_binary(issue_id) do
     with :ok <- validate_record_keys(record, allowed_keys),
+         {:ok, in_flight, close_pending} <- fetch_safety_fields(record),
          :ok <- validate_schema_version(Map.get(record, :schema_version)),
          :ok <- validate_project_namespace(Map.get(record, :project_namespace), ledger.project_id),
          :ok <- validate_non_empty_string(Map.get(record, :issue_id), :issue_id),
@@ -555,8 +556,8 @@ defmodule SymphonyElixir.AgentRuntime.AttemptLedger do
          :ok <- validate_status(Map.get(record, :status)),
          :ok <- validate_stop_reason(Map.get(record, :stop_reason)),
          :ok <- validate_route_fingerprint(Map.get(record, :route_fingerprint)),
-         :ok <- validate_in_flight(Map.get(record, :in_flight, false)),
-         :ok <- validate_close_pending(Map.get(record, :close_pending, false)),
+         :ok <- validate_in_flight(in_flight),
+         :ok <- validate_close_pending(close_pending),
          :ok <- validate_timestamp(Map.get(record, :updated_at)) do
       if record.issue_id != issue_id do
         {:error, :invalid_record}
@@ -570,6 +571,15 @@ defmodule SymphonyElixir.AgentRuntime.AttemptLedger do
 
   defp validate_record_keys(record, allowed_keys) do
     if Enum.all?(Map.keys(record), &(&1 in allowed_keys)), do: :ok, else: {:error, :invalid_record}
+  end
+
+  defp fetch_safety_fields(record) do
+    with {:ok, in_flight} <- Map.fetch(record, :in_flight),
+         {:ok, close_pending} <- Map.fetch(record, :close_pending) do
+      {:ok, in_flight, close_pending}
+    else
+      _ -> {:error, :invalid_record}
+    end
   end
 
   defp validate_schema_version(@schema_version), do: :ok

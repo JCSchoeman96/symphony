@@ -28,6 +28,19 @@ defmodule SymphonyElixir.AttemptLedgerTest do
     assert :ok = AttemptLedger.close(reopened)
   end
 
+  test "accepts explicitly persisted false safety fields after DETS reopen", %{path: path} do
+    record = snapshot("project-a", "issue-a", "lineage-a", %{})
+
+    seed(path, [
+      {{:meta, "project-a"}, metadata("project-a", @identity)},
+      {{:current, "issue-a"}, record}
+    ])
+
+    {:ok, ledger} = AttemptLedger.open("project-a", @identity, path: path)
+    assert {:ok, ^record} = AttemptLedger.current(ledger, "issue-a")
+    assert :ok = AttemptLedger.close(ledger)
+  end
+
   test "isolates namespaces and rejects provider identity drift", %{path: path, root: root} do
     {:ok, ledger} = AttemptLedger.open("project-a", @identity, path: path)
     assert :ok = AttemptLedger.close(ledger)
@@ -72,6 +85,30 @@ defmodule SymphonyElixir.AttemptLedgerTest do
     seed(path, [
       {{:meta, "project-a"}, metadata("project-a", @identity)},
       {{:current, "issue-a"}, :corrupt}
+    ])
+
+    assert {:error, {:corrupt_attempt_record, {:current, "issue-a"}, :invalid_record}} =
+             AttemptLedger.open("project-a", @identity, path: path)
+  end
+
+  test "rejects a real DETS record missing in_flight", %{path: path} do
+    record = snapshot("project-a", "issue-a", "lineage-a", %{}) |> Map.delete(:in_flight)
+
+    seed(path, [
+      {{:meta, "project-a"}, metadata("project-a", @identity)},
+      {{:current, "issue-a"}, record}
+    ])
+
+    assert {:error, {:corrupt_attempt_record, {:current, "issue-a"}, :invalid_record}} =
+             AttemptLedger.open("project-a", @identity, path: path)
+  end
+
+  test "rejects a real DETS record missing close_pending", %{path: path} do
+    record = snapshot("project-a", "issue-a", "lineage-a", %{}) |> Map.delete(:close_pending)
+
+    seed(path, [
+      {{:meta, "project-a"}, metadata("project-a", @identity)},
+      {{:current, "issue-a"}, record}
     ])
 
     assert {:error, {:corrupt_attempt_record, {:current, "issue-a"}, :invalid_record}} =
@@ -579,6 +616,8 @@ defmodule SymphonyElixir.AttemptLedgerTest do
       status: :open,
       stop_reason: nil,
       route_fingerprint: "sha256:test",
+      in_flight: false,
+      close_pending: false,
       updated_at: 1_700_000_000_000
     }
   end
