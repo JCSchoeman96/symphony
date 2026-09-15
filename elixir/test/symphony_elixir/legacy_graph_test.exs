@@ -15,8 +15,8 @@ end
 defmodule SymphonyElixir.LegacyGraphTest do
   use SymphonyElixir.TestSupport
 
-  alias SymphonyElixir.Tracker.Capabilities
   alias SymphonyElixir.Dependency.Graph
+  alias SymphonyElixir.Tracker.Capabilities
 
   setup do
     previous = Application.get_env(:symphony_elixir, :github_client_module)

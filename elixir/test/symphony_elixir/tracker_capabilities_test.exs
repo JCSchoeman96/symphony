@@ -26,6 +26,7 @@ defmodule SymphonyElixir.TrackerCapabilitiesTest do
   use SymphonyElixir.TestSupport
 
   alias SymphonyElixir.Config
+  alias SymphonyElixir.Config.Schema
   alias SymphonyElixir.Tracker
   alias SymphonyElixir.Tracker.Capabilities
 
@@ -57,7 +58,7 @@ defmodule SymphonyElixir.TrackerCapabilitiesTest do
 
   test "missing routed capabilities reject configuration before dispatch" do
     assert {:ok, settings} =
-             SymphonyElixir.Config.Schema.parse(%{
+             Schema.parse(%{
                "tracker" => %{
                  "kind" => "linear",
                  "endpoint" => "https://api.linear.app/graphql",
@@ -75,7 +76,7 @@ defmodule SymphonyElixir.TrackerCapabilitiesTest do
 
   test "legacy configuration remains valid for an adapter without the routed contract" do
     assert {:ok, settings} =
-             SymphonyElixir.Config.Schema.parse(%{
+             Schema.parse(%{
                "tracker" => %{
                  "kind" => "github",
                  "provider" => %{"repo" => "octo/repo", "token" => "token"},

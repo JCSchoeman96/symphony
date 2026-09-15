@@ -5,8 +5,7 @@ defmodule SymphonyElixir.Tracker.Memory do
 
   @behaviour SymphonyElixir.Tracker
 
-  alias SymphonyElixir.Tracker.TransitionPolicy
-  alias SymphonyElixir.Tracker.Issue
+  alias SymphonyElixir.Tracker.{Issue, TransitionPolicy}
 
   @read_tool "memory_read"
   @transition_tool "memory_transition"

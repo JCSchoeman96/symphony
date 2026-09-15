@@ -92,19 +92,29 @@ defmodule SymphonyElixir.Tracker.Capabilities do
   defp normalize_declaration(declared), do: {:error, {:invalid_capability_list, declared}}
 
   defp validate_structural_support(adapter, declared) do
-    Enum.reduce_while(declared, :ok, fn capability, :ok ->
-      case required_callback(capability) do
-        nil ->
-          {:cont, :ok}
+    Enum.reduce_while(declared, :ok, &validate_declared_capability(adapter, &1, &2))
+  end
 
-        {function, arity} ->
-          if function_exported?(adapter, function, arity) do
-            {:cont, :ok}
-          else
-            {:halt, {:error, {:missing_callback, capability, function, arity}}}
-          end
-      end
-    end)
+  defp validate_declared_capability(_adapter, _capability, {:error, _reason} = error), do: {:halt, error}
+
+  defp validate_declared_capability(adapter, capability, :ok) do
+    case required_callback(capability) do
+      nil -> {:cont, :ok}
+      callback -> validate_callback(adapter, capability, callback)
+    end
+  end
+
+  defp validate_callback(adapter, capability, {function, arity})
+       when is_atom(function) and is_integer(arity) do
+    if function_exported?(adapter, function, arity) do
+      {:cont, :ok}
+    else
+      {:halt, {:error, {:missing_callback, capability, function, arity}}}
+    end
+  end
+
+  defp validate_callback(_adapter, capability, _callback) do
+    {:halt, {:error, {:missing_callback, capability}}}
   end
 
   defp required_callback(:current_issue_refresh), do: {:fetch_issues_by_ids, 1}
