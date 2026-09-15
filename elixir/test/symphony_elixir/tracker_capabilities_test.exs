@@ -42,6 +42,11 @@ defmodule SymphonyElixir.TrackerCapabilitiesTest do
            ]
   end
 
+  test "exposes the complete local capability vocabulary" do
+    assert :conditional_transition in Capabilities.vocabulary()
+    assert length(Capabilities.vocabulary()) == 8
+  end
+
   test "resolves adapter declarations locally without invoking provider clients" do
     Application.put_env(:symphony_elixir, :linear_client_module, SymphonyElixir.TrackerCapabilitiesProbeClient)
 
@@ -114,6 +119,44 @@ defmodule SymphonyElixir.TrackerCapabilitiesTest do
 
     assert {:error, {:invalid_provider_capability_declaration, _, :capabilities_callback_failed}} =
              Capabilities.validate_adapter(SymphonyElixir.TrackerCapabilitiesThrowingAdapter)
+  end
+
+  test "tracker identity projects each provider scope without secrets" do
+    assert Tracker.identity(%{
+             kind: "linear",
+             project_slug: " linear-project ",
+             provider: %{"project_slug" => "fallback", "api_key" => "secret"}
+           }) == %{
+             tracker_kind: "linear",
+             provider_scope: %{project_slug: "linear-project"}
+           }
+
+    assert Tracker.identity(%{
+             kind: "linear",
+             project_slug: nil,
+             provider: %{project_slug: " fallback-project "}
+           }).provider_scope == %{project_slug: "fallback-project"}
+
+    assert Tracker.identity(%{kind: "github", provider: %{"repo" => " octo/repo "}}).provider_scope == %{
+             repo: "octo/repo"
+           }
+
+    assert Tracker.identity(%{kind: "gitlab", provider: %{repo: "group/project"}}).provider_scope == %{
+             repo: "group/project"
+           }
+
+    assert Tracker.identity(%{kind: "jira", provider: %{"project_key" => " JIRA "}}).provider_scope == %{
+             project_key: "JIRA"
+           }
+
+    assert Tracker.identity(%{kind: "asana", provider: %{project_gid: " 123 "}}).provider_scope == %{
+             project_gid: "123"
+           }
+
+    assert Tracker.identity(%{kind: "memory", provider: nil}).provider_scope == %{}
+    assert Tracker.identity(%{kind: "linear", project_slug: nil, provider: nil}).provider_scope == %{}
+    assert Tracker.identity(%{kind: "github", provider: %{"repo" => 123}}).provider_scope == %{}
+    assert Tracker.identity(%{kind: "other", provider: %{}}).provider_scope == %{}
   end
 
   test "tracker capability facade follows the configured adapter" do

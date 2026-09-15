@@ -32,14 +32,16 @@ If a claimed issue moves to a terminal state (`Done`, `Closed`, `Cancelled`, or 
 Symphony stops the active agent for that issue and cleans up matching workspaces.
 
 If Codex reports that operator input, approval, or MCP elicitation is required, Symphony keeps the
-issue claimed and exposes it as blocked in the runtime state, JSON API, and dashboard. Blocked
-entries are in memory only; restarting the orchestrator clears that blocked map, so any still-active
-tracker issue can become a dispatch candidate again after restart.
+issue claimed and exposes it as blocked in the runtime state, JSON API, and dashboard. The blocked
+entry itself is runtime state, but routed safety counters and exhaustion are durable in a
+project-scoped DETS ledger; restarting does not restore a Codex session or retry timer.
 
 Automatic retry accounting is bounded per issue lineage: ordinary runtime or spawn failures receive
 at most three retries, capacity waits do not consume that failure budget, and reviewer-to-correction
 loops stop after three cycles. Normal continuations and route changes are tracked separately. CI
-infrastructure is not retried automatically; a human or provider path must handle it.
+infrastructure is not retried automatically; a human or provider path must handle it. Routed mode
+requires an explicit stable `symphony.project_id`; safety-relevant writes are synced before any
+automatic follow-up, and ledger/provider reconciliation failures hold autonomous dispatch closed.
 
 Retry dispatch rechecks eligibility, capacity, and the selected role after the final graph read.
 Review-to-correction transitions count even if observed during retry wait or denied by dependencies.
@@ -161,8 +163,18 @@ Notes:
 
 - If a value is missing, defaults are used.
 - `agent.routing: routed` opts into explicit responsibility-aware profiles and
-  state routes. The shipped `WORKFLOW.md` shows the complete sample; workflows
+  state routes and requires `symphony.project_id`. The shipped `WORKFLOW.md` is a
+  legacy Linear compatibility sample; use the deterministic `memory` adapter in
+  tests until a provider passes the complete routed capability contract. Workflows
   without `agent.profiles` retain the legacy compatibility path.
+- Routed safety lineage is stored in a deterministic DETS file outside the
+  repository, workspace, and default `/tmp` directory. The namespace is keyed by
+  `symphony.project_id`, while tracker/repository identity is checked on open.
+  Corrupt, newer-schema, unavailable, or mismatched ledgers hold autonomous work
+  closed rather than resetting counters. Use `mix symphony.attempt_rearm` with an
+  explicit project, issue, reason, operator, and epoch-millisecond timestamp to rearm an
+  exhausted lineage;
+  deleting the DETS file manually is unsafe and unsupported.
 - Routed role policies are shipped in `prompts/`. Symphony reads those files
   at runtime and uses the packaged copy when a file is unavailable. An active
   attempt captures its role prompt when it starts, so a later file edit applies

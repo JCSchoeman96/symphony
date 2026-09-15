@@ -18,6 +18,8 @@ tracker:
     - Canceled
     - Duplicate
     - Done
+symphony:
+  project_id: symphony-main
 polling:
   interval_ms: 5000
 workspace:
@@ -120,9 +122,12 @@ Follow-up context:
 9. Report exact validation commands and results. Report external blockers
    without fabricating provider, CI, or runtime evidence.
 
-Attempt counters live in the orchestrator's OTP state. Workflow reloads retain
-the counters for the current live issue lineage; a process restart performs the
-existing tracker/filesystem recovery and does not synthesize retry history.
+In legacy mode, attempt counters live in the orchestrator's OTP state. In routed
+mode, safety-relevant ordinary-failure and review-cycle counters are stored in a
+project-scoped DETS ledger and synced before automatic follow-up. Workflow
+reloads and process restarts retain the durable lineage, while current issue
+state, route, dependencies, and capacity are always reread. Symphony never
+restores a prior Codex session or retry timer.
 
 Use `linear_transition` for one authorized handoff per session, then stop. The tool checks current
 issue state and dependencies before writing. If a handoff response is uncertain, report it and stop;
