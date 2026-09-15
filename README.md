@@ -58,7 +58,8 @@ An exhausted lineage requires an explicit host-only rearm:
 
 ```bash
 mix symphony.attempt_rearm --project-id symphony-main --issue-id ENG-123 \
-  --reason "provider state verified" --operator alice
+  --reason "provider state verified" --operator alice \
+  --timestamp "$(date +%s%3N)"
 ```
 
 Manual DETS deletion is unsupported because it can destroy safety history.

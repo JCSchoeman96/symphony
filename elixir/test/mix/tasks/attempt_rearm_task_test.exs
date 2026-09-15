@@ -29,6 +29,19 @@ defmodule Mix.Tasks.Symphony.AttemptRearmTest do
         "verified"
       ])
     end
+
+    assert_raise Mix.Error, ~r/Missing required option --timestamp/, fn ->
+      AttemptRearm.run([
+        "--project-id",
+        "project-a",
+        "--issue-id",
+        "issue-a",
+        "--reason",
+        "verified",
+        "--operator",
+        "operator"
+      ])
+    end
   end
 
   test "rearms an exhausted lineage and preserves the old history" do
@@ -118,6 +131,8 @@ defmodule Mix.Tasks.Symphony.AttemptRearmTest do
         "not allowed",
         "--operator",
         "operator",
+        "--timestamp",
+        "1700000000000",
         "--ledger-path",
         ledger_path,
         "--workflow",
@@ -156,7 +171,9 @@ defmodule Mix.Tasks.Symphony.AttemptRearmTest do
         "--reason",
         "verified",
         "--operator",
-        "operator"
+        "operator",
+        "--timestamp",
+        "1700000000000"
       ])
     end
   end
@@ -223,6 +240,8 @@ defmodule Mix.Tasks.Symphony.AttemptRearmTest do
         "verified",
         "--operator",
         "operator",
+        "--timestamp",
+        "1700000000000",
         "--workflow",
         workflow_path
       ])
@@ -238,6 +257,8 @@ defmodule Mix.Tasks.Symphony.AttemptRearmTest do
         "verified",
         "--operator",
         "operator",
+        "--timestamp",
+        "1700000000000",
         "--workflow",
         Path.join(System.tmp_dir!(), "missing-workflow-#{System.unique_integer([:positive])}")
       ])
@@ -268,6 +289,8 @@ defmodule Mix.Tasks.Symphony.AttemptRearmTest do
         "verified",
         "--operator",
         "operator",
+        "--timestamp",
+        "1700000000000",
         "--workflow",
         workflow_path,
         "--ledger-path",
