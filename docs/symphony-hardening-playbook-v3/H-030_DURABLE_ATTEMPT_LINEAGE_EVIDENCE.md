@@ -222,7 +222,7 @@ mix test test/symphony_elixir/attempt_ledger_test.exs \
 Result: 64 tests, 0 failures.
 
 The full coverage command completed with 535 tests, 0 failures, 6 skipped,
-and 90.34% total coverage. The H-010 truthful 90% coverage threshold was
+and 90.27% total coverage. The H-010 truthful 90% coverage threshold was
 unchanged and remained green. `mix format --check-formatted`, `mix specs.check`,
 strict Credo, Dialyzer, `make -C elixir all`, and `git diff --check` all passed;
 Dialyzer reported 0 errors.
