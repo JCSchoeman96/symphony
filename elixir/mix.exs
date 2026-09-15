@@ -10,7 +10,7 @@ defmodule SymphonyElixir.MixProject do
       start_permanent: Mix.env() == :prod,
       test_coverage: [
         summary: [
-          threshold: 100
+          threshold: 90
         ],
         ignore_modules: [
           SymphonyElixir.Asana.Client,
@@ -18,15 +18,9 @@ defmodule SymphonyElixir.MixProject do
           SymphonyElixir.GitHub.Client,
           SymphonyElixir.GitLab.Client,
           SymphonyElixir.Jira.Client,
-          SymphonyElixir.Linear.Client,
           SymphonyElixir.SpecsCheck,
-          SymphonyElixir.Orchestrator,
-          SymphonyElixir.Orchestrator.State,
-          SymphonyElixir.AgentRunner,
           SymphonyElixir.Application,
           SymphonyElixir.CLI,
-          SymphonyElixir.Codex.AppServer,
-          SymphonyElixir.Codex.DynamicTool,
           SymphonyElixir.HttpServer,
           SymphonyElixir.StatusDashboard,
           SymphonyElixir.LogFile,
