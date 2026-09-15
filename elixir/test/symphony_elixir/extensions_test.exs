@@ -218,7 +218,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     binding = SymphonyElixir.Tracker.bind_agent_tools()
     assert binding.adapter == Memory
-    assert binding.tool_specs == []
+    assert Enum.map(binding.tool_specs, &Map.fetch!(&1, "name")) == ["memory_read", "memory_transition"]
     assert binding.secret_environment_names == []
 
     assert SymphonyElixir.Tracker.execute_bound_agent_tool(binding, "not_a_memory_tool", %{})[
@@ -228,7 +228,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert {:error, {:unsupported_tracker_kind, "future-tracker"}} =
              SymphonyElixir.Tracker.adapter_for_kind("future-tracker")
 
-    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "linear")
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "linear", agent_routing: "legacy")
     assert SymphonyElixir.Tracker.adapter() == Adapter
     assert SymphonyElixir.Tracker.bind_agent_tools().secret_environment_names == ["LINEAR_API_KEY"]
   end

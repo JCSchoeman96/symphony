@@ -190,12 +190,12 @@ defmodule SymphonyElixir.RolePromptTest do
     end
   end
 
-  test "the shipped workflow uses routed lifecycle configuration" do
+  test "the shipped workflow remains legacy-compatible while Linear routed mode is gated" do
     workflow_path = Path.expand("../../WORKFLOW.md", __DIR__)
     assert {:ok, %{config: config, prompt: prompt}} = Workflow.load(workflow_path)
     assert {:ok, settings} = Schema.parse(config)
-    assert settings.agent.routing == "routed"
-    assert is_map(settings.agent.profiles)
+    assert settings.agent.routing == "legacy"
+    assert settings.agent.profiles == nil
     assert prompt =~ "role policy"
     refute prompt =~ "Merging"
     refute prompt =~ "Human Review"

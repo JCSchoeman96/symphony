@@ -14,7 +14,9 @@ end
 
 defmodule SymphonyElixir.LegacyGraphTest do
   use SymphonyElixir.TestSupport
+
   alias SymphonyElixir.Dependency.Graph
+  alias SymphonyElixir.Tracker.Capabilities
 
   setup do
     previous = Application.get_env(:symphony_elixir, :github_client_module)
@@ -39,9 +41,11 @@ defmodule SymphonyElixir.LegacyGraphTest do
     refute Graph.complete?(state.dependency_graph)
   end
 
-  test "routed dispatch fails closed for providers without graph support" do
-    write_provider_workflow("routed")
-    assert poll().running == %{}
+  test "routed configuration rejects providers without the capability contract" do
+    assert {:error, {:routed_provider_capabilities_missing, "github", missing}} =
+             write_provider_workflow("routed")
+
+    assert missing == Capabilities.required_routed()
     refute_receive {:legacy_dispatch, _, _}
   end
 
@@ -82,6 +86,6 @@ defmodule SymphonyElixir.LegacyGraphTest do
     Test {{ issue.identifier }}.
     """)
 
-    :ok = WorkflowStore.force_reload()
+    WorkflowStore.force_reload()
   end
 end

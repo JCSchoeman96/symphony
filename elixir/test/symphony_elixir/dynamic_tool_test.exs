@@ -68,13 +68,16 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "linear",
       tracker_api_token: "session-token",
-      tracker_project_slug: "session-project"
+      tracker_project_slug: "session-project",
+      agent_routing: "legacy"
     )
 
     binding = BoundDynamicTool.bind()
 
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
-    assert BoundDynamicTool.bind().tool_specs == []
+
+    assert Enum.map(BoundDynamicTool.bind().tool_specs, &Map.fetch!(&1, "name")) ==
+             ["memory_read", "memory_transition"]
 
     test_pid = self()
 
@@ -316,7 +319,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
   end
 
   test "bound dynamic tools preserve transition context from session binding" do
-    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "linear")
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "linear", agent_routing: "legacy")
 
     binding =
       BoundDynamicTool.bind(

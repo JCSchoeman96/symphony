@@ -1,14 +1,3 @@
-defmodule RetryRefreshClient do
-  alias SymphonyElixir.Tracker.Issue
-  def issue(state), do: %Issue{id: "probe", identifier: "PROBE-1", title: "Probe", state: state, dispatchable: true}
-  def fetch_issues_by_ids(_), do: {:ok, [issue(Process.get(:lookup_state, "Ready"))]}
-
-  def fetch_dependency_graph do
-    issue = %{issue(Process.get(:graph_state, "Canceled")) | blocked_by: Process.get(:graph_blockers, [])}
-    {:ok, [issue]}
-  end
-end
-
 defmodule RetryRefreshRunner do
   def run(issue, recipient, opts), do: send(recipient, {:probe_dispatch, issue.state, opts[:route].responsibility})
 end
@@ -18,19 +7,8 @@ defmodule SymphonyElixir.RetryRefreshTest do
   alias SymphonyElixir.AgentRuntime.AttemptPolicy
 
   setup do
-    previous = Application.get_env(:symphony_elixir, :linear_client_module)
-    Application.put_env(:symphony_elixir, :linear_client_module, RetryRefreshClient)
-
-    on_exit(fn ->
-      if previous do
-        Application.put_env(:symphony_elixir, :linear_client_module, previous)
-      else
-        Application.delete_env(:symphony_elixir, :linear_client_module)
-      end
-    end)
-
     write_workflow_file!(Workflow.workflow_file_path(),
-      tracker_kind: "linear",
+      tracker_kind: "memory",
       tracker_active_states: ["Ready", "In Review", "Changes Requested"],
       poll_interval_ms: 60_000
     )
@@ -40,6 +18,32 @@ defmodule SymphonyElixir.RetryRefreshTest do
 
   defp retry_state(counters \\ AttemptPolicy.new()) do
     token = make_ref()
+    issue_state = Process.get(:graph_state, "Canceled")
+    blockers = Process.get(:graph_blockers, [])
+
+    Application.put_env(
+      :symphony_elixir,
+      :memory_tracker_issues,
+      [
+        %Issue{
+          id: "probe",
+          identifier: "PROBE-1",
+          title: "Probe",
+          state: issue_state,
+          blocked_by: blockers,
+          dispatchable: true
+        }
+        | Enum.map(blockers, fn blocker ->
+            %Issue{
+              id: Map.fetch!(blocker, :id),
+              identifier: Map.get(blocker, :identifier, Map.fetch!(blocker, :id)),
+              title: "Blocker",
+              state: Map.fetch!(blocker, :state),
+              dispatchable: false
+            }
+          end)
+      ]
+    )
 
     state = %Orchestrator.State{
       poll_interval_ms: 60_000,
