@@ -43,8 +43,11 @@ new V3 corruption fix
 new reconstructed H-030 candidate
 ```
 
-The new focused fix is commit
+The H-030F focused corruption-validation fix is commit
 `2c7e0a3fd396c71e6fb460bc05d6230007e9203a`.
+
+The H-030G focused durable-resync recovery fix is commit
+`eae1c7a33ba7f432497b47a57573c32773b97c12`.
 
 ## H-030 responsibility
 
@@ -157,6 +160,25 @@ success; it does not fall back to an in-memory autonomous retry when durable
 accounting fails. The DETS file is opened as a set with autosave disabled for
 implicit timing (`auto_save: :infinity`) and is chmod'ed to `0600`.
 
+H-030G closes the recovery gap for a safety-relevant sync failure. A blocked
+ledger whose reason is `{:attempt_ledger_unavailable, {:ledger_sync_failed,
+reason}}` follows this exact lifecycle:
+
+```text
+Blocked
+→ explicit AttemptLedger.sync/1
+→ fresh durable-lineage reconciliation
+→ Ready
+→ only then reschedule or dispatch automatic work
+```
+
+If the explicit recovery sync fails, the ledger remains blocked and no retry
+dispatch, worker spawn, counter reset, or follow-up authority is granted. The
+existing poll cadence performs the next recovery attempt; no busy-loop or new
+scheduler is introduced. A readable record in the still-open DETS table after
+the original sync failure is not treated as durable authority. The successful
+resync is required before the fresh lineage reread and tracker reconciliation.
+
 ## Restart and reconciliation
 
 On routed startup, the Orchestrator opens and validates the DETS ledger before
@@ -209,6 +231,20 @@ The focused real-DETS regressions are in:
     corrupt-record error;
   - no worker dispatch occurs and `running`, `retry_attempts`, and
     `attempt_counters` remain empty.
+  - a repeated recovery sync failure leaves the ledger blocked and does not
+    dispatch a worker or create retry authority;
+  - a successful recovery sync is observed after the original failed safety
+    sync and before reconciliation restores `:ready`;
+  - the safety record is closed and reopened through the real DETS ledger
+    after recovery, with its counters and explicit safety fields intact;
+  - an ordinarily exhausted lineage remains exhausted after the same
+    close/reopen cycle and rejects a new attempt.
+
+The H-030G Orchestrator delta is limited to the dedicated sync-failure
+recovery gate in `elixir/lib/symphony_elixir/orchestrator.ex`; the focused
+regressions and their helpers are in
+`elixir/test/symphony_elixir/orchestrator_attempt_lineage_test.exs`. No
+AttemptLedger schema or validation code changed for H-030G.
 
 The focused command was:
 
@@ -219,10 +255,10 @@ mix test test/symphony_elixir/attempt_ledger_test.exs \
   test/mix/tasks/attempt_rearm_task_test.exs
 ```
 
-Result: 64 tests, 0 failures.
+Result: 67 tests, 0 failures.
 
-The full coverage command completed with 535 tests, 0 failures, 6 skipped,
-and 90.27% total coverage. The H-010 truthful 90% coverage threshold was
+The full coverage command completed with 538 tests, 0 failures, 6 skipped,
+and 90.31% total coverage. The H-010 truthful 90% coverage threshold was
 unchanged and remained green. `mix format --check-formatted`, `mix specs.check`,
 strict Credo, Dialyzer, `make -C elixir all`, and `git diff --check` all passed;
 Dialyzer reported 0 errors.
