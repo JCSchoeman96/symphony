@@ -106,6 +106,146 @@ defmodule SymphonyElixir.AttemptLedgerTest do
     assert :ok = AttemptLedger.close(sync_failed)
   end
 
+  test "tracks an in-flight reservation across a real close and reopen", %{path: path} do
+    {:ok, ledger} = AttemptLedger.open("project-a", @identity, path: path)
+
+    assert {:ok, reserved} =
+             AttemptLedger.begin_attempt(ledger, "issue-a",
+               route_fingerprint: "sha256:test",
+               updated_at: 1_700_000_000_000
+             )
+
+    assert reserved.in_flight == true
+    assert {:ok, ^reserved} = AttemptLedger.current(ledger, "issue-a")
+    assert :ok = AttemptLedger.close(ledger)
+
+    {:ok, reopened} = AttemptLedger.open("project-a", @identity, path: path)
+    assert {:ok, %{in_flight: true}} = AttemptLedger.current(reopened, "issue-a")
+    assert {:error, :attempt_in_flight} = AttemptLedger.begin_attempt(reopened, "issue-a")
+    assert :ok = AttemptLedger.clear_in_flight(reopened, "issue-a", updated_at: 1_700_000_000_001)
+    assert {:ok, %{in_flight: false}} = AttemptLedger.current(reopened, "issue-a")
+    assert :ok = AttemptLedger.close(reopened)
+  end
+
+  test "retains an unconfirmed close across a real close and reopen", %{path: path} do
+    {:ok, ledger} = AttemptLedger.open("project-a", @identity, path: path)
+
+    assert {:ok, _record} =
+             AttemptLedger.persist_safety(ledger, "issue-a", %{
+               ordinary_failures: 0,
+               ordinary_retries: 0,
+               review_cycles: 0
+             })
+
+    failing_sync = %{ledger | sync_fun: fn _table -> {:error, :injected_sync_failure} end}
+
+    assert {:error, {:ledger_sync_failed, :injected_sync_failure}} =
+             AttemptLedger.close_lineage(failing_sync, "issue-a")
+
+    assert {:ok, %{status: :closed, close_pending: true}} = AttemptLedger.current(failing_sync, "issue-a")
+    assert {:ok, [%{status: :closed, close_pending: true}]} = AttemptLedger.open_lineages(failing_sync)
+    assert :ok = AttemptLedger.close(failing_sync)
+
+    {:ok, reopened} = AttemptLedger.open("project-a", @identity, path: path)
+    assert {:ok, %{status: :closed, close_pending: true}} = AttemptLedger.current(reopened, "issue-a")
+    assert {:ok, [%{status: :closed, close_pending: true}]} = AttemptLedger.open_lineages(reopened)
+
+    zero_counters = %{ordinary_failures: 0, ordinary_retries: 0, review_cycles: 0}
+    assert {:error, :lineage_close_pending} = AttemptLedger.begin_attempt(reopened, "issue-a")
+    assert {:error, :lineage_close_pending} = AttemptLedger.fence_attempt(reopened, "issue-a")
+
+    assert {:error, :lineage_close_pending} =
+             AttemptLedger.persist_safety(reopened, "issue-a", zero_counters)
+
+    assert :ok = AttemptLedger.confirm_lineage_close(reopened, "issue-a")
+    assert {:ok, %{status: :closed, close_pending: false}} = AttemptLedger.current(reopened, "issue-a")
+    assert {:ok, []} = AttemptLedger.open_lineages(reopened)
+    assert {:error, :lineage_not_found} = AttemptLedger.confirm_lineage_close(reopened, "missing")
+    assert {:error, :invalid_attempt_arguments} = AttemptLedger.confirm_lineage_close(:invalid, "issue-a")
+
+    assert {:ok, _record} = AttemptLedger.persist_safety(reopened, "issue-b", zero_counters)
+    assert {:error, :lineage_not_closed} = AttemptLedger.confirm_lineage_close(reopened, "issue-b")
+    assert :ok = AttemptLedger.close(reopened)
+  end
+
+  test "guards reservation, fence, clear, and sync boundaries", %{path: path} do
+    {:ok, ledger} = AttemptLedger.open("project-a", @identity, path: path)
+    valid = snapshot("project-a", "issue-a", "lineage-a", %{})
+
+    assert {:error, :invalid_attempt_arguments} = AttemptLedger.begin_attempt(:invalid, "issue-a")
+    assert {:error, :invalid_attempt_arguments} = AttemptLedger.fence_attempt(:invalid, "issue-a")
+    assert {:error, :invalid_attempt_arguments} = AttemptLedger.clear_in_flight(:invalid, "issue-a")
+
+    assert :ok = AttemptLedger.put(ledger, valid)
+    assert {:ok, %{in_flight: true}} = AttemptLedger.fence_attempt(ledger, "issue-a")
+    assert :ok = AttemptLedger.clear_in_flight(ledger, "issue-a")
+    assert {:ok, %{in_flight: true}} = AttemptLedger.begin_attempt(ledger, "issue-a")
+    assert {:error, :attempt_in_flight} = AttemptLedger.begin_attempt(ledger, "issue-a")
+    assert :ok = AttemptLedger.clear_in_flight(ledger, "issue-a")
+    assert :ok = AttemptLedger.clear_in_flight(ledger, "issue-a")
+    assert :ok = AttemptLedger.close_lineage(ledger, "issue-a")
+    assert :ok = AttemptLedger.clear_in_flight(ledger, "issue-a")
+    assert {:ok, %{in_flight: true}} = AttemptLedger.begin_attempt(ledger, "issue-a")
+    assert :ok = AttemptLedger.clear_in_flight(ledger, "issue-a")
+    assert :ok = AttemptLedger.close_lineage(ledger, "issue-a")
+    assert {:ok, %{in_flight: true}} = AttemptLedger.fence_attempt(ledger, "issue-a")
+    assert :ok = AttemptLedger.clear_in_flight(ledger, "issue-a")
+
+    assert {:ok, %{in_flight: true}} = AttemptLedger.fence_attempt(ledger, "missing")
+    assert :ok = AttemptLedger.clear_in_flight(ledger, "never-started")
+
+    exhausted = snapshot("project-a", "exhausted", "lineage-exhausted", %{ordinary_failures: 4, ordinary_retries: 3})
+    exhausted = %{exhausted | status: :exhausted, stop_reason: :ordinary_retry_limit}
+    assert :ok = AttemptLedger.put(ledger, exhausted)
+    assert {:error, :lineage_exhausted} = AttemptLedger.begin_attempt(ledger, "exhausted")
+    assert {:error, :lineage_exhausted} = AttemptLedger.fence_attempt(ledger, "exhausted")
+
+    :ok = :dets.insert(ledger.table, {{:current, "corrupt"}, :corrupt})
+    assert {:error, :invalid_record} = AttemptLedger.begin_attempt(ledger, "corrupt")
+    assert {:error, :invalid_record} = AttemptLedger.fence_attempt(ledger, "corrupt")
+    assert {:error, :invalid_record} = AttemptLedger.clear_in_flight(ledger, "corrupt")
+
+    assert :ok = AttemptLedger.sync(ledger)
+    failing_sync = %{ledger | sync_fun: fn _table -> {:error, :sync_failed} end}
+    assert {:error, {:ledger_sync_failed, :sync_failed}} = AttemptLedger.sync(failing_sync)
+    assert :ok = AttemptLedger.close(ledger)
+  end
+
+  test "rejects semantically impossible safety snapshots", %{path: path} do
+    {:ok, ledger} = AttemptLedger.open("project-a", @identity, path: path)
+    valid = Map.put(snapshot("project-a", "issue-a", "lineage-a", %{}), :in_flight, false)
+
+    impossible = [
+      %{valid | safety_counters: %{ordinary_failures: 4, ordinary_retries: 3, review_cycles: 0}},
+      %{valid | safety_counters: %{ordinary_failures: 1, ordinary_retries: 0, review_cycles: 0}},
+      %{valid | status: :exhausted, stop_reason: :ordinary_retry_limit},
+      %{valid | status: :exhausted, stop_reason: :review_cycle_limit},
+      %{valid | status: :exhausted, stop_reason: nil},
+      %{valid | in_flight: true, status: :exhausted, stop_reason: :ordinary_retry_limit},
+      %{valid | status: :open, stop_reason: :unexpected},
+      %{valid | status: :exhausted, stop_reason: :unexpected},
+      %{
+        valid
+        | status: :exhausted,
+          safety_counters: %{ordinary_failures: 4, ordinary_retries: 3, review_cycles: 4},
+          stop_reason: :ordinary_retry_limit
+      },
+      %{
+        valid
+        | status: :exhausted,
+          safety_counters: %{ordinary_failures: 4, ordinary_retries: 3, review_cycles: 3},
+          stop_reason: :review_cycle_limit
+      },
+      Map.merge(valid, %{status: :closed, in_flight: true, closed_reason: :terminal})
+    ]
+
+    for record <- impossible do
+      assert {:error, _reason} = AttemptLedger.put(ledger, record)
+    end
+
+    assert :ok = AttemptLedger.close(ledger)
+  end
+
   test "rearm preserves exhausted history and creates a new lineage", %{path: path} do
     {:ok, ledger} = AttemptLedger.open("project-a", @identity, path: path)
     exhausted = snapshot("project-a", "issue-a", "lineage-a", %{ordinary_failures: 4, ordinary_retries: 3})
@@ -157,7 +297,14 @@ defmodule SymphonyElixir.AttemptLedgerTest do
                review_cycles: 0
              })
 
-    assert {:error, :lineage_exhausted} = AttemptLedger.put(ledger, %{exhausted | status: :open})
+    reset_attempt = %{
+      exhausted
+      | status: :open,
+        safety_counters: %{ordinary_failures: 3, ordinary_retries: 3, review_cycles: 0},
+        stop_reason: nil
+    }
+
+    assert {:error, :lineage_exhausted} = AttemptLedger.put(ledger, reset_attempt)
 
     assert {:ok, ^exhausted} = AttemptLedger.current(ledger, "issue-a")
     assert :ok = AttemptLedger.close(ledger)
@@ -184,6 +331,8 @@ defmodule SymphonyElixir.AttemptLedgerTest do
       Map.put(valid, :status, :invalid),
       Map.put(valid, :stop_reason, "not-an-atom"),
       Map.put(valid, :route_fingerprint, 123),
+      Map.put(valid, :in_flight, :yes),
+      Map.put(valid, :close_pending, true),
       Map.put(valid, :updated_at, -1)
     ]
 
@@ -209,6 +358,18 @@ defmodule SymphonyElixir.AttemptLedgerTest do
              AttemptLedger.rearm(ledger, "issue-a", "reason", "operator", 1_700_000_000_000)
   end
 
+  test "accepts the explicit CI-disabled exhaustion state", %{path: path} do
+    {:ok, ledger} = AttemptLedger.open("project-a", @identity, path: path)
+
+    exhausted =
+      snapshot("project-a", "issue-ci", "lineage-ci", %{})
+      |> Map.merge(%{status: :exhausted, stop_reason: :ci_retry_disabled})
+
+    assert :ok = AttemptLedger.put(ledger, exhausted)
+    assert {:ok, ^exhausted} = AttemptLedger.current(ledger, "issue-ci")
+    assert :ok = AttemptLedger.close(ledger)
+  end
+
   test "closes missing and active lineages, and keeps closed writes separate", %{path: path} do
     {:ok, ledger} = AttemptLedger.open("project-a", @identity, path: path)
 
@@ -223,7 +384,7 @@ defmodule SymphonyElixir.AttemptLedgerTest do
     assert {:ok, reopened_lineage} =
              AttemptLedger.persist_safety(ledger, "issue-a", %{
                ordinary_failures: 1,
-               ordinary_retries: 0,
+               ordinary_retries: 1,
                review_cycles: 0
              })
 

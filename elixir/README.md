@@ -172,7 +172,8 @@ Notes:
   `symphony.project_id`, while tracker/repository identity is checked on open.
   Corrupt, newer-schema, unavailable, or mismatched ledgers hold autonomous work
   closed rather than resetting counters. Use `mix symphony.attempt_rearm` with an
-  explicit project, issue, reason, and operator to rearm an exhausted lineage;
+  explicit project, issue, reason, operator, and epoch-millisecond timestamp to rearm an
+  exhausted lineage;
   deleting the DETS file manually is unsafe and unsupported.
 - Routed role policies are shipped in `prompts/`. Symphony reads those files
   at runtime and uses the packaged copy when a file is unavailable. An active

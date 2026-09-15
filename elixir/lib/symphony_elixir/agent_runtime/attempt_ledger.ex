@@ -21,6 +21,8 @@ defmodule SymphonyElixir.AgentRuntime.AttemptLedger do
     :status,
     :stop_reason,
     :route_fingerprint,
+    :in_flight,
+    :close_pending,
     :updated_at
   ]
   @history_record_keys @base_record_keys ++ [:closed_reason, :rearm_reason, :rearmed_by, :rearmed_at]
@@ -111,7 +113,8 @@ defmodule SymphonyElixir.AgentRuntime.AttemptLedger do
     with {:ok, records} <- all_records(ledger) do
       records
       |> Enum.filter(fn {key, record} ->
-        match?({:current, _issue_id}, key) and Map.get(record, :status) in [:open, :exhausted]
+        match?({:current, _issue_id}, key) and
+          (Map.get(record, :status) in [:open, :exhausted] or Map.get(record, :close_pending, false))
       end)
       |> Enum.map(&elem(&1, 1))
       |> then(&{:ok, Enum.sort_by(&1, fn record -> record.issue_id end)})
@@ -142,6 +145,136 @@ defmodule SymphonyElixir.AgentRuntime.AttemptLedger do
 
   def put(_ledger, _record), do: {:error, {:corrupt_attempt_record, :current, :invalid_record}}
 
+  @spec begin_attempt(t(), String.t()) :: {:ok, record()} | {:error, term()}
+  def begin_attempt(ledger, issue_id), do: begin_attempt(ledger, issue_id, [])
+
+  @spec begin_attempt(t(), String.t(), keyword()) :: {:ok, record()} | {:error, term()}
+  def begin_attempt(%__MODULE__{} = ledger, issue_id, opts) when is_binary(issue_id) do
+    case current(ledger, issue_id) do
+      {:ok, %{status: :exhausted}} ->
+        {:error, :lineage_exhausted}
+
+      {:ok, %{status: :open, in_flight: true}} ->
+        {:error, :attempt_in_flight}
+
+      {:ok, %{status: :closed, close_pending: true}} ->
+        {:error, :lineage_close_pending}
+
+      {:ok, %{status: :open, safety_counters: counters}} ->
+        persist_safety(ledger, issue_id, counters,
+          status: :open,
+          stop_reason: nil,
+          route_fingerprint: Keyword.get(opts, :route_fingerprint),
+          in_flight: true,
+          updated_at: Keyword.get(opts, :updated_at, now_ms())
+        )
+
+      {:ok, %{status: :closed}} ->
+        persist_safety(ledger, issue_id, durable_counter_defaults(),
+          status: :open,
+          stop_reason: nil,
+          route_fingerprint: Keyword.get(opts, :route_fingerprint),
+          in_flight: true,
+          updated_at: Keyword.get(opts, :updated_at, now_ms())
+        )
+
+      :not_found ->
+        persist_safety(ledger, issue_id, durable_counter_defaults(),
+          status: :open,
+          stop_reason: nil,
+          route_fingerprint: Keyword.get(opts, :route_fingerprint),
+          in_flight: true,
+          updated_at: Keyword.get(opts, :updated_at, now_ms())
+        )
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  def begin_attempt(_ledger, _issue_id, _opts), do: {:error, :invalid_attempt_arguments}
+
+  @spec fence_attempt(t(), String.t()) :: {:ok, record()} | {:error, term()}
+  def fence_attempt(ledger, issue_id), do: fence_attempt(ledger, issue_id, [])
+
+  @spec fence_attempt(t(), String.t(), keyword()) :: {:ok, record()} | {:error, term()}
+  def fence_attempt(%__MODULE__{} = ledger, issue_id, opts) when is_binary(issue_id) do
+    case current(ledger, issue_id) do
+      {:ok, %{status: :exhausted}} ->
+        {:error, :lineage_exhausted}
+
+      {:ok, %{status: :closed, close_pending: true}} ->
+        {:error, :lineage_close_pending}
+
+      {:ok, %{status: :open, safety_counters: counters} = record} ->
+        persist_safety(ledger, issue_id, counters,
+          status: :open,
+          stop_reason: nil,
+          route_fingerprint: Keyword.get(opts, :route_fingerprint, Map.get(record, :route_fingerprint)),
+          in_flight: true,
+          updated_at: Keyword.get(opts, :updated_at, now_ms())
+        )
+
+      {:ok, %{status: :closed}} ->
+        persist_safety(ledger, issue_id, durable_counter_defaults(),
+          status: :open,
+          stop_reason: nil,
+          route_fingerprint: Keyword.get(opts, :route_fingerprint),
+          in_flight: true,
+          updated_at: Keyword.get(opts, :updated_at, now_ms())
+        )
+
+      :not_found ->
+        persist_safety(ledger, issue_id, durable_counter_defaults(),
+          status: :open,
+          stop_reason: nil,
+          route_fingerprint: Keyword.get(opts, :route_fingerprint),
+          in_flight: true,
+          updated_at: Keyword.get(opts, :updated_at, now_ms())
+        )
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  def fence_attempt(_ledger, _issue_id, _opts), do: {:error, :invalid_attempt_arguments}
+
+  @spec clear_in_flight(t(), String.t()) :: :ok | {:error, term()}
+  def clear_in_flight(ledger, issue_id), do: clear_in_flight(ledger, issue_id, [])
+
+  @spec clear_in_flight(t(), String.t(), keyword()) :: :ok | {:error, term()}
+  def clear_in_flight(%__MODULE__{} = ledger, issue_id, opts) when is_binary(issue_id) do
+    case current(ledger, issue_id) do
+      :not_found ->
+        :ok
+
+      {:ok, %{status: :closed}} ->
+        :ok
+
+      {:ok, %{status: :open, in_flight: false}} ->
+        :ok
+
+      {:ok, record} ->
+        record =
+          record
+          |> Map.put(:in_flight, false)
+          |> Map.put(:updated_at, Keyword.get(opts, :updated_at, now_ms()))
+
+        with :ok <- validate_record(record, ledger, issue_id, @base_record_keys) do
+          persist_records(ledger, [{{:current, issue_id}, record}])
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  def clear_in_flight(_ledger, _issue_id, _opts), do: {:error, :invalid_attempt_arguments}
+
+  @spec sync(t()) :: :ok | {:error, term()}
+  def sync(%__MODULE__{table: table, sync_fun: sync_fun}), do: invoke_sync(sync_fun, table)
+
   @spec persist_safety(t(), String.t(), map(), keyword()) :: {:ok, record()} | {:error, term()}
   def persist_safety(%__MODULE__{} = ledger, issue_id, counters, opts \\ [])
       when is_binary(issue_id) and is_map(counters) do
@@ -160,6 +293,8 @@ defmodule SymphonyElixir.AgentRuntime.AttemptLedger do
            status: status,
            stop_reason: stop_reason,
            route_fingerprint: Keyword.get(opts, :route_fingerprint),
+           in_flight: Keyword.get(opts, :in_flight, false),
+           close_pending: false,
            updated_at: Keyword.get(opts, :updated_at, now_ms())
          },
          :ok <- put(ledger, record) do
@@ -175,6 +310,9 @@ defmodule SymphonyElixir.AgentRuntime.AttemptLedger do
       :not_found ->
         :ok
 
+      {:ok, %{status: :closed, close_pending: true}} ->
+        confirm_lineage_close(ledger, issue_id)
+
       {:ok, %{status: :closed}} ->
         :ok
 
@@ -183,10 +321,13 @@ defmodule SymphonyElixir.AgentRuntime.AttemptLedger do
           record
           |> Map.put(:status, :closed)
           |> Map.put(:closed_reason, Keyword.get(opts, :reason, :terminal))
+          |> Map.put(:in_flight, false)
+          |> Map.put(:close_pending, true)
           |> Map.put(:updated_at, Keyword.get(opts, :updated_at, now_ms()))
 
-        with :ok <- validate_record(record, ledger, issue_id, @history_record_keys) do
-          persist_records(ledger, [{{:current, issue_id}, record}])
+        with :ok <- validate_record(record, ledger, issue_id, @history_record_keys),
+             :ok <- persist_records(ledger, [{{:current, issue_id}, record}]) do
+          finalize_closed_lineage(ledger, issue_id, record)
         end
 
       {:error, reason} ->
@@ -194,8 +335,27 @@ defmodule SymphonyElixir.AgentRuntime.AttemptLedger do
     end
   end
 
-  @spec rearm(t(), String.t(), String.t(), String.t()) :: {:ok, record()} | {:error, term()}
-  def rearm(ledger, issue_id, reason, operator, timestamp \\ now_ms())
+  @spec confirm_lineage_close(t(), String.t()) :: :ok | {:error, term()}
+  def confirm_lineage_close(%__MODULE__{} = ledger, issue_id) when is_binary(issue_id) do
+    case current(ledger, issue_id) do
+      {:ok, %{status: :closed}} ->
+        with :ok <- sync(ledger),
+             {:ok, confirmed} <- current(ledger, issue_id) do
+          finalize_confirmed_close(ledger, issue_id, confirmed)
+        end
+
+      {:ok, _record} ->
+        {:error, :lineage_not_closed}
+
+      :not_found ->
+        {:error, :lineage_not_found}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  def confirm_lineage_close(_ledger, _issue_id), do: {:error, :invalid_attempt_arguments}
 
   @spec rearm(t(), String.t(), String.t(), String.t(), non_neg_integer()) ::
           {:ok, record()} | {:error, term()}
@@ -212,6 +372,7 @@ defmodule SymphonyElixir.AgentRuntime.AttemptLedger do
         |> Map.merge(%{
           status: :closed,
           closed_reason: :rearmed,
+          close_pending: false,
           rearm_reason: String.trim(reason),
           rearmed_by: String.trim(operator),
           rearmed_at: timestamp,
@@ -230,6 +391,7 @@ defmodule SymphonyElixir.AgentRuntime.AttemptLedger do
           status: :open,
           stop_reason: nil,
           route_fingerprint: nil,
+          in_flight: false,
           updated_at: timestamp
         })
 
@@ -393,11 +555,13 @@ defmodule SymphonyElixir.AgentRuntime.AttemptLedger do
          :ok <- validate_status(Map.get(record, :status)),
          :ok <- validate_stop_reason(Map.get(record, :stop_reason)),
          :ok <- validate_route_fingerprint(Map.get(record, :route_fingerprint)),
+         :ok <- validate_in_flight(Map.get(record, :in_flight, false)),
+         :ok <- validate_close_pending(Map.get(record, :close_pending, false)),
          :ok <- validate_timestamp(Map.get(record, :updated_at)) do
-      if record.issue_id == issue_id do
-        :ok
-      else
+      if record.issue_id != issue_id do
         {:error, :invalid_record}
+      else
+        validate_safety_state(record)
       end
     end
   end
@@ -469,6 +633,86 @@ defmodule SymphonyElixir.AgentRuntime.AttemptLedger do
   defp validate_timestamp(timestamp) when is_integer(timestamp) and timestamp >= 0, do: :ok
   defp validate_timestamp(_timestamp), do: {:error, :invalid_record}
 
+  defp validate_in_flight(value) when is_boolean(value), do: :ok
+  defp validate_in_flight(_value), do: {:error, :invalid_record}
+
+  defp validate_close_pending(value) when is_boolean(value), do: :ok
+  defp validate_close_pending(_value), do: {:error, :invalid_record}
+
+  defp validate_safety_state(%{status: status} = record) do
+    if Map.get(record, :close_pending, false) and status != :closed do
+      {:error, :invalid_record}
+    else
+      case status do
+        :open -> validate_open_safety_state(record)
+        :exhausted -> validate_exhausted_safety_state(record)
+        :closed -> validate_closed_safety_state(record)
+        _ -> {:error, :invalid_record}
+      end
+    end
+  end
+
+  defp validate_open_safety_state(%{safety_counters: counters, stop_reason: nil}),
+    do: safety_state_result(open_counters?(counters))
+
+  defp validate_open_safety_state(_record), do: {:error, :invalid_record}
+
+  defp validate_exhausted_safety_state(%{safety_counters: counters, stop_reason: stop_reason} = record) do
+    safety_state_result(not Map.get(record, :in_flight, false) and exhausted_counters?(counters, stop_reason))
+  end
+
+  defp validate_exhausted_safety_state(_record), do: {:error, :invalid_record}
+
+  defp validate_closed_safety_state(%{safety_counters: counters, stop_reason: stop_reason} = record) do
+    safety_state_result(not Map.get(record, :in_flight, false) and closed_counters?(counters, stop_reason))
+  end
+
+  defp validate_closed_safety_state(_record), do: {:error, :invalid_record}
+
+  defp safety_state_result(true), do: :ok
+  defp safety_state_result(false), do: {:error, :invalid_record}
+
+  defp open_counters?(%{
+         ordinary_failures: ordinary_failures,
+         ordinary_retries: ordinary_retries,
+         review_cycles: review_cycles
+       }) do
+    ordinary_failures in 0..AttemptPolicy.max_ordinary_retries() and
+      ordinary_retries == ordinary_failures and
+      review_cycles in 0..AttemptPolicy.max_review_cycles()
+  end
+
+  defp open_counters?(_counters), do: false
+
+  defp exhausted_counters?(counters, :ordinary_retry_limit) do
+    review_cycles_valid?(counters) and
+      counters.ordinary_failures == AttemptPolicy.max_ordinary_retries() + 1 and
+      counters.ordinary_retries == AttemptPolicy.max_ordinary_retries()
+  end
+
+  defp exhausted_counters?(counters, :review_cycle_limit) do
+    ordinary_counters_open?(counters) and
+      counters.review_cycles == AttemptPolicy.max_review_cycles()
+  end
+
+  defp exhausted_counters?(counters, :ci_retry_disabled), do: open_counters?(counters)
+  defp exhausted_counters?(_counters, _reason), do: false
+
+  defp closed_counters?(counters, nil), do: open_counters?(counters)
+  defp closed_counters?(counters, stop_reason), do: exhausted_counters?(counters, stop_reason)
+
+  defp ordinary_counters_open?(%{ordinary_failures: ordinary_failures, ordinary_retries: ordinary_retries}) do
+    ordinary_failures in 0..AttemptPolicy.max_ordinary_retries() and
+      ordinary_retries == ordinary_failures
+  end
+
+  defp ordinary_counters_open?(_counters), do: false
+
+  defp review_cycles_valid?(%{review_cycles: review_cycles}),
+    do: review_cycles in 0..AttemptPolicy.max_review_cycles()
+
+  defp review_cycles_valid?(_counters), do: false
+
   defp validate_non_empty_string(value, _field) when is_binary(value) do
     if String.trim(value) == "", do: {:error, :invalid_record}, else: :ok
   end
@@ -493,6 +737,7 @@ defmodule SymphonyElixir.AgentRuntime.AttemptLedger do
 
   defp persist_status_allowed?(ledger, issue_id, status) do
     case current(ledger, issue_id) do
+      {:ok, %{status: :closed, close_pending: true}} -> {:error, :lineage_close_pending}
       {:ok, %{status: :exhausted}} when status != :exhausted -> {:error, :lineage_exhausted}
       {:error, reason} -> {:error, reason}
       _ -> :ok
@@ -520,6 +765,22 @@ defmodule SymphonyElixir.AgentRuntime.AttemptLedger do
 
   defp validate_rearm_value(value, _field) do
     if String.trim(value) == "", do: {:error, :invalid_rearm_arguments}, else: :ok
+  end
+
+  defp finalize_closed_lineage(%__MODULE__{} = ledger, issue_id, record) do
+    finalized_record = Map.put(record, :close_pending, false)
+
+    with :ok <- validate_record(finalized_record, ledger, issue_id, @history_record_keys) do
+      persist_records(ledger, [{{:current, issue_id}, finalized_record}])
+    end
+  end
+
+  defp finalize_confirmed_close(%__MODULE__{} = ledger, issue_id, record) do
+    if Map.get(record, :close_pending, false) do
+      finalize_closed_lineage(ledger, issue_id, record)
+    else
+      :ok
+    end
   end
 
   defp persist_records(%__MODULE__{table: table, write_fun: write_fun, sync_fun: sync_fun}, records) do

@@ -19,7 +19,7 @@ defmodule Mix.Tasks.Symphony.AttemptRearm do
   Usage:
 
       mix symphony.attempt_rearm --project-id symphony-main --issue-id ENG-123 \\
-        --reason "provider state verified" --operator alice
+        --reason "provider state verified" --operator alice --timestamp 1700000000000
 
   Optional `--ledger-path` and `--workflow` arguments are useful for explicit
   administrative operations and deterministic recovery procedures.
@@ -60,6 +60,7 @@ defmodule Mix.Tasks.Symphony.AttemptRearm do
     issue_id = required_opt(opts, :issue_id)
     reason = required_opt(opts, :reason)
     operator = required_opt(opts, :operator)
+    timestamp = required_timestamp_opt(opts)
 
     with :ok <- validate_project_id(project_id),
          {:ok, settings} <- load_settings(opts[:workflow]),
@@ -71,7 +72,7 @@ defmodule Mix.Tasks.Symphony.AttemptRearm do
              issue_id,
              reason,
              operator,
-             opts[:timestamp] || System.system_time(:millisecond)
+             timestamp
            ),
          :ok <- close_ledger(ledger) do
       case result do
@@ -142,6 +143,19 @@ defmodule Mix.Tasks.Symphony.AttemptRearm do
 
       _ ->
         Mix.raise("Missing required option --#{key_to_cli(key)}")
+    end
+  end
+
+  defp required_timestamp_opt(opts) do
+    case opts[:timestamp] do
+      timestamp when is_integer(timestamp) and timestamp >= 0 ->
+        timestamp
+
+      timestamp when is_integer(timestamp) ->
+        Mix.raise("Invalid option --timestamp")
+
+      _ ->
+        Mix.raise("Missing required option --timestamp")
     end
   end
 
