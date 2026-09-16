@@ -4,6 +4,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
   alias SymphonyElixir.Config.Schema
   alias SymphonyElixir.Config.Schema.{Codex, StringOrMap}
   alias SymphonyElixir.Linear.Client
+  alias SymphonyElixir.WorkControl.{GuardClass, WorkItem}
 
   test "workspace bootstrap can be implemented in after_create hook" do
     test_root =
@@ -831,7 +832,75 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       dispatchable: true
     }
 
+    refute Orchestrator.should_dispatch_issue_for_test(issue, state)
+
+    {:ok, completed_blocker} =
+      WorkItem.from_issue(
+        %Issue{id: "blocker-2", identifier: "MT-1004", title: "Blocker", state: "Done"},
+        %{
+          provider: :memory,
+          prior_validated_lifecycle_state: :merging,
+          evidence: [GuardClass.requirement(:mechanical_guard, :completion_proof_verified)]
+        }
+      )
+
+    state = %{state | work_control: %{"blocker-2" => completed_blocker}}
     assert Orchestrator.should_dispatch_issue_for_test(issue, state)
+  end
+
+  test "routed dispatchability comes from validated canonical work control, not active state scope" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      agent_routing: "routed",
+      tracker_active_states: ["Todo"]
+    )
+
+    issue = %Issue{
+      id: "canonical-dispatch",
+      identifier: "MT-CANONICAL-DISPATCH",
+      title: "Canonical dispatch",
+      state: "In Progress",
+      blocked_by: [],
+      dispatchable: false
+    }
+
+    {:ok, work_item} =
+      WorkItem.from_issue(issue, %{
+        provider: :memory,
+        prior_validated_lifecycle_state: :in_progress
+      })
+
+    state = %Orchestrator.State{
+      max_concurrent_agents: 3,
+      running: %{},
+      claimed: MapSet.new(),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{},
+      work_control: %{issue.id => work_item}
+    }
+
+    assert Orchestrator.should_dispatch_issue_for_test(issue, state)
+  end
+
+  test "routed dispatch refresh does not reject a non-fetch-scope canonical state" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      agent_routing: "routed",
+      tracker_active_states: ["Todo"]
+    )
+
+    issue = %Issue{
+      id: "canonical-refresh",
+      identifier: "MT-CANONICAL-REFRESH",
+      title: "Canonical refresh",
+      state: "In Progress",
+      dispatchable: true
+    }
+
+    assert {:ok, ^issue} =
+             Orchestrator.revalidate_issue_for_dispatch_for_test(issue, fn ["canonical-refresh"] ->
+               {:ok, [issue]}
+             end)
   end
 
   test "dispatch revalidation skips an issue when provider routing changes" do

@@ -116,7 +116,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       blocked_by: [%{id: "blocker", identifier: "SYM-BLOCKER", state: "Ready"}]
     }
 
-    assert {:ok, route} = Router.resolve(issue, Config.settings!().agent.profiles)
+    assert {:ok, route} = Router.resolve_legacy(issue, Config.settings!().agent.profiles)
     decision = Guard.evaluate(issue, route.responsibility)
     graph = Graph.build([issue])
     orchestrator_name = Module.concat(__MODULE__, :RouteSnapshotOrchestrator)

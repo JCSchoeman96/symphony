@@ -2,6 +2,7 @@ defmodule SymphonyElixir.TrackerMemoryTest do
   use SymphonyElixir.TestSupport
 
   alias SymphonyElixir.Tracker.Memory
+  alias SymphonyElixir.WorkControl.WorkItem
 
   setup do
     issue = %Issue{
@@ -65,6 +66,7 @@ defmodule SymphonyElixir.TrackerMemoryTest do
         %{"targetState" => " In Review "},
         agent_tool_context: %{
           issue_id: issue.id,
+          current_lifecycle_state: :in_progress,
           responsibility: "implementation",
           dependency_decision: %{
             allowed?: true,
@@ -78,6 +80,159 @@ defmodule SymphonyElixir.TrackerMemoryTest do
     assert Jason.decode!(response["output"])["state"] == "In Review"
     assert {:ok, [updated]} = Memory.fetch_issues_by_ids([issue.id])
     assert updated.state == "In Review"
+  end
+
+  test "legacy provider aliases are mapped before canonical transition authorization", %{issue: issue} do
+    legacy_issue = %{issue | state: "Started"}
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [legacy_issue])
+
+    response =
+      Memory.execute_agent_tool(
+        "memory_transition",
+        %{"targetState" => "In Review"},
+        agent_routing: "legacy",
+        agent_tool_context: %{
+          issue_id: issue.id,
+          current_issue_state: "Started",
+          responsibility: "implementation",
+          dependency_decision: %{
+            allowed?: true,
+            dependency_completeness: :complete,
+            dependency_status: :none
+          }
+        }
+      )
+
+    assert response["success"]
+    assert {:ok, [updated]} = Memory.fetch_issues_by_ids([issue.id])
+    assert updated.state == "In Review"
+  end
+
+  test "routed transition rejects a fresh unsafe provider observation without mutation", %{issue: issue} do
+    response =
+      Memory.execute_agent_tool(
+        "memory_transition",
+        %{"targetState" => "In Review"},
+        agent_tool_context: %{
+          issue_id: issue.id,
+          trusted_lifecycle_state: :ready,
+          responsibility: "implementation",
+          dependency_decision: %{allowed?: true, dependency_completeness: :complete, dependency_status: :none}
+        }
+      )
+
+    refute response["success"]
+    assert {:ok, [^issue]} = Memory.fetch_issues_by_ids([issue.id])
+  end
+
+  test "provider Blocked suspends local transition authority without provider mutation", %{issue: issue} do
+    blocked = %{issue | state: "Blocked"}
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [blocked])
+
+    response =
+      Memory.execute_agent_tool(
+        "memory_transition",
+        %{"targetState" => "In Review"},
+        agent_tool_context: %{
+          issue_id: issue.id,
+          trusted_lifecycle_state: :in_progress,
+          responsibility: "implementation",
+          dependency_decision: %{allowed?: true, dependency_completeness: :complete, dependency_status: :none}
+        }
+      )
+
+    refute response["success"]
+    assert {:ok, [^blocked]} = Memory.fetch_issues_by_ids([issue.id])
+  end
+
+  test "a validated WorkItem supplies the trusted lifecycle context for a fresh transition", %{issue: issue} do
+    assert {:ok, work_item} =
+             WorkItem.from_issue(issue, %{
+               provider: :memory,
+               observed_at: ~U[2026-09-16 00:00:00Z],
+               prior_validated_lifecycle_state: :in_progress
+             })
+
+    response =
+      Memory.execute_agent_tool(
+        "memory_transition",
+        %{"targetState" => "In Review"},
+        agent_tool_context: %{
+          issue_id: issue.id,
+          work_item: work_item,
+          responsibility: "implementation",
+          dependency_decision: %{
+            allowed?: true,
+            dependency_completeness: :complete,
+            dependency_status: :none
+          }
+        }
+      )
+
+    assert response["success"]
+    assert {:ok, [updated]} = Memory.fetch_issues_by_ids([issue.id])
+    assert updated.state == "In Review"
+  end
+
+  test "routed transition validates the fresh observation against canonical context", %{issue: issue} do
+    response =
+      Memory.execute_agent_tool(
+        "memory_transition",
+        %{"targetState" => "In Review"},
+        agent_routing: "routed",
+        agent_tool_context: %{
+          issue_id: issue.id,
+          trusted_lifecycle_state: :in_progress,
+          responsibility: "implementation",
+          dependency_decision: %{allowed?: true, dependency_completeness: :complete, dependency_status: :none}
+        }
+      )
+
+    assert response["success"]
+    assert {:ok, [updated]} = Memory.fetch_issues_by_ids([issue.id])
+    assert updated.state == "In Review"
+  end
+
+  test "routed transition suspends on an unknown fresh provider observation", %{issue: issue} do
+    unknown = %{issue | state: "Mystery"}
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [unknown])
+
+    response =
+      Memory.execute_agent_tool(
+        "memory_transition",
+        %{"targetState" => "In Review"},
+        agent_routing: "routed",
+        agent_tool_context: %{
+          issue_id: issue.id,
+          trusted_lifecycle_state: :in_progress,
+          responsibility: "implementation",
+          dependency_decision: %{allowed?: true, dependency_completeness: :complete, dependency_status: :none}
+        }
+      )
+
+    refute response["success"]
+    assert {:ok, [^unknown]} = Memory.fetch_issues_by_ids([issue.id])
+  end
+
+  test "routed transition fails closed when the provider observation has no state", %{issue: issue} do
+    malformed = %{issue | state: nil}
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [malformed])
+
+    response =
+      Memory.execute_agent_tool(
+        "memory_transition",
+        %{"targetState" => "In Review"},
+        agent_routing: "routed",
+        agent_tool_context: %{
+          issue_id: issue.id,
+          trusted_lifecycle_state: :in_progress,
+          responsibility: "implementation",
+          dependency_decision: %{allowed?: true, dependency_completeness: :complete, dependency_status: :none}
+        }
+      )
+
+    refute response["success"]
+    assert {:ok, [^malformed]} = Memory.fetch_issues_by_ids([issue.id])
   end
 
   test "fails closed for malformed transition arguments and context", %{issue: issue} do
@@ -95,6 +250,20 @@ defmodule SymphonyElixir.TrackerMemoryTest do
       )
 
     assert missing_target["success"] == false
+
+    missing_trusted_state =
+      Memory.execute_agent_tool(
+        "memory_transition",
+        %{"targetState" => "In Review"},
+        agent_tool_context: %{
+          issue_id: issue.id,
+          responsibility: "implementation",
+          dependency_decision: %{allowed?: true, dependency_completeness: :complete}
+        }
+      )
+
+    refute missing_trusted_state["success"]
+    assert {:ok, [^issue]} = Memory.fetch_issues_by_ids([issue.id])
 
     missing_context =
       Memory.execute_agent_tool(

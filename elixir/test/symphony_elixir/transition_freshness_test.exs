@@ -2,6 +2,8 @@ defmodule SymphonyElixir.TransitionFreshnessTest do
   use SymphonyElixir.TestSupport
 
   alias SymphonyElixir.Codex.DynamicTool
+  alias SymphonyElixir.Linear.AgentTool
+  alias SymphonyElixir.WorkControl.WorkItem
 
   test "a bound transition rejects a terminal issue from the fresh graph" do
     binding = session_binding()
@@ -20,6 +22,87 @@ defmodule SymphonyElixir.TransitionFreshnessTest do
       assert response(session_binding(), graph)["success"] == false
       refute_received :mutation
     end
+  end
+
+  test "a fresh forward provider observation cannot replace the trusted lifecycle state" do
+    binding =
+      DynamicTool.bind(
+        agent_tool_context: %{
+          issue_id: "issue",
+          current_issue_state: "In Progress",
+          responsibility: "implementation",
+          dependency_decision: %{
+            allowed?: true,
+            dependency_completeness: :complete,
+            dependency_status: :none
+          }
+        }
+      )
+
+    assert response(binding, [raw_issue("issue", "In Review")])["success"] == false
+    refute_received :mutation
+  end
+
+  test "a bound validated WorkItem supplies canonical context to the fresh Linear read" do
+    {:ok, work_item} =
+      WorkItem.from_issue(%Issue{id: "issue", state: "In Review"}, %{
+        provider: :linear,
+        observed_at: ~U[2026-09-16 00:00:00Z],
+        prior_validated_lifecycle_state: :in_review
+      })
+
+    binding =
+      DynamicTool.bind(
+        agent_tool_context: %{
+          issue_id: "issue",
+          current_issue_state: "In Review",
+          responsibility: "review",
+          work_item: work_item,
+          work_control: %{"issue" => work_item},
+          dependency_decision: %{
+            allowed?: true,
+            dependency_completeness: :complete,
+            dependency_status: :none,
+            merge_permitted?: true
+          }
+        }
+      )
+
+    assert response(binding, [raw_issue("issue", "In Review")])["success"] == true
+    assert_received :mutation
+  end
+
+  test "routed transition rejects raw provider state without trusted canonical context" do
+    assert routed_response([raw_issue("issue", "In Review")])["success"] == false
+    refute_received :mutation
+  end
+
+  test "routed transition accepts an explicitly trusted canonical host state" do
+    context = %{
+      issue_id: "issue",
+      current_issue_state: "In Review",
+      trusted_lifecycle_state: :in_review,
+      responsibility: "review",
+      dependency_decision: %{
+        allowed?: true,
+        dependency_completeness: :complete,
+        dependency_status: :none,
+        merge_permitted?: true
+      }
+    }
+
+    assert routed_response([raw_issue("issue", "In Review")], context)["success"] == true
+    assert_received :mutation
+  end
+
+  test "a legal forward observation without handoff evidence remains validation required" do
+    assert response(session_binding(), [raw_issue("issue", "Ready to Merge")])["success"] == false
+    refute_received :mutation
+  end
+
+  test "an unknown fresh provider state remains lifecycle invalid" do
+    assert response(session_binding(), [raw_issue("issue", "Mystery")])["success"] == false
+    refute_received :mutation
   end
 
   test "transition fails closed on fresh graph errors" do
@@ -80,39 +163,101 @@ defmodule SymphonyElixir.TransitionFreshnessTest do
   end
 
   defp response(binding, graph, opts \\ []) do
+    target_state = Keyword.get(opts, :target_state, "Ready to Merge")
+    target_state_id = if target_state == "In Review", do: "review", else: "merge"
+    arguments = %{"targetState" => target_state, "targetStateId" => target_state_id}
+
+    DynamicTool.execute(
+      "linear_transition",
+      arguments,
+      binding,
+      linear_client: transition_client(graph, opts, target_state, target_state_id)
+    )
+  end
+
+  defp routed_response(
+         graph,
+         context \\ %{
+           issue_id: "issue",
+           current_issue_state: "In Review",
+           responsibility: "review",
+           dependency_decision: %{
+             allowed?: true,
+             dependency_completeness: :complete,
+             dependency_status: :none,
+             merge_permitted?: true
+           }
+         }
+       ) do
+    target_state = "Ready to Merge"
+    target_state_id = "merge"
+
+    AgentTool.execute(
+      "linear_transition",
+      %{"targetState" => target_state, "targetStateId" => target_state_id},
+      agent_routing: "routed",
+      agent_tool_context: context,
+      tracker_settings: Config.settings!().tracker,
+      linear_client: transition_client(graph, [], target_state, target_state_id)
+    )
+  end
+
+  defp transition_client(graph, opts, target_state, target_state_id) do
     parent = self()
 
-    DynamicTool.execute("linear_transition", %{"targetState" => "Ready to Merge", "targetStateId" => "merge"}, binding,
-      linear_client: fn query, variables, client_opts ->
-        cond do
-          String.contains?(query, "query SymphonyLinearDependencyGraph") ->
-            settings = Keyword.fetch!(client_opts, :tracker_settings)
-            send(parent, {:graph_page, variables.after, variables.projectSlug, settings.api_key})
+    fn query, variables, client_opts ->
+      cond do
+        String.contains?(query, "query SymphonyLinearDependencyGraph") ->
+          graph_response(graph, opts, parent, variables, client_opts)
 
-            case graph do
-              {:error, _} = error ->
-                error
+        String.contains?(query, "query SymphonyAuthorizedTransitionState") ->
+          transition_state_response(target_state, target_state_id)
 
-              nodes ->
-                more = Keyword.get(opts, :paginate, false) and is_nil(variables.after)
-
-                connection = %{
-                  "nodes" => if(more, do: [], else: nodes),
-                  "pageInfo" => %{"hasNextPage" => more, "endCursor" => if(more, do: "next", else: nil)}
-                }
-
-                {:ok, %{"data" => %{"issues" => connection}}}
-            end
-
-          String.contains?(query, "query SymphonyAuthorizedTransitionState") ->
-            {:ok, %{"data" => %{"issue" => %{"team" => %{"states" => %{"nodes" => [%{"id" => "merge", "name" => "Ready to Merge"}], "pageInfo" => %{"hasNextPage" => false}}}}}}}
-
-          true ->
-            send(parent, :mutation)
-            {:ok, %{"data" => %{"issueUpdate" => %{"success" => true}}}}
-        end
+        true ->
+          send(parent, :mutation)
+          {:ok, %{"data" => %{"issueUpdate" => %{"success" => true}}}}
       end
-    )
+    end
+  end
+
+  defp graph_response({:error, _} = error, _opts, parent, variables, client_opts) do
+    send_graph_page(parent, variables, client_opts)
+    error
+  end
+
+  defp graph_response(nodes, opts, parent, variables, client_opts) do
+    send_graph_page(parent, variables, client_opts)
+    more = Keyword.get(opts, :paginate, false) and is_nil(variables.after)
+
+    connection = %{
+      "nodes" => if(more, do: [], else: nodes),
+      "pageInfo" => %{"hasNextPage" => more, "endCursor" => if(more, do: "next", else: nil)}
+    }
+
+    {:ok, %{"data" => %{"issues" => connection}}}
+  end
+
+  defp send_graph_page(parent, variables, client_opts) do
+    settings = Keyword.fetch!(client_opts, :tracker_settings)
+    send(parent, {:graph_page, variables.after, variables.projectSlug, settings.api_key})
+  end
+
+  defp transition_state_response(target_state, target_state_id) do
+    state_name = if target_state == "In Review", do: "In Review", else: "Ready to Merge"
+
+    {:ok,
+     %{
+       "data" => %{
+         "issue" => %{
+           "team" => %{
+             "states" => %{
+               "nodes" => [%{"id" => target_state_id, "name" => state_name}],
+               "pageInfo" => %{"hasNextPage" => false}
+             }
+           }
+         }
+       }
+     }}
   end
 
   defp raw_issue(id, state, relations \\ []) do

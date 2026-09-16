@@ -8,6 +8,7 @@ defmodule SymphonyElixir.Dependency.Guard do
 
   alias SymphonyElixir.Dependency.Policy
   alias SymphonyElixir.Tracker.Issue
+  alias SymphonyElixir.WorkControl.{WorkflowLifecycle, WorkItem}
 
   @type decision :: map()
 
@@ -29,6 +30,21 @@ defmodule SymphonyElixir.Dependency.Guard do
       _invalid ->
         invalid_decision(issue, responsibility, :invalid_dependency_completeness)
     end
+  end
+
+  @spec evaluate(WorkItem.t(), String.t(), keyword()) :: decision()
+  def evaluate(%WorkItem{} = work_item, responsibility, opts) when is_list(opts) do
+    evaluate(
+      %Issue{
+        id: work_item.id,
+        identifier: work_item.identifier,
+        state: WorkflowLifecycle.display(work_item.validated_lifecycle_state),
+        blocked_by: work_item.blocked_by,
+        dependency_completeness: work_item.dependency_completeness
+      },
+      responsibility,
+      opts
+    )
   end
 
   def evaluate(issue, responsibility, _opts) do

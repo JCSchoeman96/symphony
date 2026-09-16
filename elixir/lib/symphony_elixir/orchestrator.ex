@@ -12,6 +12,14 @@ defmodule SymphonyElixir.Orchestrator do
   alias SymphonyElixir.Dependency.{Graph, Guard}
   alias SymphonyElixir.Tracker.Issue
 
+  alias SymphonyElixir.WorkControl.{
+    AuthorityDisposition,
+    LifecycleAssessment,
+    SuspensionContext,
+    WorkflowLifecycle,
+    WorkItem
+  }
+
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
   @durable_attempt_events [:ordinary_failure, :review_cycle, :ci_failure]
@@ -102,6 +110,7 @@ defmodule SymphonyElixir.Orchestrator do
       durable_blocked: %{},
       durable_exhausted: %{},
       recent_attempts: [],
+      work_control: %{},
       codex_totals: nil,
       codex_rate_limits: nil
     ]
@@ -129,6 +138,7 @@ defmodule SymphonyElixir.Orchestrator do
           tick_token: nil,
           task_supervisor: Keyword.get(opts, :task_supervisor, SymphonyElixir.TaskSupervisor),
           agent_runner: Keyword.get(opts, :agent_runner, AgentRunner),
+          work_control: initial_work_control(Keyword.get(opts, :work_control, %{})),
           codex_totals: @empty_codex_totals,
           codex_rate_limits: nil
         }
@@ -412,6 +422,18 @@ defmodule SymphonyElixir.Orchestrator do
     }
   end
 
+  defp initial_work_control(work_control) when is_map(work_control) do
+    Enum.reduce(work_control, %{}, fn
+      {issue_id, %WorkItem{} = work_item}, acc when is_binary(issue_id) ->
+        Map.put(acc, issue_id, work_item)
+
+      {_issue_id, _work_item}, acc ->
+        acc
+    end)
+  end
+
+  defp initial_work_control(_work_control), do: %{}
+
   defp mark_durable_blocked(%State{} = state, issue_id, reason) do
     %{state | durable_blocked: Map.put(state.durable_blocked, issue_id, reason)}
   end
@@ -553,6 +575,27 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   def handle_info(
+        {:agent_lifecycle_suspended, issue_id, assessment},
+        %{running: running} = state
+      )
+      when is_binary(issue_id) do
+    case Map.get(running, issue_id) do
+      nil ->
+        {:noreply, state}
+
+      running_entry ->
+        Logger.warning(
+          "Agent lifecycle continuation suspended for issue_id=#{issue_id}: " <>
+            inspect(assessment)
+        )
+
+        updated_running_entry = Map.put(running_entry, :lifecycle_suspension, assessment)
+        notify_dashboard()
+        {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+    end
+  end
+
+  def handle_info(
         {:agent_dependency_blocked, issue_id, decision},
         %{running: running} = state
       )
@@ -629,6 +672,12 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp handle_agent_down(:normal, state, issue_id, running_entry, session_id) do
     cond do
+      not is_nil(Map.get(running_entry, :lifecycle_suspension)) ->
+        error =
+          "agent suspended after lifecycle observation: #{inspect(running_entry.lifecycle_suspension)}"
+
+        block_issue_from_entry(state, issue_id, running_entry, error)
+
       input_required_blocker?(running_entry) ->
         block_input_required_agent_down(state, issue_id, running_entry, session_id, :normal)
 
@@ -914,14 +963,21 @@ defmodule SymphonyElixir.Orchestrator do
         state
         |> refresh_dependency_state(graph_issues, :complete)
         |> ensure_graph_contains_active_issues(active_issues)
+        |> refresh_work_control(graph_issues ++ active_issues)
 
       {:ok, _invalid_graph} ->
         Logger.warning("Dependency graph provider returned invalid data; implementation dispatch is disabled")
-        refresh_dependency_state(state, active_issues, {:unavailable, :invalid_dependency_graph})
+
+        state
+        |> refresh_dependency_state(active_issues, {:unavailable, :invalid_dependency_graph})
+        |> refresh_work_control(active_issues)
 
       {:error, reason} ->
         Logger.warning("Dependency graph refresh unavailable; implementation dispatch is disabled: #{inspect(reason)}")
-        refresh_dependency_state(state, active_issues, {:unavailable, graph_failure_reason(reason)})
+
+        state
+        |> refresh_dependency_state(active_issues, {:unavailable, graph_failure_reason(reason)})
+        |> refresh_work_control(active_issues)
     end
   end
 
@@ -963,14 +1019,21 @@ defmodule SymphonyElixir.Orchestrator do
         state
         |> refresh_dependency_state(graph_issues, :complete)
         |> ensure_graph_contains_running_issues(running_issues)
+        |> refresh_work_control(graph_issues ++ running_issues)
 
       {:ok, _invalid_graph} ->
         Logger.warning("Running dependency graph provider returned invalid data; active implementation workers are unsafe")
-        refresh_dependency_state(state, running_issues, {:unavailable, :invalid_dependency_graph})
+
+        state
+        |> refresh_dependency_state(running_issues, {:unavailable, :invalid_dependency_graph})
+        |> refresh_work_control(running_issues)
 
       {:error, reason} ->
         Logger.warning("Running dependency graph refresh unavailable; active implementation workers are unsafe: #{inspect(reason)}")
-        refresh_dependency_state(state, running_issues, {:unavailable, graph_failure_reason(reason)})
+
+        state
+        |> refresh_dependency_state(running_issues, {:unavailable, graph_failure_reason(reason)})
+        |> refresh_work_control(running_issues)
     end
   end
 
@@ -1056,6 +1119,8 @@ defmodule SymphonyElixir.Orchestrator do
   defp reconcile_running_issue_states([], state, _active_states, _terminal_states), do: state
 
   defp reconcile_running_issue_states([issue | rest], state, active_states, terminal_states) do
+    state = refresh_work_control(state, [issue])
+
     reconcile_running_issue_states(
       rest,
       reconcile_issue_state(issue, state, active_states, terminal_states),
@@ -1071,10 +1136,21 @@ defmodule SymphonyElixir.Orchestrator do
 
         terminate_running_issue(state, issue.id, true, :terminal)
 
-      !issue_routable?(issue) ->
+      routed_lifecycle_suspended?(issue, state) ->
+        Logger.info("Stopping active agent after unsafe lifecycle observation for #{issue_context(issue)}")
+        terminate_running_issue(state, issue.id, false, :observed)
+
+      !issue_in_routing_scope?(issue) ->
         Logger.info("Issue no longer routed to this worker: #{issue_context(issue)} assignee=#{inspect(issue.assignee_id)}; stopping active agent")
 
         terminate_running_issue(state, issue.id, false, :not_routable)
+
+      routed_issue_continuable?(issue, state) ->
+        refresh_running_issue_state(state, issue)
+
+      Config.settings!().agent.routing == "routed" ->
+        Logger.info("Stopping active agent after canonical route became unavailable for #{issue_context(issue)}")
+        terminate_running_issue(state, issue.id, false, :observed)
 
       active_issue_state?(issue.state, active_states) ->
         refresh_running_issue_state(state, issue)
@@ -1091,6 +1167,8 @@ defmodule SymphonyElixir.Orchestrator do
   defp reconcile_blocked_issue_states([], state, _active_states, _terminal_states), do: state
 
   defp reconcile_blocked_issue_states([issue | rest], state, active_states, terminal_states) do
+    state = refresh_work_control(state, [issue])
+
     reconcile_blocked_issue_states(
       rest,
       reconcile_blocked_issue_state(issue, state, active_states, terminal_states),
@@ -1109,9 +1187,20 @@ defmodule SymphonyElixir.Orchestrator do
         |> release_issue_claim(issue.id)
         |> reset_attempt_counters(issue.id)
 
-      !issue_routable?(issue) ->
+      routed_lifecycle_suspended?(issue, state) ->
+        Logger.info("Retaining blocked issue after unsafe lifecycle observation for #{issue_context(issue)}")
+        retain_blocked_issue(state, issue)
+
+      !issue_in_routing_scope?(issue) ->
         Logger.info("Blocked issue no longer routed to this worker: #{issue_context(issue)} assignee=#{inspect(issue.assignee_id)}; releasing block")
         release_issue_claim(state, issue.id)
+
+      routed_issue_continuable?(issue, state) ->
+        refresh_blocked_issue_state(state, issue)
+
+      Config.settings!().agent.routing == "routed" ->
+        Logger.info("Retaining blocked issue after canonical route became unavailable for #{issue_context(issue)}")
+        retain_blocked_issue(state, issue)
 
       active_issue_state?(issue.state, active_states) ->
         refresh_blocked_issue_state(state, issue)
@@ -1123,6 +1212,43 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp reconcile_blocked_issue_state(_issue, state, _active_states, _terminal_states), do: state
+
+  defp routed_lifecycle_suspended?(%Issue{id: issue_id}, %State{} = state)
+       when is_binary(issue_id) do
+    if Config.settings!().agent.routing == "routed" do
+      case Map.get(state.work_control, issue_id) do
+        %WorkItem{lifecycle_assessment: assessment, authority_disposition: disposition} ->
+          not LifecycleAssessment.validated?(assessment) or
+            AuthorityDisposition.suspended?(disposition)
+
+        _missing_work_item ->
+          true
+      end
+    else
+      false
+    end
+  end
+
+  defp routed_lifecycle_suspended?(_issue, _state), do: false
+
+  defp routed_issue_continuable?(%Issue{} = issue, %State{} = state) do
+    Config.settings!().agent.routing == "routed" and
+      routed_issue_in_scope?(issue) and
+      not routed_lifecycle_suspended?(issue, state) and
+      match?({:ok, %Route{}}, route_for_issue(issue, state))
+  end
+
+  defp routed_issue_continuable?(_issue, _state), do: false
+
+  defp retain_blocked_issue(%State{} = state, %Issue{id: issue_id} = issue)
+       when is_binary(issue_id) do
+    case Map.get(state.blocked, issue_id) do
+      %{issue: _} = blocked_entry -> %{state | blocked: Map.put(state.blocked, issue_id, %{blocked_entry | issue: issue})}
+      _missing -> state
+    end
+  end
+
+  defp retain_blocked_issue(state, _issue), do: state
 
   defp reconcile_missing_running_issue_ids(%State{} = state, requested_issue_ids, issues)
        when is_list(requested_issue_ids) and is_list(issues) do
@@ -1139,7 +1265,10 @@ defmodule SymphonyElixir.Orchestrator do
         state_acc
       else
         log_missing_running_issue(state_acc, issue_id)
-        terminate_running_issue(state_acc, issue_id, false, :tracker_missing)
+
+        state_acc
+        |> terminate_running_issue(issue_id, false, :tracker_missing)
+        |> forget_work_item(issue_id)
       end
     end)
   end
@@ -1161,12 +1290,21 @@ defmodule SymphonyElixir.Orchestrator do
         state_acc
       else
         Logger.info("Blocked issue no longer visible during state refresh: issue_id=#{issue_id}; releasing block")
-        release_issue_claim(state_acc, issue_id)
+
+        state_acc
+        |> release_issue_claim(issue_id)
+        |> forget_work_item(issue_id)
       end
     end)
   end
 
   defp reconcile_missing_blocked_issue_ids(state, _requested_issue_ids, _issues), do: state
+
+  defp forget_work_item(%State{} = state, issue_id) when is_binary(issue_id) do
+    %{state | work_control: Map.delete(state.work_control, issue_id)}
+  end
+
+  defp forget_work_item(state, _issue_id), do: state
 
   defp log_missing_running_issue(%State{} = state, issue_id) when is_binary(issue_id) do
     case Map.get(state.running, issue_id) do
@@ -1194,7 +1332,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp refresh_routed_running_issue(state, issue, running_entry, current_route) do
-    case route_for_issue(issue) do
+    case route_for_issue(issue, state) do
       {:ok, %Route{} = next_route} ->
         refresh_routed_running_issue(state, issue, running_entry, current_route, next_route)
 
@@ -1323,9 +1461,9 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp dependency_block_resolved?(%Issue{} = issue, %State{} = state) do
-    case route_for_issue(issue) do
+    case route_for_issue(issue, state) do
       {:ok, %Route{responsibility: responsibility}} ->
-        decision = dependency_decision(issue, responsibility)
+        decision = dependency_decision(issue, responsibility, state)
         decision.allowed? == true and not dependency_cycle?(state, issue.id)
 
       {:error, _reason} ->
@@ -1698,12 +1836,13 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp refresh_dependency_state(%State{} = state, issues, completeness) when is_list(issues) do
+    state = refresh_work_control(state, issues)
     graph = Graph.build(issues, completeness: completeness)
 
     dependency_diagnostics =
       Enum.reduce(issues, %{}, fn
         %Issue{id: issue_id} = issue, diagnostics when is_binary(issue_id) ->
-          Map.put(diagnostics, issue_id, dependency_diagnostic_for_issue(issue, graph))
+          Map.put(diagnostics, issue_id, dependency_diagnostic_for_issue(issue, graph, state))
 
         _, diagnostics ->
           diagnostics
@@ -1716,11 +1855,115 @@ defmodule SymphonyElixir.Orchestrator do
     }
   end
 
-  defp dependency_diagnostic_for_issue(%Issue{id: issue_id} = issue, %Graph{} = graph) do
-    case route_for_issue(issue) do
+  defp refresh_work_control(%State{} = state, issues) when is_list(issues) do
+    case Config.settings!().agent.routing do
+      "routed" -> refresh_routed_work_control(state, issues)
+      _legacy -> state
+    end
+  end
+
+  defp refresh_work_control(%State{} = state, _issues), do: state
+
+  defp refresh_routed_work_control(%State{} = state, issues) do
+    Enum.reduce(issues, state, &refresh_routed_work_item/2)
+  end
+
+  defp refresh_routed_work_item(%Issue{id: issue_id} = issue, %State{} = state)
+       when is_binary(issue_id) do
+    previous = Map.get(state.work_control, issue_id)
+
+    opts = %{
+      provider: Config.settings!().tracker.kind,
+      observed_at: issue.updated_at || DateTime.utc_now(),
+      prior_validated_lifecycle_state: prior_validated_state(previous),
+      prior_authority_disposition: prior_authority_disposition(previous),
+      evidence: evidence_for_observation(issue, previous)
+    }
+
+    case WorkItem.from_issue(issue, opts) do
+      {:ok, work_item} ->
+        work_item = attach_suspension_context(work_item, previous, opts)
+        %{state | work_control: Map.put(state.work_control, issue_id, work_item)}
+
+      {:error, reason} ->
+        Logger.warning("Unable to derive routed WorkItem for #{issue_context(issue)}: #{inspect(reason)}")
+        %{state | work_control: Map.delete(state.work_control, issue_id)}
+    end
+  end
+
+  defp refresh_routed_work_item(_issue, %State{} = state), do: state
+
+  defp prior_validated_state(%WorkItem{
+         authority_disposition: %AuthorityDisposition{status: :suspended, lifecycle_state: :canceled}
+       }) do
+    :canceled
+  end
+
+  defp prior_validated_state(%WorkItem{
+         suspension_context: %SuspensionContext{last_validated_lifecycle_state: state},
+         validated_lifecycle_state: fallback_state
+       }) do
+    case WorkflowLifecycle.parse(state) do
+      {:ok, canonical_state} -> canonical_state
+      {:error, _reason} -> fallback_state
+    end
+  end
+
+  defp prior_validated_state(%WorkItem{validated_lifecycle_state: state}), do: state
+  defp prior_validated_state(_previous), do: nil
+
+  defp prior_authority_disposition(%WorkItem{authority_disposition: disposition}), do: disposition
+  defp prior_authority_disposition(_previous), do: nil
+
+  defp prior_guard_evidence(%WorkItem{lifecycle_assessment: assessment}),
+    do: assessment.satisfied_guards
+
+  defp prior_guard_evidence(_previous), do: []
+
+  defp evidence_for_observation(%Issue{state: state}, %WorkItem{} = previous) do
+    case WorkflowLifecycle.parse(state) do
+      {:ok, canonical_state} when canonical_state == previous.validated_lifecycle_state ->
+        prior_guard_evidence(previous)
+
+      _different_state ->
+        []
+    end
+  end
+
+  defp evidence_for_observation(_issue, _previous), do: []
+
+  defp attach_suspension_context(%WorkItem{} = work_item, %WorkItem{} = previous, _opts) do
+    assessment = work_item.lifecycle_assessment
+
+    if assessment.status in [:authority_reducing, :validation_required, :invalid] and
+         WorkflowLifecycle.canonical?(prior_validated_state(previous)) do
+      observation = work_item.provider_observation
+
+      case SuspensionContext.new(%{
+             work_item_id: work_item.id,
+             last_validated_lifecycle_state: prior_validated_state(previous),
+             provider_observation: observation,
+             reason: assessment.reason || :unsafe_lifecycle_observation,
+             created_at: observation.observed_at,
+             recovery_policy: :fresh_reconciliation,
+             required_evidence: assessment.missing_guards,
+             resume_target: prior_validated_state(previous)
+           }) do
+        {:ok, context} -> %{work_item | suspension_context: context}
+        {:error, _reason} -> work_item
+      end
+    else
+      %{work_item | suspension_context: nil}
+    end
+  end
+
+  defp attach_suspension_context(%WorkItem{} = work_item, _previous, _opts), do: work_item
+
+  defp dependency_diagnostic_for_issue(%Issue{id: issue_id} = issue, %Graph{} = graph, %State{} = state) do
+    case route_for_issue(issue, state) do
       {:ok, %Route{responsibility: responsibility}} ->
         issue
-        |> dependency_decision(responsibility)
+        |> dependency_decision(responsibility, state)
         |> maybe_mark_dependency_incomplete(graph, issue_id)
         |> maybe_mark_dependency_cycle(graph, issue_id)
 
@@ -1729,8 +1972,8 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp dependency_decision(%Issue{} = issue, responsibility) do
-    Guard.evaluate(issue, responsibility, dependency_policy_options())
+  defp dependency_decision(%Issue{} = issue, responsibility, %State{} = state) do
+    Guard.evaluate(issue, responsibility, dependency_policy_options(state))
   end
 
   defp dependency_decision_for_state(
@@ -1740,7 +1983,7 @@ defmodule SymphonyElixir.Orchestrator do
        )
        when is_binary(issue_id) do
     issue
-    |> Guard.evaluate(responsibility, dependency_policy_options())
+    |> Guard.evaluate(responsibility, dependency_policy_options(state))
     |> maybe_mark_dependency_incomplete(state.dependency_graph, issue_id)
     |> maybe_mark_dependency_cycle(state.dependency_graph, issue_id)
   end
@@ -1856,9 +2099,9 @@ defmodule SymphonyElixir.Orchestrator do
          active_states,
          terminal_states
        ) do
-    candidate_issue?(issue, active_states, terminal_states) and
+    dispatch_candidate_issue?(issue, state, active_states, terminal_states) and
       issue_not_reserved?(state, issue.id) and
-      route_dispatchable?(issue) and
+      route_dispatchable?(issue, state) and
       dependency_dispatchable?(issue, state) and
       dispatch_resources_available?(state, issue)
   end
@@ -1920,8 +2163,53 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp candidate_issue?(_issue, _active_states, _terminal_states), do: false
 
+  defp dispatch_candidate_issue?(%Issue{} = issue, %State{} = state, _active_states, _terminal_states) do
+    if Config.settings!().agent.routing == "routed" do
+      routed_candidate_issue?(issue, state)
+    else
+      candidate_issue?(issue, active_state_set(), terminal_state_set())
+    end
+  end
+
+  defp dispatch_candidate_issue?(_issue, _state, _active_states, _terminal_states), do: false
+
+  defp routed_candidate_issue?(%Issue{} = issue, %State{} = state) do
+    candidate_shape?(issue) and
+      routed_issue_in_scope?(issue) and
+      match?({:ok, %Route{}}, route_for_issue(issue, state))
+  end
+
+  defp candidate_shape?(%Issue{id: id, identifier: identifier, title: title, state: state_name}) do
+    Enum.all?([id, identifier, title, state_name], &present_string?/1)
+  end
+
+  defp candidate_shape?(_issue), do: false
+
   defp issue_routable?(%Issue{} = issue) do
     Issue.routable?(issue, Config.settings!().tracker.required_labels)
+  end
+
+  defp issue_in_routing_scope?(%Issue{} = issue) do
+    if Config.settings!().agent.routing == "routed" do
+      routed_issue_in_scope?(issue)
+    else
+      issue_routable?(issue)
+    end
+  end
+
+  defp routed_issue_in_scope?(%Issue{} = issue) do
+    required_labels = Config.settings!().tracker.required_labels
+    labels = Issue.label_names(issue)
+
+    Enum.all?(required_labels, fn required_label ->
+      Enum.any?(labels, fn label -> normalize_label(label) == normalize_label(required_label) end)
+    end)
+  end
+
+  defp normalize_label(label) when is_binary(label) do
+    label
+    |> String.trim()
+    |> String.downcase()
   end
 
   defp terminal_issue_state?(state_name, terminal_states) when is_binary(state_name) do
@@ -1971,9 +2259,9 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp dispatch_refreshed_issue(state, refreshed_issue, attempt, preferred_worker_host) do
-    if candidate_issue?(refreshed_issue, active_state_set(), terminal_state_set()) and
+    if dispatch_candidate_issue?(refreshed_issue, state, active_state_set(), terminal_state_set()) and
          dispatch_slots_available?(refreshed_issue, state) do
-      case route_for_issue(refreshed_issue) do
+      case route_for_issue(refreshed_issue, state) do
         {:ok, %Route{} = route} ->
           dispatch_if_dependency_allowed(state, refreshed_issue, route, attempt, preferred_worker_host)
 
@@ -2024,14 +2312,21 @@ defmodule SymphonyElixir.Orchestrator do
         state
         |> refresh_dependency_state(graph_issues, :complete)
         |> ensure_graph_contains_issue(fallback_issue)
+        |> refresh_work_control(graph_issues ++ [fallback_issue])
 
       {:ok, _invalid_graph} ->
         Logger.warning("Final dependency graph refresh returned invalid data; implementation dispatch is disabled")
-        refresh_dependency_state(state, [fallback_issue], {:unavailable, :invalid_dependency_graph})
+
+        state
+        |> refresh_dependency_state([fallback_issue], {:unavailable, :invalid_dependency_graph})
+        |> refresh_work_control([fallback_issue])
 
       {:error, reason} ->
         Logger.warning("Final dependency graph refresh unavailable; implementation dispatch is disabled: #{inspect(reason)}")
-        refresh_dependency_state(state, [fallback_issue], {:unavailable, graph_failure_reason(reason)})
+
+        state
+        |> refresh_dependency_state([fallback_issue], {:unavailable, graph_failure_reason(reason)})
+        |> refresh_work_control([fallback_issue])
     end
   end
 
@@ -2161,16 +2456,21 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp spawn_prepared_issue_on_worker_host(%State{} = state, issue, route, attempt, recipient, worker_host) do
+    work_item = active_work_item_for_attempt(state, issue.id)
+
     case Task.Supervisor.start_child(state.task_supervisor, fn ->
            state.agent_runner.run(issue, recipient,
              attempt: attempt,
              worker_host: worker_host,
              route: route,
+             work_item: work_item,
+             work_control: state.work_control,
              dependency_decision: Map.get(state.dependency_diagnostics, issue.id)
            )
          end) do
       {:ok, pid} ->
         ref = Process.monitor(pid)
+        state = put_active_work_item(state, issue.id, work_item)
 
         Logger.info("Dispatching issue to agent: #{issue_context(issue)} pid=#{inspect(pid)} attempt=#{inspect(attempt)} worker_host=#{worker_host || "local"}")
 
@@ -2188,6 +2488,7 @@ defmodule SymphonyElixir.Orchestrator do
             route_fingerprint: route.fingerprint,
             route_change_termination: false,
             route_change: nil,
+            lifecycle_suspension: nil,
             worker_host: worker_host,
             workspace_path: nil,
             session_id: nil,
@@ -2249,15 +2550,35 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp active_work_item_for_attempt(%State{} = state, issue_id) when is_binary(issue_id) do
+    case Map.get(state.work_control, issue_id) do
+      %WorkItem{authority_disposition: disposition} = work_item ->
+        case AuthorityDisposition.transition(disposition, :active, %{attempt_started: true}) do
+          {:ok, active_disposition} -> %{work_item | authority_disposition: active_disposition}
+          {:error, :attempt_not_started} -> work_item
+          {:error, :invalid_disposition_transition} -> work_item
+          {:error, _reason} -> work_item
+        end
+
+      _missing_work_item ->
+        nil
+    end
+  end
+
+  defp active_work_item_for_attempt(_state, _issue_id), do: nil
+
+  defp put_active_work_item(%State{} = state, issue_id, %WorkItem{} = work_item)
+       when is_binary(issue_id) do
+    %{state | work_control: Map.put(state.work_control, issue_id, work_item)}
+  end
+
+  defp put_active_work_item(state, _issue_id, _work_item), do: state
+
   defp revalidate_issue_for_dispatch(%Issue{id: issue_id}, issue_fetcher, terminal_states)
        when is_binary(issue_id) and is_function(issue_fetcher, 1) do
     case issue_fetcher.([issue_id]) do
       {:ok, [%Issue{} = refreshed_issue | _]} ->
-        if retry_candidate_issue?(refreshed_issue, terminal_states) do
-          {:ok, refreshed_issue}
-        else
-          {:skip, refreshed_issue}
-        end
+        revalidate_refreshed_issue(refreshed_issue, terminal_states)
 
       {:ok, []} ->
         {:skip, :missing}
@@ -2268,6 +2589,30 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp revalidate_issue_for_dispatch(issue, _issue_fetcher, _terminal_states), do: {:ok, issue}
+
+  defp revalidate_refreshed_issue(%Issue{} = issue, terminal_states) do
+    if Config.settings!().agent.routing == "routed" do
+      revalidate_routed_issue(issue, terminal_states)
+    else
+      revalidate_legacy_issue(issue, terminal_states)
+    end
+  end
+
+  defp revalidate_routed_issue(%Issue{} = issue, terminal_states) do
+    if terminal_issue_state?(issue.state, terminal_states) do
+      {:skip, issue}
+    else
+      {:ok, issue}
+    end
+  end
+
+  defp revalidate_legacy_issue(%Issue{} = issue, terminal_states) do
+    if retry_candidate_issue?(issue, terminal_states) do
+      {:ok, issue}
+    else
+      {:skip, issue}
+    end
+  end
 
   @doc false
   @spec record_attempt_event_for_test(State.t(), String.t(), atom()) :: term()
@@ -2649,6 +2994,7 @@ defmodule SymphonyElixir.Orchestrator do
 
         state =
           state
+          |> refresh_work_control([issue])
           |> record_recent_attempt(
             issue_id,
             Map.merge(metadata, %{issue: issue, identifier: issue.identifier, attempt: attempt}),
@@ -2658,6 +3004,9 @@ defmodule SymphonyElixir.Orchestrator do
           |> reset_attempt_counters(issue_id)
 
         {:noreply, state}
+
+      Config.settings!().agent.routing == "routed" ->
+        handle_routed_retry_issue_lookup(issue, state, issue_id, attempt, metadata)
 
       retry_candidate_issue?(issue, terminal_states) ->
         handle_active_retry(state, issue, attempt, metadata)
@@ -2671,7 +3020,35 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp handle_retry_issue_lookup(nil, state, issue_id, _attempt, _metadata) do
     Logger.debug("Issue no longer visible, removing claim issue_id=#{issue_id}")
-    {:noreply, release_issue_claim(state, issue_id)}
+
+    {:noreply,
+     state
+     |> release_issue_claim(issue_id)
+     |> forget_work_item(issue_id)}
+  end
+
+  defp handle_routed_retry_issue_lookup(%Issue{} = issue, state, issue_id, attempt, metadata) do
+    trusted_work_item = Map.get(state.work_control, issue_id)
+    state = refresh_work_control(state, [issue])
+
+    cond do
+      not routed_issue_in_scope?(issue) ->
+        Logger.debug("Issue is no longer routed, removing claim issue_id=#{issue_id}")
+        {:noreply, release_issue_claim(state, issue_id)}
+
+      not trusted_retry_work_item?(trusted_work_item) ->
+        dispatch_active_retry(state, issue, attempt, metadata)
+
+      true ->
+        handle_trusted_routed_retry(state, issue, attempt, metadata)
+    end
+  end
+
+  defp handle_trusted_routed_retry(state, issue, attempt, metadata) do
+    case route_for_issue(issue, state) do
+      {:ok, %Route{}} -> handle_active_retry(state, issue, attempt, metadata)
+      {:error, reason} -> retry_after_route_error(state, issue, attempt, metadata, reason)
+    end
   end
 
   defp cleanup_issue_workspace(identifier, worker_host \\ nil)
@@ -2726,7 +3103,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp retry_available_for_dispatch?(issue, state, metadata) do
-    retry_candidate_issue?(issue, terminal_state_set()) and
+    retry_candidate_for_state?(issue, state, terminal_state_set()) and
       dispatch_slots_available?(issue, state) and
       worker_slots_available?(state, metadata[:worker_host])
   end
@@ -2777,8 +3154,8 @@ defmodule SymphonyElixir.Orchestrator do
     refreshed_issue = Map.get(state.dependency_graph.nodes, refreshed_issue.id, refreshed_issue)
 
     cond do
-      not retry_candidate_issue?(refreshed_issue, terminal_state_set()) ->
-        handle_retry_issue_lookup(refreshed_issue, state, issue.id, attempt, metadata)
+      not retry_candidate_for_state?(refreshed_issue, state, terminal_state_set()) ->
+        handle_non_candidate_retry(state, issue, refreshed_issue, attempt, metadata)
 
       not retry_available_for_dispatch?(refreshed_issue, state, metadata) ->
         schedule_retry_without_slots(state, refreshed_issue, attempt, metadata)
@@ -2788,8 +3165,23 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp handle_non_candidate_retry(state, issue, refreshed_issue, attempt, metadata) do
+    if Config.settings!().agent.routing == "routed" and routed_issue_in_scope?(refreshed_issue) do
+      handle_routed_non_candidate_retry(state, issue, refreshed_issue, attempt, metadata)
+    else
+      handle_retry_issue_lookup(refreshed_issue, state, issue.id, attempt, metadata)
+    end
+  end
+
+  defp handle_routed_non_candidate_retry(state, issue, refreshed_issue, attempt, metadata) do
+    case route_for_issue(refreshed_issue, state) do
+      {:error, reason} -> retry_after_route_error(state, refreshed_issue, attempt, metadata, reason)
+      {:ok, %Route{}} -> handle_retry_issue_lookup(refreshed_issue, state, issue.id, attempt, metadata)
+    end
+  end
+
   defp dispatch_final_retry(state, issue, refreshed_issue, attempt, metadata) do
-    case route_for_issue(refreshed_issue) do
+    case route_for_issue(refreshed_issue, state) do
       {:ok, %Route{} = route} ->
         dispatch_routable_retry(state, issue, refreshed_issue, route, attempt, metadata)
 
@@ -2819,14 +3211,38 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp retry_after_route_error(state, issue, attempt, metadata, reason) do
-    retry_after_failure(
-      state,
-      issue,
-      attempt,
-      metadata,
-      "retry route resolution failed: #{inspect(reason)}"
-    )
+    if Config.settings!().agent.routing == "routed" and routed_lifecycle_error?(reason) do
+      error = "routed lifecycle authority suspended: #{inspect(reason)}"
+
+      blocked_entry =
+        Map.merge(metadata, %{
+          issue: issue,
+          identifier: issue.identifier,
+          issue_url: issue.url,
+          retry_attempt: attempt
+        })
+
+      {:noreply, block_issue_from_entry(state, issue.id, blocked_entry, error)}
+    else
+      retry_after_failure(
+        state,
+        issue,
+        attempt,
+        metadata,
+        "retry route resolution failed: #{inspect(reason)}"
+      )
+    end
   end
+
+  defp routed_lifecycle_error?(:canonical_work_item_required), do: true
+  defp routed_lifecycle_error?(:lifecycle_validation_required), do: true
+  defp routed_lifecycle_error?(:authority_unavailable), do: true
+  defp routed_lifecycle_error?(:invalid_work_item), do: true
+  defp routed_lifecycle_error?(:missing_validated_lifecycle_state), do: true
+  defp routed_lifecycle_error?({:authority_reducing, _reason}), do: true
+  defp routed_lifecycle_error?({:invalid_lifecycle, _reason}), do: true
+  defp routed_lifecycle_error?({:not_dispatchable_state, _state}), do: true
+  defp routed_lifecycle_error?(_reason), do: false
 
   defp retry_after_refresh_error(state, issue, attempt, metadata, reason) do
     retry_after_failure(
@@ -3062,7 +3478,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp running_entry_session_id(_running_entry), do: "n/a"
 
-  defp route_for_issue(%Issue{} = issue) do
+  defp route_for_issue(%Issue{} = issue, state) do
     settings = Config.settings!()
 
     if settings.agent.routing == "legacy" do
@@ -3072,21 +3488,37 @@ defmodule SymphonyElixir.Orchestrator do
         {:error, {:not_dispatchable_state, normalize_issue_state(issue.state)}}
       end
     else
-      case Router.resolve(issue, settings.agent.profiles, settings.agent.routes) do
-        {:ok, %Route{runtime_name: "codex"} = route} ->
-          {:ok, route}
-
-        {:ok, %Route{runtime_name: runtime_name}} ->
-          {:error, {:runtime_not_available, runtime_name}}
-
-        {:error, reason} ->
-          {:error, reason}
-      end
+      routed_route_for_issue(issue, state, settings)
     end
   end
 
-  defp route_dispatchable?(%Issue{} = issue) do
-    match?({:ok, %Route{}}, route_for_issue(issue))
+  defp routed_route_for_issue(%Issue{} = issue, state, settings) do
+    work_item = if is_struct(state, State), do: Map.get(state.work_control, issue.id), else: nil
+
+    case work_item do
+      %WorkItem{} = work_item ->
+        resolve_routed_route(work_item, settings)
+
+      _missing_work_item ->
+        {:error, :canonical_work_item_required}
+    end
+  end
+
+  defp resolve_routed_route(%WorkItem{} = work_item, settings) do
+    case Router.resolve(work_item, settings.agent.profiles, settings.agent.routes) do
+      {:ok, %Route{runtime_name: "codex"} = route} ->
+        {:ok, route}
+
+      {:ok, %Route{runtime_name: runtime_name}} ->
+        {:error, {:runtime_not_available, runtime_name}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp route_dispatchable?(%Issue{} = issue, %State{} = state) do
+    match?({:ok, %Route{}}, route_for_issue(issue, state))
   end
 
   defp route_change_metadata(%Route{} = previous_route, %Route{} = next_route) do
@@ -3114,10 +3546,10 @@ defmodule SymphonyElixir.Orchestrator do
           cached_decision
 
         _ ->
-          case route_for_issue(issue) do
+          case route_for_issue(issue, state) do
             {:ok, %Route{responsibility: responsibility}} ->
               issue
-              |> Guard.evaluate(responsibility, dependency_policy_options())
+              |> Guard.evaluate(responsibility, dependency_policy_options(state))
               |> maybe_mark_dependency_incomplete(state.dependency_graph, issue_id)
               |> maybe_mark_dependency_cycle(state.dependency_graph, issue_id)
 
@@ -3141,7 +3573,7 @@ defmodule SymphonyElixir.Orchestrator do
       Guard.evaluate(
         issue,
         responsibility,
-        dependency_policy_options()
+        dependency_policy_options(state)
       )
 
     decision =
@@ -3164,12 +3596,13 @@ defmodule SymphonyElixir.Orchestrator do
     Enum.find(Graph.cycles(graph), &Enum.member?(&1, issue_id)) || []
   end
 
-  defp dependency_policy_options do
+  defp dependency_policy_options(%State{} = state) do
     settings = Config.settings!()
 
     [
       active_states: settings.tracker.active_states || [],
-      terminal_states: settings.tracker.terminal_states || []
+      terminal_states: settings.tracker.terminal_states || [],
+      work_control: state.work_control
     ]
   end
 
@@ -4155,6 +4588,21 @@ defmodule SymphonyElixir.Orchestrator do
   defp retry_candidate_issue?(%Issue{} = issue, terminal_states) do
     candidate_issue?(issue, active_state_set(), terminal_states)
   end
+
+  defp retry_candidate_for_state?(%Issue{} = issue, %State{} = state, terminal_states) do
+    if Config.settings!().agent.routing == "routed" do
+      routed_candidate_issue?(issue, state)
+    else
+      retry_candidate_issue?(issue, terminal_states)
+    end
+  end
+
+  defp retry_candidate_for_state?(_issue, _state, _terminal_states), do: false
+
+  defp trusted_retry_work_item?(%WorkItem{lifecycle_assessment: assessment}),
+    do: LifecycleAssessment.validated?(assessment)
+
+  defp trusted_retry_work_item?(_work_item), do: false
 
   defp dispatch_slots_available?(%Issue{} = issue, %State{} = state) do
     available_slots(state) > 0 and state_slots_available?(issue, state.running)

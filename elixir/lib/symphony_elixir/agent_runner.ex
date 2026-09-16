@@ -8,6 +8,7 @@ defmodule SymphonyElixir.AgentRunner do
   alias SymphonyElixir.AgentRuntime.{Profile, Route, Router}
   alias SymphonyElixir.Dependency.Guard
   alias SymphonyElixir.Tracker.Issue
+  alias SymphonyElixir.WorkControl.{LifecycleAssessment, WorkflowLifecycle, WorkItem}
 
   @type worker_host :: String.t() | nil
 
@@ -20,7 +21,8 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   @doc false
-  @spec continuation_prompt_for_test(Issue.t(), Route.t(), pos_integer(), pos_integer()) :: String.t()
+  @spec continuation_prompt_for_test(Issue.t(), Route.t(), pos_integer(), pos_integer()) ::
+          String.t()
   def continuation_prompt_for_test(%Issue{} = issue, %Route{} = route, turn_number, max_turns)
       when is_integer(turn_number) and is_integer(max_turns) do
     build_turn_prompt(issue, [route: route], turn_number, max_turns)
@@ -29,29 +31,47 @@ defmodule SymphonyElixir.AgentRunner do
   @spec run(map(), pid() | nil, keyword()) :: :ok | no_return()
   def run(issue, codex_update_recipient \\ nil, opts \\ []) do
     # The orchestrator owns host retries so one worker lifetime never hops machines.
-    worker_host = selected_worker_host(Keyword.get(opts, :worker_host), Config.settings!().worker.ssh_hosts)
+    worker_host =
+      selected_worker_host(Keyword.get(opts, :worker_host), Config.settings!().worker.ssh_hosts)
 
     case route_from_options(issue, opts) do
       {:ok, route} ->
-        opts = maybe_put_route(opts, route)
-
-        Logger.info(
-          "Starting agent run for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}" <>
-            route_log_context(route)
-        )
-
-        case run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
-          :ok ->
-            :ok
-
-          {:error, reason} ->
-            Logger.error("Agent run failed for #{issue_context(issue)}: #{inspect(reason)}")
-            raise RuntimeError, "Agent run failed for #{issue_context(issue)}: #{inspect(reason)}"
-        end
+        run_with_route(issue, codex_update_recipient, opts, worker_host, route)
 
       {:error, reason} ->
         Logger.error("Agent route resolution failed for #{issue_context(issue)}: #{inspect(reason)}")
-        raise RuntimeError, "Agent route resolution failed for #{issue_context(issue)}: #{inspect(reason)}"
+
+        raise RuntimeError,
+              "Agent route resolution failed for #{issue_context(issue)}: #{inspect(reason)}"
+    end
+  end
+
+  defp run_with_route(issue, codex_update_recipient, opts, worker_host, route) do
+    case validate_routed_attempt(route, opts) do
+      :ok ->
+        run_validated_attempt(issue, codex_update_recipient, opts, worker_host, route)
+
+      {:error, reason} ->
+        Logger.error("Agent route authority validation failed for #{issue_context(issue)}: #{inspect(reason)}")
+        raise RuntimeError, "Agent route authority validation failed for #{issue_context(issue)}: #{inspect(reason)}"
+    end
+  end
+
+  defp run_validated_attempt(issue, codex_update_recipient, opts, worker_host, route) do
+    opts = maybe_put_route(opts, route)
+
+    Logger.info(
+      "Starting agent run for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}" <>
+        route_log_context(route)
+    )
+
+    case run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.error("Agent run failed for #{issue_context(issue)}: #{inspect(reason)}")
+        raise RuntimeError, "Agent run failed for #{issue_context(issue)}: #{inspect(reason)}"
     end
   end
 
@@ -129,7 +149,8 @@ defmodule SymphonyElixir.AgentRunner do
         opts: runtime_opts,
         issue_state_fetcher: issue_state_fetcher,
         route: route,
-        role_prompt: role_prompt
+        role_prompt: role_prompt,
+        work_item: Keyword.get(opts, :work_item)
       }
 
       run_runtime_session(runtime, session, fn ->
@@ -161,12 +182,40 @@ defmodule SymphonyElixir.AgentRunner do
       case continue_with_issue_and_route(
              context.issue,
              context.issue_state_fetcher,
-             context.route
+             context.route,
+             context.work_item,
+             context.opts
            ) do
+        {:continue, refreshed_issue, refreshed_route, refreshed_work_item} ->
+          continue_after_turn(
+            context,
+            refreshed_issue,
+            refreshed_route,
+            refreshed_work_item,
+            turn_number,
+            max_turns
+          )
+
         {:continue, refreshed_issue, refreshed_route} ->
-          continue_after_turn(context, refreshed_issue, refreshed_route, turn_number, max_turns)
+          continue_after_turn(
+            context,
+            refreshed_issue,
+            refreshed_route,
+            nil,
+            turn_number,
+            max_turns
+          )
 
         {:done, _refreshed_issue} ->
+          :ok
+
+        {:suspended, refreshed_issue, assessment} ->
+          notify_lifecycle_suspended(
+            context.codex_update_recipient,
+            refreshed_issue,
+            assessment
+          )
+
           :ok
 
         {:error, reason} ->
@@ -213,8 +262,15 @@ defmodule SymphonyElixir.AgentRunner do
     :erlang.raise(kind, reason, stacktrace)
   end
 
-  defp continue_after_turn(context, refreshed_issue, refreshed_route, turn_number, max_turns) do
-    decision = dependency_decision(refreshed_issue, refreshed_route)
+  defp continue_after_turn(
+         context,
+         refreshed_issue,
+         refreshed_route,
+         refreshed_work_item,
+         turn_number,
+         max_turns
+       ) do
+    decision = dependency_decision(refreshed_issue, refreshed_route, context.opts)
 
     cond do
       decision.allowed? != true ->
@@ -245,43 +301,177 @@ defmodule SymphonyElixir.AgentRunner do
             "turn=#{turn_number}/#{max_turns}"
         )
 
-        next_context = %{context | issue: refreshed_issue, route: refreshed_route}
+        next_opts =
+          context.opts
+          |> maybe_put_work_item(refreshed_work_item)
+
+        next_opts =
+          Keyword.put(
+            next_opts,
+            :agent_tool_context,
+            agent_tool_context(refreshed_issue, refreshed_route, next_opts)
+          )
+
+        next_context = %{
+          context
+          | issue: refreshed_issue,
+            route: refreshed_route,
+            opts: next_opts,
+            work_item: refreshed_work_item
+        }
+
         do_run_codex_turns(next_context, turn_number + 1, max_turns)
     end
   end
 
-  defp continue_with_issue_and_route(issue, issue_state_fetcher, nil) do
+  defp continue_with_issue_and_route(issue, issue_state_fetcher, nil, _work_item, _opts) do
     case continue_with_issue?(issue, issue_state_fetcher) do
       {:continue, refreshed_issue} -> {:continue, refreshed_issue, nil}
       other -> other
     end
   end
 
-  defp continue_with_issue_and_route(issue, issue_state_fetcher, %Route{}) do
-    case continue_with_issue?(issue, issue_state_fetcher) do
-      {:continue, %Issue{} = refreshed_issue} ->
-        case resolve_route(refreshed_issue) do
-          {:ok, %Route{} = refreshed_route} ->
-            {:continue, refreshed_issue, refreshed_route}
+  defp continue_with_issue_and_route(
+         issue,
+         issue_state_fetcher,
+         %Route{} = route,
+         work_item,
+         opts
+       ) do
+    refreshed_result =
+      if Config.settings!().agent.routing == "legacy" do
+        continue_with_issue?(issue, issue_state_fetcher)
+      else
+        continue_with_routed_issue?(issue, issue_state_fetcher)
+      end
 
-          {:error, reason} ->
-            {:error, {:route_resolution_failed, reason}}
+    case refreshed_result do
+      {:continue, %Issue{} = refreshed_issue} ->
+        if Config.settings!().agent.routing == "legacy" do
+          {:continue, refreshed_issue, Route.legacy(refreshed_issue)}
+        else
+          assess_routed_continuation(
+            refreshed_issue,
+            route,
+            work_item,
+            Keyword.get(opts, :guard_evidence, []),
+            Keyword.get(opts, :assessment_context, %{})
+          )
         end
+
+      {:done, _refreshed_issue} = done ->
+        done
 
       other ->
         other
     end
   end
 
-  defp resolve_route(%Issue{} = issue) do
-    settings = Config.settings!()
+  defp assess_routed_continuation(
+         %Issue{} = issue,
+         %Route{} = route,
+         %WorkItem{} = prior_work_item,
+         evidence,
+         assessment_context
+       ) do
+    opts = %{
+      provider: Config.settings!().tracker.kind,
+      observed_at: issue.updated_at || DateTime.utc_now(),
+      prior_validated_lifecycle_state: prior_work_item.validated_lifecycle_state,
+      prior_authority_disposition: prior_work_item.authority_disposition,
+      evidence: evidence_for_observation(issue, prior_work_item, evidence),
+      assessment_context: assessment_context
+    }
 
-    if settings.agent.routing == "legacy" do
-      {:ok, Route.legacy(issue)}
-    else
-      Router.resolve(issue, settings.agent.profiles, settings.agent.routes)
+    case WorkItem.from_issue(issue, opts) do
+      {:ok, %WorkItem{} = work_item} ->
+        case routed_continuation_route(work_item, prior_work_item, route) do
+          {:ok, %Route{} = next_route} ->
+            {:continue, issue, next_route, work_item}
+
+          :error ->
+            {:suspended, issue, work_item.lifecycle_assessment}
+        end
+
+      {:error, _reason} ->
+        {:suspended, issue, nil}
     end
   end
+
+  defp assess_routed_continuation(%Issue{} = issue, _route, _work_item, _evidence, _assessment_context),
+    do: {:suspended, issue, nil}
+
+  defp routed_continuation_route(
+         %WorkItem{} = work_item,
+         %WorkItem{} = prior_work_item,
+         %Route{} = current_route
+       ) do
+    cond do
+      not LifecycleAssessment.validated?(work_item.lifecycle_assessment) ->
+        :error
+
+      not WorkItem.authority_available?(work_item) ->
+        :error
+
+      current_route.responsibility !=
+          WorkflowLifecycle.responsibility(prior_work_item.validated_lifecycle_state) ->
+        :error
+
+      true ->
+        settings = Config.settings!()
+
+        case Router.resolve(work_item, settings.agent.profiles, settings.agent.routes) do
+          {:ok, %Route{} = next_route} -> {:ok, next_route}
+          {:error, _reason} -> :error
+        end
+    end
+  end
+
+  defp evidence_for_observation(
+         %Issue{state: state},
+         %WorkItem{
+           validated_lifecycle_state: validated_state,
+           lifecycle_assessment: assessment
+         },
+         evidence
+       ) do
+    evidence_for_observation(state, validated_state, assessment.satisfied_guards, evidence)
+  end
+
+  defp evidence_for_observation(state, validated_state, prior_evidence, forward_evidence) do
+    case WorkflowLifecycle.parse(state) do
+      {:ok, ^validated_state} -> prior_evidence
+      _ -> forward_evidence
+    end
+  end
+
+  defp continue_with_routed_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher)
+       when is_binary(issue_id) do
+    case issue_state_fetcher.([issue_id]) do
+      {:ok, [%Issue{} = refreshed_issue | _]} ->
+        if routed_issue_in_scope?(refreshed_issue) do
+          {:continue, refreshed_issue}
+        else
+          {:done, refreshed_issue}
+        end
+
+      {:ok, []} ->
+        {:done, issue}
+
+      {:error, reason} ->
+        {:error, {:issue_state_refresh_failed, reason}}
+    end
+  end
+
+  defp continue_with_routed_issue?(issue, _issue_state_fetcher), do: {:done, issue}
+
+  defp notify_lifecycle_suspended(recipient, %Issue{id: issue_id}, assessment)
+       when is_pid(recipient) and is_binary(issue_id) do
+    send(recipient, {:agent_lifecycle_suspended, issue_id, assessment})
+    :ok
+  end
+
+  defp notify_lifecycle_suspended(_recipient, _issue, _assessment), do: :ok
 
   defp route_changed?(nil, nil), do: false
   defp route_changed?(%Route{} = left, %Route{} = right), do: not Route.same?(left, right)
@@ -308,6 +498,11 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp notify_dependency_blocked(_recipient, _issue, _decision), do: :ok
 
+  defp maybe_put_work_item(opts, %WorkItem{} = work_item),
+    do: Keyword.put(opts, :work_item, work_item)
+
+  defp maybe_put_work_item(opts, _work_item), do: Keyword.delete(opts, :work_item)
+
   defp dependency_metadata(decision) when is_map(decision) do
     Map.take(decision, [
       :allowed?,
@@ -324,19 +519,29 @@ defmodule SymphonyElixir.AgentRunner do
     ])
   end
 
-  defp dependency_decision(%Issue{} = issue, %Route{responsibility: responsibility}) do
-    Guard.evaluate(issue, responsibility, dependency_policy_options())
+  defp dependency_decision(%Issue{} = issue, %Route{responsibility: responsibility}, opts) do
+    Guard.evaluate(issue, responsibility, dependency_policy_options(opts))
   end
 
-  defp dependency_decision(_issue, _route), do: %{allowed?: true}
+  defp dependency_decision(_issue, _route, _opts), do: %{allowed?: true}
 
   defp agent_tool_context(%Issue{} = issue, %Route{} = route, opts) do
-    %{
+    context = %{
       issue_id: issue.id,
       current_issue_state: issue.state,
       responsibility: route.responsibility,
-      dependency_decision: dependency_decision_from_options(issue, route, opts)
+      dependency_decision: dependency_decision_from_options(issue, route, opts),
+      work_control: Keyword.get(opts, :work_control, %{}),
+      guard_evidence: Keyword.get(opts, :guard_evidence, [])
     }
+
+    case Keyword.get(opts, :work_item) do
+      %WorkItem{validated_lifecycle_state: state} = work_item ->
+        Map.merge(context, %{trusted_lifecycle_state: state, work_item: work_item})
+
+      _missing_work_item ->
+        context
+    end
   end
 
   defp agent_tool_context(%Issue{} = issue, _route, _opts) do
@@ -351,24 +556,31 @@ defmodule SymphonyElixir.AgentRunner do
   defp dependency_decision_from_options(issue, route, opts) do
     case Keyword.get(opts, :dependency_decision) do
       %{allowed?: _} = decision -> decision
-      _ -> dependency_decision(issue, route)
+      _ -> dependency_decision(issue, route, opts)
     end
   end
 
-  defp dependency_policy_options do
+  defp dependency_policy_options(opts) when is_list(opts) do
     settings = Config.settings!()
 
-    [
+    options = [
       active_states: settings.tracker.active_states || [],
       terminal_states: settings.tracker.terminal_states || []
     ]
+
+    case Keyword.get(opts, :work_control) do
+      work_control when is_map(work_control) -> Keyword.put(options, :work_control, work_control)
+      _missing -> options
+    end
   end
 
   defp max_turns_for_route(%Route{profile: %Profile{max_turns: max_turns}}), do: max_turns
   defp max_turns_for_route(_route), do: Config.settings!().agent.max_turns
 
   defp max_turns_for_run(%Route{} = route, _opts), do: max_turns_for_route(route)
-  defp max_turns_for_run(_route, opts), do: Keyword.get(opts, :max_turns, max_turns_for_route(nil))
+
+  defp max_turns_for_run(_route, opts),
+    do: Keyword.get(opts, :max_turns, max_turns_for_route(nil))
 
   defp profile_runtime_options(opts, %Route{profile: %Profile{} = profile}) do
     Keyword.merge(opts, Profile.runtime_options(profile))
@@ -381,6 +593,48 @@ defmodule SymphonyElixir.AgentRunner do
       nil -> {:ok, nil}
       %Route{} = route -> {:ok, route}
       route -> {:error, {:invalid_route, route}}
+    end
+  end
+
+  defp validate_routed_attempt(%Route{} = route, opts) do
+    if Config.settings!().agent.routing == "routed" do
+      validate_routed_work_item(route, Keyword.get(opts, :work_item))
+    else
+      :ok
+    end
+  end
+
+  defp validate_routed_attempt(_route, _opts) do
+    if Config.settings!().agent.routing == "legacy" do
+      :ok
+    else
+      {:error, :canonical_work_item_required}
+    end
+  end
+
+  defp validate_routed_work_item(_route, work_item) when not is_struct(work_item, WorkItem),
+    do: {:error, :canonical_work_item_required}
+
+  defp validate_routed_work_item(route, %WorkItem{} = work_item) do
+    cond do
+      not LifecycleAssessment.validated?(work_item.lifecycle_assessment) ->
+        {:error, :lifecycle_validation_required}
+
+      not WorkItem.authority_available?(work_item) ->
+        {:error, :authority_unavailable}
+
+      true ->
+        validate_routed_route(route, work_item)
+    end
+  end
+
+  defp validate_routed_route(route, %WorkItem{} = work_item) do
+    settings = Config.settings!()
+
+    case Router.resolve(work_item, settings.agent.profiles, settings.agent.routes) do
+      {:ok, ^route} -> :ok
+      {:ok, _other_route} -> {:error, :route_authority_mismatch}
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -415,7 +669,8 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher) when is_binary(issue_id) do
+  defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher)
+       when is_binary(issue_id) do
     case issue_state_fetcher.([issue_id]) do
       {:ok, [%Issue{} = refreshed_issue | _]} ->
         if active_issue_state?(refreshed_issue.state) and issue_routable?(refreshed_issue) do
@@ -447,6 +702,15 @@ defmodule SymphonyElixir.AgentRunner do
     Issue.routable?(issue, Config.settings!().tracker.required_labels)
   end
 
+  defp routed_issue_in_scope?(%Issue{} = issue) do
+    required_labels = Config.settings!().tracker.required_labels
+    labels = Issue.label_names(issue)
+
+    Enum.all?(required_labels, fn required_label ->
+      Enum.any?(labels, fn label -> normalize_label(label) == normalize_label(required_label) end)
+    end)
+  end
+
   defp selected_worker_host(nil, []), do: nil
 
   defp selected_worker_host(preferred_host, configured_hosts) when is_list(configured_hosts) do
@@ -468,6 +732,12 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp normalize_issue_state(state_name) when is_binary(state_name) do
     state_name
+    |> String.trim()
+    |> String.downcase()
+  end
+
+  defp normalize_label(label) when is_binary(label) do
+    label
     |> String.trim()
     |> String.downcase()
   end
