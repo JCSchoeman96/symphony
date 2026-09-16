@@ -1,6 +1,6 @@
 # P-000 Plane provider feasibility evidence
 
-This is a concise summary of the accepted P-000 architecture evidence recorded in the V4.1 authority source, [../SYMPHONY_HARDENING_ROADMAP_V4_1.md](../SYMPHONY_HARDENING_ROADMAP_V4_1.md). It is not a new experiment report. This documentation phase did not rerun live Plane experiments.
+This is a concise summary of the accepted P-000 architecture evidence recorded in the V4.1 authority source, [V4_1_MASTER_ROADMAP.md](V4_1_MASTER_ROADMAP.md). It is not a new experiment report. This documentation phase did not rerun live Plane experiments.
 
 ## Decision
 
