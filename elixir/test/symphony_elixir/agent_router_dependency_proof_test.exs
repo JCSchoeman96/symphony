@@ -116,7 +116,11 @@ defmodule SymphonyElixir.AgentRouterDependencyProofTest do
                    test_pid: test_pid,
                    route: route,
                    work_item: work_item,
-                   guard_evidence: transition_evidence([state | refreshed_states]),
+                   guard_evidence: transition_evidence([state | refreshed_states], stage_issue.id),
+                   assessment_context: %{
+                     runtime_attempt_id: "attempt-#{stage_issue.id}",
+                     lineage_generation: 1
+                   },
                    issue_state_fetcher: sequence_fetcher(stage_issue, refreshed_states)
                  )
 
@@ -430,12 +434,28 @@ defmodule SymphonyElixir.AgentRouterDependencyProofTest do
     end
   end
 
-  defp transition_evidence(states) do
+  defp transition_evidence(states, work_item_id) do
     states
     |> Enum.chunk_every(2, 1, :discard)
     |> Enum.flat_map(fn [source, target] ->
       {:ok, metadata} = WorkflowLifecycle.transition(source, target)
-      metadata.guard_requirements
+
+      Enum.map(metadata.guard_requirements, fn
+        %{class: :semantic_attestation, name: name} ->
+          {:ok, evidence} =
+            GuardClass.semantic_attestation(name, %{
+              responsibility: metadata.responsibility,
+              runtime_attempt_id: "attempt-#{work_item_id}",
+              lineage_generation: 1,
+              subject: {:work_item, work_item_id},
+              timestamp: DateTime.utc_now()
+            })
+
+          evidence
+
+        requirement ->
+          requirement
+      end)
     end)
   end
 

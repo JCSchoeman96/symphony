@@ -71,25 +71,48 @@ defmodule SymphonyElixir.WorkControl.LifecycleAssessment do
   def resolve_mapping(%__MODULE__{}), do: {:error, :assessment_already_resolved}
 
   @spec assess(ProviderObservation.t(), WorkflowLifecycle.state() | nil, term()) :: t()
-  def assess(%ProviderObservation{} = observation, prior_validated_state, evidence) do
-    observation
-    |> new()
-    |> assess(prior_validated_state, evidence)
-  end
+  def assess(%ProviderObservation{} = observation, prior_validated_state, evidence),
+    do: assess(observation, prior_validated_state, evidence, %{})
 
   @spec assess(t(), WorkflowLifecycle.state() | nil, term()) :: t()
-  def assess(%__MODULE__{} = assessment, prior_validated_state, evidence) do
+  def assess(%__MODULE__{} = assessment, prior_validated_state, evidence),
+    do: assess(assessment, prior_validated_state, evidence, %{})
+
+  @spec assess(ProviderObservation.t(), WorkflowLifecycle.state() | nil, term(), map()) :: t()
+  def assess(%ProviderObservation{} = observation, prior_validated_state, evidence, context)
+      when is_map(context) do
+    observation
+    |> new()
+    |> assess(prior_validated_state, evidence, context)
+  end
+
+  @spec assess(t(), WorkflowLifecycle.state() | nil, term(), map()) :: t()
+  def assess(%__MODULE__{} = assessment, prior_validated_state, evidence, context)
+      when is_map(context) do
     evidence = normalize_evidence(evidence)
 
     case resolve_mapping(assessment) do
       {:ok, mapped_assessment} ->
-        assess_mapped(mapped_assessment, normalize_prior_state(prior_validated_state), evidence)
+        assess_mapped(
+          mapped_assessment,
+          normalize_prior_state(prior_validated_state),
+          evidence,
+          assessment_context(mapped_assessment, context)
+        )
 
       {:error, %__MODULE__{} = invalid} ->
         %{invalid | assessed_at: DateTime.utc_now()}
 
       {:error, :assessment_already_resolved} ->
-        finalize(assessment, :invalid, assessment.mapped_state, prior_validated_state, [], evidence, :assessment_reused)
+        finalize(
+          assessment,
+          :invalid,
+          assessment.mapped_state,
+          prior_validated_state,
+          [],
+          evidence,
+          :assessment_reused
+        )
     end
   end
 
@@ -120,7 +143,7 @@ defmodule SymphonyElixir.WorkControl.LifecycleAssessment do
   @spec dependency_satisfying?(t()) :: boolean()
   def dependency_satisfying?(assessment), do: completion_validated?(assessment)
 
-  defp assess_mapped(%__MODULE__{mapped_state: mapped_state} = assessment, nil, evidence) do
+  defp assess_mapped(%__MODULE__{mapped_state: mapped_state} = assessment, nil, evidence, context) do
     cond do
       mapped_state == :backlog ->
         finalize(assessment, :validated, mapped_state, mapped_state, [], evidence, :initial_inactive_state)
@@ -132,14 +155,14 @@ defmodule SymphonyElixir.WorkControl.LifecycleAssessment do
         finalize(assessment, :authority_reducing, mapped_state, mapped_state, [], evidence, :provider_blocked)
 
       mapped_state == :done ->
-        assess_completion(assessment, nil, evidence)
+        assess_completion(assessment, nil, evidence, context)
 
       true ->
         finalize(assessment, :validation_required, mapped_state, nil, [], evidence, :initial_state_requires_validation)
     end
   end
 
-  defp assess_mapped(%__MODULE__{mapped_state: mapped_state} = assessment, prior_state, evidence) do
+  defp assess_mapped(%__MODULE__{mapped_state: mapped_state} = assessment, prior_state, evidence, context) do
     cond do
       mapped_state == :canceled ->
         finalize(assessment, :authority_reducing, mapped_state, mapped_state, [], evidence, :canceled)
@@ -148,37 +171,38 @@ defmodule SymphonyElixir.WorkControl.LifecycleAssessment do
         finalize(assessment, :authority_reducing, mapped_state, mapped_state, [], evidence, :provider_blocked)
 
       mapped_state == prior_state and mapped_state == :done ->
-        require_completion_proof(assessment, prior_state, evidence)
+        require_completion_proof(assessment, prior_state, evidence, context)
 
       mapped_state == :done ->
-        assess_completion(assessment, prior_state, evidence)
+        assess_completion(assessment, prior_state, evidence, context)
 
       mapped_state == prior_state ->
         finalize(assessment, :validated, mapped_state, mapped_state, [], evidence, :corroborated_state)
 
       true ->
-        assess_transition(assessment, prior_state, mapped_state, evidence)
+        assess_transition(assessment, prior_state, mapped_state, evidence, context)
     end
   end
 
-  defp assess_completion(assessment, prior_state, evidence) do
+  defp assess_completion(assessment, prior_state, evidence, context) do
     cond do
       is_nil(prior_state) ->
-        require_completion_proof(assessment, nil, [])
+        require_completion_proof(assessment, nil, [], context)
 
       prior_state == :merging ->
-        require_completion_proof(assessment, prior_state, evidence)
+        require_completion_proof(assessment, prior_state, evidence, context)
 
       true ->
-        assess_transition(assessment, prior_state, :done, evidence)
+        assess_transition(assessment, prior_state, :done, evidence, context)
     end
   end
 
-  defp assess_transition(assessment, prior_state, mapped_state, evidence) do
+  defp assess_transition(assessment, prior_state, mapped_state, evidence, context) do
     case WorkflowLifecycle.transition(prior_state, mapped_state) do
       {:ok, metadata} ->
         required_guards = metadata.guard_requirements
-        missing_guards = GuardClass.missing(required_guards, evidence)
+        guard_context = Map.put(context, :responsibility, metadata.responsibility)
+        missing_guards = GuardClass.missing(required_guards, evidence, guard_context)
 
         if missing_guards == [] do
           finalize(
@@ -188,7 +212,8 @@ defmodule SymphonyElixir.WorkControl.LifecycleAssessment do
             mapped_state,
             required_guards,
             evidence,
-            :transition_validated
+            :transition_validated,
+            guard_context
           )
         else
           finalize(
@@ -198,7 +223,8 @@ defmodule SymphonyElixir.WorkControl.LifecycleAssessment do
             prior_state,
             required_guards,
             evidence,
-            :required_evidence_missing
+            :required_evidence_missing,
+            guard_context
           )
         end
 
@@ -207,9 +233,9 @@ defmodule SymphonyElixir.WorkControl.LifecycleAssessment do
     end
   end
 
-  defp require_completion_proof(assessment, prior_state, evidence) do
+  defp require_completion_proof(assessment, prior_state, evidence, context) do
     required_guards = [GuardClass.requirement(:mechanical_guard, :completion_proof_verified)]
-    missing_guards = GuardClass.missing(required_guards, evidence)
+    missing_guards = GuardClass.missing(required_guards, evidence, context)
 
     if missing_guards == [] do
       finalize(
@@ -219,7 +245,8 @@ defmodule SymphonyElixir.WorkControl.LifecycleAssessment do
         :done,
         required_guards,
         evidence,
-        if(prior_state == :done, do: :corroborated_completion, else: :completion_proof_verified)
+        if(prior_state == :done, do: :corroborated_completion, else: :completion_proof_verified),
+        context
       )
     else
       finalize(
@@ -229,23 +256,45 @@ defmodule SymphonyElixir.WorkControl.LifecycleAssessment do
         prior_state,
         required_guards,
         evidence,
-        :completion_proof_required
+        :completion_proof_required,
+        context
       )
     end
   end
 
-  defp finalize(assessment, status, mapped_state, validated_state, required_guards, evidence, reason) do
+  defp finalize(
+         assessment,
+         status,
+         mapped_state,
+         validated_state,
+         required_guards,
+         evidence,
+         reason,
+         context \\ %{}
+       ) do
     %{
       assessment
       | status: status,
         mapped_state: mapped_state,
         validated_state: validated_state,
         required_guards: required_guards,
-        satisfied_guards: evidence,
-        missing_guards: GuardClass.missing(required_guards, evidence),
+        satisfied_guards: satisfied_evidence(required_guards, evidence, context),
+        missing_guards: GuardClass.missing(required_guards, evidence, context),
         reason: reason,
         assessed_at: DateTime.utc_now()
     }
+  end
+
+  defp assessment_context(%__MODULE__{work_item_id: work_item_id}, context) do
+    Map.put(context, :subject, {:work_item, work_item_id})
+  end
+
+  defp satisfied_evidence(requirements, evidence, context) do
+    evidence = normalize_evidence(evidence)
+
+    Enum.filter(evidence, fn candidate ->
+      Enum.any?(requirements, &GuardClass.satisfied?(&1, candidate, context))
+    end)
   end
 
   defp normalize_prior_state(nil), do: nil

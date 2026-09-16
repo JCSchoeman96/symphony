@@ -112,7 +112,15 @@ defmodule SymphonyElixir.WorkControl.WorkItem do
     with {:ok, observation} <- ProviderObservation.from_issue(issue, opts) do
       prior_state = Map.get(opts, :prior_validated_lifecycle_state)
       evidence = Map.get(opts, :evidence, [])
-      assessment = LifecycleAssessment.assess(observation, prior_state, evidence)
+
+      assessment =
+        LifecycleAssessment.assess(
+          observation,
+          prior_state,
+          evidence,
+          lifecycle_assessment_context(opts)
+        )
+
       previous_disposition = Map.get(opts, :prior_authority_disposition)
       disposition = AuthorityDisposition.derive(assessment, previous_disposition)
 
@@ -177,5 +185,20 @@ defmodule SymphonyElixir.WorkControl.WorkItem do
 
   defp valid_fields?(attrs) do
     Enum.all?(Map.keys(attrs), &(&1 in @field_names))
+  end
+
+  defp lifecycle_assessment_context(opts) do
+    context =
+      case Map.get(opts, :assessment_context, %{}) do
+        context when is_map(context) -> context
+        _invalid_context -> %{}
+      end
+
+    Enum.reduce([:runtime_attempt_id, :lineage_generation], context, fn key, context ->
+      case Map.fetch(opts, key) do
+        {:ok, value} -> Map.put(context, key, value)
+        :error -> context
+      end
+    end)
   end
 end

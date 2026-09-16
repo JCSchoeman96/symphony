@@ -64,6 +64,34 @@ defmodule SymphonyElixir.WorkControlWorkItemTest do
     assert WorkItem.canonical_state(work_item) == :ready
   end
 
+  test "work item assessment requires matching semantic attestation context" do
+    {:ok, attestation} =
+      GuardClass.semantic_attestation(:plan_attested, %{
+        responsibility: "planning",
+        runtime_attempt_id: "attempt-1",
+        lineage_generation: 1,
+        subject: {:work_item, "issue-1"},
+        timestamp: @now
+      })
+
+    planning_guard = GuardClass.requirement(:mechanical_guard, :planning_requirements_verified)
+
+    assert {:ok, work_item} =
+             WorkItem.from_issue(issue("Ready"), %{
+               provider: :memory,
+               observed_at: @now,
+               prior_validated_lifecycle_state: :planning,
+               evidence: [attestation, planning_guard],
+               assessment_context: %{
+                 runtime_attempt_id: "attempt-1",
+                 lineage_generation: 1
+               }
+             })
+
+    assert work_item.lifecycle_assessment.status == :validated
+    assert work_item.validated_lifecycle_state == :ready
+  end
+
   test "raw provider done and canceled never satisfy dependency completion" do
     assert {:ok, raw_done} = WorkItem.from_issue(issue("Done"), %{provider: :memory, observed_at: @now})
     refute WorkItem.dependency_satisfying?(raw_done)

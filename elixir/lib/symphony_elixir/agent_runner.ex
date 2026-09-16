@@ -304,9 +304,12 @@ defmodule SymphonyElixir.AgentRunner do
         next_opts =
           context.opts
           |> maybe_put_work_item(refreshed_work_item)
-          |> Keyword.put(
+
+        next_opts =
+          Keyword.put(
+            next_opts,
             :agent_tool_context,
-            agent_tool_context(refreshed_issue, refreshed_route, context.opts)
+            agent_tool_context(refreshed_issue, refreshed_route, next_opts)
           )
 
         next_context = %{
@@ -351,7 +354,8 @@ defmodule SymphonyElixir.AgentRunner do
             refreshed_issue,
             route,
             work_item,
-            Keyword.get(opts, :guard_evidence, [])
+            Keyword.get(opts, :guard_evidence, []),
+            Keyword.get(opts, :assessment_context, %{})
           )
         end
 
@@ -367,14 +371,16 @@ defmodule SymphonyElixir.AgentRunner do
          %Issue{} = issue,
          %Route{} = route,
          %WorkItem{} = prior_work_item,
-         evidence
+         evidence,
+         assessment_context
        ) do
     opts = %{
       provider: Config.settings!().tracker.kind,
       observed_at: issue.updated_at || DateTime.utc_now(),
       prior_validated_lifecycle_state: prior_work_item.validated_lifecycle_state,
       prior_authority_disposition: prior_work_item.authority_disposition,
-      evidence: evidence_for_observation(issue, prior_work_item, evidence)
+      evidence: evidence_for_observation(issue, prior_work_item, evidence),
+      assessment_context: assessment_context
     }
 
     case WorkItem.from_issue(issue, opts) do
@@ -392,7 +398,7 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp assess_routed_continuation(%Issue{} = issue, _route, _work_item, _evidence),
+  defp assess_routed_continuation(%Issue{} = issue, _route, _work_item, _evidence, _assessment_context),
     do: {:suspended, issue, nil}
 
   defp routed_continuation_route(

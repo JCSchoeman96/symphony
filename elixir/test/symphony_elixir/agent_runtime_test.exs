@@ -36,7 +36,7 @@ defmodule SymphonyElixir.AgentRuntimeTest do
   alias SymphonyElixir.AgentRuntime
   alias SymphonyElixir.AgentRuntime.{Codex, Router}
   alias SymphonyElixir.Codex.AppServer
-  alias SymphonyElixir.WorkControl.WorkItem
+  alias SymphonyElixir.WorkControl.{GuardClass, WorkItem}
 
   @work_control_now ~U[2026-09-16 00:00:00Z]
 
@@ -314,6 +314,47 @@ defmodule SymphonyElixir.AgentRuntimeTest do
     assert_receive {:runtime_stopped, %{session_id: "fake-session"}}
   end
 
+  test "routed AgentRunner passes the refreshed WorkItem to the next turn context" do
+    test_pid = self()
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      agent_routing: "routed",
+      tracker_active_states: ["Ready", "In Progress"],
+      max_turns: 2
+    )
+
+    issue = %Issue{
+      id: "refreshed-work-item",
+      identifier: "SYM-REFRESHED-WORK-ITEM",
+      title: "Refreshed WorkItem",
+      state: "Ready",
+      dispatchable: true
+    }
+
+    refreshed_issue = %{issue | state: "In Progress"}
+    profiles = Config.settings!().agent.profiles
+    work_item = trusted_work_item(issue)
+    assert {:ok, route} = Router.resolve(work_item, profiles)
+
+    assert :ok =
+             AgentRunner.run(issue, test_pid,
+               runtime: SymphonyElixir.AgentRuntimeTestFake,
+               test_pid: test_pid,
+               route: route,
+               work_item: work_item,
+               guard_evidence: [GuardClass.requirement(:mechanical_guard, :dispatch_guard)],
+               issue_state_fetcher: fn [_issue_id] -> {:ok, [refreshed_issue]} end
+             )
+
+    assert_receive {:runtime_turn_options, first_turn_opts}
+    assert_receive {:runtime_turn_options, second_turn_opts}
+    assert first_turn_opts[:agent_tool_context].trusted_lifecycle_state == :ready
+    assert second_turn_opts[:agent_tool_context].trusted_lifecycle_state == :in_progress
+    assert second_turn_opts[:agent_tool_context].work_item.validated_lifecycle_state == :in_progress
+    assert second_turn_opts[:agent_tool_context].work_item != work_item
+  end
+
   test "AgentRunner keeps effective profile options on continuation turns" do
     test_pid = self()
 
@@ -356,7 +397,7 @@ defmodule SymphonyElixir.AgentRuntimeTest do
       assert turn_opts[:agent_tool_context].issue_id == "runtime-options-continuation"
       assert turn_opts[:agent_tool_context].current_issue_state == "Ready"
       assert turn_opts[:agent_tool_context].trusted_lifecycle_state == :ready
-      assert turn_opts[:agent_tool_context].work_item == work_item
+      assert %WorkItem{} = turn_opts[:agent_tool_context].work_item
       assert turn_opts[:agent_tool_context].responsibility == "implementation"
 
       assert turn_opts[:agent_tool_context].dependency_decision == %{
@@ -375,6 +416,9 @@ defmodule SymphonyElixir.AgentRuntimeTest do
                identifier: "SYM-RUNTIME-OPTIONS"
              }
     end
+
+    assert first_turn_opts[:agent_tool_context].work_item == work_item
+    assert second_turn_opts[:agent_tool_context].work_item != work_item
   end
 
   test "AgentRunner stops when a refreshed implementation becomes dependency-blocked" do

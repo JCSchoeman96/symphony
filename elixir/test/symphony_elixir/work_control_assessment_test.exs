@@ -24,6 +24,33 @@ defmodule SymphonyElixir.WorkControlAssessmentTest do
     observation
   end
 
+  defp semantic_evidence(name \\ :plan_attested, overrides \\ %{}) do
+    attrs =
+      Map.merge(
+        %{
+          responsibility: "planning",
+          runtime_attempt_id: "attempt-1",
+          lineage_generation: 1,
+          subject: {:work_item, "issue-1"},
+          timestamp: @now
+        },
+        overrides
+      )
+
+    {:ok, evidence} = GuardClass.semantic_attestation(name, attrs)
+    evidence
+  end
+
+  defp assessment_context(overrides \\ %{}) do
+    Map.merge(
+      %{
+        runtime_attempt_id: "attempt-1",
+        lineage_generation: 1
+      },
+      overrides
+    )
+  end
+
   test "provider observation is immutable factual evidence and maps without authorizing" do
     assert {:ok, observation} =
              ProviderObservation.new(%{
@@ -115,12 +142,145 @@ defmodule SymphonyElixir.WorkControlAssessmentTest do
       )
 
     assert from_map.status == :validation_required
-    assert from_map.missing_guards == [planning_guard]
-    assert from_map.satisfied_guards == [plan_attestation]
+    assert from_map.missing_guards == [plan_attestation, planning_guard]
+    assert from_map.satisfied_guards == []
 
     from_malformed_evidence = LifecycleAssessment.assess(observation("Ready"), :planning, :not_evidence)
     assert from_malformed_evidence.status == :validation_required
     assert from_malformed_evidence.missing_guards == [plan_attestation, planning_guard]
+  end
+
+  test "semantic attestation evidence cannot be a replayable class and name token" do
+    requirement = GuardClass.requirement(:semantic_attestation, :plan_attested)
+
+    evidence = %{
+      class: :semantic_attestation,
+      name: :plan_attested,
+      responsibility: "planning",
+      runtime_attempt_id: "attempt-1",
+      lineage_generation: 1,
+      subject: {:work_item, "issue-1"},
+      timestamp: @now
+    }
+
+    refute GuardClass.satisfied?(requirement, %{class: requirement.class, name: requirement.name})
+    refute GuardClass.satisfied?(requirement, evidence)
+  end
+
+  test "semantic attestations require attributed and contextually matching evidence" do
+    requirement = GuardClass.requirement(:semantic_attestation, :plan_attested)
+    evidence = semantic_evidence()
+
+    context =
+      assessment_context()
+      |> Map.put(:responsibility, "planning")
+      |> Map.put(:subject, {:work_item, "issue-1"})
+
+    assert GuardClass.valid_evidence?(evidence)
+    assert GuardClass.satisfied?(requirement, evidence, Map.put(context, :subject, {:work_item, "issue-1"}))
+
+    for field <- [:responsibility, :runtime_attempt_id, :lineage_generation, :subject, :timestamp] do
+      refute GuardClass.satisfied?(requirement, Map.delete(evidence, field), context)
+    end
+
+    refute GuardClass.satisfied?(requirement, %{evidence | responsibility: "review"}, context)
+    refute GuardClass.satisfied?(requirement, %{evidence | runtime_attempt_id: "attempt-2"}, context)
+    refute GuardClass.satisfied?(requirement, %{evidence | lineage_generation: 2}, context)
+    refute GuardClass.satisfied?(requirement, %{evidence | subject: {:work_item, "issue-2"}}, context)
+    refute GuardClass.satisfied?(requirement, %{evidence | timestamp: "not-a-timestamp"}, context)
+
+    for field <- [:responsibility, :runtime_attempt_id, :lineage_generation, :subject, :timestamp] do
+      assert {:error, _reason} =
+               GuardClass.semantic_attestation(:plan_attested, Map.delete(evidence, field))
+    end
+  end
+
+  test "semantic attestation validation rejects malformed fields and contexts" do
+    requirement = GuardClass.requirement(:semantic_attestation, :plan_attested)
+    evidence = semantic_evidence()
+
+    context =
+      assessment_context()
+      |> Map.put(:responsibility, "planning")
+      |> Map.put(:subject, {:work_item, "issue-1"})
+
+    assert {:error, :invalid_semantic_attestation} =
+             GuardClass.semantic_attestation(:plan_attested, :not_a_map)
+
+    refute GuardClass.valid_evidence?(:malformed)
+    assert GuardClass.valid_evidence?(GuardClass.requirement(:mechanical_guard, :dispatch_guard), :not_a_context)
+    refute GuardClass.satisfied?(requirement, evidence, :not_a_context)
+    refute GuardClass.all_satisfied?([requirement], evidence, :not_a_context)
+    assert GuardClass.missing(%{}, evidence, :not_a_context) == []
+
+    refute GuardClass.valid_evidence?(%{class: :semantic_attestation, name: "not_an_atom"})
+
+    refute GuardClass.satisfied?(requirement, evidence, Map.put(context, :timestamp, DateTime.add(@now, 1, :second)))
+
+    for {field, value} <- [
+          {:responsibility, 123},
+          {:runtime_attempt_id, %{}},
+          {:lineage_generation, -1},
+          {:subject, 123},
+          {:timestamp, "not-a-timestamp"}
+        ] do
+      assert {:error, _reason} =
+               GuardClass.semantic_attestation(:plan_attested, Map.put(evidence, field, value))
+    end
+
+    assert {:ok, _atom_responsibility} =
+             GuardClass.semantic_attestation(:plan_attested, %{evidence | responsibility: :planning})
+
+    assert {:ok, _atom_attempt} =
+             GuardClass.semantic_attestation(:plan_attested, %{evidence | runtime_attempt_id: :attempt_1})
+
+    assert {:ok, _integer_attempt} =
+             GuardClass.semantic_attestation(:plan_attested, %{evidence | runtime_attempt_id: 1})
+
+    assert {:ok, _reference_attempt} =
+             GuardClass.semantic_attestation(:plan_attested, %{evidence | runtime_attempt_id: make_ref()})
+
+    assert {:ok, _map_subject} =
+             GuardClass.semantic_attestation(:plan_attested, %{evidence | subject: %{work_item_id: "issue-1"}})
+
+    assert {:ok, _string_subject} =
+             GuardClass.semantic_attestation(:plan_attested, %{evidence | subject: "issue-1"})
+  end
+
+  test "lifecycle assessment rejects cross-item and cross-attempt semantic replay" do
+    requirement = GuardClass.requirement(:semantic_attestation, :plan_attested)
+    planning_guard = GuardClass.requirement(:mechanical_guard, :planning_requirements_verified)
+    evidence = semantic_evidence()
+    context = Map.put(assessment_context(), :responsibility, "planning")
+
+    assert LifecycleAssessment.assess(
+             observation("Ready"),
+             :planning,
+             [evidence, planning_guard],
+             context
+           ).status == :validated
+
+    cross_item =
+      LifecycleAssessment.assess(
+        observation("Ready", "issue-2"),
+        :planning,
+        [evidence, planning_guard],
+        context
+      )
+
+    assert cross_item.status == :validation_required
+    assert cross_item.missing_guards == [requirement]
+
+    cross_attempt =
+      LifecycleAssessment.assess(
+        observation("Ready"),
+        :planning,
+        [evidence, planning_guard],
+        %{context | runtime_attempt_id: "attempt-2"}
+      )
+
+    assert cross_attempt.status == :validation_required
+    assert cross_attempt.missing_guards == [requirement]
   end
 
   test "initial inactive backlog is validated without granting authority" do
@@ -150,17 +310,25 @@ defmodule SymphonyElixir.WorkControlAssessmentTest do
   end
 
   test "legal forward transitions require every typed guard" do
-    plan_attestation = GuardClass.requirement(:semantic_attestation, :plan_attested)
+    plan_attestation = semantic_evidence()
     planning_guard = GuardClass.requirement(:mechanical_guard, :planning_requirements_verified)
+    context = Map.put(assessment_context(), :responsibility, "planning")
 
-    missing_guard = LifecycleAssessment.assess(observation("Ready"), :planning, [plan_attestation])
+    missing_guard = LifecycleAssessment.assess(observation("Ready"), :planning, [plan_attestation], context)
     assert missing_guard.status == :validation_required
     assert missing_guard.missing_guards == [planning_guard]
 
-    complete = LifecycleAssessment.assess(observation("Ready"), :planning, [plan_attestation, planning_guard])
+    complete =
+      LifecycleAssessment.assess(
+        observation("Ready"),
+        :planning,
+        [plan_attestation, planning_guard],
+        context
+      )
+
     assert complete.status == :validated
     assert complete.validated_state == :ready
-    assert complete.required_guards == [plan_attestation, planning_guard]
+    assert complete.required_guards == [GuardClass.requirement(:semantic_attestation, :plan_attested), planning_guard]
   end
 
   test "done requires a typed completion proof and canceled or blocked reduce authority" do
