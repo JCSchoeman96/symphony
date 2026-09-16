@@ -212,6 +212,8 @@ defmodule SymphonyElixir.WorkControlAssessmentTest do
     refute GuardClass.satisfied?(requirement, evidence, :not_a_context)
     refute GuardClass.all_satisfied?([requirement], evidence, :not_a_context)
     assert GuardClass.missing(%{}, evidence, :not_a_context) == []
+    refute GuardClass.valid_evidence?(evidence, :not_a_context)
+    assert GuardClass.missing([requirement], evidence, :not_a_context) == [requirement]
 
     refute GuardClass.valid_evidence?(%{class: :semantic_attestation, name: "not_an_atom"})
 

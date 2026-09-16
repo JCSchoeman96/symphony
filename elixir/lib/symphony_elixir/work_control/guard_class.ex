@@ -63,6 +63,7 @@ defmodule SymphonyElixir.WorkControl.GuardClass do
     valid_evidence?(evidence) and semantic_context_matches?(evidence, context)
   end
 
+  def valid_evidence?(%{class: :semantic_attestation}, _context), do: false
   def valid_evidence?(evidence, _context), do: valid_evidence?(evidence)
 
   @spec satisfied?(requirement(), term()) :: boolean()
@@ -97,6 +98,7 @@ defmodule SymphonyElixir.WorkControl.GuardClass do
     Enum.reject(requirements, &satisfied?(&1, evidence, context))
   end
 
+  def missing(requirements, _evidence, _context) when is_list(requirements), do: requirements
   def missing(_requirements, _evidence, _context), do: []
 
   @spec classes_for([requirement()]) :: [class()]
