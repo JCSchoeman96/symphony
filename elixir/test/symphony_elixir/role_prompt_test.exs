@@ -26,6 +26,7 @@ defmodule SymphonyElixir.RolePromptTest do
 
   alias SymphonyElixir.AgentRuntime.{Profile, Route, Router}
   alias SymphonyElixir.Config.Schema
+  alias SymphonyElixir.WorkControl.WorkItem
 
   test "routed prompts combine exactly one role policy with the workflow prompt" do
     workflow_prompt = "Workflow instructions for {{ issue.identifier }}"
@@ -33,7 +34,7 @@ defmodule SymphonyElixir.RolePromptTest do
 
     issue = %Issue{id: "planner-issue", identifier: "SYM-PROMPT", title: "Prompt", state: "Planning"}
     profiles = Profile.default_profiles("codex app-server", 20)
-    assert {:ok, route} = Router.resolve(issue, profiles)
+    assert {:ok, route} = Router.resolve_legacy(issue, profiles)
 
     prompt = PromptBuilder.build_prompt(issue, route: route)
 
@@ -46,7 +47,7 @@ defmodule SymphonyElixir.RolePromptTest do
   test "continuation prompts preserve the selected role policy" do
     profiles = Profile.default_profiles("codex app-server", 20)
     issue = %Issue{id: "review-issue", identifier: "SYM-REVIEW", title: "Review", state: "In Review"}
-    assert {:ok, route} = Router.resolve(issue, profiles)
+    assert {:ok, route} = Router.resolve_legacy(issue, profiles)
 
     prompt =
       AgentRunner.continuation_prompt_for_test(
@@ -66,7 +67,7 @@ defmodule SymphonyElixir.RolePromptTest do
     assert PromptBuilder.role_prompt(nil) == nil
 
     issue = %Issue{id: "prompt-branches", identifier: "SYM-PROMPT-BRANCHES", state: "Planning"}
-    assert {:ok, route} = Router.resolve(issue, Profile.default_profiles("codex app-server", 20))
+    assert {:ok, route} = Router.resolve_legacy(issue, Profile.default_profiles("codex app-server", 20))
 
     markdown_route = %{route | profile: %{route.profile | prompt: "planner.md"}}
     assert PromptBuilder.role_prompt(markdown_route) =~ "Role policy: planner"
@@ -95,7 +96,7 @@ defmodule SymphonyElixir.RolePromptTest do
     on_exit(fn -> File.rm(prompt_path) end)
 
     issue = %Issue{id: "custom-prompt", identifier: "SYM-CUSTOM-PROMPT", state: "Planning"}
-    assert {:ok, route} = Router.resolve(issue, Profile.default_profiles("codex app-server", 20))
+    assert {:ok, route} = Router.resolve_legacy(issue, Profile.default_profiles("codex app-server", 20))
     custom_route = %{route | profile: %{route.profile | prompt: prompt_name}}
 
     assert PromptBuilder.role_prompt(custom_route) == prompt_body
@@ -114,7 +115,7 @@ defmodule SymphonyElixir.RolePromptTest do
     end)
 
     issue = %Issue{id: "runtime-prompt", identifier: "SYM-RUNTIME-PROMPT", state: "Planning"}
-    assert {:ok, route} = Router.resolve(issue, Profile.default_profiles("codex app-server", 20))
+    assert {:ok, route} = Router.resolve_legacy(issue, Profile.default_profiles("codex app-server", 20))
     assert PromptBuilder.role_prompt(route) == "Role policy: planner runtime version one"
 
     File.write!(prompt_path, "Role policy: planner runtime version two")
@@ -152,7 +153,13 @@ defmodule SymphonyElixir.RolePromptTest do
       dispatchable: true
     }
 
-    assert {:ok, route} = Router.resolve(issue, Config.settings!().agent.profiles)
+    {:ok, work_item} =
+      WorkItem.from_issue(issue, %{
+        provider: :memory,
+        prior_validated_lifecycle_state: issue.state
+      })
+
+    assert {:ok, route} = Router.resolve(work_item, Config.settings!().agent.profiles)
 
     assert :ok =
              AgentRunner.run(issue, test_pid,
@@ -161,7 +168,8 @@ defmodule SymphonyElixir.RolePromptTest do
                prompt_path: prompt_path,
                replacement_prompt: "Role policy: builder attempt version two",
                route: route,
-               issue_state_fetcher: fn [_issue_id] -> {:ok, [%{issue | state: "In Progress"}]} end
+               work_item: work_item,
+               issue_state_fetcher: fn [_issue_id] -> {:ok, [issue]} end
              )
 
     assert_receive {:role_prompt_turn, 1, first_prompt}
@@ -182,7 +190,7 @@ defmodule SymphonyElixir.RolePromptTest do
           {"Changes Requested", "fixer", ["workspace-write", "Do not approve your own changes or merge"]}
         ] do
       issue = %Issue{id: "role-#{role}", identifier: "SYM-ROLE-#{role}", state: state}
-      assert {:ok, route} = Router.resolve(issue, profiles)
+      assert {:ok, route} = Router.resolve_legacy(issue, profiles)
       prompt = PromptBuilder.role_prompt(route)
 
       assert prompt =~ "Role policy: #{role}"

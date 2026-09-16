@@ -58,6 +58,7 @@ defmodule SymphonyElixir.AgentRouterDependencyProofTest do
 
   alias SymphonyElixir.AgentRuntime.Router
   alias SymphonyElixir.Dependency.{Graph, Guard}
+  alias SymphonyElixir.WorkControl.{GuardClass, WorkflowLifecycle, WorkItem}
 
   @dag_capture :symphony_full_proof_dag_capture
 
@@ -96,7 +97,15 @@ defmodule SymphonyElixir.AgentRouterDependencyProofTest do
     stage_evidence =
       Enum.map(stages, fn {state, profile_name, responsibility, sandbox, refreshed_states, evidence} ->
         stage_issue = %{issue | state: state}
-        assert {:ok, route} = Router.resolve(stage_issue, Config.settings!().agent.profiles)
+
+        {:ok, work_item} =
+          WorkItem.from_issue(stage_issue, %{
+            provider: :memory,
+            observed_at: DateTime.utc_now(),
+            prior_validated_lifecycle_state: state
+          })
+
+        assert {:ok, route} = Router.resolve(work_item, Config.settings!().agent.profiles)
         assert route.profile_name == profile_name
         assert route.responsibility == responsibility
         assert route.runtime_name == "codex"
@@ -106,6 +115,8 @@ defmodule SymphonyElixir.AgentRouterDependencyProofTest do
                    runtime: SymphonyElixir.FullProofCodexRuntime,
                    test_pid: test_pid,
                    route: route,
+                   work_item: work_item,
+                   guard_evidence: transition_evidence([state | refreshed_states]),
                    issue_state_fetcher: sequence_fetcher(stage_issue, refreshed_states)
                  )
 
@@ -124,9 +135,16 @@ defmodule SymphonyElixir.AgentRouterDependencyProofTest do
             {refreshed_state, prompt}
           end)
 
-        assert_receive {:agent_route_changed, "lifecycle-proof", previous_route, next_route}, 1_000
-        assert previous_route.fingerprint == route.fingerprint
-        assert next_route.starting_state == List.last(refreshed_states) |> String.downcase()
+        if List.last(refreshed_states) == "Ready to Merge" do
+          assert_receive {:agent_lifecycle_suspended, "lifecycle-proof", assessment}, 1_000
+          assert assessment.status == :validated
+          refute_receive {:agent_route_changed, "lifecycle-proof", _previous_route, _next_route}, 100
+        else
+          assert_receive {:agent_route_changed, "lifecycle-proof", previous_route, next_route}, 1_000
+          assert previous_route.fingerprint == route.fingerprint
+          assert next_route.starting_state == List.last(refreshed_states) |> String.downcase()
+        end
+
         assert_receive {:proof_session_stopped, ^session_id}, 1_000
 
         %{
@@ -141,9 +159,30 @@ defmodule SymphonyElixir.AgentRouterDependencyProofTest do
         }
       end)
 
-    assert Enum.map(stage_evidence, & &1.profile) == ["planner", "builder", "reviewer", "fixer", "reviewer"]
-    assert Enum.map(stage_evidence, & &1.responsibility) == ["planning", "implementation", "review", "correction", "review"]
-    assert Enum.map(stage_evidence, & &1.sandbox) == ["read-only", "workspace-write", "read-only", "workspace-write", "read-only"]
+    assert Enum.map(stage_evidence, & &1.profile) == [
+             "planner",
+             "builder",
+             "reviewer",
+             "fixer",
+             "reviewer"
+           ]
+
+    assert Enum.map(stage_evidence, & &1.responsibility) == [
+             "planning",
+             "implementation",
+             "review",
+             "correction",
+             "review"
+           ]
+
+    assert Enum.map(stage_evidence, & &1.sandbox) == [
+             "read-only",
+             "workspace-write",
+             "read-only",
+             "workspace-write",
+             "read-only"
+           ]
+
     assert length(Enum.uniq(Enum.map(stage_evidence, & &1.session_id))) == length(stage_evidence)
     assert Enum.at(stage_evidence, 1).turns |> length() == 2
     assert Enum.count(stage_evidence, &(&1.profile == "reviewer")) <= 3
@@ -157,12 +196,17 @@ defmodule SymphonyElixir.AgentRouterDependencyProofTest do
            ]
 
     Enum.each(stage_evidence, fn %{profile: profile, turns: turns} ->
-      assert Enum.all?(turns, fn {_state, prompt} -> String.contains?(prompt, "Role policy: #{profile}") end)
+      assert Enum.all?(turns, fn {_state, prompt} ->
+               String.contains?(prompt, "Role policy: #{profile}")
+             end)
     end)
 
     planner_prompt = stage_evidence |> Enum.at(0) |> Map.fetch!(:turns) |> List.first() |> elem(1)
     builder_prompt = stage_evidence |> Enum.at(1) |> Map.fetch!(:turns) |> List.first() |> elem(1)
-    reviewer_prompt = stage_evidence |> Enum.at(2) |> Map.fetch!(:turns) |> List.first() |> elem(1)
+
+    reviewer_prompt =
+      stage_evidence |> Enum.at(2) |> Map.fetch!(:turns) |> List.first() |> elem(1)
+
     fixer_prompt = stage_evidence |> Enum.at(3) |> Map.fetch!(:turns) |> List.first() |> elem(1)
 
     assert planner_prompt =~ "Do not modify production source"
@@ -171,10 +215,16 @@ defmodule SymphonyElixir.AgentRouterDependencyProofTest do
     assert fixer_prompt =~ "Do not approve your own changes or merge"
 
     merge_issue = %{issue | state: "Ready to Merge"}
-    assert {:ok, merge_route} = Router.resolve(merge_issue, Config.settings!().agent.profiles)
-    assert merge_route.profile_name == "merge_gatekeeper"
-    assert merge_route.runtime_name == "deferred"
-    refute merge_route.profile.command
+
+    {:ok, merge_work_item} =
+      WorkItem.from_issue(merge_issue, %{
+        provider: :memory,
+        observed_at: DateTime.utc_now(),
+        prior_validated_lifecycle_state: merge_issue.state
+      })
+
+    assert {:error, :authority_unavailable} = Router.resolve(merge_work_item, Config.settings!().agent.profiles)
+    refute Config.settings!().agent.profiles["merge_gatekeeper"].command
     refute Map.has_key?(Map.from_struct(Config.settings!().agent), :auto_merge)
   end
 
@@ -191,12 +241,15 @@ defmodule SymphonyElixir.AgentRouterDependencyProofTest do
 
     issues = dag_issues()
     Application.put_env(:symphony_elixir, :memory_tracker_issues, issues)
-    orchestrator_name = Module.concat(__MODULE__, "DagOrchestrator#{System.unique_integer([:positive])}")
+
+    orchestrator_name =
+      Module.concat(__MODULE__, "DagOrchestrator#{System.unique_integer([:positive])}")
 
     {:ok, pid} =
       Orchestrator.start_link(
         name: orchestrator_name,
-        agent_runner: SymphonyElixir.FullProofDagRunner
+        agent_runner: SymphonyElixir.FullProofDagRunner,
+        work_control: trusted_work_control(issues)
       )
 
     on_exit(fn ->
@@ -206,29 +259,40 @@ defmodule SymphonyElixir.AgentRouterDependencyProofTest do
 
     initial = receive_dispatches(2)
     assert Enum.map(initial, &elem(&1, 0)) == ["dag-a", "dag-independent"]
-    assert Enum.all?(initial, fn {_id, _identifier, _state, opts, _worker_pid} -> opts[:route].profile_name == "builder" end)
+
+    assert Enum.all?(initial, fn {_id, _identifier, _state, opts, _worker_pid} ->
+             opts[:route].profile_name == "builder"
+           end)
+
     refute_receive {:dag_started, "dag-b", _identifier, _state, _opts, _worker_pid}, 100
     refute_receive {:dag_started, "dag-c", _identifier, _state, _opts, _worker_pid}, 100
-    refute_receive {:dag_started, "dag-canceled-dependent", _identifier, _state, _opts, _worker_pid}, 100
+
+    refute_receive {:dag_started, "dag-canceled-dependent", _identifier, _state, _opts, _worker_pid},
+                   100
+
     refute_receive {:dag_started, "dag-cycle-a", _identifier, _state, _opts, _worker_pid}, 100
 
-    put_dag_issues(issues, a: "Done", independent: "Done", a_blocker: "Done")
+    updated_issues = put_dag_issues(issues, a: "Done", independent: "Done", a_blocker: "Done")
+    put_completed_work_items!(pid, updated_issues)
     finish_dispatched!(pid, initial)
     trigger_poll!(pid)
 
     second = receive_dispatches(2)
     assert Enum.map(second, &elem(&1, 0)) == ["dag-b", "dag-c"]
 
-    put_dag_issues(
-      issues,
-      a: "Done",
-      independent: "Done",
-      b: "Done",
-      c: "Done",
-      a_blocker: "Done",
-      b_blocker: "Done",
-      c_blocker: "Done"
-    )
+    updated_issues =
+      put_dag_issues(
+        issues,
+        a: "Done",
+        independent: "Done",
+        b: "Done",
+        c: "Done",
+        a_blocker: "Done",
+        b_blocker: "Done",
+        c_blocker: "Done"
+      )
+
+    put_completed_work_items!(pid, updated_issues)
 
     finish_dispatched!(pid, second)
     trigger_poll!(pid)
@@ -236,42 +300,48 @@ defmodule SymphonyElixir.AgentRouterDependencyProofTest do
     third = receive_dispatches(4)
     assert Enum.map(third, &elem(&1, 0)) == ["dag-d", "dag-e", "dag-f", "dag-g"]
 
-    put_dag_issues(
-      issues,
-      a: "Done",
-      independent: "Done",
-      b: "Done",
-      c: "Done",
-      d: "Done",
-      e: "Done",
-      f: "Done",
-      a_blocker: "Done",
-      b_blocker: "Done",
-      c_blocker: "Done",
-      f_blocker: "Done"
-    )
+    updated_issues =
+      put_dag_issues(
+        issues,
+        a: "Done",
+        independent: "Done",
+        b: "Done",
+        c: "Done",
+        d: "Done",
+        e: "Done",
+        f: "Done",
+        a_blocker: "Done",
+        b_blocker: "Done",
+        c_blocker: "Done",
+        f_blocker: "Done"
+      )
+
+    put_completed_work_items!(pid, updated_issues)
 
     finish_dispatched!(pid, Enum.take(third, 3))
     trigger_poll!(pid)
 
     refute_receive {:dag_started, "dag-h", _identifier, _state, _opts, _worker_pid}, 100
 
-    put_dag_issues(
-      issues,
-      a: "Done",
-      independent: "Done",
-      b: "Done",
-      c: "Done",
-      d: "Done",
-      e: "Done",
-      f: "Done",
-      g: "Done",
-      a_blocker: "Done",
-      b_blocker: "Done",
-      c_blocker: "Done",
-      f_blocker: "Done",
-      g_blocker: "Done"
-    )
+    updated_issues =
+      put_dag_issues(
+        issues,
+        a: "Done",
+        independent: "Done",
+        b: "Done",
+        c: "Done",
+        d: "Done",
+        e: "Done",
+        f: "Done",
+        g: "Done",
+        a_blocker: "Done",
+        b_blocker: "Done",
+        c_blocker: "Done",
+        f_blocker: "Done",
+        g_blocker: "Done"
+      )
+
+    put_completed_work_items!(pid, updated_issues)
 
     finish_dispatched!(pid, [List.last(third)])
     trigger_poll!(pid)
@@ -279,23 +349,26 @@ defmodule SymphonyElixir.AgentRouterDependencyProofTest do
     [final] = receive_dispatches(1)
     assert elem(final, 0) == "dag-h"
 
-    put_dag_issues(
-      issues,
-      a: "Done",
-      independent: "Done",
-      b: "Done",
-      c: "Done",
-      d: "Done",
-      e: "Done",
-      f: "Done",
-      g: "Done",
-      h: "Done",
-      a_blocker: "Done",
-      b_blocker: "Done",
-      c_blocker: "Done",
-      f_blocker: "Done",
-      g_blocker: "Done"
-    )
+    updated_issues =
+      put_dag_issues(
+        issues,
+        a: "Done",
+        independent: "Done",
+        b: "Done",
+        c: "Done",
+        d: "Done",
+        e: "Done",
+        f: "Done",
+        g: "Done",
+        h: "Done",
+        a_blocker: "Done",
+        b_blocker: "Done",
+        c_blocker: "Done",
+        f_blocker: "Done",
+        g_blocker: "Done"
+      )
+
+    put_completed_work_items!(pid, updated_issues)
 
     finish_dispatched!(pid, [final])
 
@@ -316,10 +389,26 @@ defmodule SymphonyElixir.AgentRouterDependencyProofTest do
     all_dispatches = initial ++ second ++ third ++ [final]
     dispatch_ids = Enum.map(all_dispatches, &elem(&1, 0))
     assert dispatch_ids == Enum.uniq(dispatch_ids)
-    assert dispatch_ids == ["dag-a", "dag-independent", "dag-b", "dag-c", "dag-d", "dag-e", "dag-f", "dag-g", "dag-h"]
+
+    assert dispatch_ids == [
+             "dag-a",
+             "dag-independent",
+             "dag-b",
+             "dag-c",
+             "dag-d",
+             "dag-e",
+             "dag-f",
+             "dag-g",
+             "dag-h"
+           ]
 
     assert Guard.evaluate(
-             %Issue{id: "proof", identifier: "SYM-PROOF", state: "Ready", blocked_by: [%{id: "canceled", state: "Canceled"}]},
+             %Issue{
+               id: "proof",
+               identifier: "SYM-PROOF",
+               state: "Ready",
+               blocked_by: [%{id: "canceled", state: "Canceled"}]
+             },
              "implementation"
            ).allowed? == false
 
@@ -339,6 +428,53 @@ defmodule SymphonyElixir.AgentRouterDependencyProofTest do
           {{:ok, [%{issue | state: List.last(states)}]}, []}
       end)
     end
+  end
+
+  defp transition_evidence(states) do
+    states
+    |> Enum.chunk_every(2, 1, :discard)
+    |> Enum.flat_map(fn [source, target] ->
+      {:ok, metadata} = WorkflowLifecycle.transition(source, target)
+      metadata.guard_requirements
+    end)
+  end
+
+  defp trusted_work_control(issues) when is_list(issues) do
+    Map.new(issues, fn issue -> {issue.id, trusted_work_item(issue)} end)
+  end
+
+  defp trusted_work_item(%Issue{} = issue) do
+    {:ok, work_item} =
+      WorkItem.from_issue(issue, %{
+        provider: :memory,
+        observed_at: DateTime.utc_now(),
+        prior_validated_lifecycle_state: issue.state
+      })
+
+    work_item
+  end
+
+  defp put_completed_work_items!(pid, issues) when is_pid(pid) and is_list(issues) do
+    completed =
+      issues
+      |> Enum.filter(&(&1.state == "Done"))
+      |> Map.new(fn issue -> {issue.id, completed_work_item(issue)} end)
+
+    :sys.replace_state(pid, fn state ->
+      %{state | work_control: Map.merge(state.work_control, completed)}
+    end)
+  end
+
+  defp completed_work_item(%Issue{} = issue) do
+    {:ok, work_item} =
+      WorkItem.from_issue(issue, %{
+        provider: :memory,
+        observed_at: DateTime.utc_now(),
+        prior_validated_lifecycle_state: "Merging",
+        evidence: [GuardClass.requirement(:mechanical_guard, :completion_proof_verified)]
+      })
+
+    work_item
   end
 
   defp dag_issues do
@@ -396,7 +532,10 @@ defmodule SymphonyElixir.AgentRouterDependencyProofTest do
   defp dag_state_override("dag-f", changes), do: Keyword.get(changes, :f, "Ready")
   defp dag_state_override("dag-g", changes), do: Keyword.get(changes, :g, "Ready")
   defp dag_state_override("dag-h", changes), do: Keyword.get(changes, :h, "Ready")
-  defp dag_state_override("dag-independent", changes), do: Keyword.get(changes, :independent, "Ready")
+
+  defp dag_state_override("dag-independent", changes),
+    do: Keyword.get(changes, :independent, "Ready")
+
   defp dag_state_override(_issue_id, _changes), do: "Ready"
 
   defp update_dag_blocker_states(blockers, changes) do
@@ -460,7 +599,9 @@ defmodule SymphonyElixir.AgentRouterDependencyProofTest do
 
     assert_eventually(fn ->
       state = :sys.get_state(pid)
-      not Map.has_key?(state.retry_attempts, issue_id) and not MapSet.member?(state.claimed, issue_id)
+
+      not Map.has_key?(state.retry_attempts, issue_id) and
+        not MapSet.member?(state.claimed, issue_id)
     end)
   end
 

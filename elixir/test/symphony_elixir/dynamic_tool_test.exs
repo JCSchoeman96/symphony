@@ -273,7 +273,45 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     assert response["success"] == true
   end
 
-  test "linear_transition denies unresolved implementation work after refreshing Linear" do
+  test "legacy linear transitions map provider aliases before canonical authorization" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "linear",
+      agent_routing: "legacy",
+      tracker_active_states: ["Started"]
+    )
+
+    test_pid = self()
+
+    response =
+      DynamicTool.execute(
+        "linear_transition",
+        %{"targetState" => "In Review", "targetStateId" => "state-review"},
+        agent_tool_context: %{
+          issue_id: "issue-legacy-alias",
+          current_issue_state: "Started",
+          responsibility: "implementation",
+          dependency_decision: %{allowed?: true, dependency_completeness: :complete, dependency_status: :none}
+        },
+        linear_client: fn query, _variables, _opts ->
+          cond do
+            String.contains?(query, "SymphonyLinearDependencyGraph") ->
+              {:ok, %{"data" => %{"issues" => graph_connection("issue-legacy-alias", "Started")}}}
+
+            String.starts_with?(String.trim(query), "query") ->
+              {:ok, state_response()}
+
+            true ->
+              send(test_pid, :legacy_alias_transition_called)
+              {:ok, %{"data" => %{"issueUpdate" => %{"success" => true}}}}
+          end
+        end
+      )
+
+    assert response["success"]
+    assert_received :legacy_alias_transition_called
+  end
+
+  test "linear_transition denies the raw Ready to In Review shortcut before dependency authorization" do
     response =
       DynamicTool.execute(
         "linear_transition",
@@ -292,7 +330,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
       )
 
     assert response["success"] == false
-    assert Jason.decode!(response["output"])["error"]["code"] == "dependency_transition_denied"
+    assert Jason.decode!(response["output"])["error"]["code"] == "unauthorized_transition"
   end
 
   test "linear_transition denies an unresolved In Review to Ready to Merge handoff" do

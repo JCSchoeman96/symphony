@@ -8,6 +8,7 @@ defmodule SymphonyElixir.Linear.AgentTool do
   alias SymphonyElixir.Linear.Client
   alias SymphonyElixir.Tracker.Issue
   alias SymphonyElixir.Tracker.TransitionPolicy
+  alias SymphonyElixir.WorkControl.{LifecycleAssessment, ProviderObservation, WorkflowLifecycle, WorkItem}
 
   @linear_graphql_tool "linear_graphql"
   @linear_transition_tool "linear_transition"
@@ -128,13 +129,16 @@ defmodule SymphonyElixir.Linear.AgentTool do
     linear_client = Keyword.get(opts, :linear_client, &Client.graphql/3)
     client_opts = Keyword.take(opts, [:tracker_settings])
     context = Keyword.get(opts, :agent_tool_context, %{})
+    routed? = routed?(opts)
 
     with {:ok, target_state, target_state_id} <- normalize_transition_arguments(arguments),
          {:ok, issue_id} <- normalize_issue_id(context),
+         {:ok, trusted_state} <- require_trusted_lifecycle_context(context, routed?),
          :ok <-
            TransitionPolicy.authorize_intent(
              Map.merge(context, %{
                issue_id: issue_id,
+               current_state: trusted_state,
                target_state: target_state
              })
            ),
@@ -142,7 +146,15 @@ defmodule SymphonyElixir.Linear.AgentTool do
            linear_client.(@transition_state_query, %{"issueId" => issue_id}, client_opts),
          {:ok, ^target_state_id} <-
            verify_transition_state(state_response, target_state, target_state_id),
-         :ok <- authorize_fresh_transition(context, issue_id, target_state, linear_client, client_opts),
+         :ok <-
+           authorize_fresh_transition(
+             context,
+             issue_id,
+             target_state,
+             linear_client,
+             client_opts,
+             routed?
+           ),
          :ok <- claim_transition(Keyword.get(opts, :transition_guard)),
          {:ok, response} <-
            linear_client.(@transition_mutation, %{"issueId" => issue_id, "stateId" => target_state_id}, client_opts) do
@@ -153,7 +165,14 @@ defmodule SymphonyElixir.Linear.AgentTool do
     end
   end
 
-  defp authorize_fresh_transition(context, issue_id, target_state, linear_client, client_opts) do
+  defp authorize_fresh_transition(
+         context,
+         issue_id,
+         target_state,
+         linear_client,
+         client_opts,
+         routed?
+       ) do
     tracker = Keyword.get_lazy(client_opts, :tracker_settings, fn -> Config.settings!().tracker end)
 
     with {:ok, issues} <-
@@ -168,7 +187,8 @@ defmodule SymphonyElixir.Linear.AgentTool do
       decision =
         Guard.evaluate(issue, responsibility,
           active_states: tracker.active_states,
-          terminal_states: tracker.terminal_states
+          terminal_states: tracker.terminal_states,
+          work_control: dependency_work_control(context, issues)
         )
 
       decision =
@@ -178,17 +198,210 @@ defmodule SymphonyElixir.Linear.AgentTool do
           decision
         end
 
-      TransitionPolicy.authorize(
-        Map.merge(context, %{
-          current_state: issue.state,
-          target_state: target_state,
-          dependency_decision: decision
-        })
-      )
+      case authorize_fresh_lifecycle(context, issue, routed?) do
+        :ok ->
+          TransitionPolicy.authorize(
+            Map.merge(context, %{
+              current_state: trusted_lifecycle_state(context, routed?),
+              target_state: target_state,
+              dependency_decision: decision
+            })
+          )
+
+        {:error, _reason} = error ->
+          error
+      end
     else
       _ -> {:error, :transition_context_unavailable}
     end
   end
+
+  defp authorize_fresh_lifecycle(context, %Issue{} = issue, true) do
+    with {:ok, trusted_state} <- trusted_lifecycle_state_result(context, true),
+         {:ok, observation} <- ProviderObservation.from_issue(issue, %{provider: :linear}),
+         assessment <-
+           LifecycleAssessment.assess(
+             observation,
+             trusted_state,
+             Map.get(context, :guard_evidence, Map.get(context, :evidence, []))
+           ),
+         true <- LifecycleAssessment.validated?(assessment) do
+      :ok
+    else
+      {:error, _reason} -> {:error, :canonical_work_item_required}
+      false -> {:error, fresh_lifecycle_error(context, issue, true)}
+    end
+  end
+
+  defp authorize_fresh_lifecycle(context, %Issue{} = issue, false) do
+    with {:ok, trusted_state} <- trusted_lifecycle_state_result(context, false),
+         {:ok, observation} <- ProviderObservation.from_issue(issue, %{provider: :linear}),
+         {:ok, observed_state} <- ProviderObservation.map_legacy_state(observation),
+         true <- observed_state == trusted_state do
+      :ok
+    else
+      false -> {:error, :lifecycle_invalid}
+      {:error, _reason} -> {:error, :canonical_work_item_required}
+    end
+  end
+
+  defp fresh_lifecycle_error(context, issue, routed?) do
+    case trusted_lifecycle_state_result(context, routed?) do
+      {:ok, trusted_state} ->
+        {:ok, observation} = ProviderObservation.from_issue(issue, %{provider: :linear})
+        evidence = Map.get(context, :guard_evidence, Map.get(context, :evidence, []))
+        assessment = LifecycleAssessment.assess(observation, trusted_state, evidence)
+
+        cond do
+          LifecycleAssessment.authority_reducing?(assessment) -> :lifecycle_authority_reducing
+          LifecycleAssessment.validation_required?(assessment) -> :lifecycle_validation_required
+          LifecycleAssessment.invalid?(assessment) -> :lifecycle_invalid
+          true -> :lifecycle_invalid
+        end
+
+      {:error, _reason} ->
+        :canonical_work_item_required
+    end
+  end
+
+  defp trusted_lifecycle_state(context, routed?) do
+    case trusted_lifecycle_state_result(context, routed?) do
+      {:ok, state} -> state
+      {:error, _reason} -> nil
+    end
+  end
+
+  defp trusted_lifecycle_state_result(context, routed?) when is_map(context) do
+    case Map.get(context, :work_item) do
+      %WorkItem{} = work_item ->
+        trusted_work_item_state(work_item)
+
+      _ ->
+        parse_trusted_lifecycle_state(context, routed?)
+    end
+  end
+
+  defp parse_trusted_lifecycle_state(context, routed?) do
+    case trusted_state_value(context, routed?) do
+      nil ->
+        {:error, :canonical_work_item_required}
+
+      value ->
+        with {:ok, observation} <-
+               ProviderObservation.new(%{
+                 provider: :linear,
+                 work_item_id: "trusted-context",
+                 provider_state_name: provider_state_name_for_value(value)
+               }),
+             {:ok, state} <- map_trusted_state(observation, routed?) do
+          {:ok, state}
+        else
+          _error -> {:error, :canonical_work_item_required}
+        end
+    end
+  end
+
+  defp trusted_work_item_state(%WorkItem{
+         lifecycle_assessment: assessment,
+         validated_lifecycle_state: state
+       }) do
+    if LifecycleAssessment.validated?(assessment) do
+      case WorkflowLifecycle.parse(state) do
+        {:ok, canonical_state} -> {:ok, canonical_state}
+        {:error, _reason} -> {:error, :invalid_work_item}
+      end
+    else
+      {:error, :invalid_work_item}
+    end
+  end
+
+  defp trusted_state_value(context, routed?) do
+    Map.get(context, :trusted_lifecycle_state) ||
+      Map.get(context, :current_lifecycle_state) ||
+      raw_provider_state(context, routed?)
+  end
+
+  defp raw_provider_state(context, false), do: Map.get(context, :current_issue_state)
+  defp raw_provider_state(_context, true), do: nil
+
+  defp provider_state_name_for_value(value) when is_binary(value), do: value
+
+  defp provider_state_name_for_value(value) when is_atom(value) do
+    case WorkflowLifecycle.parse(value) do
+      {:ok, state} -> WorkflowLifecycle.display(state)
+      {:error, _reason} -> Atom.to_string(value)
+    end
+  end
+
+  defp provider_state_name_for_value(_value), do: nil
+
+  defp map_trusted_state(observation, true), do: ProviderObservation.map_state(observation)
+  defp map_trusted_state(observation, false), do: ProviderObservation.map_legacy_state(observation)
+
+  defp require_trusted_lifecycle_context(context, routed?) when is_map(context) do
+    case trusted_lifecycle_state_result(context, routed?) do
+      {:ok, state} -> {:ok, state}
+      {:error, _reason} -> {:error, :canonical_work_item_required}
+    end
+  end
+
+  defp require_trusted_lifecycle_context(_context, _routed?), do: {:error, :canonical_work_item_required}
+
+  defp routed?(opts) when is_list(opts) do
+    Keyword.get(opts, :agent_routing, Config.settings!().agent.routing) == "routed"
+  end
+
+  defp dependency_work_control(context, issues) when is_map(context) and is_list(issues) do
+    previous_work_control = Map.get(context, :work_control, %{})
+
+    if is_map(previous_work_control) do
+      Enum.reduce(issues, %{}, &refresh_dependency_work_item(&1, &2, previous_work_control))
+    else
+      %{}
+    end
+  end
+
+  defp dependency_work_control(_context, _issues), do: %{}
+
+  defp refresh_dependency_work_item(
+         %Issue{id: issue_id} = issue,
+         work_control,
+         previous_work_control
+       )
+       when is_binary(issue_id) do
+    previous = Map.get(previous_work_control, issue_id)
+
+    opts = %{
+      provider: :linear,
+      prior_validated_lifecycle_state: prior_validated_state(previous),
+      evidence: evidence_for_observation(issue, previous)
+    }
+
+    case WorkItem.from_issue(issue, opts) do
+      {:ok, work_item} -> Map.put(work_control, issue_id, work_item)
+      {:error, _reason} -> work_control
+    end
+  end
+
+  defp refresh_dependency_work_item(_issue, work_control, _previous_work_control), do: work_control
+
+  defp prior_validated_state(%WorkItem{validated_lifecycle_state: state}), do: state
+  defp prior_validated_state(_previous), do: nil
+
+  defp prior_guard_evidence(%WorkItem{lifecycle_assessment: assessment}),
+    do: assessment.satisfied_guards
+
+  defp evidence_for_observation(%Issue{state: state}, %WorkItem{} = previous) do
+    case WorkflowLifecycle.parse(state) do
+      {:ok, canonical_state} when canonical_state == previous.validated_lifecycle_state ->
+        prior_guard_evidence(previous)
+
+      _different_state ->
+        []
+    end
+  end
+
+  defp evidence_for_observation(_issue, _previous), do: []
 
   # Bound sessions share this guard across calls. Consume before sending the mutation:
   # a transport error can mean the provider committed it without returning a response.

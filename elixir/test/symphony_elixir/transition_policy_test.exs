@@ -53,6 +53,27 @@ defmodule SymphonyElixir.Tracker.TransitionPolicyTest do
     end
   end
 
+  test "delegates canonical transition metadata and guard classes to WorkflowLifecycle" do
+    assert {:ok, metadata} =
+             TransitionPolicy.transition_metadata(%{
+               current_state: "Merging",
+               target_state: "Done"
+             })
+
+    assert metadata.source == :merging
+    assert metadata.target == :done
+    assert metadata.guard_classes == [:mechanical_guard]
+    assert Enum.any?(metadata.guard_requirements, &(&1.name == :completion_proof_verified))
+
+    assert {:error, %{code: :unauthorized_transition}} =
+             TransitionPolicy.authorize(%{
+               responsibility: "implementation",
+               current_state: "Ready",
+               target_state: "In Review",
+               dependency_decision: allowed_dependency()
+             })
+  end
+
   test "merge handoff requires an allowed, complete dependency decision" do
     for decision <- [
           %{allowed?: true, dependency_status: :unresolved, dependency_completeness: :complete},
@@ -88,11 +109,14 @@ defmodule SymphonyElixir.Tracker.TransitionPolicyTest do
   end
 
   test "implementation and correction fail closed when dependency data is not dispatchable" do
-    for responsibility <- ["implementation", "correction"] do
+    for {responsibility, current_state} <- [
+          {"implementation", "In Progress"},
+          {"correction", "Changes Requested"}
+        ] do
       assert {:error, %{code: :dependency_transition_denied}} =
                TransitionPolicy.authorize(%{
                  responsibility: responsibility,
-                 current_state: if(responsibility == "implementation", do: "Ready", else: "Changes Requested"),
+                 current_state: current_state,
                  target_state: "In Review",
                  dependency_decision: %{
                    allowed?: false,
@@ -116,7 +140,7 @@ defmodule SymphonyElixir.Tracker.TransitionPolicyTest do
     assert :ok =
              TransitionPolicy.authorize(%{
                "responsibility" => "review",
-               "current_issue_state" => "In Review",
+               "current_state" => "In Review",
                "target_state" => "Ready to Merge",
                "dependency_decision" => %{
                  "allowed?" => "true",
@@ -148,6 +172,64 @@ defmodule SymphonyElixir.Tracker.TransitionPolicyTest do
 
     assert {:error, %{code: :invalid_transition_context}} =
              TransitionPolicy.authorize(:not_a_context)
+  end
+
+  test "raw provider issue state is not a canonical transition source" do
+    assert {:error, %{code: :invalid_transition_context}} =
+             TransitionPolicy.authorize(%{
+               responsibility: "review",
+               current_issue_state: "In Review",
+               target_state: "Ready to Merge",
+               dependency_decision: allowed_dependency()
+             })
+  end
+
+  test "exposes guard metadata and accepts canonical owner atoms for non-agent transitions" do
+    assert {:ok, requirements} =
+             TransitionPolicy.guard_requirements(%{
+               current_state: "Ready",
+               target_state: "In Progress"
+             })
+
+    assert Enum.map(requirements, & &1.name) == [:dispatch_guard]
+
+    assert :ok =
+             TransitionPolicy.authorize_intent(%{
+               responsibility: :symphony,
+               current_state: "Ready",
+               target_state: "In Progress"
+             })
+
+    assert :ok =
+             TransitionPolicy.authorize_intent(%{
+               responsibility: :human,
+               current_state: "Planning",
+               target_state: "Canceled"
+             })
+
+    assert :ok =
+             TransitionPolicy.authorize_intent(%{
+               responsibility: :system,
+               current_state: "Merging",
+               target_state: "Done"
+             })
+
+    assert {:error, %{code: :invalid_transition_context}} =
+             TransitionPolicy.transition_metadata(:invalid)
+
+    assert {:error, %{code: :invalid_transition_context}} =
+             TransitionPolicy.authorize_intent(:invalid)
+
+    assert {:error, %{code: :invalid_transition_context}} =
+             TransitionPolicy.guard_requirements(%{current_state: "Mystery", target_state: "Ready"})
+
+    assert {:ok, metadata} =
+             TransitionPolicy.transition_metadata(%{
+               "current_lifecycle_state" => "Merging",
+               "target_state" => "Done"
+             })
+
+    assert metadata.source == :merging
   end
 
   defp allowed_dependency do

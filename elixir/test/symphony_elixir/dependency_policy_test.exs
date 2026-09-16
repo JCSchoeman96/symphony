@@ -2,15 +2,79 @@ defmodule SymphonyElixir.DependencyPolicyTest do
   use SymphonyElixir.TestSupport
 
   alias SymphonyElixir.Dependency.{Guard, Policy}
+  alias SymphonyElixir.WorkControl.{GuardClass, WorkItem}
 
-  test "classifies only Done as satisfied" do
-    assert Policy.classify_state("Done") == :satisfied
+  test "raw provider Done is unresolved without validated lifecycle completion" do
+    assert Policy.classify_state("Done") == :unresolved
     assert Policy.classify_state("In Progress") == :unresolved
     assert Policy.classify_state("Ready to Merge") == :unresolved
     assert Policy.classify_state("Canceled") == :invalidated
     assert Policy.classify_state("Cancelled") == :invalidated
     assert Policy.classify_state("Closed") == :invalidated
     assert Policy.classify_state("Duplicate") == :invalidated
+  end
+
+  test "only validated canonical Done with a completion proof satisfies a blocker" do
+    proof = GuardClass.requirement(:mechanical_guard, :completion_proof_verified)
+
+    {:ok, raw_done} =
+      WorkItem.from_issue(%Issue{id: "blocker", state: "Done"}, %{
+        provider: :memory,
+        observed_at: ~U[2026-09-16 00:00:00Z]
+      })
+
+    {:ok, completed} =
+      WorkItem.from_issue(%Issue{id: "blocker", state: "Done"}, %{
+        provider: :memory,
+        observed_at: ~U[2026-09-16 00:00:00Z],
+        prior_validated_lifecycle_state: :merging,
+        evidence: [proof]
+      })
+
+    {:ok, canceled} =
+      WorkItem.from_issue(%Issue{id: "canceled-blocker", state: "Canceled"}, %{
+        provider: :memory,
+        observed_at: ~U[2026-09-16 00:00:00Z],
+        prior_validated_lifecycle_state: :in_progress
+      })
+
+    assert {:ok, %{status: :unresolved}} =
+             Policy.classify_blocker(%{id: "blocker", state: "Done"}, work_control: %{"blocker" => raw_done})
+
+    assert {:ok, %{status: :satisfied}} =
+             Policy.classify_blocker(%{id: "blocker", state: "Done"}, work_control: %{"blocker" => completed})
+
+    assert {:ok, %{status: :invalidated}} =
+             Policy.classify_blocker(
+               %{id: "canceled-blocker", state: "Canceled"},
+               work_control: %{"canceled-blocker" => canceled}
+             )
+
+    raw_decision =
+      Guard.evaluate(
+        %Issue{id: "dependent", state: "Ready", blocked_by: [%{id: "blocker", state: "Done"}]},
+        "implementation",
+        work_control: %{"blocker" => raw_done}
+      )
+
+    completed_decision =
+      Guard.evaluate(
+        %Issue{id: "dependent", state: "Ready", blocked_by: [%{id: "blocker", state: "Done"}]},
+        "implementation",
+        work_control: %{"blocker" => completed}
+      )
+
+    refute raw_decision.allowed?
+    assert raw_decision.dependency_status == :unresolved
+    assert completed_decision.allowed?
+    assert completed_decision.dependency_status == :satisfied
+
+    assert {:ok, %{status: :satisfied, blocker: %{state: "Done"}}} =
+             Policy.classify_blocker(completed)
+
+    synthetic_decision = Guard.evaluate(completed, "implementation", [])
+    assert synthetic_decision.allowed?
+    assert synthetic_decision.dependency_status == :none
   end
 
   test "classifies configured custom active and terminal states" do

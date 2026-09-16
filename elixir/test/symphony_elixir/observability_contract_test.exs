@@ -33,7 +33,7 @@ defmodule SymphonyElixir.ObservabilityContractTest do
       url: "https://example.org/issues/SYM-OBS"
     }
 
-    assert {:ok, route} = Router.resolve(issue, Config.settings!().agent.profiles)
+    assert {:ok, route} = Router.resolve_legacy(issue, Config.settings!().agent.profiles)
 
     counters = %{
       ordinary_failures: 2,

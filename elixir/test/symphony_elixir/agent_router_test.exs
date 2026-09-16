@@ -3,12 +3,51 @@ defmodule SymphonyElixir.AgentRouterTest do
 
   alias SymphonyElixir.AgentRuntime.{Profile, Route, Router}
   alias SymphonyElixir.Config.Schema
+  alias SymphonyElixir.WorkControl.{AuthorityDisposition, LifecycleAssessment, WorkItem}
+
+  @now ~U[2026-09-16 00:00:00Z]
+
+  defp trusted_work_item(state, prior_state \\ nil) do
+    issue = %Issue{id: "canonical-#{state}", state: state, dispatchable: true}
+
+    {:ok, work_item} =
+      WorkItem.from_issue(issue, %{
+        provider: :memory,
+        observed_at: @now,
+        prior_validated_lifecycle_state: prior_state || state
+      })
+
+    work_item
+  end
 
   test "profiles cannot select another built-in responsibility prompt" do
     for prompt <- ["builder", "builder.md", "fixer", "reviewer"] do
       assert {:error, {:invalid_profile, "planner", _}} =
                Profile.resolve_profiles(%{"planner" => %{"prompt" => prompt}}, "codex app-server", 2)
     end
+  end
+
+  test "routed router requires a canonical WorkItem rather than a raw provider issue" do
+    profiles = Profile.default_profiles("codex app-server", 20)
+
+    assert {:error, :canonical_work_item_required} =
+             Router.resolve(%Issue{id: "raw-ready", state: "Ready"}, profiles)
+
+    for state <- ["Ready", "In Review", "Ready to Merge", "Done"] do
+      assert {:error, :canonical_work_item_required} =
+               Router.resolve(%Issue{id: "raw-#{state}", state: state}, profiles)
+    end
+  end
+
+  test "routed router derives responsibility from the validated canonical WorkItem" do
+    profiles = Profile.default_profiles("codex app-server", 20)
+    work_item = trusted_work_item("Ready")
+
+    assert {:ok, %Route{} = route} = Router.resolve(work_item, profiles)
+    assert route.starting_state == "ready"
+    assert route.profile_name == "builder"
+    assert route.responsibility == "implementation"
+    assert Router.expected_responsibility(:in_review) == "review"
   end
 
   test "default profiles provide isolated responsibility and sandbox settings" do
@@ -55,7 +94,7 @@ defmodule SymphonyElixir.AgentRouterTest do
     profiles = Profile.default_profiles("codex app-server", 20)
     issue = %Issue{id: "issue-1", identifier: "SYM-1", state: "  In   Review "}
 
-    assert {:ok, %Route{} = route} = Router.resolve(issue, profiles)
+    assert {:ok, %Route{} = route} = Router.resolve_legacy(issue, profiles)
     assert route.issue_id == "issue-1"
     assert route.starting_state == "in review"
     assert route.profile_name == "reviewer"
@@ -70,7 +109,7 @@ defmodule SymphonyElixir.AgentRouterTest do
 
     for state <- ["Open", "Opened", "Pending", "Started", "In Development"] do
       assert {:ok, %Route{profile_name: "builder", responsibility: "implementation"}} =
-               Router.resolve(%Issue{id: "issue-#{state}", state: state}, profiles)
+               Router.resolve_legacy(%Issue{id: "issue-#{state}", state: state}, profiles)
     end
   end
 
@@ -78,19 +117,19 @@ defmodule SymphonyElixir.AgentRouterTest do
     profiles = Profile.default_profiles("codex app-server", 20)
 
     assert {:error, {:unknown_issue_state, "mystery"}} =
-             Router.resolve(%Issue{id: "issue-1", state: "Mystery"}, profiles)
+             Router.resolve_legacy(%Issue{id: "issue-1", state: "Mystery"}, profiles)
 
     assert {:error, {:missing_profile, "reviewer"}} =
-             Router.resolve(%Issue{id: "issue-1", state: "In Review"}, Map.delete(profiles, "reviewer"))
+             Router.resolve_legacy(%Issue{id: "issue-1", state: "In Review"}, Map.delete(profiles, "reviewer"))
 
     assert {:error, {:invalid_profile, "planner"}} =
-             Router.resolve(%Issue{id: "issue-1", state: "Planning"}, %{"planner" => :invalid})
+             Router.resolve_legacy(%Issue{id: "issue-1", state: "Planning"}, %{"planner" => :invalid})
 
     assert {:error, :invalid_profiles} =
-             Router.resolve(%Issue{id: "issue-1", state: "Planning"}, nil)
+             Router.resolve_legacy(%Issue{id: "issue-1", state: "Planning"}, nil)
 
     assert {:error, :invalid_issue} =
-             Router.resolve(%Issue{id: nil, state: "Planning"}, profiles)
+             Router.resolve_legacy(%Issue{id: nil, state: "Planning"}, profiles)
   end
 
   test "profile validation rejects unknown runtimes and unsafe sandbox names" do
@@ -232,10 +271,10 @@ defmodule SymphonyElixir.AgentRouterTest do
     issue = %Issue{id: "custom-route", state: "Ready"}
 
     assert {:ok, %Route{profile_name: "custom_builder", responsibility: "implementation"}} =
-             Router.resolve(issue, profiles, %{"ready" => "custom builder"})
+             Router.resolve_legacy(issue, profiles, %{"ready" => "custom builder"})
 
     assert {:error, {:route_responsibility_mismatch, "ready", "review"}} =
-             Router.resolve(issue, profiles, %{"ready" => "reviewer"})
+             Router.resolve_legacy(issue, profiles, %{"ready" => "reviewer"})
   end
 
   test "profile normalization rejects malformed values and supports deferred commands" do
@@ -435,10 +474,10 @@ defmodule SymphonyElixir.AgentRouterTest do
     issue = %Issue{id: "route-errors", state: "Ready"}
 
     assert {:error, {:invalid_route_state, "  "}} =
-             Router.resolve(issue, profiles, %{"  " => "builder"})
+             Router.resolve_legacy(issue, profiles, %{"  " => "builder"})
 
     assert {:error, {:invalid_route_profile, "ready", 42}} =
-             Router.resolve(issue, profiles, %{"ready" => 42})
+             Router.resolve_legacy(issue, profiles, %{"ready" => 42})
 
     assert {:error, {:route_state_collision, "ready"}} =
              Router.validate_routes(%{"Ready" => "builder", "ready" => "builder"}, profiles)
@@ -452,7 +491,7 @@ defmodule SymphonyElixir.AgentRouterTest do
     invalid_policy = %{profiles["reviewer"] | sandbox: "workspace-write"}
 
     assert {:error, {:invalid_profile, "reviewer", policy_message}} =
-             Router.resolve(%{issue | state: "In Review"}, Map.put(profiles, "reviewer", invalid_policy))
+             Router.resolve_legacy(%{issue | state: "In Review"}, Map.put(profiles, "reviewer", invalid_policy))
 
     assert policy_message =~ "read-only"
 
@@ -460,8 +499,76 @@ defmodule SymphonyElixir.AgentRouterTest do
     assert Router.expected_responsibility("unknown") == nil
     assert Router.validate_routes(:invalid, profiles) == {:error, :invalid_routes}
 
-    assert Router.resolve(issue, profiles, :invalid) == {:error, :invalid_issue}
-    assert Router.resolve(issue, :invalid, %{}) == {:error, :invalid_profiles}
+    assert Router.resolve_legacy(issue, profiles, :invalid) == {:error, :invalid_issue}
+    assert Router.resolve_legacy(issue, :invalid, %{}) == {:error, :invalid_profiles}
+  end
+
+  test "routed resolution fails closed for assessment, authority, profile, and route errors" do
+    profiles = Profile.default_profiles("codex app-server", 20)
+    ready = trusted_work_item("Ready")
+
+    assert {:error, :invalid_profiles} = Router.resolve(ready, nil)
+    assert {:error, :invalid_profiles} = Router.resolve(ready, nil, nil)
+    assert {:error, :invalid_work_item} = Router.resolve(ready, profiles, :invalid)
+    assert {:error, :invalid_work_item} = Router.resolve(:not_a_work_item, profiles)
+    assert {:error, :invalid_profiles} = Router.resolve(%Issue{id: "raw", state: "Ready"}, nil)
+    assert {:error, :invalid_profiles} = Router.resolve(%Issue{id: "raw", state: "Ready"}, nil, nil)
+    assert {:error, :canonical_work_item_required} = Router.resolve(%Issue{id: "raw", state: "Ready"}, profiles, nil)
+    assert {:error, :invalid_work_item} = Router.resolve(:not_a_work_item, profiles, nil)
+
+    assert {:ok, unassessed_ready} =
+             WorkItem.from_issue(%Issue{id: "unassessed", state: "Ready"}, %{
+               provider: :memory,
+               observed_at: @now
+             })
+
+    assert {:error, :lifecycle_validation_required} = Router.resolve(unassessed_ready, profiles)
+
+    assert {:ok, canceled} =
+             WorkItem.from_issue(%Issue{id: "canceled", state: "Canceled"}, %{
+               provider: :memory,
+               observed_at: @now,
+               prior_validated_lifecycle_state: :ready
+             })
+
+    assert {:error, {:authority_reducing, :canceled}} = Router.resolve(canceled, profiles)
+
+    assert {:ok, unknown} =
+             WorkItem.from_issue(%Issue{id: "unknown", state: "Mystery"}, %{
+               provider: :memory,
+               observed_at: @now
+             })
+
+    assert {:error, {:invalid_lifecycle, :unknown_mapping}} = Router.resolve(unknown, profiles)
+
+    {:ok, mapped_assessment} =
+      ready.provider_observation
+      |> LifecycleAssessment.new()
+      |> LifecycleAssessment.resolve_mapping()
+
+    mapping_only = %{
+      ready
+      | lifecycle_assessment: mapped_assessment,
+        authority_disposition: AuthorityDisposition.derive(mapped_assessment)
+    }
+
+    assert {:error, {:invalid_lifecycle, :mapping_resolved}} =
+             Router.resolve(mapping_only, profiles)
+
+    assert {:error, {:missing_profile, "builder"}} = Router.resolve(ready, %{})
+    assert {:error, {:invalid_profile, "builder"}} = Router.resolve(ready, %{"builder" => :invalid})
+
+    mismatched_profile = %{profiles["builder"] | responsibility: "review"}
+
+    assert {:error, {:route_responsibility_mismatch, "ready", "implementation"}} =
+             Router.resolve(ready, %{"builder" => mismatched_profile})
+
+    assert {:ok, %Route{profile_name: "builder"}} =
+             Router.resolve(ready, profiles, %{"Ready" => "builder"})
+
+    assert :ok = Router.validate_routes(%{"Ready" => "builder"}, profiles)
+    assert :ok = Router.validate_routes(nil, profiles)
+    assert {:error, :invalid_routes} = Router.validate_routes(:invalid, profiles)
   end
 
   test "schema formats routed profile and route validation errors" do

@@ -63,11 +63,13 @@ defmodule SymphonyElixir.Tracker do
   """
   @spec bind_agent_tools(keyword()) :: map()
   def bind_agent_tools(opts \\ []) do
-    tracker_settings = Config.settings!().tracker
+    settings = Config.settings!()
+    tracker_settings = settings.tracker
     adapter = adapter_for_settings!(tracker_settings)
 
     %{
       adapter: adapter,
+      agent_routing: settings.agent.routing,
       tracker_settings: tracker_settings,
       tool_specs: adapter_agent_tool_specs(adapter),
       secret_environment_names: adapter_secret_environment_names(adapter, tracker_settings),
@@ -89,6 +91,7 @@ defmodule SymphonyElixir.Tracker do
       arguments,
       opts
       |> Keyword.put(:tracker_settings, tracker_settings)
+      |> Keyword.put(:agent_routing, Map.get(binding, :agent_routing, "legacy"))
       |> Keyword.put(:transition_guard, Map.get(binding, :transition_guard))
       |> Keyword.put(:agent_tool_context, Map.get(binding, :agent_tool_context, %{}))
     )

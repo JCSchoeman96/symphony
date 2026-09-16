@@ -2,31 +2,12 @@ defmodule SymphonyElixir.Tracker.TransitionPolicy do
   @moduledoc """
   Pure authorization policy for workflow-controlled issue state transitions.
 
-  Provider-native transition tools call this policy with the responsibility and
-  dependency decision captured when the agent session was bound. The policy
-  authorizes only the handoff owned by that responsibility; it does not mutate
-  tracker or orchestrator state.
+  Canonical state legality, ownership, and guard metadata come from
+  `WorkflowLifecycle`. Provider observations are checked by their caller before
+  this policy is used; raw provider state is not a canonical authority grant.
   """
 
-  @handoff_targets %{
-    "planning" => %{"planning" => ["ready"]},
-    "implementation" => %{
-      "ready" => ["in review"],
-      "todo" => ["in review"],
-      "open" => ["in review"],
-      "opened" => ["in review"],
-      "pending" => ["in review"],
-      "started" => ["in review"],
-      "in development" => ["in review"],
-      "in progress" => ["in review"]
-    },
-    "review" => %{"in review" => ["changes requested", "ready to merge"]},
-    "correction" => %{
-      "changes requested" => ["in review"],
-      "rework" => ["in review"]
-    },
-    "merge" => %{}
-  }
+  alias SymphonyElixir.WorkControl.WorkflowLifecycle
 
   @type authorization_error :: %{
           code: :invalid_transition_context | :unauthorized_transition | :dependency_transition_denied,
@@ -36,8 +17,8 @@ defmodule SymphonyElixir.Tracker.TransitionPolicy do
   @spec authorize(map()) :: :ok | {:error, authorization_error()}
   def authorize(context) when is_map(context) do
     with {:ok, responsibility} <- normalized_context_token(context, :responsibility),
-         {:ok, current_state} <- normalized_context_token(context, :current_state),
-         {:ok, target_state} <- normalized_context_token(context, :target_state),
+         {:ok, current_state} <- canonical_context_state(context, :current_state),
+         {:ok, target_state} <- canonical_context_state(context, :target_state),
          {:ok, dependency_decision} <- dependency_decision(context),
          :ok <- authorize_handoff(responsibility, current_state, target_state),
          :ok <- authorize_dependencies(responsibility, target_state, dependency_decision) do
@@ -52,15 +33,42 @@ defmodule SymphonyElixir.Tracker.TransitionPolicy do
 
   @doc "Checks the role-owned handoff before reading mutable provider state."
   @spec authorize_intent(map()) :: :ok | {:error, authorization_error()}
-  def authorize_intent(context) do
+  def authorize_intent(context) when is_map(context) do
     with {:ok, responsibility} <- normalized_context_token(context, :responsibility),
-         {:ok, current_state} <- normalized_context_token(context, :current_state),
-         {:ok, target_state} <- normalized_context_token(context, :target_state),
+         {:ok, current_state} <- canonical_context_state(context, :current_state),
+         {:ok, target_state} <- canonical_context_state(context, :target_state),
          :ok <- authorize_handoff(responsibility, current_state, target_state) do
       :ok
     else
       {:error, %{} = error} -> {:error, error}
       {:error, reason} -> {:error, invalid_context_error(reason)}
+    end
+  end
+
+  def authorize_intent(_context), do: {:error, invalid_context_error(:not_a_map)}
+
+  @spec transition_metadata(map()) ::
+          {:ok, SymphonyElixir.WorkControl.WorkflowLifecycle.transition_metadata()}
+          | {:error, authorization_error()}
+  def transition_metadata(context) when is_map(context) do
+    with {:ok, current_state} <- canonical_context_state(context, :current_state),
+         {:ok, target_state} <- canonical_context_state(context, :target_state),
+         {:ok, metadata} <- WorkflowLifecycle.transition(current_state, target_state) do
+      {:ok, metadata}
+    else
+      {:error, reason} -> {:error, invalid_context_error(reason)}
+    end
+  end
+
+  def transition_metadata(_context), do: {:error, invalid_context_error(:not_a_map)}
+
+  @spec guard_requirements(map()) ::
+          {:ok, [SymphonyElixir.WorkControl.GuardClass.requirement()]}
+          | {:error, authorization_error()}
+  def guard_requirements(context) do
+    case transition_metadata(context) do
+      {:ok, metadata} -> {:ok, metadata.guard_requirements}
+      {:error, _reason} = error -> error
     end
   end
 
@@ -72,16 +80,31 @@ defmodule SymphonyElixir.Tracker.TransitionPolicy do
         normalized = normalize_token(value)
         if normalized == "", do: {:error, {:missing, key}}, else: {:ok, normalized}
 
+      value when is_atom(value) and not is_nil(value) ->
+        normalized = value |> Atom.to_string() |> normalize_token()
+        if normalized == "", do: {:error, {:missing, key}}, else: {:ok, normalized}
+
       _ ->
         {:error, {:missing, key}}
+    end
+  end
+
+  defp canonical_context_state(context, key) do
+    value = context_value(context, key)
+
+    case WorkflowLifecycle.parse(value) do
+      {:ok, state} -> {:ok, state}
+      {:error, reason} -> {:error, reason}
     end
   end
 
   defp context_value(context, :current_state) do
     Map.get(context, :current_state) ||
       Map.get(context, "current_state") ||
-      Map.get(context, :current_issue_state) ||
-      Map.get(context, "current_issue_state")
+      Map.get(context, :current_lifecycle_state) ||
+      Map.get(context, "current_lifecycle_state") ||
+      Map.get(context, :trusted_lifecycle_state) ||
+      Map.get(context, "trusted_lifecycle_state")
   end
 
   defp context_value(context, key), do: Map.get(context, key) || Map.get(context, Atom.to_string(key))
@@ -94,14 +117,27 @@ defmodule SymphonyElixir.Tracker.TransitionPolicy do
   end
 
   defp authorize_handoff(responsibility, current_state, target_state) do
-    allowed_targets = get_in(@handoff_targets, [responsibility, current_state]) || []
+    case WorkflowLifecycle.transition(current_state, target_state) do
+      {:ok, metadata} ->
+        if owner_matches?(metadata.owner, responsibility) do
+          :ok
+        else
+          {:error, unauthorized_error()}
+        end
 
-    if target_state in allowed_targets do
-      :ok
-    else
-      {:error, unauthorized_error()}
+      {:error, _reason} ->
+        {:error, unauthorized_error()}
     end
   end
+
+  defp owner_matches?(:planner, "planning"), do: true
+  defp owner_matches?(:builder, "implementation"), do: true
+  defp owner_matches?(:independent_reviewer, "review"), do: true
+  defp owner_matches?(:fixer, "correction"), do: true
+  defp owner_matches?(:symphony, "symphony"), do: true
+  defp owner_matches?(:human, "human"), do: true
+  defp owner_matches?(:system, "system"), do: true
+  defp owner_matches?(_owner, _responsibility), do: false
 
   defp authorize_dependencies("implementation", _target_state, decision),
     do: require_complete_allowed_dependency(decision)
@@ -109,7 +145,7 @@ defmodule SymphonyElixir.Tracker.TransitionPolicy do
   defp authorize_dependencies("correction", _target_state, decision),
     do: require_complete_allowed_dependency(decision)
 
-  defp authorize_dependencies("review", "ready to merge", decision) do
+  defp authorize_dependencies("review", :ready_to_merge, decision) do
     if complete_allowed_dependency?(decision) and truthy?(decision_value(decision, :merge_permitted?)) do
       :ok
     else

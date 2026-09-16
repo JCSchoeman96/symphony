@@ -2,9 +2,12 @@ defmodule SymphonyElixir.Dependency.Policy do
   @moduledoc """
   Pure lifecycle-aware classification and responsibility policy for hard blockers.
 
-  A dependency is successful only when its normalized state is `done`. Other
+  A raw provider `done` state is unresolved. A dependency is successful only
+  when its WorkItem carries a validated canonical completion assessment. Other
   known terminal outcomes are invalidated rather than treated as successful.
   """
+
+  alias SymphonyElixir.WorkControl.WorkItem
 
   @responsibilities ~w(planning implementation review correction merge)
   @default_active_states [
@@ -44,7 +47,7 @@ defmodule SymphonyElixir.Dependency.Policy do
          {:ok, known_states} <- known_states(opts) do
       cond do
         normalized_state == "done" ->
-          :satisfied
+          :unresolved
 
         MapSet.member?(invalidated_states(opts), normalized_state) ->
           :invalidated
@@ -59,9 +62,16 @@ defmodule SymphonyElixir.Dependency.Policy do
   end
 
   @spec classify_blocker(term(), keyword()) :: {:ok, map()} | {:error, term()}
-  def classify_blocker(blocker, opts \\ []) do
+  def classify_blocker(blocker, opts \\ [])
+
+  @spec classify_blocker(WorkItem.t(), keyword()) :: {:ok, map()} | {:error, term()}
+  def classify_blocker(%WorkItem{} = work_item, _opts) do
+    {:ok, %{blocker: blocker_from_work_item(work_item), status: work_item_classification(work_item)}}
+  end
+
+  def classify_blocker(blocker, opts) when is_list(opts) do
     with {:ok, normalized_blocker} <- normalize_blocker(blocker),
-         classification <- classify_state(normalized_blocker.state, opts),
+         classification <- classify_blocker_state(normalized_blocker, opts),
          {:ok, classification} <- ensure_classification(classification) do
       {:ok, %{blocker: normalized_blocker, status: classification}}
     end
@@ -211,6 +221,39 @@ defmodule SymphonyElixir.Dependency.Policy do
     classified_blockers
     |> Enum.filter(&(&1.status == status))
     |> Enum.map(& &1.blocker)
+  end
+
+  defp classify_blocker_state(%{id: blocker_id, state: state}, opts) do
+    case work_item_for(opts, blocker_id) do
+      %WorkItem{} = work_item -> work_item_classification(work_item)
+      _missing -> classify_state(state, opts)
+    end
+  end
+
+  defp work_item_for(opts, blocker_id) do
+    case Keyword.get(opts, :work_control, %{}) do
+      work_control when is_map(work_control) ->
+        Map.get(work_control, blocker_id) || Map.get(work_control, to_string(blocker_id))
+
+      _invalid ->
+        nil
+    end
+  end
+
+  defp work_item_classification(%WorkItem{} = work_item) do
+    cond do
+      WorkItem.dependency_satisfying?(work_item) -> :satisfied
+      WorkItem.canonical_state(work_item) == :canceled -> :invalidated
+      true -> :unresolved
+    end
+  end
+
+  defp blocker_from_work_item(%WorkItem{} = work_item) do
+    %{
+      id: work_item.id,
+      identifier: work_item.identifier,
+      state: work_item.provider_observation.provider_state_name
+    }
   end
 
   defp dependency_status([]), do: :none

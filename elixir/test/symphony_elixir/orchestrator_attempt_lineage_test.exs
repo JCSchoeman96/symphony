@@ -14,6 +14,7 @@ defmodule SymphonyElixir.OrchestratorAttemptLineageTest do
 
   alias SymphonyElixir.AgentRuntime.AttemptLedger
   alias SymphonyElixir.AgentRuntime.{Route, Router}
+  alias SymphonyElixir.WorkControl.WorkItem
 
   test "restores consumed ordinary retry budget across orchestrator restart" do
     project_id = "restart-#{System.unique_integer([:positive])}"
@@ -747,8 +748,7 @@ defmodule SymphonyElixir.OrchestratorAttemptLineageTest do
         sync_fun: fn _table -> {:error, :injected_sync_failure} end
       )
 
-    {:ok, previous_route} =
-      Router.resolve(issue, Config.settings!().agent.profiles, Config.settings!().agent.routes)
+    {:ok, previous_route} = Router.resolve(trusted_work_item(issue), Config.settings!().agent.profiles)
 
     state = %Orchestrator.State{
       attempt_ledger: ledger,
@@ -765,6 +765,7 @@ defmodule SymphonyElixir.OrchestratorAttemptLineageTest do
         }
       },
       claimed: MapSet.new([issue.id]),
+      work_control: %{issue.id => trusted_work_item(next_issue)},
       codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
     }
 
@@ -1089,7 +1090,7 @@ defmodule SymphonyElixir.OrchestratorAttemptLineageTest do
                updated_at: 1_700_000_000_000
              )
 
-    {:ok, previous_route} = Router.resolve(issue, Config.settings!().agent.profiles, Config.settings!().agent.routes)
+    {:ok, previous_route} = Router.resolve(trusted_work_item(issue), Config.settings!().agent.profiles)
 
     state = %Orchestrator.State{
       attempt_ledger: ledger,
@@ -1108,6 +1109,7 @@ defmodule SymphonyElixir.OrchestratorAttemptLineageTest do
         }
       },
       claimed: MapSet.new([issue.id]),
+      work_control: %{issue.id => trusted_work_item(next_issue)},
       codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
     }
 
@@ -1374,11 +1376,34 @@ defmodule SymphonyElixir.OrchestratorAttemptLineageTest do
       Keyword.merge(
         [
           name: name,
-          agent_runner: SymphonyElixir.AttemptLedgerFailingRunner
+          agent_runner: SymphonyElixir.AttemptLedgerFailingRunner,
+          work_control: trusted_work_control()
         ],
         extra_opts
       )
     )
+  end
+
+  defp trusted_work_control do
+    Application.get_env(:symphony_elixir, :memory_tracker_issues, [])
+    |> Enum.reduce(%{}, fn
+      %Issue{id: issue_id} = issue, work_control when is_binary(issue_id) ->
+        Map.put(work_control, issue_id, trusted_work_item(issue))
+
+      _issue, work_control ->
+        work_control
+    end)
+  end
+
+  defp trusted_work_item(%Issue{} = issue) do
+    {:ok, work_item} =
+      WorkItem.from_issue(issue, %{
+        provider: :memory,
+        observed_at: DateTime.utc_now(),
+        prior_validated_lifecycle_state: issue.state
+      })
+
+    work_item
   end
 
   defp eventually(fun, attempts \\ 100)
