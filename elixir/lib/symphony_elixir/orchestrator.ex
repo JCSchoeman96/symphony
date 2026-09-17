@@ -10,11 +10,14 @@ defmodule SymphonyElixir.Orchestrator do
   alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
   alias SymphonyElixir.AgentRuntime.{AttemptLedger, AttemptPolicy, Route, Router}
   alias SymphonyElixir.Dependency.{Graph, Guard}
+  alias SymphonyElixir.Plane.ProjectContract
   alias SymphonyElixir.Tracker.Issue
 
   alias SymphonyElixir.WorkControl.{
     AuthorityDisposition,
     LifecycleAssessment,
+    ProjectContractAuthority,
+    ProviderProjectContract,
     SuspensionContext,
     WorkflowLifecycle,
     WorkItem
@@ -67,7 +70,9 @@ defmodule SymphonyElixir.Orchestrator do
     :tracker_missing,
     :blocked,
     :invalid_attempt,
-    :observed
+    :observed,
+    :provider_configuration_changed,
+    :provider_configuration_drift
   ]
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
@@ -111,6 +116,7 @@ defmodule SymphonyElixir.Orchestrator do
       durable_exhausted: %{},
       recent_attempts: [],
       work_control: %{},
+      project_contract_authority: nil,
       codex_totals: nil,
       codex_rate_limits: nil
     ]
@@ -139,6 +145,7 @@ defmodule SymphonyElixir.Orchestrator do
           task_supervisor: Keyword.get(opts, :task_supervisor, SymphonyElixir.TaskSupervisor),
           agent_runner: Keyword.get(opts, :agent_runner, AgentRunner),
           work_control: initial_work_control(Keyword.get(opts, :work_control, %{})),
+          project_contract_authority: ProjectContractAuthority.new(config.provider_project_contract),
           codex_totals: @empty_codex_totals,
           codex_rate_limits: nil
         }
@@ -453,14 +460,70 @@ defmodule SymphonyElixir.Orchestrator do
     %{state | durable_in_flight: MapSet.delete(state.durable_in_flight, issue_id)}
   end
 
-  defp autonomous_dispatch_allowed?(%State{attempt_ledger_status: status})
+  defp autonomous_dispatch_allowed?(%State{attempt_ledger_status: status} = state)
        when status in [:disabled, :ready],
-       do: true
+       do: ProjectContractAuthority.allowed?(state.project_contract_authority)
 
   defp autonomous_dispatch_allowed?(%State{}), do: false
 
   defp ledger_block_reason(%State{attempt_ledger_status: {:blocked, reason}}), do: reason
   defp ledger_block_reason(_state), do: nil
+
+  defp reconcile_project_contract_state(
+         %State{
+           project_contract_authority: %ProjectContractAuthority{
+             contract: %ProviderProjectContract{} = contract
+           }
+         } = state,
+         snapshot
+       )
+       when is_map(snapshot) do
+    validation = ProjectContract.validate(contract, snapshot)
+    {apply_project_contract_validation(state, validation), validation}
+  end
+
+  defp reconcile_project_contract_state(%State{} = state, _snapshot),
+    do: {state, {:error, :provider_project_contract_not_configured}}
+
+  defp apply_project_contract_validation(
+         %State{} = state,
+         %ProviderProjectContract.ValidationResult{} = validation
+       ) do
+    authority = ProjectContractAuthority.apply_validation(state.project_contract_authority, validation)
+    state = %{state | project_contract_authority: authority}
+
+    if ProjectContractAuthority.suspended?(authority) do
+      suspend_running_for_project_contract(state, :provider_configuration_drift)
+    else
+      state
+    end
+  end
+
+  defp suspend_running_for_project_contract(%State{} = state, reason) do
+    state =
+      Enum.reduce(Map.keys(state.running), state, fn issue_id, state_acc ->
+        terminate_running_issue(state_acc, issue_id, false, reason)
+      end)
+
+    cancel_project_contract_retries(state)
+  end
+
+  defp cancel_project_contract_retries(%State{} = state) do
+    Enum.each(state.retry_attempts, fn {_issue_id, retry} ->
+      case Map.get(retry, :timer_ref) do
+        timer_ref when is_reference(timer_ref) -> Process.cancel_timer(timer_ref)
+        _ -> :ok
+      end
+    end)
+
+    retry_issue_ids = Map.keys(state.retry_attempts)
+
+    %{
+      state
+      | retry_attempts: %{},
+        claimed: Enum.reduce(retry_issue_ids, state.claimed, &MapSet.delete(&2, &1))
+    }
+  end
 
   @impl true
   def handle_info({:tick, tick_token}, %{tick_token: tick_token} = state)
@@ -3666,6 +3729,38 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  @doc """
+  Reconciles the configured provider project contract against a fresh provider
+  snapshot. The provider snapshot is supplied by a trusted adapter boundary;
+  this operation performs no provider mutation. The P-030 provider adapter is
+  responsible for invoking this handoff after its authoritative read.
+  """
+  @spec reconcile_project_contract(GenServer.server(), map()) ::
+          {:ok, ProviderProjectContract.ValidationResult.t()} | {:error, term()}
+  def reconcile_project_contract(server \\ __MODULE__, snapshot) when is_map(snapshot) do
+    GenServer.call(server, {:reconcile_project_contract, snapshot})
+  end
+
+  @doc false
+  @spec reconcile_project_contract_for_test(State.t(), map()) :: State.t()
+  def reconcile_project_contract_for_test(%State{} = state, snapshot) when is_map(snapshot) do
+    {state, _result} = reconcile_project_contract_state(state, snapshot)
+    state
+  end
+
+  @doc false
+  @spec reconfigure_project_contract_for_test(
+          State.t(),
+          nil | ProviderProjectContract.t()
+        ) :: State.t()
+  def reconfigure_project_contract_for_test(%State{} = state, contract) do
+    synchronize_project_contract_config(state, contract)
+  end
+
+  @doc false
+  @spec autonomous_dispatch_allowed_for_test?(State.t()) :: boolean()
+  def autonomous_dispatch_allowed_for_test?(%State{} = state), do: autonomous_dispatch_allowed?(state)
+
   @doc false
   @spec observability_error(term()) :: String.t() | nil
   def observability_error(value), do: snapshot_safe_error(value)
@@ -3810,6 +3905,7 @@ defmodule SymphonyElixir.Orchestrator do
        recent_attempts: snapshot_recent_attempts(state),
        dependency_diagnostics: snapshot_dependency_diagnostics(state),
        dependency_graph: snapshot_dependency_graph(state),
+       project_contract: ProjectContractAuthority.observability(state.project_contract_authority),
        codex_totals: state.codex_totals,
        rate_limits: observability_rate_limits(Map.get(state, :codex_rate_limits)),
        polling: %{
@@ -3818,6 +3914,19 @@ defmodule SymphonyElixir.Orchestrator do
          poll_interval_ms: state.poll_interval_ms
        }
      }, state}
+  end
+
+  def handle_call({:reconcile_project_contract, snapshot}, _from, %State{} = state)
+      when is_map(snapshot) do
+    {state, result} = reconcile_project_contract_state(state, snapshot)
+
+    case result do
+      %ProviderProjectContract.ValidationResult{} = validation ->
+        {:reply, {:ok, validation}, state}
+
+      {:error, _reason} = error ->
+        {:reply, error, state}
+    end
   end
 
   def handle_call(:request_refresh, _from, state) do
@@ -4509,8 +4618,42 @@ defmodule SymphonyElixir.Orchestrator do
         max_concurrent_agents: config.agent.max_concurrent_agents
     }
 
-    synchronize_attempt_ledger_config(state, config)
+    state
+    |> synchronize_project_contract_config(config.provider_project_contract)
+    |> synchronize_attempt_ledger_config(config)
   end
+
+  defp synchronize_project_contract_config(%State{} = state, contract) do
+    previous_authority = state.project_contract_authority
+    authority = ProjectContractAuthority.reconfigure(state.project_contract_authority, contract)
+    state = %{state | project_contract_authority: authority}
+
+    if project_contract_changed?(previous_authority, contract) do
+      suspend_running_for_project_contract(state, :provider_configuration_changed)
+    else
+      state
+    end
+  end
+
+  defp project_contract_changed?(nil, nil), do: false
+  defp project_contract_changed?(nil, %ProviderProjectContract{}), do: true
+  defp project_contract_changed?(%ProjectContractAuthority{contract: nil}, nil), do: false
+  defp project_contract_changed?(%ProjectContractAuthority{contract: nil}, %ProviderProjectContract{}), do: true
+
+  defp project_contract_changed?(
+         %ProjectContractAuthority{contract: %ProviderProjectContract{}},
+         nil
+       ),
+       do: true
+
+  defp project_contract_changed?(
+         %ProjectContractAuthority{contract: %ProviderProjectContract{} = previous},
+         %ProviderProjectContract{} = next
+       ) do
+    ProviderProjectContract.fingerprint(previous) != ProviderProjectContract.fingerprint(next)
+  end
+
+  defp project_contract_changed?(_previous, next), do: not is_nil(next)
 
   defp synchronize_attempt_ledger_config(%State{} = state, %{agent: %{routing: "legacy"}}) do
     case state.attempt_ledger do
