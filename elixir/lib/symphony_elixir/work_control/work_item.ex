@@ -167,6 +167,16 @@ defmodule SymphonyElixir.WorkControl.WorkItem do
     LifecycleAssessment.dependency_satisfying?(assessment)
   end
 
+  @spec suspend(t(), atom()) :: {:ok, t()} | {:error, atom()}
+  def suspend(%__MODULE__{} = work_item, reason) when is_atom(reason) do
+    with {:ok, disposition} <- AuthorityDisposition.suspend(work_item.authority_disposition, reason),
+         {:ok, context} <- suspension_context(work_item, reason) do
+      {:ok, %{work_item | authority_disposition: disposition, suspension_context: context}}
+    end
+  end
+
+  def suspend(%__MODULE__{}, _reason), do: {:error, :invalid_suspension_reason}
+
   @spec authority_available?(t()) :: boolean()
   def authority_available?(%__MODULE__{
         lifecycle_assessment: assessment,
@@ -200,5 +210,38 @@ defmodule SymphonyElixir.WorkControl.WorkItem do
         :error -> context
       end
     end)
+  end
+
+  defp suspension_context(%__MODULE__{} = work_item, reason) do
+    case work_item.suspension_context do
+      %SuspensionContext{status: :open, reason: ^reason} = context ->
+        {:ok, context}
+
+      _previous_context ->
+        last_validated_state =
+          work_item.suspension_context && work_item.suspension_context.last_validated_lifecycle_state
+
+        last_validated_state = last_validated_state || work_item.validated_lifecycle_state
+
+        with true <- WorkflowLifecycle.canonical?(last_validated_state),
+             %ProviderObservation{} = observation <- work_item.provider_observation,
+             {:ok, context} <-
+               SuspensionContext.new(%{
+                 work_item_id: work_item.id,
+                 last_validated_lifecycle_state: last_validated_state,
+                 provider_observation: observation,
+                 reason: reason,
+                 created_at: observation.observed_at,
+                 recovery_policy: :fresh_reconciliation,
+                 required_evidence: [],
+                 resume_target: last_validated_state
+               }) do
+          {:ok, context}
+        else
+          false -> {:error, :missing_validated_lifecycle_state}
+          {:error, _reason} = error -> error
+          _observation -> {:error, :missing_provider_observation}
+        end
+    end
   end
 end

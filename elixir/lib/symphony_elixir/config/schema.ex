@@ -8,6 +8,7 @@ defmodule SymphonyElixir.Config.Schema do
   alias SymphonyElixir.AgentRuntime.Profile
   alias SymphonyElixir.AgentRuntime.Router
   alias SymphonyElixir.PathSafety
+  alias SymphonyElixir.WorkControl.ProviderProjectContract
 
   @primary_key false
   @linear_endpoint "https://api.linear.app/graphql"
@@ -353,6 +354,7 @@ defmodule SymphonyElixir.Config.Schema do
     embeds_one(:hooks, Hooks, on_replace: :update, defaults_to_struct: true)
     embeds_one(:observability, Observability, on_replace: :update, defaults_to_struct: true)
     embeds_one(:server, Server, on_replace: :update, defaults_to_struct: true)
+    field(:provider_project_contract, :map)
   end
 
   @spec parse(map()) :: {:ok, %__MODULE__{}} | {:error, {:invalid_workflow_config, String.t()}}
@@ -482,7 +484,7 @@ defmodule SymphonyElixir.Config.Schema do
 
   defp changeset(attrs) do
     %__MODULE__{}
-    |> cast(attrs, [])
+    |> cast(attrs, [:provider_project_contract], empty_values: [])
     |> cast_embed(:symphony, with: &Symphony.changeset/2)
     |> cast_embed(:tracker, with: &Tracker.changeset/2)
     |> cast_embed(:polling, with: &Polling.changeset/2)
@@ -528,7 +530,31 @@ defmodule SymphonyElixir.Config.Schema do
 
     settings = %{settings | tracker: tracker, workspace: workspace, codex: codex}
 
-    finalize_agent_profiles(settings)
+    with {:ok, provider_project_contract} <-
+           resolve_provider_project_contract(settings.provider_project_contract) do
+      settings = %{settings | provider_project_contract: provider_project_contract}
+      finalize_agent_profiles(settings)
+    end
+  end
+
+  defp resolve_provider_project_contract(nil), do: {:ok, nil}
+
+  defp resolve_provider_project_contract(attrs) when is_map(attrs) do
+    case ProviderProjectContract.new(attrs) do
+      {:ok, contract} ->
+        {:ok, contract}
+
+      {:error, %ProviderProjectContract.ConfigError{} = error} ->
+        {:error, {:invalid_workflow_config, format_provider_project_contract_error(error)}}
+    end
+  end
+
+  defp resolve_provider_project_contract(_value),
+    do: {:error, {:invalid_workflow_config, "provider_project_contract must be a map"}}
+
+  defp format_provider_project_contract_error(%ProviderProjectContract.ConfigError{} = error) do
+    field = if is_atom(error.field), do: ".#{error.field}", else: ""
+    "provider_project_contract#{field} is invalid (#{error.code})"
   end
 
   defp resolve_tracker_credentials(%{kind: "linear"} = tracker, provider) do
