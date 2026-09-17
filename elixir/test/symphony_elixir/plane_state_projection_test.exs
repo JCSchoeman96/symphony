@@ -99,6 +99,29 @@ defmodule SymphonyElixir.PlaneStateProjectionTest do
                @scope
              )
 
+    assert {:error, :wrong_project} =
+             StateProjection.project_work_item(
+               Map.put(item, "project", "other-project") |> Map.put("updated_at", "2026-09-17T08:09:10Z"),
+               @scope
+             )
+
+    assert {:error, :wrong_project} =
+             StateProjection.project_work_item(
+               Map.put(item, "workspace", "other-workspace") |> Map.put("updated_at", "2026-09-17T08:09:10Z"),
+               @scope
+             )
+
+    valid_item = Map.put(item, "updated_at", "2026-09-17T08:09:10Z")
+
+    assert {:ok, _projected} =
+             StateProjection.project_work_item(Map.put(valid_item, "project", "project-1"), @scope)
+
+    assert {:ok, _projected} =
+             StateProjection.project_work_item(Map.put(valid_item, "workspace", "workspace-id-1"), @scope)
+
+    assert {:ok, _projected} =
+             StateProjection.project_work_item(Map.put(valid_item, "workspace", "workspace-slug-1"), @scope)
+
     assert {:error, {:provider_malformed, {:missing_scope, :workspace_id}}} =
              StateProjection.project_work_item(item, %{project_id: "project-1"})
   end

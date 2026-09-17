@@ -120,30 +120,52 @@ defmodule SymphonyElixir.Plane.StateProjection do
     returned_projects =
       scope_values([
         first_text(raw_item, [:project_id]),
-        nested_text(raw_value(raw_item, :project), [:id, :uuid])
+        project_reference(raw_value(raw_item, :project))
       ])
 
     returned_workspace_ids =
       scope_values([
         first_text(raw_item, [:workspace_id]),
-        nested_text(raw_value(raw_item, :workspace), [:id])
+        scope_reference(raw_value(raw_item, :workspace), [:id])
       ])
 
     returned_workspace_slugs =
       scope_values([
         first_text(raw_item, [:workspace_slug]),
-        nested_text(raw_value(raw_item, :workspace), [:slug])
+        scope_reference(raw_value(raw_item, :workspace), [:slug])
       ])
 
+    returned_workspace_scalars =
+      scope_values([scalar_scope_reference(raw_value(raw_item, :workspace))])
+
     cond do
-      Enum.any?(returned_projects, &(&1 != project_id)) -> {:error, :wrong_project}
-      Enum.any?(returned_workspace_ids, &(&1 != workspace_id)) -> {:error, :wrong_project}
-      present?(workspace_slug) and Enum.any?(returned_workspace_slugs, &(&1 != workspace_slug)) -> {:error, :wrong_project}
-      true -> :ok
+      Enum.any?(returned_projects, &(&1 != project_id)) ->
+        {:error, :wrong_project}
+
+      Enum.any?(returned_workspace_ids, &(&1 != workspace_id)) ->
+        {:error, :wrong_project}
+
+      present?(workspace_slug) and Enum.any?(returned_workspace_slugs, &(&1 != workspace_slug)) ->
+        {:error, :wrong_project}
+
+      Enum.any?(returned_workspace_scalars, &(&1 != workspace_id and &1 != workspace_slug)) ->
+        {:error, :wrong_project}
+
+      true ->
+        :ok
     end
   end
 
   defp scope_values(values), do: Enum.filter(values, &present?/1)
+
+  defp project_reference(value) when is_map(value), do: nested_text(value, [:id, :uuid])
+  defp project_reference(value), do: text_value(value)
+
+  defp scope_reference(value, keys) when is_map(value), do: nested_text(value, keys)
+  defp scope_reference(_value, _keys), do: nil
+
+  defp scalar_scope_reference(value) when is_binary(value), do: text_value(value)
+  defp scalar_scope_reference(_value), do: nil
 
   defp expected_identifier(scope, key) do
     case first_value(scope, [key]) do
