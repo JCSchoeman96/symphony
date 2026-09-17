@@ -79,6 +79,14 @@ defmodule SymphonyElixir.PlaneStateProjectionTest do
              StateProjection.project_project(%{"id" => "project-1", "name" => "Project", "workspace" => "workspace-id-1"})
 
     assert project_with_scope.workspace_id == "workspace-id-1"
+
+    assert {:error, :wrong_project} =
+             StateProjection.project_project(%{
+               "id" => "project-1",
+               "name" => "Project",
+               "workspace_id" => "workspace-id-1",
+               "workspace" => "workspace-recreated"
+             })
   end
 
   test "projects and verifies stable state scope for fresh project snapshots" do

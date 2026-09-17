@@ -80,13 +80,12 @@ defmodule SymphonyElixir.Plane.StateProjection do
   @spec project_project(map()) :: {:ok, map()} | {:error, term()}
   def project_project(raw_project) when is_map(raw_project) do
     with {:ok, project_id} <- required_identifier(raw_project, [:id, :uuid]),
+         {:ok, workspace_id} <- project_workspace_id(raw_project),
          {:ok, name} <- optional_required_text(first_value(raw_project, [:name, :identifier]), :name) do
       {:ok,
        %{
          provider: :plane,
-         workspace_id:
-           first_text(raw_project, [:workspace_id]) ||
-             provider_scope_reference(raw_value(raw_project, :workspace), [:id, :uuid]),
+         workspace_id: workspace_id,
          workspace_slug: first_text(raw_project, [:workspace_slug]),
          project_id: project_id,
          name: name,
@@ -149,6 +148,21 @@ defmodule SymphonyElixir.Plane.StateProjection do
   defp project_workspace_name(raw_project) do
     first_text(raw_project, [:workspace_name]) ||
       nested_text(raw_value(raw_project, :workspace), [:name])
+  end
+
+  defp project_workspace_id(raw_project) do
+    workspace_ids =
+      scope_values([
+        first_text(raw_project, [:workspace_id]),
+        provider_scope_reference(raw_value(raw_project, :workspace), [:id, :uuid])
+      ])
+      |> Enum.uniq()
+
+    case workspace_ids do
+      [] -> {:ok, nil}
+      [workspace_id] -> {:ok, workspace_id}
+      _multiple -> {:error, :wrong_project}
+    end
   end
 
   defp validate_scope(raw_item, workspace_id, workspace_slug, project_id) do
