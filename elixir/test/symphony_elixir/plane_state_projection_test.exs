@@ -39,14 +39,15 @@ defmodule SymphonyElixir.PlaneStateProjectionTest do
                  "id" => "item-1",
                  "name" => "Foreign item",
                  "state" => %{"id" => "state-ready", "name" => "Ready", "group" => "unstarted"},
-                 "project_id" => "other-project"
+                 "project_id" => "other-project",
+                 "workspace_id" => "workspace-id-1"
                },
                @scope
              )
   end
 
   test "fails closed for missing or malformed state facts" do
-    item = %{"id" => "item-1", "name" => "Broken"}
+    item = %{"id" => "item-1", "name" => "Broken", "project" => "project-1", "workspace" => "workspace-id-1"}
     assert {:error, {:provider_malformed, :missing_state}} = StateProjection.project_work_item(item, @scope)
 
     malformed = Map.put(item, "state", %{"id" => "state-1", "name" => "Ready", "group" => "unknown"})
@@ -73,6 +74,37 @@ defmodule SymphonyElixir.PlaneStateProjectionTest do
     assert project.workspace_slug == "workspace-slug-1"
     assert project.workspace_name == nil
     assert project.name == "Project"
+
+    assert {:ok, project_with_scope} =
+             StateProjection.project_project(%{"id" => "project-1", "name" => "Project", "workspace" => "workspace-id-1"})
+
+    assert project_with_scope.workspace_id == "workspace-id-1"
+  end
+
+  test "projects and verifies stable state scope for fresh project snapshots" do
+    assert {:ok, state} =
+             StateProjection.project_state(
+               %{
+                 "id" => "state-1",
+                 "name" => "Ready",
+                 "group" => "unstarted",
+                 "project" => "project-1",
+                 "workspace" => "workspace-id-1"
+               },
+               @scope
+             )
+
+    assert state.project_id == "project-1"
+    assert state.workspace_id == "workspace-id-1"
+
+    assert {:error, :wrong_project} =
+             StateProjection.project_state(
+               %{"id" => "state-1", "name" => "Ready", "group" => "unstarted", "project" => "project-1", "workspace" => "other-workspace"},
+               @scope
+             )
+
+    assert {:error, {:provider_malformed, {:missing_scope, :workspace_id}}} =
+             StateProjection.project_state(%{"id" => "state-1", "name" => "Ready", "group" => "unstarted"}, @scope)
   end
 
   test "fails closed for invalid resource shapes, scope and timestamps" do
@@ -84,7 +116,9 @@ defmodule SymphonyElixir.PlaneStateProjectionTest do
       "id" => "item-1",
       "name" => "Work",
       "state" => %{"id" => "state-1", "name" => "Ready", "group" => "unstarted"},
-      "updated_at" => "not-a-date"
+      "updated_at" => "not-a-date",
+      "project" => "project-1",
+      "workspace" => "workspace-id-1"
     }
 
     assert {:error, {:provider_malformed, {:invalid_datetime, :updated_at}}} =
@@ -114,12 +148,12 @@ defmodule SymphonyElixir.PlaneStateProjectionTest do
     valid_item = Map.put(item, "updated_at", "2026-09-17T08:09:10Z")
 
     assert {:ok, _projected} =
-             StateProjection.project_work_item(Map.put(valid_item, "project", "project-1"), @scope)
+             StateProjection.project_work_item(valid_item, @scope)
 
     assert {:ok, _projected} =
-             StateProjection.project_work_item(Map.put(valid_item, "workspace", "workspace-id-1"), @scope)
+             StateProjection.project_work_item(Map.put(valid_item, "workspace", %{"id" => "workspace-id-1"}), @scope)
 
-    assert {:ok, _projected} =
+    assert {:error, :wrong_project} =
              StateProjection.project_work_item(Map.put(valid_item, "workspace", "workspace-slug-1"), @scope)
 
     assert {:error, {:provider_malformed, {:missing_scope, :workspace_id}}} =
@@ -142,7 +176,9 @@ defmodule SymphonyElixir.PlaneStateProjectionTest do
                  "labels" => [%{"name" => "bug"}, "urgent", %{"name" => "bug"}, 42],
                  "state" => %{"id" => "state-1", "name" => "Ready", "group" => "unstarted"},
                  "updated_at" => "2026-09-17T08:09:10Z",
-                 "created_at" => "2026-09-16T08:09:10Z"
+                 "created_at" => "2026-09-16T08:09:10Z",
+                 "project" => "project-1",
+                 "workspace" => "workspace-id-1"
                },
                @scope
              )
@@ -158,7 +194,9 @@ defmodule SymphonyElixir.PlaneStateProjectionTest do
                  "id" => "item-1",
                  "state" => %{"id" => "state-1", "name" => "Ready", "group" => "unstarted"},
                  "updated_at" => "2026-09-17T08:09:10Z",
-                 "created_at" => 42
+                 "created_at" => 42,
+                 "project" => "project-1",
+                 "workspace" => "workspace-id-1"
                },
                @scope
              )

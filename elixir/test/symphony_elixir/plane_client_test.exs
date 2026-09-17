@@ -28,6 +28,32 @@ defmodule SymphonyElixir.PlaneClientTest do
     assert {"X-API-Key", "secret"} in headers
   end
 
+  test "requests the factual fields required for project work items and states" do
+    parent = self()
+
+    request_fun = fn request ->
+      send(parent, {:request, request.path, request.params})
+
+      body =
+        if String.ends_with?(request.path, "/work-items/") or String.ends_with?(request.path, "/states/"),
+          do: %{"results" => [], "count" => 0, "total_results" => 0, "next_page_results" => false, "next_cursor" => nil},
+          else: %{"id" => "project-1"}
+
+      {:ok, %{status: 200, body: body}}
+    end
+
+    assert {:ok, []} = Client.list_work_items(@config, request_fun: request_fun)
+    assert_receive {:request, work_items_path, work_item_params}
+    assert String.ends_with?(work_items_path, "/work-items/")
+    assert work_item_params["expand"] == "state"
+    assert work_item_params["fields"] == "id,name,description,priority,sequence_id,state,labels,created_at,updated_at,project,workspace"
+
+    assert {:ok, []} = Client.list_states(@config, request_fun: request_fun)
+    assert_receive {:request, states_path, state_params}
+    assert String.ends_with?(states_path, "/states/")
+    assert state_params["fields"] == "id,name,group,project,workspace"
+  end
+
   test "combines every work-item page and rejects incomplete cursor pagination" do
     parent = self()
 
@@ -69,7 +95,7 @@ defmodule SymphonyElixir.PlaneClientTest do
     assert_receive {:request, %{params: first_params}}
     assert first_params["per_page"] == 100
     assert first_params["expand"] == "state"
-    refute Map.has_key?(first_params, "fields")
+    assert first_params["fields"] == "id,name,description,priority,sequence_id,state,labels,created_at,updated_at,project,workspace"
     assert_receive {:request, %{params: second_params}}
     assert second_params["cursor"] == "c1"
 
@@ -179,6 +205,17 @@ defmodule SymphonyElixir.PlaneClientTest do
                   }}
                end
              )
+  end
+
+  test "requires Plane pagination completeness metadata" do
+    for body <- [
+          %{"results" => [], "next_page_results" => false, "next_cursor" => nil},
+          %{"results" => [], "total_results" => 0, "next_page_results" => false, "next_cursor" => nil},
+          %{"results" => [], "count" => 0, "next_page_results" => false, "next_cursor" => nil}
+        ] do
+      assert {:error, :snapshot_incomplete} =
+               Client.list_work_items(@config, request_fun: fn _request -> {:ok, %{status: 200, body: body}} end)
+    end
   end
 
   test "does not return earlier pages when a later page fails" do
@@ -483,7 +520,13 @@ defmodule SymphonyElixir.PlaneClientTest do
       {:ok,
        %{
          status: 200,
-         body: %{"results" => [%{"id" => "item-#{page}"}], "next_page_results" => true, "next_cursor" => "cursor-#{page}"}
+         body: %{
+           "results" => [%{"id" => "item-#{page}"}],
+           "count" => 1,
+           "total_results" => 101,
+           "next_page_results" => true,
+           "next_cursor" => "cursor-#{page}"
+         }
        }}
     end
 
@@ -500,7 +543,7 @@ defmodule SymphonyElixir.PlaneClientTest do
 
       body =
         if String.ends_with?(request.path, "/work-items/") or String.ends_with?(request.path, "/states/") do
-          %{"results" => [], "next_page_results" => false, "next_cursor" => nil}
+          %{"results" => [], "count" => 0, "total_results" => 0, "next_page_results" => false, "next_cursor" => nil}
         else
           %{"id" => "project-1", "workspace" => %{"slug" => "workspace-1"}}
         end

@@ -15,6 +15,8 @@ defmodule SymphonyElixir.Plane.Client do
   @max_states 64
   @max_response_bytes 4_000_000
   @response_too_large_marker :symphony_plane_response_too_large
+  @work_item_fields "id,name,description,priority,sequence_id,state,labels,created_at,updated_at,project,workspace"
+  @state_fields "id,name,group,project,workspace"
 
   defmodule Error do
     @moduledoc "Safe Plane transport error without response bodies or headers."
@@ -68,7 +70,7 @@ defmodule SymphonyElixir.Plane.Client do
       paginate(%{
         config: config,
         path: states_path(config),
-        params: %{"per_page" => @page_size},
+        params: state_params(),
         kind: :states,
         opts: opts,
         acc: [],
@@ -219,7 +221,7 @@ defmodule SymphonyElixir.Plane.Client do
     total_results = raw_value(body, :total_results)
 
     cond do
-      is_nil(count) and is_nil(total_results) -> {:ok, nil, nil}
+      is_nil(count) or is_nil(total_results) -> {:error, :snapshot_incomplete}
       not valid_page_count?(count) or not valid_page_count?(total_results) -> {:error, :provider_malformed}
       count != length(results) -> {:error, :provider_malformed}
       total_results < count -> {:error, :provider_malformed}
@@ -428,7 +430,14 @@ defmodule SymphonyElixir.Plane.Client do
   defp states_path(config), do: project_path(config) <> "states/"
 
   defp state_expansion_params, do: %{"expand" => "state"}
-  defp work_item_params, do: Map.put(state_expansion_params(), "per_page", @page_size)
+
+  defp work_item_params do
+    state_expansion_params()
+    |> Map.put("per_page", @page_size)
+    |> Map.put("fields", @work_item_fields)
+  end
+
+  defp state_params, do: %{"per_page" => @page_size, "fields" => @state_fields}
   defp limit_for(:work_items), do: @max_work_items
   defp limit_for(:states), do: @max_states
 

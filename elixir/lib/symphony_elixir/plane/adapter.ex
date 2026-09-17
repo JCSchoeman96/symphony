@@ -119,12 +119,13 @@ defmodule SymphonyElixir.Plane.Adapter do
          {:ok, project} <- StateProjection.project_project(raw_project),
          :ok <- validate_project_scope(project, config),
          {:ok, raw_states} <- Client.list_states(config, request_opts(request_fun)),
-         {:ok, states} <- project_states(raw_states) do
+         {:ok, states} <- project_states(raw_states, config),
+         {:ok, workspace_id} <- observed_workspace_id(project, states) do
       {:ok,
        %{
          provider: :plane,
-         workspace_id: config.workspace_id,
-         project_id: config.project_id,
+         workspace_id: workspace_id,
+         project_id: project.project_id,
          workspace_name: project.workspace_name,
          project_name: project.name,
          project_identifier: project.identifier,
@@ -150,9 +151,9 @@ defmodule SymphonyElixir.Plane.Adapter do
     end
   end
 
-  defp project_states(raw_states) when is_list(raw_states) do
+  defp project_states(raw_states, config) when is_list(raw_states) do
     Enum.reduce_while(raw_states, {:ok, []}, fn raw_state, {:ok, acc} ->
-      case StateProjection.project_state(raw_state) do
+      case StateProjection.project_state(raw_state, scope(config)) do
         {:ok, state} -> {:cont, {:ok, [state | acc]}}
         {:error, reason} -> {:halt, {:error, reason}}
       end
@@ -160,6 +161,23 @@ defmodule SymphonyElixir.Plane.Adapter do
     |> case do
       {:ok, states} -> {:ok, Enum.reverse(states)}
       {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp observed_workspace_id(project, states) do
+    state_workspace_ids = states |> Enum.map(&Map.get(&1, :workspace_id)) |> Enum.uniq()
+
+    case state_workspace_ids do
+      [workspace_id] ->
+        if present?(project.workspace_id) and project.workspace_id != workspace_id,
+          do: {:error, :wrong_project},
+          else: {:ok, workspace_id}
+
+      [] ->
+        if present?(project.workspace_id), do: {:ok, project.workspace_id}, else: {:error, :snapshot_incomplete}
+
+      _multiple ->
+        {:error, :wrong_project}
     end
   end
 

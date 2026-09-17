@@ -61,15 +61,21 @@ defmodule SymphonyElixir.Plane.StateProjection do
   def project_work_item(_raw_item, _expected_scope), do: {:error, {:provider_malformed, :invalid_work_item}}
 
   @spec project_state(map()) :: {:ok, %{id: String.t(), name: String.t() | nil, group: atom()}} | {:error, term()}
-  def project_state(raw_state) when is_map(raw_state) do
+  def project_state(raw_state) when is_map(raw_state), do: project_state(raw_state, nil)
+  def project_state(_raw_state), do: {:error, {:provider_malformed, :invalid_state}}
+
+  @spec project_state(map(), map() | nil) :: {:ok, map()} | {:error, term()}
+  def project_state(raw_state, expected_scope) when is_map(raw_state) and (is_map(expected_scope) or is_nil(expected_scope)) do
     with {:ok, id} <- required_identifier(raw_state, [:id, :uuid]),
          {:ok, group} <- project_group(raw_value(raw_state, :group)),
-         {:ok, name} <- required_text(raw_value(raw_state, :name), :name) do
-      {:ok, %{id: id, name: name, group: group}}
+         {:ok, name} <- required_text(raw_value(raw_state, :name), :name),
+         {:ok, scope} <- project_state_scope(raw_state, expected_scope) do
+      state = %{id: id, name: name, group: group}
+      {:ok, if(scope, do: Map.merge(state, scope), else: state)}
     end
   end
 
-  def project_state(_raw_state), do: {:error, {:provider_malformed, :invalid_state}}
+  def project_state(_raw_state, _expected_scope), do: {:error, {:provider_malformed, :invalid_state}}
 
   @spec project_project(map()) :: {:ok, map()} | {:error, term()}
   def project_project(raw_project) when is_map(raw_project) do
@@ -78,7 +84,9 @@ defmodule SymphonyElixir.Plane.StateProjection do
       {:ok,
        %{
          provider: :plane,
-         workspace_id: first_text(raw_project, [:workspace_id]),
+         workspace_id:
+           first_text(raw_project, [:workspace_id]) ||
+             provider_scope_reference(raw_value(raw_project, :workspace), [:id, :uuid]),
          workspace_slug: first_text(raw_project, [:workspace_slug]),
          project_id: project_id,
          name: name,
@@ -111,6 +119,33 @@ defmodule SymphonyElixir.Plane.StateProjection do
     end
   end
 
+  defp project_state_scope(_raw_state, nil), do: {:ok, nil}
+
+  defp project_state_scope(raw_state, expected_scope) do
+    with {:ok, workspace_id} <- expected_identifier(expected_scope, :workspace_id),
+         {:ok, project_id} <- expected_identifier(expected_scope, :project_id) do
+      returned_workspace_ids =
+        scope_values([
+          first_text(raw_state, [:workspace_id]),
+          provider_scope_reference(raw_value(raw_state, :workspace), [:id, :uuid])
+        ])
+
+      returned_project_ids =
+        scope_values([
+          first_text(raw_state, [:project_id]),
+          provider_scope_reference(raw_value(raw_state, :project), [:id, :uuid])
+        ])
+
+      cond do
+        returned_workspace_ids == [] -> {:error, {:provider_malformed, {:missing_scope, :workspace_id}}}
+        returned_project_ids == [] -> {:error, {:provider_malformed, {:missing_scope, :project_id}}}
+        Enum.any?(returned_workspace_ids, &(&1 != workspace_id)) -> {:error, :wrong_project}
+        Enum.any?(returned_project_ids, &(&1 != project_id)) -> {:error, :wrong_project}
+        true -> {:ok, %{workspace_id: hd(returned_workspace_ids), project_id: hd(returned_project_ids)}}
+      end
+    end
+  end
+
   defp project_workspace_name(raw_project) do
     first_text(raw_project, [:workspace_name]) ||
       nested_text(raw_value(raw_project, :workspace), [:name])
@@ -126,7 +161,8 @@ defmodule SymphonyElixir.Plane.StateProjection do
     returned_workspace_ids =
       scope_values([
         first_text(raw_item, [:workspace_id]),
-        scope_reference(raw_value(raw_item, :workspace), [:id])
+        scope_reference(raw_value(raw_item, :workspace), [:id, :uuid]),
+        scalar_scope_reference(raw_value(raw_item, :workspace))
       ])
 
     returned_workspace_slugs =
@@ -135,10 +171,13 @@ defmodule SymphonyElixir.Plane.StateProjection do
         scope_reference(raw_value(raw_item, :workspace), [:slug])
       ])
 
-    returned_workspace_scalars =
-      scope_values([scalar_scope_reference(raw_value(raw_item, :workspace))])
-
     cond do
+      returned_projects == [] ->
+        {:error, {:provider_malformed, {:missing_scope, :project_id}}}
+
+      returned_workspace_ids == [] ->
+        {:error, {:provider_malformed, {:missing_scope, :workspace_id}}}
+
       Enum.any?(returned_projects, &(&1 != project_id)) ->
         {:error, :wrong_project}
 
@@ -148,15 +187,15 @@ defmodule SymphonyElixir.Plane.StateProjection do
       present?(workspace_slug) and Enum.any?(returned_workspace_slugs, &(&1 != workspace_slug)) ->
         {:error, :wrong_project}
 
-      Enum.any?(returned_workspace_scalars, &(&1 != workspace_id and &1 != workspace_slug)) ->
-        {:error, :wrong_project}
-
       true ->
         :ok
     end
   end
 
   defp scope_values(values), do: Enum.filter(values, &present?/1)
+
+  defp provider_scope_reference(value, keys) when is_map(value), do: nested_text(value, keys)
+  defp provider_scope_reference(value, _keys), do: text_value(value)
 
   defp project_reference(value) when is_map(value), do: nested_text(value, [:id, :uuid])
   defp project_reference(value), do: text_value(value)
