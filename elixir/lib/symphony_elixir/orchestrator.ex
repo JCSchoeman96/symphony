@@ -16,7 +16,7 @@ defmodule SymphonyElixir.Orchestrator do
   alias SymphonyElixir.WorkControl.{
     AuthorityDisposition,
     LifecycleAssessment,
-    ProjectContractAuthority,
+    ProjectContractEvidence,
     ProviderProjectContract,
     SuspensionContext,
     WorkflowLifecycle,
@@ -116,7 +116,7 @@ defmodule SymphonyElixir.Orchestrator do
       durable_exhausted: %{},
       recent_attempts: [],
       work_control: %{},
-      project_contract_authority: nil,
+      project_contract_evidence: nil,
       codex_totals: nil,
       codex_rate_limits: nil
     ]
@@ -145,7 +145,7 @@ defmodule SymphonyElixir.Orchestrator do
           task_supervisor: Keyword.get(opts, :task_supervisor, SymphonyElixir.TaskSupervisor),
           agent_runner: Keyword.get(opts, :agent_runner, AgentRunner),
           work_control: initial_work_control(Keyword.get(opts, :work_control, %{})),
-          project_contract_authority: ProjectContractAuthority.new(config.provider_project_contract),
+          project_contract_evidence: ProjectContractEvidence.new(config.provider_project_contract),
           codex_totals: @empty_codex_totals,
           codex_rate_limits: nil
         }
@@ -462,7 +462,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp autonomous_dispatch_allowed?(%State{attempt_ledger_status: status} = state)
        when status in [:disabled, :ready],
-       do: ProjectContractAuthority.allowed?(state.project_contract_authority)
+       do: not ProjectContractEvidence.reconciliation_required?(state.project_contract_evidence)
 
   defp autonomous_dispatch_allowed?(%State{}), do: false
 
@@ -471,7 +471,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp reconcile_project_contract_state(
          %State{
-           project_contract_authority: %ProjectContractAuthority{
+           project_contract_evidence: %ProjectContractEvidence{
              contract: %ProviderProjectContract{} = contract
            }
          } = state,
@@ -489,14 +489,37 @@ defmodule SymphonyElixir.Orchestrator do
          %State{} = state,
          %ProviderProjectContract.ValidationResult{} = validation
        ) do
-    authority = ProjectContractAuthority.apply_validation(state.project_contract_authority, validation)
-    state = %{state | project_contract_authority: authority}
+    evidence = ProjectContractEvidence.apply_validation(state.project_contract_evidence, validation)
+    state = %{state | project_contract_evidence: evidence}
 
-    if ProjectContractAuthority.suspended?(authority) do
-      suspend_running_for_project_contract(state, :provider_configuration_drift)
+    if ProjectContractEvidence.reconciliation_required?(evidence) do
+      reason = evidence.reason || :provider_configuration_drift
+
+      state
+      |> suspend_work_control_for_project_contract(reason)
+      |> suspend_running_for_project_contract(reason)
     else
       state
     end
+  end
+
+  defp suspend_work_control_for_project_contract(%State{} = state, reason) do
+    work_control =
+      Enum.reduce(state.work_control, %{}, fn
+        {issue_id, %WorkItem{} = work_item}, work_control_acc ->
+          suspended_work_item =
+            case WorkItem.suspend(work_item, reason) do
+              {:ok, suspended} -> suspended
+              {:error, _reason} -> work_item
+            end
+
+          Map.put(work_control_acc, issue_id, suspended_work_item)
+
+        {issue_id, work_item}, work_control_acc ->
+          Map.put(work_control_acc, issue_id, work_item)
+      end)
+
+    %{state | work_control: work_control}
   end
 
   defp suspend_running_for_project_contract(%State{} = state, reason) do
@@ -1945,7 +1968,11 @@ defmodule SymphonyElixir.Orchestrator do
 
     case WorkItem.from_issue(issue, opts) do
       {:ok, work_item} ->
-        work_item = attach_suspension_context(work_item, previous, opts)
+        work_item =
+          work_item
+          |> attach_suspension_context(previous, opts)
+          |> apply_project_contract_guard(state)
+
         %{state | work_control: Map.put(state.work_control, issue_id, work_item)}
 
       {:error, reason} ->
@@ -2021,6 +2048,21 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp attach_suspension_context(%WorkItem{} = work_item, _previous, _opts), do: work_item
+
+  defp apply_project_contract_guard(%WorkItem{} = work_item, %State{} = state) do
+    evidence = state.project_contract_evidence
+
+    if ProjectContractEvidence.reconciliation_required?(evidence) do
+      reason = evidence.reason || :provider_configuration_drift
+
+      case WorkItem.suspend(work_item, reason) do
+        {:ok, suspended} -> suspended
+        {:error, _reason} -> work_item
+      end
+    else
+      work_item
+    end
+  end
 
   defp dependency_diagnostic_for_issue(%Issue{id: issue_id} = issue, %Graph{} = graph, %State{} = state) do
     case route_for_issue(issue, state) do
@@ -3905,7 +3947,7 @@ defmodule SymphonyElixir.Orchestrator do
        recent_attempts: snapshot_recent_attempts(state),
        dependency_diagnostics: snapshot_dependency_diagnostics(state),
        dependency_graph: snapshot_dependency_graph(state),
-       project_contract: ProjectContractAuthority.observability(state.project_contract_authority),
+       project_contract: ProjectContractEvidence.observability(state.project_contract_evidence),
        codex_totals: state.codex_totals,
        rate_limits: observability_rate_limits(Map.get(state, :codex_rate_limits)),
        polling: %{
@@ -4624,12 +4666,16 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp synchronize_project_contract_config(%State{} = state, contract) do
-    previous_authority = state.project_contract_authority
-    authority = ProjectContractAuthority.reconfigure(state.project_contract_authority, contract)
-    state = %{state | project_contract_authority: authority}
+    previous_evidence = state.project_contract_evidence
+    evidence = ProjectContractEvidence.reconfigure(previous_evidence, contract)
+    state = %{state | project_contract_evidence: evidence}
 
-    if project_contract_changed?(previous_authority, contract) do
-      suspend_running_for_project_contract(state, :provider_configuration_changed)
+    if project_contract_changed?(previous_evidence, contract) do
+      reason = evidence.reason || :provider_configuration_changed
+
+      state
+      |> suspend_work_control_for_project_contract(reason)
+      |> suspend_running_for_project_contract(reason)
     else
       state
     end
@@ -4637,17 +4683,17 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp project_contract_changed?(nil, nil), do: false
   defp project_contract_changed?(nil, %ProviderProjectContract{}), do: true
-  defp project_contract_changed?(%ProjectContractAuthority{contract: nil}, nil), do: false
-  defp project_contract_changed?(%ProjectContractAuthority{contract: nil}, %ProviderProjectContract{}), do: true
+  defp project_contract_changed?(%ProjectContractEvidence{contract: nil}, nil), do: false
+  defp project_contract_changed?(%ProjectContractEvidence{contract: nil}, %ProviderProjectContract{}), do: true
 
   defp project_contract_changed?(
-         %ProjectContractAuthority{contract: %ProviderProjectContract{}},
+         %ProjectContractEvidence{contract: %ProviderProjectContract{}},
          nil
        ),
        do: true
 
   defp project_contract_changed?(
-         %ProjectContractAuthority{contract: %ProviderProjectContract{} = previous},
+         %ProjectContractEvidence{contract: %ProviderProjectContract{} = previous},
          %ProviderProjectContract{} = next
        ) do
     ProviderProjectContract.fingerprint(previous) != ProviderProjectContract.fingerprint(next)

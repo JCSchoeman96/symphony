@@ -125,6 +125,19 @@ defmodule SymphonyElixir.WorkControl.AuthorityDisposition do
 
   def transition(_disposition, _target, _opts), do: {:error, :invalid_disposition_transition}
 
+  @spec suspend(t(), atom()) :: {:ok, t()} | {:error, atom()}
+  def suspend(%__MODULE__{status: status} = disposition, reason)
+      when status in [:eligible, :active] and is_atom(reason) do
+    {:ok, %{disposition | status: :suspended, reason: reason, updated_at: DateTime.utc_now()}}
+  end
+
+  def suspend(%__MODULE__{status: :suspended} = disposition, reason) when is_atom(reason) do
+    {:ok, %{disposition | reason: reason, updated_at: DateTime.utc_now()}}
+  end
+
+  def suspend(%__MODULE__{status: :escalated}, _reason), do: {:error, :terminal_disposition}
+  def suspend(%__MODULE__{}, _reason), do: {:error, :authority_unavailable}
+
   @spec none?(t()) :: boolean()
   def none?(%__MODULE__{status: :none}), do: true
   def none?(_disposition), do: false

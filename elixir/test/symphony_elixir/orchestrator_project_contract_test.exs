@@ -3,25 +3,27 @@ defmodule SymphonyElixir.OrchestratorProjectContractTest do
 
   alias SymphonyElixir.Orchestrator
   alias SymphonyElixir.Tracker.Capabilities
+  alias SymphonyElixir.Tracker.Issue
 
   alias SymphonyElixir.WorkControl.{
-    ProjectContractAuthority,
+    ProjectContractEvidence,
     ProviderProjectContract,
-    WorkflowLifecycle
+    WorkflowLifecycle,
+    WorkItem
   }
 
   @states WorkflowLifecycle.states()
 
-  test "contract drift fences orchestrator authority without a provider mutation" do
+  test "contract drift fences autonomous dispatch without a provider mutation" do
     contract = contract!()
 
     state = %Orchestrator.State{
       attempt_ledger_status: :disabled,
-      project_contract_authority: ProjectContractAuthority.new(contract)
+      project_contract_evidence: ProjectContractEvidence.new(contract)
     }
 
     validated = Orchestrator.reconcile_project_contract_for_test(state, snapshot())
-    assert validated.project_contract_authority.status == :valid
+    assert validated.project_contract_evidence.validation.status == :valid
     assert Orchestrator.autonomous_dispatch_allowed_for_test?(validated)
 
     drifted =
@@ -30,9 +32,39 @@ defmodule SymphonyElixir.OrchestratorProjectContractTest do
         Map.put(snapshot(), :project_id, "project-recreated")
       )
 
-    assert drifted.project_contract_authority.status == :suspended
-    assert drifted.project_contract_authority.suspension.reason == :provider_configuration_drift
+    assert drifted.project_contract_evidence.validation.status == :drift_detected
+    assert drifted.project_contract_evidence.reason == :provider_configuration_drift
+    assert ProjectContractEvidence.reconciliation_required?(drifted.project_contract_evidence)
     refute Orchestrator.autonomous_dispatch_allowed_for_test?(drifted)
+  end
+
+  test "contract drift suspends existing WorkItems through canonical P-010 authority" do
+    contract = contract!()
+    issue = %Issue{id: "issue-1", identifier: "SYM-1", title: "Contract guard", state: "Ready"}
+
+    {:ok, work_item} =
+      WorkItem.from_issue(issue, %{
+        provider: :memory,
+        observed_at: DateTime.utc_now(),
+        prior_validated_lifecycle_state: :ready
+      })
+
+    state = %Orchestrator.State{
+      attempt_ledger_status: :disabled,
+      project_contract_evidence: ProjectContractEvidence.new(contract),
+      work_control: %{issue.id => work_item}
+    }
+
+    drifted =
+      state
+      |> Orchestrator.reconcile_project_contract_for_test(snapshot())
+      |> Orchestrator.reconcile_project_contract_for_test(Map.put(snapshot(), :project_id, "project-recreated"))
+
+    suspended_work_item = drifted.work_control[issue.id]
+    assert suspended_work_item.authority_disposition.status == :suspended
+    assert suspended_work_item.authority_disposition.reason == :provider_configuration_drift
+    assert suspended_work_item.suspension_context.reason == :provider_configuration_drift
+    refute WorkItem.authority_available?(suspended_work_item)
   end
 
   test "contract suspension remains closed until revalidation of the current contract" do
@@ -40,7 +72,7 @@ defmodule SymphonyElixir.OrchestratorProjectContractTest do
 
     state = %Orchestrator.State{
       attempt_ledger_status: :disabled,
-      project_contract_authority: ProjectContractAuthority.new(contract)
+      project_contract_evidence: ProjectContractEvidence.new(contract)
     }
 
     suspended =
@@ -48,13 +80,13 @@ defmodule SymphonyElixir.OrchestratorProjectContractTest do
       |> Orchestrator.reconcile_project_contract_for_test(snapshot())
       |> Orchestrator.reconcile_project_contract_for_test(Map.put(snapshot(), :project_id, "wrong-project"))
 
-    assert suspended.project_contract_authority.status == :suspended
+    assert suspended.project_contract_evidence.validation.status == :drift_detected
     refute Orchestrator.autonomous_dispatch_allowed_for_test?(suspended)
 
     recovered = Orchestrator.reconcile_project_contract_for_test(suspended, snapshot())
 
-    assert recovered.project_contract_authority.status == :valid
-    assert recovered.project_contract_authority.suspension.status == :resolved
+    assert recovered.project_contract_evidence.validation.status == :valid
+    refute ProjectContractEvidence.reconciliation_required?(recovered.project_contract_evidence)
     assert Orchestrator.autonomous_dispatch_allowed_for_test?(recovered)
   end
 
@@ -69,13 +101,13 @@ defmodule SymphonyElixir.OrchestratorProjectContractTest do
     contract = contract!()
 
     :sys.replace_state(pid, fn state ->
-      %{state | attempt_ledger_status: :disabled, project_contract_authority: ProjectContractAuthority.new(contract)}
+      %{state | attempt_ledger_status: :disabled, project_contract_evidence: ProjectContractEvidence.new(contract)}
     end)
 
     assert {:ok, %ProviderProjectContract.ValidationResult{status: :valid}} =
              Orchestrator.reconcile_project_contract(name, snapshot())
 
-    assert :sys.get_state(pid).project_contract_authority.status == :valid
+    assert :sys.get_state(pid).project_contract_evidence.validation.status == :valid
   end
 
   test "changing the configured contract stops running work and clears pending retries" do
@@ -83,7 +115,7 @@ defmodule SymphonyElixir.OrchestratorProjectContractTest do
     retry_timer = Process.send_after(self(), :project_contract_retry, 60_000)
 
     state = %Orchestrator.State{
-      project_contract_authority: ProjectContractAuthority.new(contract),
+      project_contract_evidence: ProjectContractEvidence.new(contract),
       running: %{
         "running-issue" => %{
           pid: nil,
@@ -101,12 +133,60 @@ defmodule SymphonyElixir.OrchestratorProjectContractTest do
 
     changed = Orchestrator.reconfigure_project_contract_for_test(state, %{contract | project_id: "project-2"})
 
-    assert changed.project_contract_authority.status == :unvalidated
+    assert changed.project_contract_evidence.reason == :provider_configuration_changed
+    assert ProjectContractEvidence.reconciliation_required?(changed.project_contract_evidence)
     assert changed.running == %{}
     assert changed.retry_attempts == %{}
     assert changed.claimed == MapSet.new()
     assert changed.recent_attempts |> hd() |> Map.get(:termination_reason) == :provider_configuration_changed
     refute_receive :project_contract_retry, 0
+  end
+
+  test "removing an established contract keeps canonical authority fenced" do
+    contract = contract!()
+    issue = %Issue{id: "issue-1", identifier: "SYM-1", title: "Contract removal", state: "Ready"}
+
+    {:ok, work_item} =
+      WorkItem.from_issue(issue, %{
+        provider: :memory,
+        observed_at: DateTime.utc_now(),
+        prior_validated_lifecycle_state: :ready
+      })
+
+    state = %Orchestrator.State{
+      attempt_ledger_status: :disabled,
+      project_contract_evidence: ProjectContractEvidence.new(contract),
+      work_control: %{issue.id => work_item}
+    }
+
+    removed =
+      state
+      |> Orchestrator.reconcile_project_contract_for_test(snapshot())
+      |> Orchestrator.reconfigure_project_contract_for_test(nil)
+
+    refute Orchestrator.autonomous_dispatch_allowed_for_test?(removed)
+    assert removed.project_contract_evidence.reason == :provider_contract_removed
+    assert removed.work_control[issue.id].authority_disposition.status == :suspended
+    assert removed.work_control[issue.id].suspension_context.reason == :provider_contract_removed
+  end
+
+  test "removing a drift-suspended contract cannot clear the canonical fence" do
+    contract = contract!()
+
+    state = %Orchestrator.State{
+      attempt_ledger_status: :disabled,
+      project_contract_evidence: ProjectContractEvidence.new(contract)
+    }
+
+    removed =
+      state
+      |> Orchestrator.reconcile_project_contract_for_test(snapshot())
+      |> Orchestrator.reconcile_project_contract_for_test(Map.put(snapshot(), :workspace_id, "workspace-recreated"))
+      |> Orchestrator.reconfigure_project_contract_for_test(nil)
+
+    refute Orchestrator.autonomous_dispatch_allowed_for_test?(removed)
+    assert removed.project_contract_evidence.reason == :provider_contract_removed
+    assert ProjectContractEvidence.reconciliation_required?(removed.project_contract_evidence)
   end
 
   defp contract! do

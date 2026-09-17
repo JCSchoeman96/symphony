@@ -8,6 +8,7 @@ defmodule SymphonyElixir.WorkControlWorkItemTest do
     GuardClass,
     LifecycleAssessment,
     ProviderObservation,
+    SuspensionContext,
     WorkItem
   }
 
@@ -62,6 +63,43 @@ defmodule SymphonyElixir.WorkControlWorkItemTest do
     assert work_item.authority_disposition.status == :eligible
     assert WorkItem.dispatchable?(work_item)
     assert WorkItem.canonical_state(work_item) == :ready
+  end
+
+  test "project configuration drift suspends through canonical work-control authority" do
+    assert {:ok, work_item} =
+             WorkItem.from_issue(issue("Ready"), %{
+               provider: :memory,
+               observed_at: @now,
+               prior_validated_lifecycle_state: :ready
+             })
+
+    assert {:ok, suspended} = WorkItem.suspend(work_item, :provider_configuration_drift)
+
+    assert suspended.authority_disposition.status == :suspended
+    assert suspended.authority_disposition.reason == :provider_configuration_drift
+    assert %SuspensionContext{} = suspended.suspension_context
+    assert suspended.suspension_context.status == :open
+    assert suspended.suspension_context.reason == :provider_configuration_drift
+    refute WorkItem.authority_available?(suspended)
+  end
+
+  test "canonical suspension rejects invalid reasons and unavailable authority" do
+    assert {:ok, work_item} =
+             WorkItem.from_issue(issue("Ready"), %{
+               provider: :memory,
+               observed_at: @now,
+               prior_validated_lifecycle_state: :ready
+             })
+
+    assert {:error, :invalid_suspension_reason} = WorkItem.suspend(work_item, "drift")
+
+    unavailable = %{
+      work_item
+      | authority_disposition: %AuthorityDisposition{status: :none, lifecycle_state: :ready}
+    }
+
+    assert {:error, :authority_unavailable} =
+             WorkItem.suspend(unavailable, :provider_configuration_drift)
   end
 
   test "work item assessment requires matching semantic attestation context" do
