@@ -90,6 +90,33 @@ defmodule SymphonyElixir.OrchestratorProjectContractTest do
     assert Orchestrator.autonomous_dispatch_allowed_for_test?(recovered)
   end
 
+  test "provider snapshot transport failure reuses the canonical incomplete-contract fence" do
+    contract = contract!()
+
+    state = %Orchestrator.State{
+      attempt_ledger_status: :disabled,
+      project_contract_evidence: ProjectContractEvidence.new(contract)
+    }
+
+    validated = Orchestrator.reconcile_provider_project_snapshot_for_test(state, {:ok, snapshot()})
+    assert validated.project_contract_evidence.validation.status == :valid
+    assert Orchestrator.autonomous_dispatch_allowed_for_test?(validated)
+
+    unavailable =
+      Orchestrator.reconcile_provider_project_snapshot_for_test(
+        validated,
+        {:error, :provider_unavailable}
+      )
+
+    assert unavailable.project_contract_evidence.validation.status == :snapshot_incomplete
+    assert unavailable.project_contract_evidence.reason == :provider_contract_snapshot_incomplete
+    refute Orchestrator.autonomous_dispatch_allowed_for_test?(unavailable)
+
+    malformed = Orchestrator.reconcile_provider_project_snapshot_for_test(unavailable, :malformed)
+    assert malformed.project_contract_evidence.validation.status == :snapshot_incomplete
+    refute Orchestrator.autonomous_dispatch_allowed_for_test?(malformed)
+  end
+
   test "public reconciliation call hands a trusted snapshot to the orchestrator" do
     name = String.to_atom("project-contract-orchestrator-#{System.unique_integer([:positive])}")
     {:ok, pid} = Orchestrator.start_link(name: name)

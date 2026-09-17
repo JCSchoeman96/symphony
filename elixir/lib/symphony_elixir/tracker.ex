@@ -17,12 +17,14 @@ defmodule SymphonyElixir.Tracker do
     "gitlab" => SymphonyElixir.GitLab.Adapter,
     "jira" => SymphonyElixir.Jira.Adapter,
     "linear" => SymphonyElixir.Linear.Adapter,
-    "memory" => SymphonyElixir.Tracker.Memory
+    "memory" => SymphonyElixir.Tracker.Memory,
+    "plane" => SymphonyElixir.Plane.Adapter
   }
 
   @callback fetch_issues_by_states([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
   @callback fetch_issues_by_ids([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
   @callback fetch_dependency_graph() :: {:ok, term()} | {:error, term()}
+  @callback fetch_project_snapshot() :: {:ok, map()} | {:error, term()}
   @callback agent_tool_specs() :: [map()]
   @callback execute_agent_tool(String.t(), term(), keyword()) :: map()
   @callback secret_environment_names(map()) :: [String.t()]
@@ -32,6 +34,7 @@ defmodule SymphonyElixir.Tracker do
   @optional_callbacks agent_tool_specs: 0,
                       execute_agent_tool: 3,
                       fetch_dependency_graph: 0,
+                      fetch_project_snapshot: 0,
                       validate_config: 1,
                       capabilities: 0
 
@@ -53,6 +56,17 @@ defmodule SymphonyElixir.Tracker do
       adapter.fetch_dependency_graph()
     else
       {:error, :dependency_graph_unsupported}
+    end
+  end
+
+  @spec fetch_project_snapshot() :: {:ok, map()} | {:error, term()}
+  def fetch_project_snapshot do
+    adapter = adapter()
+
+    if Code.ensure_loaded?(adapter) and function_exported?(adapter, :fetch_project_snapshot, 0) do
+      adapter.fetch_project_snapshot()
+    else
+      {:error, :project_snapshot_unsupported}
     end
   end
 
@@ -189,18 +203,51 @@ defmodule SymphonyElixir.Tracker do
     compact_scope(%{project_gid: provider_value(tracker_settings.provider, "project_gid")})
   end
 
+  defp provider_scope("plane", tracker_settings) do
+    provider = Map.get(tracker_settings, :provider) || Map.get(tracker_settings, "provider") || %{}
+
+    compact_scope(%{
+      workspace_slug: plane_workspace_scope(provider, tracker_settings),
+      project_id: plane_project_scope(provider, tracker_settings)
+    })
+  end
+
   defp provider_scope(_kind, _tracker_settings), do: %{}
 
   defp provider_value(provider, key) when is_map(provider) do
-    case key do
-      "project_slug" -> Map.get(provider, "project_slug") || Map.get(provider, :project_slug)
-      "repo" -> Map.get(provider, "repo") || Map.get(provider, :repo)
-      "project_key" -> Map.get(provider, "project_key") || Map.get(provider, :project_key)
-      "project_gid" -> Map.get(provider, "project_gid") || Map.get(provider, :project_gid)
-    end
+    Map.get(provider, key) || Map.get(provider, provider_key_atom(key))
   end
 
   defp provider_value(_provider, _key), do: nil
+
+  defp provider_key_atom("project_slug"), do: :project_slug
+  defp provider_key_atom("repo"), do: :repo
+  defp provider_key_atom("project_key"), do: :project_key
+  defp provider_key_atom("project_gid"), do: :project_gid
+  defp provider_key_atom("workspace_slug"), do: :workspace_slug
+  defp provider_key_atom("workspace_id"), do: :workspace_id
+  defp provider_key_atom("project_id"), do: :project_id
+  defp provider_key_atom("project"), do: :project
+
+  defp plane_workspace_scope(provider, tracker_settings) do
+    provider_value(provider, "workspace_slug") ||
+      provider_value(provider, "workspace_id") ||
+      first_scope_value(tracker_settings, [:workspace_slug, "workspace_slug", :workspace_id, "workspace_id"])
+  end
+
+  defp plane_project_scope(provider, tracker_settings) do
+    provider_value(provider, "project_id") ||
+      provider_value(provider, "project") ||
+      first_scope_value(tracker_settings, [:project_id, "project_id"])
+  end
+
+  defp first_scope_value(map, keys), do: Enum.find_value(keys, &scope_value(Map.get(map, &1)))
+
+  defp scope_value(value) when is_binary(value) do
+    if String.trim(value) == "", do: nil, else: value
+  end
+
+  defp scope_value(_value), do: nil
 
   defp compact_scope(scope) do
     Enum.reduce(scope, %{}, fn

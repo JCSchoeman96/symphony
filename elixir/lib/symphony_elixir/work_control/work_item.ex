@@ -204,7 +204,7 @@ defmodule SymphonyElixir.WorkControl.WorkItem do
         _invalid_context -> %{}
       end
 
-    Enum.reduce([:runtime_attempt_id, :lineage_generation], context, fn key, context ->
+    Enum.reduce([:runtime_attempt_id, :lineage_generation, :provider_project_contract], context, fn key, context ->
       case Map.fetch(opts, key) do
         {:ok, value} -> Map.put(context, key, value)
         :error -> context

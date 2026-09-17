@@ -7,7 +7,7 @@ defmodule SymphonyElixir.WorkControl.LifecycleAssessment do
   observation is trusted for local authority.
   """
 
-  alias SymphonyElixir.WorkControl.{GuardClass, ProviderObservation, WorkflowLifecycle}
+  alias SymphonyElixir.WorkControl.{GuardClass, ProviderObservation, ProviderProjectContract, WorkflowLifecycle}
 
   defstruct [
     :work_item_id,
@@ -59,16 +59,33 @@ defmodule SymphonyElixir.WorkControl.LifecycleAssessment do
   @spec resolve_mapping(t()) ::
           {:ok, t()} | {:error, t()} | {:error, :assessment_already_resolved}
   def resolve_mapping(%__MODULE__{status: :unassessed} = assessment) do
-    case ProviderObservation.map_state(assessment.provider_observation) do
-      {:ok, state} ->
-        {:ok, %{assessment | status: :mapping_resolved, mapped_state: state}}
-
-      {:error, :unknown_provider_state} ->
-        {:error, finalize(assessment, :invalid, nil, nil, [], [], :unknown_mapping)}
-    end
+    resolve_mapping(assessment, %{})
   end
 
   def resolve_mapping(%__MODULE__{}), do: {:error, :assessment_already_resolved}
+
+  @spec resolve_mapping(t(), map()) ::
+          {:ok, t()} | {:error, t()} | {:error, :assessment_already_resolved}
+  def resolve_mapping(%__MODULE__{status: :unassessed} = assessment, context) when is_map(context) do
+    mapping_result =
+      case Map.get(context, :provider_project_contract) do
+        %ProviderProjectContract{} = contract ->
+          ProviderObservation.map_state(assessment.provider_observation, contract)
+
+        _missing_contract ->
+          ProviderObservation.map_state(assessment.provider_observation)
+      end
+
+    case mapping_result do
+      {:ok, state} ->
+        {:ok, %{assessment | status: :mapping_resolved, mapped_state: state}}
+
+      {:error, reason} when reason in [:unknown_provider_state, :unknown_state_mapping, :state_group_mismatch] ->
+        {:error, finalize(assessment, :invalid, nil, nil, [], [], mapping_reason(reason))}
+    end
+  end
+
+  def resolve_mapping(%__MODULE__{}, _context), do: {:error, :assessment_already_resolved}
 
   @spec assess(ProviderObservation.t(), WorkflowLifecycle.state() | nil, term()) :: t()
   def assess(%ProviderObservation{} = observation, prior_validated_state, evidence),
@@ -91,7 +108,7 @@ defmodule SymphonyElixir.WorkControl.LifecycleAssessment do
       when is_map(context) do
     evidence = normalize_evidence(evidence)
 
-    case resolve_mapping(assessment) do
+    case resolve_mapping(assessment, context) do
       {:ok, mapped_assessment} ->
         assess_mapped(
           mapped_assessment,
@@ -309,4 +326,8 @@ defmodule SymphonyElixir.WorkControl.LifecycleAssessment do
   defp normalize_evidence(evidence) when is_list(evidence), do: evidence
   defp normalize_evidence(evidence) when is_map(evidence), do: [evidence]
   defp normalize_evidence(_evidence), do: []
+
+  defp mapping_reason(:unknown_provider_state), do: :unknown_mapping
+  defp mapping_reason(:unknown_state_mapping), do: :unknown_state_mapping
+  defp mapping_reason(:state_group_mismatch), do: :state_group_mismatch
 end

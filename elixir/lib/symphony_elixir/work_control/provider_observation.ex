@@ -8,7 +8,7 @@ defmodule SymphonyElixir.WorkControl.ProviderObservation do
   """
 
   alias SymphonyElixir.Tracker.Issue
-  alias SymphonyElixir.WorkControl.WorkflowLifecycle
+  alias SymphonyElixir.WorkControl.{ProviderProjectContract, WorkflowLifecycle}
 
   defstruct [
     :provider,
@@ -83,17 +83,20 @@ defmodule SymphonyElixir.WorkControl.ProviderObservation do
 
   @spec from_issue(Issue.t(), map()) :: {:ok, t()} | {:error, atom()}
   def from_issue(%Issue{} = issue, opts) when is_map(opts) do
+    provider = Map.get(opts, :provider, :unknown)
+    observed_at = Map.get(opts, :observed_at, DateTime.utc_now())
+
     new(%{
-      provider: Map.get(opts, :provider, :unknown),
+      provider: provider,
       work_item_id: issue.id,
-      workspace_id: Map.get(opts, :workspace_id),
-      project_id: Map.get(opts, :project_id),
-      provider_state_id: Map.get(opts, :provider_state_id),
-      provider_state_group: Map.get(opts, :provider_state_group),
-      provider_state_name: issue.state,
-      provider_updated_at: issue.updated_at,
-      observed_at: Map.get(opts, :observed_at, DateTime.utc_now()),
-      snapshot_identity: Map.get(opts, :snapshot_identity)
+      workspace_id: Map.get(opts, :workspace_id) || issue.workspace_id,
+      project_id: Map.get(opts, :project_id) || issue.project_id,
+      provider_state_id: Map.get(opts, :provider_state_id) || issue.provider_state_id,
+      provider_state_group: Map.get(opts, :provider_state_group) || issue.provider_state_group,
+      provider_state_name: Map.get(opts, :provider_state_name) || issue.state,
+      provider_updated_at: Map.get(opts, :provider_updated_at) || issue.updated_at,
+      observed_at: observed_at,
+      snapshot_identity: Map.get(opts, :snapshot_identity) || default_snapshot_identity(provider, issue, observed_at)
     })
   end
 
@@ -103,6 +106,16 @@ defmodule SymphonyElixir.WorkControl.ProviderObservation do
       {:ok, state} -> {:ok, state}
       {:error, _reason} -> {:error, :unknown_provider_state}
     end
+  end
+
+  @spec map_state(t(), ProviderProjectContract.t()) ::
+          {:ok, WorkflowLifecycle.state()}
+          | {:error, :unknown_state_mapping | :state_group_mismatch}
+  def map_state(
+        %__MODULE__{provider_state_id: provider_state_id, provider_state_group: provider_state_group},
+        %ProviderProjectContract{} = contract
+      ) do
+    ProviderProjectContract.resolve_provider_state(contract, provider_state_id, provider_state_group)
   end
 
   @spec map_legacy_state(t()) :: {:ok, WorkflowLifecycle.state()} | {:error, :unknown_provider_state}
@@ -127,6 +140,20 @@ defmodule SymphonyElixir.WorkControl.ProviderObservation do
   end
 
   defp non_empty_binary?(value), do: is_binary(value) and String.trim(value) != ""
+
+  defp default_snapshot_identity(provider, %Issue{} = issue, observed_at)
+       when provider in [:plane, "plane"] do
+    %{
+      provider: :plane,
+      workspace_id: issue.workspace_id,
+      project_id: issue.project_id,
+      work_item_id: issue.id,
+      provider_updated_at: issue.updated_at,
+      observed_at: observed_at
+    }
+  end
+
+  defp default_snapshot_identity(_provider, _issue, _observed_at), do: nil
 
   defp normalize_state_name(state) do
     state
