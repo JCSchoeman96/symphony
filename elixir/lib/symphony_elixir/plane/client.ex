@@ -295,18 +295,26 @@ defmodule SymphonyElixir.Plane.Client do
   defp perform_request(config, %{path: path, params: params, headers: headers}) do
     url = config.base_url <> path
 
-    case Req.request(
-           method: :get,
-           url: url,
-           headers: headers,
-           params: params,
-           connect_options: [timeout: @connect_timeout_ms],
-           receive_timeout: @receive_timeout_ms,
-           retry: false,
-           into: &bounded_response_body/2
-         ) do
-      {:ok, response} -> normalize_response(%{status: response.status, headers: response.headers, body: response.body})
-      {:error, reason} -> {:error, transport_error(reason)}
+    req_options = [
+      method: :get,
+      url: url,
+      headers: headers,
+      params: params,
+      connect_options: [timeout: @connect_timeout_ms],
+      receive_timeout: @receive_timeout_ms,
+      compressed: false,
+      raw: true,
+      retry: false,
+      redirect: false,
+      into: &bounded_response_body/2
+    ]
+
+    case Req.request(req_options) do
+      {:ok, %{status: status, headers: response_headers, body: body}} ->
+        normalize_response(%{status: status, headers: response_headers, body: body})
+
+      {:error, reason} ->
+        {:error, transport_error(reason)}
     end
   end
 
