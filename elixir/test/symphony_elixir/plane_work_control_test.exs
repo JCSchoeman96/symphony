@@ -37,6 +37,32 @@ defmodule SymphonyElixir.PlaneWorkControlTest do
     refute Map.has_key?(work_item.provider_observation, :validated_lifecycle_state)
   end
 
+  test "fresh observations keep provider update time separate from host observation time" do
+    provider_updated_at = ~U[2026-01-01 00:00:00Z]
+    observed_at = ~U[2026-09-17 08:09:10Z]
+
+    issue = %Issue{
+      id: "item-1",
+      state: "Ready",
+      workspace_id: "workspace-stable-1",
+      project_id: "project-1",
+      provider_state_id: "state-ready",
+      provider_state_group: :unstarted,
+      updated_at: provider_updated_at
+    }
+
+    assert {:ok, work_item} =
+             WorkItem.from_issue(issue, %{
+               provider: :plane,
+               observed_at: observed_at,
+               provider_project_contract: contract!()
+             })
+
+    assert work_item.provider_observation.provider_updated_at == provider_updated_at
+    assert work_item.provider_observation.observed_at == observed_at
+    assert DateTime.compare(work_item.provider_observation.observed_at, provider_updated_at) == :gt
+  end
+
   test "unknown IDs and changed groups fail closed even when the display name is unchanged" do
     contract = contract!()
 

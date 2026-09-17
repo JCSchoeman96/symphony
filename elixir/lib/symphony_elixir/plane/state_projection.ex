@@ -17,9 +17,10 @@ defmodule SymphonyElixir.Plane.StateProjection do
   @spec project_work_item(map(), map()) :: {:ok, map()} | {:error, term()}
   def project_work_item(raw_item, expected_scope) when is_map(raw_item) and is_map(expected_scope) do
     with {:ok, workspace_id} <- expected_identifier(expected_scope, :workspace_id),
+         {:ok, workspace_slug} <- expected_optional_identifier(expected_scope, :workspace_slug),
          {:ok, project_id} <- expected_identifier(expected_scope, :project_id),
          {:ok, id} <- required_identifier(raw_item, [:id, :uuid]),
-         :ok <- validate_scope(raw_item, workspace_id, project_id),
+         :ok <- validate_scope(raw_item, workspace_id, workspace_slug, project_id),
          {:ok, state} <- project_state_from_item(raw_item),
          {:ok, updated_at} <- required_datetime(raw_value(raw_item, :updated_at), :updated_at),
          {:ok, created_at} <- optional_datetime(raw_value(raw_item, :created_at), :created_at) do
@@ -27,6 +28,7 @@ defmodule SymphonyElixir.Plane.StateProjection do
        %{
          id: id,
          workspace_id: workspace_id,
+         workspace_slug: workspace_slug,
          project_id: project_id,
          provider_state_id: state.id,
          provider_state_group: state.group,
@@ -46,6 +48,7 @@ defmodule SymphonyElixir.Plane.StateProjection do
          dependency_completeness: {:unavailable, :dependency_graph_unsupported},
          native_ref: %{
            "workspace_id" => workspace_id,
+           "workspace_slug" => workspace_slug,
            "project_id" => project_id,
            "work_item_id" => id,
            "provider_state_id" => state.id,
@@ -71,12 +74,12 @@ defmodule SymphonyElixir.Plane.StateProjection do
   @spec project_project(map()) :: {:ok, map()} | {:error, term()}
   def project_project(raw_project) when is_map(raw_project) do
     with {:ok, project_id} <- required_identifier(raw_project, [:id, :uuid]),
-         {:ok, workspace_id} <- project_workspace(raw_project),
          {:ok, name} <- optional_required_text(first_value(raw_project, [:name, :identifier]), :name) do
       {:ok,
        %{
          provider: :plane,
-         workspace_id: workspace_id,
+         workspace_id: first_text(raw_project, [:workspace_id]),
+         workspace_slug: first_text(raw_project, [:workspace_slug]),
          project_id: project_id,
          name: name,
          workspace_name: project_workspace_name(raw_project),
@@ -108,37 +111,34 @@ defmodule SymphonyElixir.Plane.StateProjection do
     end
   end
 
-  defp project_workspace(raw_project) do
-    workspace = raw_value(raw_project, :workspace)
-
-    workspace_id =
-      first_text(raw_project, [:workspace_slug, :workspace_id]) ||
-        if(is_map(workspace), do: first_text(workspace, [:slug, :id]), else: nil)
-
-    if present?(workspace_id), do: {:ok, workspace_id}, else: {:error, {:provider_malformed, :missing_workspace}}
-  end
-
   defp project_workspace_name(raw_project) do
     first_text(raw_project, [:workspace_name]) ||
       nested_text(raw_value(raw_project, :workspace), [:name])
   end
 
-  defp validate_scope(raw_item, workspace_id, project_id) do
+  defp validate_scope(raw_item, workspace_id, workspace_slug, project_id) do
     returned_projects =
       scope_values([
         first_text(raw_item, [:project_id]),
         nested_text(raw_value(raw_item, :project), [:id, :uuid])
       ])
 
-    returned_workspaces =
+    returned_workspace_ids =
       scope_values([
-        first_text(raw_item, [:workspace_slug, :workspace_id]),
-        nested_text(raw_value(raw_item, :workspace), [:slug, :id])
+        first_text(raw_item, [:workspace_id]),
+        nested_text(raw_value(raw_item, :workspace), [:id])
+      ])
+
+    returned_workspace_slugs =
+      scope_values([
+        first_text(raw_item, [:workspace_slug]),
+        nested_text(raw_value(raw_item, :workspace), [:slug])
       ])
 
     cond do
       Enum.any?(returned_projects, &(&1 != project_id)) -> {:error, :wrong_project}
-      Enum.any?(returned_workspaces, &(&1 != workspace_id)) -> {:error, :wrong_project}
+      Enum.any?(returned_workspace_ids, &(&1 != workspace_id)) -> {:error, :wrong_project}
+      present?(workspace_slug) and Enum.any?(returned_workspace_slugs, &(&1 != workspace_slug)) -> {:error, :wrong_project}
       true -> :ok
     end
   end
@@ -146,7 +146,7 @@ defmodule SymphonyElixir.Plane.StateProjection do
   defp scope_values(values), do: Enum.filter(values, &present?/1)
 
   defp expected_identifier(scope, key) do
-    case first_value(scope, [key, alternate_scope_key(key)]) do
+    case first_value(scope, [key]) do
       value when is_binary(value) ->
         value = String.trim(value)
         if value == "", do: {:error, {:provider_malformed, {:missing_scope, key}}}, else: {:ok, value}
@@ -156,8 +156,19 @@ defmodule SymphonyElixir.Plane.StateProjection do
     end
   end
 
-  defp alternate_scope_key(:workspace_id), do: :workspace_slug
-  defp alternate_scope_key(:project_id), do: :project
+  defp expected_optional_identifier(scope, key) do
+    case first_value(scope, [key]) do
+      nil ->
+        {:ok, nil}
+
+      value when is_binary(value) ->
+        value = String.trim(value)
+        if value == "", do: {:error, {:provider_malformed, {:invalid_scope, key}}}, else: {:ok, value}
+
+      _value ->
+        {:error, {:provider_malformed, {:invalid_scope, key}}}
+    end
+  end
 
   defp required_identifier(raw, keys) do
     case first_text(raw, keys) do

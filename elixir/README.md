@@ -287,6 +287,16 @@ codex:
   `tracker_payload`, and missing cursors to `tracker_pagination`; logs and tool responses carry the
   human-readable provider detail.
 
+### Plane adapter profile
+
+- Config: use `tracker.kind: plane` with `tracker.provider.workspace_slug` for the Plane REST
+  path, an explicit stable `tracker.provider.workspace_id`, and `tracker.provider.project_id`.
+  `tracker.provider.api_key` must be `$PLANE_API_KEY` (or be supplied host-side); literal tokens
+  are rejected. The endpoint is the host-controlled `https://api.plane.so` default.
+- P-030 is read-only and currently supports only fresh issue refresh. Legacy Plane orchestration
+  is rejected, and routed configuration remains fail-closed until its complete capability contract
+  is implemented. Plane reads never grant lifecycle authority or completion proof.
+
 ### GitHub Issues adapter
 
 - Config: use `tracker.kind: github` with required `tracker.provider.repo` in `owner/repo` form,

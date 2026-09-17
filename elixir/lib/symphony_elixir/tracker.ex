@@ -208,6 +208,7 @@ defmodule SymphonyElixir.Tracker do
 
     compact_scope(%{
       workspace_slug: plane_workspace_scope(provider, tracker_settings),
+      workspace_id: plane_workspace_id(provider, tracker_settings),
       project_id: plane_project_scope(provider, tracker_settings)
     })
   end
@@ -231,8 +232,12 @@ defmodule SymphonyElixir.Tracker do
 
   defp plane_workspace_scope(provider, tracker_settings) do
     provider_value(provider, "workspace_slug") ||
-      provider_value(provider, "workspace_id") ||
-      first_scope_value(tracker_settings, [:workspace_slug, "workspace_slug", :workspace_id, "workspace_id"])
+      first_scope_value(tracker_settings, [:workspace_slug, "workspace_slug"])
+  end
+
+  defp plane_workspace_id(provider, tracker_settings) do
+    provider_value(provider, "workspace_id") ||
+      first_scope_value(tracker_settings, [:workspace_id, "workspace_id"])
   end
 
   defp plane_project_scope(provider, tracker_settings) do

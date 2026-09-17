@@ -1998,7 +1998,7 @@ defmodule SymphonyElixir.Orchestrator do
 
     opts = %{
       provider: Config.settings!().tracker.kind,
-      observed_at: issue.updated_at || DateTime.utc_now(),
+      observed_at: DateTime.utc_now(),
       prior_validated_lifecycle_state: prior_validated_state(previous),
       prior_authority_disposition: prior_authority_disposition(previous),
       evidence: evidence_for_observation(issue, previous),

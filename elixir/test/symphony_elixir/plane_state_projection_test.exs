@@ -3,7 +3,7 @@ defmodule SymphonyElixir.PlaneStateProjectionTest do
 
   alias SymphonyElixir.Plane.StateProjection
 
-  @scope %{workspace_id: "workspace-1", project_id: "project-1"}
+  @scope %{workspace_slug: "workspace-slug-1", workspace_id: "workspace-id-1", project_id: "project-1"}
 
   test "projects a work item without turning the provider name into canonical lifecycle authority" do
     assert {:ok, projected} =
@@ -14,13 +14,15 @@ defmodule SymphonyElixir.PlaneStateProjectionTest do
                  "state" => %{"id" => "state-ready", "name" => "Ready for work", "group" => "unstarted"},
                  "updated_at" => "2026-09-17T08:09:10Z",
                  "project_id" => "project-1",
-                 "workspace" => %{"slug" => "workspace-1"}
+                 "workspace_slug" => "workspace-slug-1",
+                 "workspace_id" => "workspace-id-1"
                },
                @scope
              )
 
     assert projected.id == "item-1"
-    assert projected.workspace_id == "workspace-1"
+    assert projected.workspace_id == "workspace-id-1"
+    assert projected.workspace_slug == "workspace-slug-1"
     assert projected.project_id == "project-1"
     assert projected.provider_state_id == "state-ready"
     assert projected.provider_state_group == :unstarted
@@ -63,12 +65,13 @@ defmodule SymphonyElixir.PlaneStateProjectionTest do
              StateProjection.project_project(%{
                "id" => "project-1",
                "name" => "Project",
-               "workspace" => %{"slug" => "workspace-1", "name" => "Workspace"}
+               "workspace_slug" => "workspace-slug-1"
              })
 
     assert project.project_id == "project-1"
-    assert project.workspace_id == "workspace-1"
-    assert project.workspace_name == "Workspace"
+    assert project.workspace_id == nil
+    assert project.workspace_slug == "workspace-slug-1"
+    assert project.workspace_name == nil
     assert project.name == "Project"
   end
 
@@ -145,13 +148,13 @@ defmodule SymphonyElixir.PlaneStateProjectionTest do
     assert {:error, {:provider_malformed, {:invalid_field, :name}}} =
              StateProjection.project_state(%{"id" => "state-1", "name" => 42, "group" => "started"})
 
-    assert {:error, {:provider_malformed, :missing_workspace}} =
+    assert {:ok, %{project_id: "project-1", workspace_id: nil}} =
              StateProjection.project_project(%{"id" => "project-1"})
 
     assert {:error, {:provider_malformed, {:invalid_field, :name}}} =
              StateProjection.project_project(%{"id" => "project-1", "workspace" => %{"slug" => "workspace-1"}, "name" => 42})
 
     assert {:ok, %{name: nil}} =
-             StateProjection.project_project(%{"id" => "project-1", "workspace_id" => "workspace-1"})
+             StateProjection.project_project(%{"id" => "project-1", "workspace_id" => "workspace-id-1"})
   end
 end

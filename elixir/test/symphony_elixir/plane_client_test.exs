@@ -3,7 +3,13 @@ defmodule SymphonyElixir.PlaneClientTest do
 
   alias SymphonyElixir.Plane.Client
 
-  @config %{base_url: "https://api.plane.so", workspace_id: "workspace-1", project_id: "project-1", api_key: "secret"}
+  @config %{
+    base_url: "https://api.plane.so",
+    workspace_slug: "workspace-1",
+    workspace_id: "workspace-id-1",
+    project_id: "project-1",
+    api_key: "secret"
+  }
 
   test "uses bounded GET requests with scoped paths and state expansion" do
     parent = self()
@@ -18,7 +24,7 @@ defmodule SymphonyElixir.PlaneClientTest do
 
     assert_receive {:request, %{method: :get, path: path, params: params, headers: headers}}
     assert path == "/api/v1/workspaces/workspace-1/projects/project-1/work-items/item-1/"
-    assert params == %{"fields" => "state", "expand" => "state"}
+    assert params == %{"expand" => "state"}
     assert {"X-API-Key", "secret"} in headers
   end
 
@@ -30,10 +36,30 @@ defmodule SymphonyElixir.PlaneClientTest do
 
       case request.params["cursor"] do
         nil ->
-          {:ok, %{status: 200, body: %{"results" => [%{"id" => "one"}], "next_page_results" => true, "next_cursor" => "c1"}}}
+          {:ok,
+           %{
+             status: 200,
+             body: %{
+               "results" => [%{"id" => "one"}],
+               "count" => 1,
+               "total_results" => 2,
+               "next_page_results" => true,
+               "next_cursor" => "c1"
+             }
+           }}
 
         "c1" ->
-          {:ok, %{status: 200, body: %{"results" => [%{"id" => "two"}], "next_page_results" => false, "next_cursor" => nil}}}
+          {:ok,
+           %{
+             status: 200,
+             body: %{
+               "results" => [%{"id" => "two"}],
+               "count" => 1,
+               "total_results" => 2,
+               "next_page_results" => false,
+               "next_cursor" => nil
+             }
+           }}
       end
     end
 
@@ -43,13 +69,139 @@ defmodule SymphonyElixir.PlaneClientTest do
     assert_receive {:request, %{params: first_params}}
     assert first_params["per_page"] == 100
     assert first_params["expand"] == "state"
+    refute Map.has_key?(first_params, "fields")
     assert_receive {:request, %{params: second_params}}
     assert second_params["cursor"] == "c1"
 
     assert {:error, :snapshot_incomplete} =
              Client.list_work_items(@config,
                request_fun: fn _request ->
-                 {:ok, %{status: 200, body: %{"results" => [], "next_page_results" => true, "next_cursor" => nil}}}
+                 {:ok,
+                  %{
+                    status: 200,
+                    body: %{
+                      "results" => [],
+                      "count" => 0,
+                      "total_results" => 1,
+                      "next_page_results" => true,
+                      "next_cursor" => nil
+                    }
+                  }}
+               end
+             )
+
+    assert {:error, :snapshot_incomplete} =
+             Client.list_work_items(@config,
+               request_fun: fn request ->
+                 body =
+                   case request.params["cursor"] do
+                     nil ->
+                       %{
+                         "results" => [%{"id" => "one"}],
+                         "count" => 1,
+                         "total_results" => 2,
+                         "next_page_results" => true,
+                         "next_cursor" => "c1"
+                       }
+
+                     "c1" ->
+                       %{
+                         "results" => [%{"id" => "two"}],
+                         "next_page_results" => false,
+                         "next_cursor" => nil
+                       }
+                   end
+
+                 {:ok, %{status: 200, body: body}}
+               end
+             )
+  end
+
+  test "rejects contradictory pagination metadata instead of accepting a partial snapshot" do
+    assert {:error, :provider_malformed} =
+             Client.list_work_items(@config,
+               request_fun: fn _request ->
+                 {:ok,
+                  %{
+                    status: 200,
+                    body: %{
+                      "results" => [%{"id" => "one"}],
+                      "count" => 2,
+                      "total_results" => 1,
+                      "next_page_results" => false,
+                      "next_cursor" => nil
+                    }
+                  }}
+               end
+             )
+
+    assert {:error, :snapshot_incomplete} =
+             Client.list_work_items(@config,
+               request_fun: fn request ->
+                 body =
+                   case request.params["cursor"] do
+                     nil ->
+                       %{
+                         "results" => [%{"id" => "one"}],
+                         "count" => 1,
+                         "total_results" => 2,
+                         "next_page_results" => true,
+                         "next_cursor" => "c1"
+                       }
+
+                     "c1" ->
+                       %{
+                         "results" => [%{"id" => "two"}],
+                         "count" => 1,
+                         "total_results" => 3,
+                         "next_page_results" => false,
+                         "next_cursor" => nil
+                       }
+                   end
+
+                 {:ok, %{status: 200, body: body}}
+               end
+             )
+
+    assert {:error, :snapshot_incomplete} =
+             Client.list_work_items(@config,
+               request_fun: fn _request ->
+                 {:ok,
+                  %{
+                    status: 200,
+                    body: %{
+                      "results" => [%{"id" => "one"}],
+                      "count" => 1,
+                      "total_results" => 2,
+                      "next_page_results" => false,
+                      "next_cursor" => nil
+                    }
+                  }}
+               end
+             )
+  end
+
+  test "does not return earlier pages when a later page fails" do
+    assert {:error, :provider_unavailable} =
+             Client.list_work_items(@config,
+               request_fun: fn request ->
+                 case request.params["cursor"] do
+                   nil ->
+                     {:ok,
+                      %{
+                        status: 200,
+                        body: %{
+                          "results" => [%{"id" => "one"}],
+                          "count" => 1,
+                          "total_results" => 2,
+                          "next_page_results" => true,
+                          "next_cursor" => "c1"
+                        }
+                      }}
+
+                   "c1" ->
+                     {:error, :timeout}
+                 end
                end
              )
   end
@@ -63,6 +215,8 @@ defmodule SymphonyElixir.PlaneClientTest do
              status: 200,
              body: %{
                "results" => [%{"id" => "s1"}],
+               "count" => 1,
+               "total_results" => 2,
                "next_page_results" => true,
                "next_cursor" => "state-page-2"
              }
@@ -72,7 +226,13 @@ defmodule SymphonyElixir.PlaneClientTest do
           {:ok,
            %{
              status: 200,
-             body: %{"results" => [%{"id" => "s2"}], "next_page_results" => false, "next_cursor" => nil}
+             body: %{
+               "results" => [%{"id" => "s2"}],
+               "count" => 1,
+               "total_results" => 2,
+               "next_page_results" => false,
+               "next_cursor" => nil
+             }
            }}
       end
     end
@@ -89,7 +249,16 @@ defmodule SymphonyElixir.PlaneClientTest do
     assert {:error, :provider_malformed} =
              Client.list_states(@config,
                request_fun: fn _request ->
-                 {:ok, %{status: 200, body: %{"results" => [%{"id" => "ok"}, :bad], "next_page_results" => false}}}
+                 {:ok,
+                  %{
+                    status: 200,
+                    body: %{
+                      "results" => [%{"id" => "ok"}, :bad],
+                      "count" => 2,
+                      "total_results" => 2,
+                      "next_page_results" => false
+                    }
+                  }}
                end
              )
 
@@ -98,7 +267,16 @@ defmodule SymphonyElixir.PlaneClientTest do
     assert {:error, :snapshot_incomplete} =
              Client.list_states(@config,
                request_fun: fn _request ->
-                 {:ok, %{status: 200, body: %{"results" => too_many_states, "next_page_results" => false}}}
+                 {:ok,
+                  %{
+                    status: 200,
+                    body: %{
+                      "results" => too_many_states,
+                      "count" => 65,
+                      "total_results" => 65,
+                      "next_page_results" => false
+                    }
+                  }}
                end
              )
   end
@@ -130,6 +308,16 @@ defmodule SymphonyElixir.PlaneClientTest do
 
     assert {:error, :provider_unavailable} =
              Client.get_project(@config, request_fun: fn _request -> {:error, :timeout} end)
+
+    assert {:error, {:rate_limited, %{retry_after: nil}}} =
+             Client.get_project(@config,
+               request_fun: fn _request ->
+                 {:ok, %{status: 429, headers: %{"retry-after" => "-1"}, body: %{}}}
+               end
+             )
+
+    assert {:error, :provider_unavailable} =
+             Client.get_project(@config, request_fun: fn _request -> :invalid_response end)
   end
 
   test "rejects unsafe production base URLs while allowing HTTP only through an injected test request" do
@@ -153,6 +341,20 @@ defmodule SymphonyElixir.PlaneClientTest do
                request_fun: fn _request -> {:ok, %{status: 200, body: "not-json"}} end
              )
 
+    assert {:error, :provider_response_too_large} =
+             Client.get_project(@config,
+               request_fun: fn _request ->
+                 {:ok, %{status: 200, body: String.duplicate("x", 4_000_001)}}
+               end
+             )
+
+    assert {:error, :provider_response_too_large} =
+             Client.list_work_items(@config,
+               request_fun: fn _request ->
+                 {:ok, %{status: 200, body: String.duplicate("x", 4_000_001)}}
+               end
+             )
+
     assert {:error, :provider_malformed} =
              Client.get_project(@config,
                request_fun: fn _request -> {:ok, %{status: 200, body: []}} end
@@ -166,7 +368,7 @@ defmodule SymphonyElixir.PlaneClientTest do
     assert {:error, :invalid_scope} =
              Client.get_work_item(@config, "", request_fun: fn _request -> {:ok, %{status: 200, body: %{}}} end)
 
-    assert {:error, :invalid_scope} = Client.get_project(%{@config | workspace_id: ""}, request_fun: fn _ -> :ok end)
+    assert {:error, :invalid_scope} = Client.get_project(%{@config | workspace_slug: ""}, request_fun: fn _ -> :ok end)
     assert {:error, :missing_credential} = Client.get_project(%{@config | api_key: nil}, request_fun: fn _ -> :ok end)
     assert {:error, :provider_unavailable} = Client.get_project(@config, request_fun: :not_a_function)
   end
@@ -209,6 +411,10 @@ defmodule SymphonyElixir.PlaneClientTest do
              Client.get_project(@config,
                request_fun: fn _request -> {:ok, %{status: 429, headers: :not_headers, body: %{}}} end
              )
+  end
+
+  test "rejects non-map client configuration before transport" do
+    assert {:error, :invalid_configuration} = Client.validate_config(:invalid)
   end
 
   test "rejects malformed pagination and transport-double shapes" do

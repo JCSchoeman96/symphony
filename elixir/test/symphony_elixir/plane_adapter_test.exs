@@ -8,7 +8,7 @@ defmodule SymphonyElixir.PlaneAdapterTest do
     kind: "plane",
     api_key: "secret",
     endpoint: "https://api.plane.so",
-    provider: %{"workspace_slug" => "workspace-1", "project_id" => "project-1", "api_key" => "$PLANE_API_KEY"},
+    provider: %{"workspace_slug" => "workspace-1", "workspace_id" => "workspace-stable-1", "project_id" => "project-1", "api_key" => "$PLANE_API_KEY"},
     secret_environment_names: ["PLANE_API_KEY"]
   }
 
@@ -40,7 +40,7 @@ defmodule SymphonyElixir.PlaneAdapterTest do
     assert {:ok, [%Issue{} = first]} = Adapter.fetch_issues_by_ids_for_test(["item-1"], @settings, request_fun)
     assert {:ok, [%Issue{} = second]} = Adapter.fetch_issues_by_ids_for_test(["item-1"], @settings, request_fun)
     assert first.id == second.id
-    assert first.workspace_id == "workspace-1"
+    assert first.workspace_id == "workspace-stable-1"
     assert first.project_id == "project-1"
     assert first.provider_state_id == "state-ready"
     assert first.provider_state_group == :unstarted
@@ -106,7 +106,7 @@ defmodule SymphonyElixir.PlaneAdapterTest do
                "name" => "Project",
                "identifier" => "PROJ",
                "description" => "Description",
-               "workspace" => %{"slug" => "workspace-1", "name" => "Workspace"}
+               "workspace_slug" => "workspace-1"
              }
            }}
 
@@ -127,15 +127,33 @@ defmodule SymphonyElixir.PlaneAdapterTest do
 
     assert {:ok, snapshot} = Adapter.fetch_project_snapshot_for_test(@settings, request_fun)
     assert snapshot.provider == :plane
-    assert snapshot.workspace_id == "workspace-1"
+    assert snapshot.workspace_id == "workspace-stable-1"
     assert snapshot.project_id == "project-1"
-    assert snapshot.workspace_name == "Workspace"
+    assert snapshot.workspace_name == nil
     assert snapshot.project_identifier == "PROJ"
     assert snapshot.project_description == "Description"
     assert snapshot.completeness == :complete
     assert hd(snapshot.states) == %{id: "state-ready", name: "Ready", group: :unstarted}
     assert snapshot.capability_statuses.current_issue_refresh == :supported
     assert snapshot.capability_statuses.dependency_graph == :unsupported
+  end
+
+  test "rejects a project response with a contradictory stable workspace or project ID" do
+    for project <- [
+          %{"id" => "project-1", "workspace_id" => "other-stable-workspace"},
+          %{"id" => "other-project", "name" => "Project"}
+        ] do
+      assert {:error, :wrong_project} =
+               Adapter.fetch_project_snapshot_for_test(@settings, fn request ->
+                 case request.path do
+                   "/api/v1/workspaces/workspace-1/projects/project-1/" ->
+                     {:ok, %{status: 200, body: project}}
+
+                   _states_path ->
+                     {:ok, %{status: 200, body: %{"results" => [], "next_page_results" => false}}}
+                 end
+               end)
+    end
   end
 
   test "validates Plane scope, host credential references and operator endpoint boundaries" do
@@ -145,6 +163,9 @@ defmodule SymphonyElixir.PlaneAdapterTest do
     assert {:error, :missing_plane_project_id} =
              Adapter.validate_config(%{kind: "plane", api_key: "secret", workspace_slug: "workspace-1"})
 
+    assert {:error, :missing_plane_workspace_id} =
+             Adapter.validate_config(%{kind: "plane", api_key: "secret", workspace_slug: "workspace-1", project_id: "project-1"})
+
     assert {:error, :missing_plane_api_key} =
              Adapter.validate_config(%{kind: "plane", workspace_slug: "workspace-1", project_id: "project-1"})
 
@@ -153,6 +174,7 @@ defmodule SymphonyElixir.PlaneAdapterTest do
                kind: "plane",
                api_key: "$OTHER_TOKEN",
                workspace_slug: "workspace-1",
+               workspace_id: "workspace-stable-1",
                project_id: "project-1",
                provider: %{"api_key" => "$OTHER_TOKEN"}
              })
@@ -162,6 +184,7 @@ defmodule SymphonyElixir.PlaneAdapterTest do
                kind: "plane",
                api_key: "literal",
                workspace_slug: "workspace-1",
+               workspace_id: "workspace-stable-1",
                project_id: "project-1",
                provider: %{"api_key" => "literal"}
              })
@@ -189,6 +212,20 @@ defmodule SymphonyElixir.PlaneAdapterTest do
                   body: %{
                     "id" => "foreign",
                     "project_id" => "other-project",
+                    "state" => %{"id" => "state-1", "name" => "Ready", "group" => "unstarted"},
+                    "updated_at" => "2026-09-17T08:09:10Z"
+                  }
+                }}
+             end)
+
+    assert {:error, :wrong_project} =
+             Adapter.fetch_issues_by_ids_for_test(["foreign-workspace"], @settings, fn _request ->
+               {:ok,
+                %{
+                  status: 200,
+                  body: %{
+                    "id" => "foreign-workspace",
+                    "workspace_id" => "other-stable-workspace",
                     "state" => %{"id" => "state-1", "name" => "Ready", "group" => "unstarted"},
                     "updated_at" => "2026-09-17T08:09:10Z"
                   }
@@ -227,9 +264,9 @@ defmodule SymphonyElixir.PlaneAdapterTest do
     settings = %{
       "kind" => "plane",
       "api_key" => "secret",
-      "provider" => %{"api_key" => "$PLANE_API_KEY"},
+      "provider" => %{"workspace_slug" => "workspace-1", "workspace_id" => "workspace-stable-1", "api_key" => "$PLANE_API_KEY"},
       "secret_environment_names" => ["PLANE_API_KEY"],
-      "provider_project_contract" => %{"workspace_id" => "workspace-1", "project_id" => "project-1"}
+      "provider_project_contract" => %{"workspace_id" => "workspace-stable-1", "project_id" => "project-1"}
     }
 
     assert {:ok, [%Issue{id: "item-1"}]} =

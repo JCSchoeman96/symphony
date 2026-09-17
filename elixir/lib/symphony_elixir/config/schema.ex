@@ -556,9 +556,10 @@ defmodule SymphonyElixir.Config.Schema do
        ) do
     provider =
       provider
-      |> put_if_absent("workspace_slug", tracker.workspace_slug || tracker.workspace_id)
+      |> put_if_absent("workspace_slug", tracker.workspace_slug)
+      |> put_if_absent("workspace_id", tracker.workspace_id)
       |> put_if_absent("project_id", tracker.project_id)
-      |> put_if_absent("workspace_slug", contract.workspace_id)
+      |> put_if_absent("workspace_id", contract.workspace_id)
       |> put_if_absent("project_id", contract.project_id)
 
     %{settings | tracker: %{tracker | provider: provider}}

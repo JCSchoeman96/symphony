@@ -190,17 +190,21 @@ defmodule SymphonyElixir.Plane.Adapter do
 
   defp client_config(tracker_settings) when is_map(tracker_settings) do
     provider = provider_settings(tracker_settings)
-    {workspace_id, project_id} = configured_scope(tracker_settings, provider)
+    {workspace_slug, workspace_id, project_id} = configured_scope(tracker_settings, provider)
     api_key = configured_api_key(tracker_settings)
     base_url = Application.get_env(:symphony_elixir, :plane_api_base_url, Client.default_base_url())
 
-    validate_client_config(base_url, workspace_id, project_id, api_key)
+    validate_client_config(base_url, workspace_slug, workspace_id, project_id, api_key)
   end
 
   defp configured_scope(tracker_settings, provider) do
+    workspace_slug =
+      first_string(provider, ["workspace_slug", :workspace_slug]) ||
+        first_string(tracker_settings, [:workspace_slug, "workspace_slug"])
+
     workspace_id =
-      first_string(provider, ["workspace_slug", "workspace_id", :workspace_slug, :workspace_id]) ||
-        first_string(tracker_settings, [:workspace_slug, :workspace_id, "workspace_slug", "workspace_id"]) ||
+      first_string(provider, ["workspace_id", :workspace_id]) ||
+        first_string(tracker_settings, [:workspace_id, "workspace_id"]) ||
         contract_value(tracker_settings, :workspace_id)
 
     project_id =
@@ -208,7 +212,7 @@ defmodule SymphonyElixir.Plane.Adapter do
         first_string(tracker_settings, [:project_id, "project_id", "project"]) ||
         contract_value(tracker_settings, :project_id)
 
-    {workspace_id, project_id}
+    {workspace_slug, workspace_id, project_id}
   end
 
   defp configured_api_key(tracker_settings) do
@@ -217,12 +221,29 @@ defmodule SymphonyElixir.Plane.Adapter do
       System.get_env(@plane_api_key_env)
   end
 
-  defp validate_client_config(base_url, workspace_id, project_id, api_key) do
+  defp validate_client_config(base_url, workspace_slug, workspace_id, project_id, api_key) do
     cond do
-      not present?(workspace_id) -> {:error, :missing_plane_workspace_slug}
-      not present?(project_id) -> {:error, :missing_plane_project_id}
-      not present?(api_key) -> {:error, :missing_plane_api_key}
-      true -> {:ok, %{base_url: base_url, workspace_id: workspace_id, project_id: project_id, api_key: api_key}}
+      not present?(workspace_slug) ->
+        {:error, :missing_plane_workspace_slug}
+
+      not present?(project_id) ->
+        {:error, :missing_plane_project_id}
+
+      not present?(api_key) ->
+        {:error, :missing_plane_api_key}
+
+      not present?(workspace_id) ->
+        {:error, :missing_plane_workspace_id}
+
+      true ->
+        {:ok,
+         %{
+           base_url: base_url,
+           workspace_slug: workspace_slug,
+           workspace_id: workspace_id,
+           project_id: project_id,
+           api_key: api_key
+         }}
     end
   end
 
@@ -255,11 +276,16 @@ defmodule SymphonyElixir.Plane.Adapter do
       else: {:error, :plane_endpoint_must_be_host_controlled}
   end
 
-  defp validate_project_scope(%{workspace_id: workspace_id, project_id: project_id}, config) do
-    if workspace_id == config.workspace_id and project_id == config.project_id, do: :ok, else: {:error, :wrong_project}
+  defp validate_project_scope(project, config) do
+    cond do
+      project.project_id != config.project_id -> {:error, :wrong_project}
+      present?(project.workspace_id) and project.workspace_id != config.workspace_id -> {:error, :wrong_project}
+      present?(project.workspace_slug) and project.workspace_slug != config.workspace_slug -> {:error, :wrong_project}
+      true -> :ok
+    end
   end
 
-  defp scope(config), do: %{workspace_id: config.workspace_id, project_id: config.project_id}
+  defp scope(config), do: %{workspace_slug: config.workspace_slug, workspace_id: config.workspace_id, project_id: config.project_id}
 
   defp capability_statuses do
     Map.new(Capabilities.vocabulary(), fn capability ->

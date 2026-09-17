@@ -13,6 +13,8 @@ defmodule SymphonyElixir.Plane.Client do
   @max_pages 100
   @max_work_items 10_000
   @max_states 64
+  @max_response_bytes 4_000_000
+  @response_too_large_marker :symphony_plane_response_too_large
 
   defmodule Error do
     @moduledoc "Safe Plane transport error without response bodies or headers."
@@ -54,7 +56,8 @@ defmodule SymphonyElixir.Plane.Client do
         acc: [],
         cursors: [],
         page_count: 0,
-        item_count: 0
+        item_count: 0,
+        total_results: nil
       })
     end
   end
@@ -71,7 +74,8 @@ defmodule SymphonyElixir.Plane.Client do
         acc: [],
         cursors: [],
         page_count: 0,
-        item_count: 0
+        item_count: 0,
+        total_results: nil
       })
     end
   end
@@ -103,40 +107,47 @@ defmodule SymphonyElixir.Plane.Client do
 
   defp paginate_page(%{config: config, path: path, params: params, kind: kind, opts: opts} = context) do
     with {:ok, response} <- request(config, path, params, opts),
-         {:ok, page, next_cursor, next?} <- decode_page(response, kind),
+         {:ok, page, next_cursor, next?, page_total} <- decode_page(response, kind),
          {:ok, updated_acc} <- append_page(context.acc, page, kind, context.item_count) do
-      advance_pagination(context, updated_acc, page, next_cursor, next?)
+      advance_pagination(context, updated_acc, page, page_total, next_cursor, next?)
     end
   end
 
-  defp advance_pagination(context, updated_acc, page, _next_cursor, false) do
+  defp advance_pagination(context, updated_acc, page, page_total, _next_cursor, false) do
     next_count = context.item_count + length(page)
 
-    if next_count <= limit_for(context.kind), do: {:ok, Enum.reverse(updated_acc)}, else: {:error, :snapshot_incomplete}
+    with {:ok, total_results} <- reconcile_total_results(context.total_results, page_total),
+         :ok <- validate_terminal_count(next_count, total_results) do
+      if next_count <= limit_for(context.kind), do: {:ok, Enum.reverse(updated_acc)}, else: {:error, :snapshot_incomplete}
+    end
   end
 
-  defp advance_pagination(_context, _updated_acc, _page, next_cursor, true)
+  defp advance_pagination(_context, _updated_acc, _page, _page_total, next_cursor, true)
        when not is_binary(next_cursor) or next_cursor == "" do
     {:error, :snapshot_incomplete}
   end
 
-  defp advance_pagination(context, updated_acc, page, next_cursor, true) do
-    if next_cursor in context.cursors do
-      {:error, :snapshot_incomplete}
-    else
-      next_context = %{
-        config: context.config,
-        path: context.path,
-        params: Map.put(context.params, "cursor", next_cursor),
-        kind: context.kind,
-        opts: context.opts,
-        acc: updated_acc,
-        cursors: [next_cursor | context.cursors],
-        page_count: context.page_count + 1,
-        item_count: context.item_count + length(page)
-      }
+  defp advance_pagination(context, updated_acc, page, page_total, next_cursor, true) do
+    with {:ok, total_results} <- reconcile_total_results(context.total_results, page_total),
+         :ok <- validate_running_count(context.item_count + length(page), total_results) do
+      if next_cursor in context.cursors do
+        {:error, :snapshot_incomplete}
+      else
+        next_context = %{
+          config: context.config,
+          path: context.path,
+          params: Map.put(context.params, "cursor", next_cursor),
+          kind: context.kind,
+          opts: context.opts,
+          acc: updated_acc,
+          cursors: [next_cursor | context.cursors],
+          page_count: context.page_count + 1,
+          item_count: context.item_count + length(page),
+          total_results: total_results
+        }
 
-      paginate(next_context)
+        paginate(next_context)
+      end
     end
   end
 
@@ -162,14 +173,14 @@ defmodule SymphonyElixir.Plane.Client do
     with {:ok, body} <- successful_body(response, :page),
          {:ok, results} <- page_results(body),
          {:ok, next?} <- page_next(body),
-         :ok <- page_counts(body) do
+         {:ok, _page_count, total_results} <- page_counts(body, results) do
       next_cursor = raw_value(body, :next_cursor)
 
       if next? and not valid_cursor?(next_cursor) do
         {:error, :snapshot_incomplete}
       else
         _ = kind
-        {:ok, results, next_cursor, next?}
+        {:ok, results, next_cursor, next?, total_results}
       end
     end
   end
@@ -203,15 +214,36 @@ defmodule SymphonyElixir.Plane.Client do
     end
   end
 
-  defp page_counts(body) do
-    if valid_page_count?(raw_value(body, :count)) and valid_page_count?(raw_value(body, :total_results)) do
-      :ok
-    else
-      {:error, :provider_malformed}
+  defp page_counts(body, results) do
+    count = raw_value(body, :count)
+    total_results = raw_value(body, :total_results)
+
+    cond do
+      is_nil(count) and is_nil(total_results) -> {:ok, nil, nil}
+      not valid_page_count?(count) or not valid_page_count?(total_results) -> {:error, :provider_malformed}
+      count != length(results) -> {:error, :provider_malformed}
+      total_results < count -> {:error, :provider_malformed}
+      true -> {:ok, count, total_results}
     end
   end
 
-  defp valid_page_count?(nil), do: true
+  defp reconcile_total_results(nil, total_results), do: {:ok, total_results}
+  defp reconcile_total_results(total_results, total_results), do: {:ok, total_results}
+  defp reconcile_total_results(_expected, nil), do: {:error, :snapshot_incomplete}
+  defp reconcile_total_results(_expected, _observed), do: {:error, :snapshot_incomplete}
+
+  defp validate_running_count(count, total_results) when is_integer(total_results) do
+    if count <= total_results, do: :ok, else: {:error, :snapshot_incomplete}
+  end
+
+  defp validate_running_count(_count, _total_results), do: :ok
+
+  defp validate_terminal_count(count, total_results) when is_integer(total_results) do
+    if count == total_results, do: :ok, else: {:error, :snapshot_incomplete}
+  end
+
+  defp validate_terminal_count(_count, _total_results), do: :ok
+
   defp valid_page_count?(value), do: is_integer(value) and value >= 0
 
   defp request(config, path, params, opts) do
@@ -268,11 +300,18 @@ defmodule SymphonyElixir.Plane.Client do
            params: params,
            connect_options: [timeout: @connect_timeout_ms],
            receive_timeout: @receive_timeout_ms,
-           retry: false
+           retry: false,
+           into: &bounded_response_body/2
          ) do
       {:ok, response} -> normalize_response(%{status: response.status, headers: response.headers, body: response.body})
       {:error, reason} -> {:error, transport_error(reason)}
     end
+  end
+
+  defp bounded_response_body({:data, chunk}, {request, response}) when is_binary(chunk) do
+    if byte_size(response.body || "") + byte_size(chunk) > @max_response_bytes,
+      do: {:halt, {request, %{response | body: @response_too_large_marker}}},
+      else: {:cont, {request, %{response | body: (response.body || "") <> chunk}}}
   end
 
   defp normalize_response(response) do
@@ -316,12 +355,17 @@ defmodule SymphonyElixir.Plane.Client do
 
   defp successful_body(_response, _expected), do: {:error, :provider_malformed}
 
+  defp decode_body(@response_too_large_marker), do: {:error, :provider_response_too_large}
   defp decode_body(body) when is_map(body) or is_list(body), do: {:ok, body}
 
   defp decode_body(body) when is_binary(body) do
-    case Jason.decode(body) do
-      {:ok, decoded} -> {:ok, decoded}
-      {:error, _reason} -> {:error, :provider_malformed}
+    if byte_size(body) > @max_response_bytes do
+      {:error, :provider_response_too_large}
+    else
+      case Jason.decode(body) do
+        {:ok, decoded} -> {:ok, decoded}
+        {:error, _reason} -> {:error, :provider_malformed}
+      end
     end
   end
 
@@ -334,12 +378,13 @@ defmodule SymphonyElixir.Plane.Client do
     base_url = Map.get(config, :base_url)
     base_url = if is_nil(base_url), do: Map.get(config, "base_url", @default_base_url), else: base_url
 
-    workspace_id = first_present(config, [:workspace_id, "workspace_id", :workspace_slug, "workspace_slug"])
+    workspace_slug = first_present(config, [:workspace_slug, "workspace_slug"])
+    workspace_id = first_present(config, [:workspace_id, "workspace_id"])
     project_id = first_present(config, [:project_id, "project_id"])
     api_key = first_present(config, [:api_key, "api_key"])
 
     cond do
-      not present?(workspace_id) or not present?(project_id) ->
+      not present?(workspace_slug) or not present?(project_id) ->
         {:error, :invalid_scope}
 
       not present?(api_key) ->
@@ -352,6 +397,7 @@ defmodule SymphonyElixir.Plane.Client do
         {:ok,
          %{
            base_url: String.trim_trailing(base_url, "/"),
+           workspace_slug: workspace_slug,
            workspace_id: workspace_id,
            project_id: project_id,
            api_key: api_key
@@ -376,12 +422,12 @@ defmodule SymphonyElixir.Plane.Client do
 
   defp validate_base_url(_value, _test_request?), do: :error
 
-  defp project_path(config), do: "/api/v1/workspaces/#{encoded(config.workspace_id)}/projects/#{encoded(config.project_id)}/"
+  defp project_path(config), do: "/api/v1/workspaces/#{encoded(config.workspace_slug)}/projects/#{encoded(config.project_id)}/"
   defp work_item_path(config, id), do: work_items_path(config) <> encoded(id) <> "/"
   defp work_items_path(config), do: project_path(config) <> "work-items/"
   defp states_path(config), do: project_path(config) <> "states/"
 
-  defp state_expansion_params, do: %{"fields" => "state", "expand" => "state"}
+  defp state_expansion_params, do: %{"expand" => "state"}
   defp work_item_params, do: Map.put(state_expansion_params(), "per_page", @page_size)
   defp limit_for(:work_items), do: @max_work_items
   defp limit_for(:states), do: @max_states

@@ -23,6 +23,7 @@ defmodule SymphonyElixir.PlaneConfigTest do
                  "kind" => "plane",
                  "provider" => %{
                    "workspace_slug" => "workspace-1",
+                   "workspace_id" => "workspace-stable-1",
                    "project_id" => "project-1",
                    "api_key" => "$PLANE_API_KEY"
                  }
@@ -31,12 +32,12 @@ defmodule SymphonyElixir.PlaneConfigTest do
 
     assert settings.tracker.api_key == "host-secret"
     assert "PLANE_API_KEY" in settings.tracker.secret_environment_names
-    assert :ok = Config.validate_settings(settings)
+    assert {:error, :plane_legacy_routing_unsupported} = Config.validate_settings(settings)
     assert {:ok, SymphonyElixir.Plane.Adapter} = Tracker.adapter_for_kind("plane")
 
     assert Tracker.identity(settings.tracker) == %{
              tracker_kind: "plane",
-             provider_scope: %{workspace_slug: "workspace-1", project_id: "project-1"}
+             provider_scope: %{workspace_slug: "workspace-1", workspace_id: "workspace-stable-1", project_id: "project-1"}
            }
   end
 
@@ -46,15 +47,17 @@ defmodule SymphonyElixir.PlaneConfigTest do
                "tracker" => %{
                  "kind" => "plane",
                  "workspace_slug" => "workspace-1",
+                 "workspace_id" => "workspace-stable-1",
                  "project_id" => "project-1",
                  "api_key" => "$PLANE_API_KEY"
                }
              })
 
-    assert :ok = Config.validate_settings(settings)
+    assert {:error, :plane_legacy_routing_unsupported} = Config.validate_settings(settings)
 
     assert Tracker.identity(settings.tracker).provider_scope == %{
              workspace_slug: "workspace-1",
+             workspace_id: "workspace-stable-1",
              project_id: "project-1"
            }
   end
@@ -66,6 +69,7 @@ defmodule SymphonyElixir.PlaneConfigTest do
                  "kind" => "plane",
                  "provider" => %{
                    "workspace_slug" => "workspace-1",
+                   "workspace_id" => "workspace-stable-1",
                    "project_id" => "project-1",
                    "api_key" => "literal-token"
                  }
@@ -79,6 +83,7 @@ defmodule SymphonyElixir.PlaneConfigTest do
                "tracker" => %{
                  "kind" => "plane",
                  "workspace_slug" => "workspace-1",
+                 "workspace_id" => "workspace-stable-1",
                  "project_id" => "project-1",
                  "api_key" => "literal-token"
                }
@@ -94,6 +99,7 @@ defmodule SymphonyElixir.PlaneConfigTest do
                  "kind" => "plane",
                  "provider" => %{
                    "workspace_slug" => "workspace-1",
+                   "workspace_id" => "workspace-stable-1",
                    "project_id" => "project-1",
                    "api_key" => "$PLANE_API_KEY"
                  }
