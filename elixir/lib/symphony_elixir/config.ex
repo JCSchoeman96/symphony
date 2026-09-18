@@ -144,11 +144,17 @@ defmodule SymphonyElixir.Config do
       {:error, :missing_tracker_kind}
     else
       with :ok <- Tracker.validate_config(settings.tracker),
+           :ok <- validate_plane_runtime_mode(settings),
            :ok <- Tracker.validate_routed_capabilities(settings) do
         Schema.validate_project_identity(settings)
       end
     end
   end
+
+  defp validate_plane_runtime_mode(%{tracker: %{kind: "plane"}, agent: %{routing: "legacy"}}),
+    do: {:error, :plane_legacy_routing_unsupported}
+
+  defp validate_plane_runtime_mode(_settings), do: :ok
 
   defp format_config_error(reason) do
     case reason do

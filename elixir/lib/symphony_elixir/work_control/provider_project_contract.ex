@@ -233,6 +233,24 @@ defmodule SymphonyElixir.WorkControl.ProviderProjectContract do
     "sha256:" <> Base.encode16(digest, case: :lower)
   end
 
+  @spec resolve_provider_state(t(), String.t() | nil, atom() | String.t() | nil) ::
+          {:ok, WorkflowLifecycle.state()} | {:error, :unknown_state_mapping | :state_group_mismatch}
+  def resolve_provider_state(%__MODULE__{} = contract, provider_state_id, provider_state_group) do
+    normalized_group = normalize_provider_group(provider_state_group)
+
+    case Enum.find(contract.state_mappings, fn {_state, mapping} -> mapping.state_id == provider_state_id end) do
+      nil ->
+        {:error, :unknown_state_mapping}
+
+      {canonical_state, %{group: expected_group}} ->
+        if expected_group == normalized_group do
+          {:ok, canonical_state}
+        else
+          {:error, :state_group_mismatch}
+        end
+    end
+  end
+
   defp validate_schema_version({:ok, @schema_version}), do: :ok
 
   defp validate_schema_version({:ok, value}),
@@ -592,4 +610,19 @@ defmodule SymphonyElixir.WorkControl.ProviderProjectContract do
   defp safe_config_value(value) when is_atom(value) or is_number(value) or is_boolean(value), do: value
   defp safe_config_value(nil), do: nil
   defp safe_config_value(_value), do: "[redacted]"
+
+  defp normalize_provider_group(group) when group in [:backlog, :unstarted, :started, :completed, :cancelled], do: group
+
+  defp normalize_provider_group(group) when is_binary(group) do
+    case String.trim(String.downcase(group)) do
+      "backlog" -> :backlog
+      "unstarted" -> :unstarted
+      "started" -> :started
+      "completed" -> :completed
+      "cancelled" -> :cancelled
+      _ -> nil
+    end
+  end
+
+  defp normalize_provider_group(_group), do: nil
 end

@@ -12,6 +12,7 @@ defmodule SymphonyElixir.Config.Schema do
 
   @primary_key false
   @linear_endpoint "https://api.linear.app/graphql"
+  @plane_endpoint "https://api.plane.so"
   @linear_active_states ["Todo", "In Progress"]
   @linear_terminal_states ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
   @project_id_pattern ~r/\A[A-Za-z0-9][A-Za-z0-9._-]*\z/
@@ -91,6 +92,9 @@ defmodule SymphonyElixir.Config.Schema do
       field(:endpoint, :string)
       field(:api_key, :string)
       field(:project_slug, :string)
+      field(:workspace_slug, :string)
+      field(:workspace_id, :string)
+      field(:project_id, :string)
       field(:assignee, :string)
       field(:provider, :map, default: %{})
       field(:secret_environment_names, {:array, :string}, default: [])
@@ -109,6 +113,9 @@ defmodule SymphonyElixir.Config.Schema do
           :endpoint,
           :api_key,
           :project_slug,
+          :workspace_slug,
+          :workspace_id,
+          :project_id,
           :assignee,
           :provider,
           :required_labels,
@@ -510,6 +517,9 @@ defmodule SymphonyElixir.Config.Schema do
       | endpoint: Map.get(provider, "endpoint", settings.tracker.endpoint),
         api_key: api_key,
         project_slug: Map.get(provider, "project_slug", settings.tracker.project_slug),
+        workspace_slug: Map.get(provider, "workspace_slug", settings.tracker.workspace_slug),
+        workspace_id: Map.get(provider, "workspace_id", settings.tracker.workspace_id),
+        project_id: Map.get(provider, "project_id", settings.tracker.project_id),
         assignee: assignee,
         provider: provider,
         secret_environment_names: Enum.uniq(secret_environment_names),
@@ -533,8 +543,32 @@ defmodule SymphonyElixir.Config.Schema do
     with {:ok, provider_project_contract} <-
            resolve_provider_project_contract(settings.provider_project_contract) do
       settings = %{settings | provider_project_contract: provider_project_contract}
-      finalize_agent_profiles(settings)
+
+      settings
+      |> enrich_plane_scope(provider_project_contract)
+      |> finalize_agent_profiles()
     end
+  end
+
+  defp enrich_plane_scope(
+         %{tracker: %{kind: "plane", provider: provider} = tracker} = settings,
+         %ProviderProjectContract{} = contract
+       ) do
+    provider =
+      provider
+      |> put_if_absent("workspace_slug", tracker.workspace_slug)
+      |> put_if_absent("workspace_id", tracker.workspace_id)
+      |> put_if_absent("project_id", tracker.project_id)
+      |> put_if_absent("workspace_id", contract.workspace_id)
+      |> put_if_absent("project_id", contract.project_id)
+
+    %{settings | tracker: %{tracker | provider: provider}}
+  end
+
+  defp enrich_plane_scope(settings, _contract), do: settings
+
+  defp put_if_absent(map, key, value) do
+    if is_nil(Map.get(map, key)) and not is_nil(value), do: Map.put(map, key, value), else: map
   end
 
   defp resolve_provider_project_contract(nil), do: {:ok, nil}
@@ -576,6 +610,23 @@ defmodule SymphonyElixir.Config.Schema do
       resolved_assignee,
       linear_provider,
       ["LINEAR_API_KEY" | env_reference_names([linear_provider["api_key"]])]
+    }
+  end
+
+  defp resolve_tracker_credentials(%{kind: "plane"} = tracker, provider) do
+    plane_provider =
+      provider
+      |> Map.put_new("endpoint", tracker.endpoint || @plane_endpoint)
+      |> Map.put_new("api_key", tracker.api_key)
+
+    resolved_api_key =
+      resolve_secret_setting(plane_provider["api_key"], System.get_env("PLANE_API_KEY"))
+
+    {
+      resolved_api_key,
+      tracker.assignee,
+      plane_provider,
+      ["PLANE_API_KEY" | env_reference_names([plane_provider["api_key"]])]
     }
   end
 

@@ -974,10 +974,48 @@ defmodule SymphonyElixir.Orchestrator do
   defp maybe_dispatch_ready(%State{} = state) do
     state =
       state
+      |> reconcile_provider_project_contract_from_provider()
       |> reconcile_running_issues()
       |> reconcile_blocked_issues()
 
     dispatch_ready_if_allowed(state)
+  end
+
+  defp reconcile_provider_project_contract_from_provider(
+         %State{
+           project_contract_evidence: %ProjectContractEvidence{
+             contract: %ProviderProjectContract{}
+           }
+         } = state
+       ) do
+    apply_provider_project_snapshot(state, Tracker.fetch_project_snapshot())
+  end
+
+  defp reconcile_provider_project_contract_from_provider(%State{} = state), do: state
+
+  @doc false
+  @spec reconcile_provider_project_snapshot_for_test(State.t(), term()) :: State.t()
+  def reconcile_provider_project_snapshot_for_test(%State{} = state, result),
+    do: apply_provider_project_snapshot(state, result)
+
+  defp apply_provider_project_snapshot(%State{} = state, {:ok, snapshot}) when is_map(snapshot) do
+    {state, _validation} = reconcile_project_contract_state(state, snapshot)
+    state
+  end
+
+  defp apply_provider_project_snapshot(%State{} = state, {:error, reason}) do
+    Logger.debug("Provider project snapshot unavailable; autonomous dispatch remains fenced: #{safe_reason(reason)}")
+    mark_provider_project_snapshot_incomplete(state)
+  end
+
+  defp apply_provider_project_snapshot(%State{} = state, _invalid) do
+    Logger.debug("Provider project snapshot malformed; autonomous dispatch remains fenced")
+    mark_provider_project_snapshot_incomplete(state)
+  end
+
+  defp mark_provider_project_snapshot_incomplete(%State{} = state) do
+    {state, _validation} = reconcile_project_contract_state(state, %{completeness: :incomplete})
+    state
   end
 
   defp dispatch_ready_if_allowed(%State{} = state) do
@@ -1960,10 +1998,11 @@ defmodule SymphonyElixir.Orchestrator do
 
     opts = %{
       provider: Config.settings!().tracker.kind,
-      observed_at: issue.updated_at || DateTime.utc_now(),
+      observed_at: DateTime.utc_now(),
       prior_validated_lifecycle_state: prior_validated_state(previous),
       prior_authority_disposition: prior_authority_disposition(previous),
-      evidence: evidence_for_observation(issue, previous)
+      evidence: evidence_for_observation(issue, previous),
+      provider_project_contract: Config.settings!().provider_project_contract
     }
 
     case WorkItem.from_issue(issue, opts) do
