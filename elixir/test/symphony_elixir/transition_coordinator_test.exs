@@ -63,9 +63,15 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
     refute_received :submitted
   end
 
-  test "uses the default server and keeps an active item claimed" do
+  test "cleans up unavailable claims and keeps an active item claimed" do
     {:ok, intent} = SemanticTransitionIntent.new(intent_attrs())
-    assert {:error, _reason} = TransitionCoordinator.request_transition(intent)
+    unavailable_server = String.to_atom("missing-transition-coordinator-#{System.unique_integer([:positive])}")
+
+    assert {:error, :coordinator_unavailable} =
+             TransitionCoordinator.request_transition(unavailable_server, intent)
+
+    assert {:error, :coordinator_unavailable} =
+             TransitionCoordinator.request_transition(unavailable_server, intent)
 
     {:ok, coordinator} =
       TransitionCoordinator.start_link(
