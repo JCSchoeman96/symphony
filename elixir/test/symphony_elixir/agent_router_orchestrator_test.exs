@@ -22,6 +22,7 @@ defmodule SymphonyElixir.AgentRouterOrchestratorTest do
   use SymphonyElixir.TestSupport
 
   alias SymphonyElixir.AgentRuntime.Router
+  alias SymphonyElixir.Dependency.Graph
   alias SymphonyElixir.WorkControl.{GuardClass, WorkItem}
 
   @now ~U[2026-09-16 00:00:00Z]
@@ -337,7 +338,15 @@ defmodule SymphonyElixir.AgentRouterOrchestratorTest do
       poll_interval_ms: 60_000
     )
 
-    Application.put_env(:symphony_elixir, :memory_tracker_issues, [planning_issue, ready_issue])
+    blocker_issue = %Issue{
+      id: "active-blocker",
+      identifier: "SYM-BLOCKER",
+      title: "Active blocker",
+      state: "In Progress",
+      dispatchable: false
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [planning_issue, ready_issue, blocker_issue])
 
     orchestrator_name =
       Module.concat(__MODULE__, "Orchestrator#{System.unique_integer([:positive])}")
@@ -598,6 +607,7 @@ defmodule SymphonyElixir.AgentRouterOrchestratorTest do
     state = %Orchestrator.State{
       running: %{issue.id => running_entry},
       claimed: MapSet.new([issue.id]),
+      dependency_graph: Graph.build([issue]),
       work_control: %{issue.id => work_item}
     }
 

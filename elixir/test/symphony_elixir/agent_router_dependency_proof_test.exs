@@ -525,6 +525,7 @@ defmodule SymphonyElixir.AgentRouterDependencyProofTest do
          ]}
       ),
       issue.({"dag-independent", "SYM-INDEPENDENT", []}),
+      %{issue.({"dag-canceled", "SYM-CANCELED", []}) | state: "Canceled", dispatchable: false},
       issue.({"dag-canceled-dependent", "SYM-CANCELED-DEPENDENT", [%{id: "dag-canceled", identifier: "SYM-CANCELED", state: "Canceled"}]}),
       issue.({"dag-cycle-a", "SYM-CYCLE-A", [%{id: "dag-cycle-b", identifier: "SYM-CYCLE-B", state: "Ready"}]}),
       issue.({"dag-cycle-b", "SYM-CYCLE-B", [%{id: "dag-cycle-c", identifier: "SYM-CYCLE-C", state: "Ready"}]}),

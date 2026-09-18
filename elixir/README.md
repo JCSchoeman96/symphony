@@ -43,13 +43,15 @@ infrastructure is not retried automatically; a human or provider path must handl
 requires an explicit stable `symphony.project_id`; safety-relevant writes are synced before any
 automatic follow-up, and ledger/provider reconciliation failures hold autonomous dispatch closed.
 
-Retry dispatch rechecks eligibility, capacity, and the selected role after the final graph read.
-Review-to-correction transitions count even if observed during retry wait or denied by dependencies.
-Previously counted route changes are not charged again when the retry starts.
+Retry dispatch rechecks eligibility, capacity, and the selected role against the immutable graph
+epoch from reconciliation. It does not fetch provider relations per candidate. A later
+reconciliation publishes a new epoch when dependencies change; incomplete or unavailable graph
+data fails routed dispatch closed until reconciliation succeeds. Review-to-correction transitions
+count even if observed during retry wait or denied by dependencies. Previously counted route
+changes are not charged again when the retry starts.
 
-Legacy routing preserves per-issue dependency checks for adapters that do not implement a graph
-read, without reporting a complete graph. Routed implementation/correction remain disabled for
-those adapters. A graph fetch failure from a supported adapter still fails closed in either mode.
+Legacy adapters retain accepted per-issue blocker checks and do not claim a complete graph epoch.
+Routed implementation/correction remain disabled for providers missing their required capabilities.
 Built-in role prompt names must match the profile responsibility, including `.md` names. Custom
 prompt text and files are trusted operator configuration and require manual role-policy review.
 
@@ -293,9 +295,12 @@ codex:
   path, an explicit stable `tracker.provider.workspace_id`, and `tracker.provider.project_id`.
   `tracker.provider.api_key` must be `$PLANE_API_KEY` (or be supplied host-side); literal tokens
   are rejected. The endpoint is the host-controlled `https://api.plane.so` default.
-- P-030 is read-only and currently supports only fresh issue refresh. Legacy Plane orchestration
-  is rejected, and routed configuration remains fail-closed until its complete capability contract
-  is implemented. Plane reads never grant lifecycle authority or completion proof.
+- P-040 is read-only and supports fresh issue refresh plus bounded, complete dependency graph
+  epochs. Plane enumerates the configured project, reads each item's fixed relations endpoint with
+  bounded concurrency, rejects incomplete or cross-project data, and publishes a new immutable
+  epoch only after the closing node set remains stable. Routed configuration remains fail-closed
+  because later transition and agent-tool capabilities are still unsupported. Plane reads never
+  grant lifecycle authority or completion proof.
 
 ### GitHub Issues adapter
 

@@ -975,6 +975,7 @@ defmodule SymphonyElixir.Orchestrator do
     state =
       state
       |> reconcile_provider_project_contract_from_provider()
+      |> refresh_dependency_state_for_reconciliation()
       |> reconcile_running_issues()
       |> reconcile_blocked_issues()
 
@@ -1032,7 +1033,7 @@ defmodule SymphonyElixir.Orchestrator do
          {:ok, issues} <- Tracker.fetch_issues_by_states(Config.settings!().tracker.active_states) do
       state
       |> clear_visible_durable_blocks(issues)
-      |> refresh_dependency_state_for_poll(issues)
+      |> ensure_graph_contains_active_issues(issues)
       |> dispatch_ready_issues(issues)
     else
       {:error, :missing_linear_api_token} ->
@@ -1073,6 +1074,10 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp refresh_dependency_state_for_reconciliation(%State{} = state) do
+    refresh_dependency_state_for_poll(state, [])
+  end
+
   defp dispatch_ready_issues(%State{} = state, issues) do
     if available_slots(state) > 0 do
       choose_issues(issues, state)
@@ -1083,11 +1088,15 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp refresh_dependency_state_for_poll(%State{} = state, active_issues) when is_list(active_issues) do
     case Tracker.fetch_dependency_graph() do
+      {:ok, %Graph{} = graph} ->
+        state
+        |> refresh_dependency_graph_epoch(graph)
+        |> ensure_graph_contains_active_issues(active_issues)
+
       {:ok, graph_issues} when is_list(graph_issues) ->
         state
         |> refresh_dependency_state(graph_issues, :complete)
         |> ensure_graph_contains_active_issues(active_issues)
-        |> refresh_work_control(graph_issues ++ active_issues)
 
       {:ok, _invalid_graph} ->
         Logger.warning("Dependency graph provider returned invalid data; implementation dispatch is disabled")
@@ -1103,10 +1112,6 @@ defmodule SymphonyElixir.Orchestrator do
         |> refresh_dependency_state(active_issues, {:unavailable, graph_failure_reason(reason)})
         |> refresh_work_control(active_issues)
     end
-  end
-
-  defp refresh_dependency_state_for_poll(%State{} = state, _active_issues) do
-    refresh_dependency_state(state, [], {:unavailable, :invalid_active_issue_collection})
   end
 
   defp reconcile_running_issues(%State{} = state) do
@@ -1138,27 +1143,9 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp refresh_dependency_state_for_running(%State{} = state, running_issues)
        when is_list(running_issues) do
-    case Tracker.fetch_dependency_graph() do
-      {:ok, graph_issues} when is_list(graph_issues) ->
-        state
-        |> refresh_dependency_state(graph_issues, :complete)
-        |> ensure_graph_contains_running_issues(running_issues)
-        |> refresh_work_control(graph_issues ++ running_issues)
-
-      {:ok, _invalid_graph} ->
-        Logger.warning("Running dependency graph provider returned invalid data; active implementation workers are unsafe")
-
-        state
-        |> refresh_dependency_state(running_issues, {:unavailable, :invalid_dependency_graph})
-        |> refresh_work_control(running_issues)
-
-      {:error, reason} ->
-        Logger.warning("Running dependency graph refresh unavailable; active implementation workers are unsafe: #{inspect(reason)}")
-
-        state
-        |> refresh_dependency_state(running_issues, {:unavailable, graph_failure_reason(reason)})
-        |> refresh_work_control(running_issues)
-    end
+    state
+    |> refresh_work_control(overlay_state_dependency_facts(state, running_issues))
+    |> ensure_graph_contains_running_issues(running_issues)
   end
 
   defp refresh_dependency_state_for_running(%State{} = state, _running_issues) do
@@ -1243,6 +1230,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp reconcile_running_issue_states([], state, _active_states, _terminal_states), do: state
 
   defp reconcile_running_issue_states([issue | rest], state, active_states, terminal_states) do
+    issue = overlay_current_dependency_facts(state, issue)
     state = refresh_work_control(state, [issue])
 
     reconcile_running_issue_states(
@@ -1291,6 +1279,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp reconcile_blocked_issue_states([], state, _active_states, _terminal_states), do: state
 
   defp reconcile_blocked_issue_states([issue | rest], state, active_states, terminal_states) do
+    issue = overlay_current_dependency_facts(state, issue)
     state = refresh_work_control(state, [issue])
 
     reconcile_blocked_issue_states(
@@ -1960,11 +1949,17 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp refresh_dependency_state(%State{} = state, issues, completeness) when is_list(issues) do
-    state = refresh_work_control(state, issues)
     graph = Graph.build(issues, completeness: completeness)
 
+    refresh_dependency_graph_epoch(state, graph)
+  end
+
+  defp refresh_dependency_graph_epoch(%State{} = state, %Graph{} = graph) do
+    issues = graph.nodes |> Map.values() |> overlay_epoch_dependency_facts(graph)
+    state = refresh_work_control(%{state | dependency_graph: graph}, issues)
+
     dependency_diagnostics =
-      Enum.reduce(issues, %{}, fn
+      Enum.reduce(Map.values(graph.nodes), %{}, fn
         %Issue{id: issue_id} = issue, diagnostics when is_binary(issue_id) ->
           Map.put(diagnostics, issue_id, dependency_diagnostic_for_issue(issue, graph, state))
 
@@ -1978,6 +1973,41 @@ defmodule SymphonyElixir.Orchestrator do
         dependency_diagnostics: dependency_diagnostics
     }
   end
+
+  defp overlay_epoch_dependency_facts(issues, %Graph{} = graph) when is_list(issues) do
+    Enum.map(issues, &overlay_epoch_dependency_facts(graph, &1))
+  end
+
+  defp overlay_epoch_dependency_facts(%Graph{} = graph, %Issue{id: issue_id} = issue)
+       when is_binary(issue_id) do
+    case Map.get(graph.nodes, issue_id) do
+      %Issue{} = epoch_issue ->
+        %{issue | blocked_by: epoch_issue.blocked_by, dependency_completeness: epoch_issue.dependency_completeness}
+
+      _missing ->
+        %{issue | blocked_by: [], dependency_completeness: {:unavailable, :missing_graph_node}}
+    end
+  end
+
+  defp overlay_epoch_dependency_facts(_graph, issue), do: issue
+
+  defp overlay_state_dependency_facts(%State{dependency_graph: %Graph{} = graph}, issues)
+       when is_list(issues) do
+    if Config.settings!().agent.routing == "legacy",
+      do: issues,
+      else: overlay_epoch_dependency_facts(issues, graph)
+  end
+
+  defp overlay_state_dependency_facts(_state, issues), do: issues
+
+  defp overlay_current_dependency_facts(%State{} = state, %Issue{} = issue) do
+    case overlay_state_dependency_facts(state, [issue]) do
+      [%Issue{} = overlaid] -> overlaid
+      _invalid -> issue
+    end
+  end
+
+  defp overlay_current_dependency_facts(_state, issue), do: issue
 
   defp refresh_work_control(%State{} = state, issues) when is_list(issues) do
     case Config.settings!().agent.routing do
@@ -2390,9 +2420,14 @@ defmodule SymphonyElixir.Orchestrator do
   defp dispatch_issue(%State{} = state, issue, attempt \\ nil, preferred_worker_host \\ nil) do
     case refresh_issue_for_dispatch(issue) do
       {:ok, %Issue{} = refreshed_issue} ->
-        state = refresh_dependency_graph_for_dispatch(state, refreshed_issue)
-        final_issue = Map.get(state.dependency_graph.nodes, refreshed_issue.id, refreshed_issue)
-        dispatch_refreshed_issue(state, final_issue, attempt, preferred_worker_host)
+        case overlay_candidate_dependency_facts(state, refreshed_issue) do
+          {:ok, state, final_issue} ->
+            dispatch_refreshed_issue(state, final_issue, attempt, preferred_worker_host)
+
+          {:error, reason} ->
+            Logger.info("Skipping dispatch; dependency epoch is unavailable for #{issue_context(refreshed_issue)}: #{inspect(reason)}")
+            state
+        end
 
       {:skip, _reason} ->
         state
@@ -2450,27 +2485,28 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp refresh_dependency_graph_for_dispatch(%State{} = state, fallback_issue) do
-    case Tracker.fetch_dependency_graph() do
-      {:ok, graph_issues} when is_list(graph_issues) ->
-        state
-        |> refresh_dependency_state(graph_issues, :complete)
-        |> ensure_graph_contains_issue(fallback_issue)
-        |> refresh_work_control(graph_issues ++ [fallback_issue])
+  defp overlay_candidate_dependency_facts(%State{dependency_graph: %Graph{} = graph} = state, %Issue{id: issue_id} = issue)
+       when is_binary(issue_id) do
+    if Config.settings!().agent.routing == "legacy" do
+      {:ok, state, issue}
+    else
+      overlay_routed_candidate_dependency_facts(graph, state, issue, issue_id)
+    end
+  end
 
-      {:ok, _invalid_graph} ->
-        Logger.warning("Final dependency graph refresh returned invalid data; implementation dispatch is disabled")
+  defp overlay_candidate_dependency_facts(_state, _issue), do: {:error, :graph_unavailable}
 
-        state
-        |> refresh_dependency_state([fallback_issue], {:unavailable, :invalid_dependency_graph})
-        |> refresh_work_control([fallback_issue])
+  defp overlay_routed_candidate_dependency_facts(graph, state, issue, issue_id) do
+    cond do
+      not Graph.complete?(graph) ->
+        {:error, :graph_incomplete}
 
-      {:error, reason} ->
-        Logger.warning("Final dependency graph refresh unavailable; implementation dispatch is disabled: #{inspect(reason)}")
+      not Map.has_key?(graph.nodes, issue_id) ->
+        {:error, :missing_graph_node}
 
-        state
-        |> refresh_dependency_state([fallback_issue], {:unavailable, graph_failure_reason(reason)})
-        |> refresh_work_control([fallback_issue])
+      true ->
+        final_issue = overlay_epoch_dependency_facts(graph, issue)
+        {:ok, refresh_work_control(state, [final_issue]), final_issue}
     end
   end
 
@@ -2478,12 +2514,16 @@ defmodule SymphonyElixir.Orchestrator do
   defp graph_failure_reason(_reason), do: :dependency_graph_unavailable
 
   defp ensure_graph_contains_active_issues(%State{} = state, active_issues) when is_list(active_issues) do
-    ensure_graph_contains_issues(state, active_issues)
+    if Config.settings!().agent.routing == "legacy",
+      do: state,
+      else: ensure_graph_contains_issues(state, active_issues)
   end
 
   defp ensure_graph_contains_running_issues(%State{} = state, running_issues)
        when is_list(running_issues) do
-    ensure_graph_contains_issues(state, running_issues)
+    if Config.settings!().agent.routing == "legacy",
+      do: state,
+      else: ensure_graph_contains_issues(state, running_issues)
   end
 
   defp ensure_graph_contains_issues(%State{} = state, issues) when is_list(issues) do
@@ -2498,16 +2538,6 @@ defmodule SymphonyElixir.Orchestrator do
 
     if missing_issue?, do: mark_graph_incomplete(state, :missing_graph_node), else: state
   end
-
-  defp ensure_graph_contains_issue(%State{} = state, %Issue{id: issue_id}) when is_binary(issue_id) do
-    if Map.has_key?(state.dependency_graph.nodes, issue_id) do
-      state
-    else
-      mark_graph_incomplete(state, :missing_graph_node)
-    end
-  end
-
-  defp ensure_graph_contains_issue(state, _issue), do: mark_graph_incomplete(state, :invalid_dispatch_issue)
 
   defp mark_graph_incomplete(%State{dependency_graph: %Graph{} = graph} = state, reason) do
     %{state | dependency_graph: %{graph | completeness: {:incomplete, reason}}}
@@ -3294,18 +3324,22 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp dispatch_refreshed_retry(state, issue, refreshed_issue, attempt, metadata) do
-    state = refresh_dependency_graph_for_dispatch(state, refreshed_issue)
-    refreshed_issue = Map.get(state.dependency_graph.nodes, refreshed_issue.id, refreshed_issue)
+    case overlay_candidate_dependency_facts(state, refreshed_issue) do
+      {:ok, state, refreshed_issue} ->
+        cond do
+          not retry_candidate_for_state?(refreshed_issue, state, terminal_state_set()) ->
+            handle_non_candidate_retry(state, issue, refreshed_issue, attempt, metadata)
 
-    cond do
-      not retry_candidate_for_state?(refreshed_issue, state, terminal_state_set()) ->
-        handle_non_candidate_retry(state, issue, refreshed_issue, attempt, metadata)
+          not retry_available_for_dispatch?(refreshed_issue, state, metadata) ->
+            schedule_retry_without_slots(state, refreshed_issue, attempt, metadata)
 
-      not retry_available_for_dispatch?(refreshed_issue, state, metadata) ->
-        schedule_retry_without_slots(state, refreshed_issue, attempt, metadata)
+          true ->
+            dispatch_final_retry(state, issue, refreshed_issue, attempt, metadata)
+        end
 
-      true ->
-        dispatch_final_retry(state, issue, refreshed_issue, attempt, metadata)
+      {:error, reason} ->
+        Logger.info("Deferring retry; dependency epoch is unavailable for #{issue_context(refreshed_issue)}: #{inspect(reason)}")
+        {:noreply, release_issue_claim(state, issue.id)}
     end
   end
 
