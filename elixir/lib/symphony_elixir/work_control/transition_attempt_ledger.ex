@@ -6,7 +6,7 @@ defmodule SymphonyElixir.WorkControl.TransitionAttemptLedger do
   Every safety-critical write is followed by an explicit DETS sync.
   """
 
-  alias SymphonyElixir.WorkControl.TransitionAttempt
+  alias SymphonyElixir.WorkControl.{TransitionAttempt, WorkflowLifecycle}
 
   @schema_version 1
   @reconciliation_statuses [:submitted, :mutation_submitted, :verifying, :conflict, :indeterminate]
@@ -72,9 +72,8 @@ defmodule SymphonyElixir.WorkControl.TransitionAttemptLedger do
   @spec put_sync(t(), TransitionAttempt.t() | map()) :: :ok | {:error, term()}
   def put_sync(%__MODULE__{} = ledger, attempt) do
     with {:ok, record, attempt_id, work_item_id} <- validate_attempt(ledger, attempt),
-         :ok <- persist(ledger, [{{:attempt, attempt_id}, record}, {{:latest, work_item_id}, attempt_id}]),
-         :ok <- sync(ledger) do
-      :ok
+         :ok <- persist(ledger, [{{:attempt, attempt_id}, record}, {{:latest, work_item_id}, attempt_id}]) do
+      sync(ledger)
     end
   end
 
@@ -112,15 +111,28 @@ defmodule SymphonyElixir.WorkControl.TransitionAttemptLedger do
     candidates =
       :dets.foldl(
         fn
-          {{:attempt, _attempt_id}, attempt}, acc -> if reconciliation_candidate?(attempt), do: [attempt | acc], else: acc
-          _other, acc -> acc
+          {{:attempt, _attempt_id}, attempt}, acc ->
+            if reconciliation_candidate?(attempt), do: [attempt | acc], else: acc
+
+          _other, acc ->
+            acc
         end,
         [],
         table
       )
 
     rank = %{submitted: 0, mutation_submitted: 0, verifying: 1, conflict: 2, indeterminate: 3}
-    {:ok, Enum.sort_by(candidates, &{Map.get(rank, Map.get(&1, :status) || Map.get(&1, :state), 99), Map.get(&1, :updated_at, 0), attempt_identifier(&1)})}
+
+    sorted =
+      Enum.sort_by(candidates, fn attempt ->
+        {
+          Map.get(rank, Map.get(attempt, :status) || Map.get(attempt, :state), 99),
+          Map.get(attempt, :updated_at, 0),
+          attempt_identifier(attempt)
+        }
+      end)
+
+    {:ok, sorted}
   rescue
     _error -> {:error, {:corrupt_transition_attempt, :invalid_record}}
   end
@@ -136,9 +148,8 @@ defmodule SymphonyElixir.WorkControl.TransitionAttemptLedger do
 
     case metadata_records do
       [] ->
-        with :ok <- persist(ledger, [{{:meta, ledger.project_id}, metadata(ledger)}]),
-             :ok <- sync(ledger) do
-          :ok
+        with :ok <- persist(ledger, [{{:meta, ledger.project_id}, metadata(ledger)}]) do
+          sync(ledger)
         end
 
       [{{:meta, _stored_project}, metadata}] ->
@@ -153,9 +164,14 @@ defmodule SymphonyElixir.WorkControl.TransitionAttemptLedger do
 
   defp validate_metadata(%{schema_version: @schema_version, project_namespace: project_id, tracker_identity: identity}, ledger) do
     cond do
-      project_id != ledger.project_id -> {:error, {:ledger_project_namespace_mismatch, project_id, ledger.project_id}}
-      identity != ledger.tracker_identity -> {:error, {:ledger_tracker_identity_mismatch, identity, ledger.tracker_identity}}
-      true -> :ok
+      project_id != ledger.project_id ->
+        {:error, {:ledger_project_namespace_mismatch, project_id, ledger.project_id}}
+
+      identity != ledger.tracker_identity ->
+        {:error, {:ledger_tracker_identity_mismatch, identity, ledger.tracker_identity}}
+
+      true ->
+        :ok
     end
   end
 
@@ -177,32 +193,61 @@ defmodule SymphonyElixir.WorkControl.TransitionAttemptLedger do
     work_item_id = Map.get(record, :work_item_id)
     status = Map.get(record, :status) || Map.get(record, :state)
 
-    cond do
-      Map.get(record, :schema_version, @schema_version) != @schema_version ->
-        {:error, {:corrupt_transition_attempt, :invalid_record}}
-
-      Map.get(record, :project_namespace, ledger.project_id) != ledger.project_id ->
-        {:error, {:ledger_project_namespace_mismatch, Map.get(record, :project_namespace), ledger.project_id}}
-
-      not valid_id?(attempt_id) or not valid_id?(work_item_id) ->
-        {:error, {:corrupt_transition_attempt, :invalid_record}}
-
-      not valid_state_pair?(record) ->
-        {:error, {:corrupt_transition_attempt, :invalid_record}}
-
-      status not in @allowed_statuses ->
-        {:error, {:corrupt_transition_attempt, :invalid_record}}
-
-      not valid_timestamp?(Map.get(record, :created_at)) or
-          not valid_timestamp?(Map.get(record, :updated_at)) ->
-        {:error, {:corrupt_transition_attempt, :invalid_record}}
-
-      unexpected_keys?(record, original) ->
-        {:error, {:corrupt_transition_attempt, :invalid_record}}
-
-      true ->
-        {:ok, original, attempt_id, work_item_id}
+    with :ok <- validate_schema_version(record),
+         :ok <- validate_project_namespace(record, ledger),
+         :ok <- validate_attempt_ids(attempt_id, work_item_id),
+         :ok <- validate_state_pair(record),
+         :ok <- validate_status(status),
+         :ok <- validate_attempt_timestamps(record),
+         :ok <- validate_record_keys(record, original) do
+      {:ok, original, attempt_id, work_item_id}
     end
+  end
+
+  defp validate_schema_version(record) do
+    if Map.get(record, :schema_version, @schema_version) == @schema_version do
+      :ok
+    else
+      {:error, {:corrupt_transition_attempt, :invalid_record}}
+    end
+  end
+
+  defp validate_project_namespace(record, ledger) do
+    project_namespace = Map.get(record, :project_namespace, ledger.project_id)
+
+    if project_namespace == ledger.project_id do
+      :ok
+    else
+      {:error, {:ledger_project_namespace_mismatch, project_namespace, ledger.project_id}}
+    end
+  end
+
+  defp validate_attempt_ids(attempt_id, work_item_id) do
+    if valid_id?(attempt_id) and valid_id?(work_item_id) do
+      :ok
+    else
+      {:error, {:corrupt_transition_attempt, :invalid_record}}
+    end
+  end
+
+  defp validate_state_pair(record) do
+    if valid_state_pair?(record), do: :ok, else: {:error, {:corrupt_transition_attempt, :invalid_record}}
+  end
+
+  defp validate_status(status) do
+    if status in @allowed_statuses, do: :ok, else: {:error, {:corrupt_transition_attempt, :invalid_record}}
+  end
+
+  defp validate_attempt_timestamps(record) do
+    if valid_timestamp?(Map.get(record, :created_at)) and valid_timestamp?(Map.get(record, :updated_at)) do
+      :ok
+    else
+      {:error, {:corrupt_transition_attempt, :invalid_record}}
+    end
+  end
+
+  defp validate_record_keys(record, original) do
+    if unexpected_keys?(record, original), do: {:error, {:corrupt_transition_attempt, :invalid_record}}, else: :ok
   end
 
   defp unexpected_keys?(record, %TransitionAttempt{}), do: Enum.any?(Map.keys(record), &(&1 not in Map.keys(%TransitionAttempt{})))
@@ -226,8 +271,7 @@ defmodule SymphonyElixir.WorkControl.TransitionAttemptLedger do
     source = Map.get(record, :source_state) || Map.get(record, :requested_from)
     target = Map.get(record, :target_state) || Map.get(record, :requested_to)
 
-    SymphonyElixir.WorkControl.WorkflowLifecycle.canonical?(source) and
-      SymphonyElixir.WorkControl.WorkflowLifecycle.canonical?(target)
+    WorkflowLifecycle.canonical?(source) and WorkflowLifecycle.canonical?(target)
   end
 
   defp persist(%__MODULE__{table: table, write_fun: write_fun}, records) do
@@ -255,7 +299,15 @@ defmodule SymphonyElixir.WorkControl.TransitionAttemptLedger do
     sync_fun = Keyword.get(opts, :sync_fun, &:dets.sync/1)
 
     if is_function(write_fun, 2) and is_function(sync_fun, 1) do
-      {:ok, %__MODULE__{table: table, path: path, project_id: project_id, tracker_identity: identity, write_fun: write_fun, sync_fun: sync_fun}}
+      {:ok,
+       %__MODULE__{
+         table: table,
+         path: path,
+         project_id: project_id,
+         tracker_identity: identity,
+         write_fun: write_fun,
+         sync_fun: sync_fun
+       }}
     else
       {:error, :invalid_ledger_callbacks}
     end

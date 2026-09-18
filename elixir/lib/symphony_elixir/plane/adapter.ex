@@ -72,15 +72,13 @@ defmodule SymphonyElixir.Plane.Adapter do
          :ok <- validate_contract_scope(config, contract),
          :ok <- validate_work_item_scope(Keyword.get(opts, :pre_observation), config, work_item_id),
          {:ok, mapping} <- ProviderProjectContract.provider_mapping_for(contract, requested_to),
-         :ok <- validate_target_mapping(mapping, contract, requested_to),
-         :ok <-
-           Client.update_work_item_state(
-             config,
-             work_item_id,
-             mapping.state_id,
-             request_opts(Keyword.get(opts, :request_fun))
-           ) do
-      :ok
+         :ok <- validate_target_mapping(mapping, contract, requested_to) do
+      Client.update_work_item_state(
+        config,
+        work_item_id,
+        mapping.state_id,
+        request_opts(Keyword.get(opts, :request_fun))
+      )
     end
   end
 
@@ -458,17 +456,31 @@ defmodule SymphonyElixir.Plane.Adapter do
     project_id = Map.get(observation, :project_id) || Map.get(observation, "project_id")
     work_item_id = Map.get(observation, :work_item_id) || Map.get(observation, "work_item_id")
 
-    cond do
-      not is_binary(work_item_id) or String.trim(work_item_id) == "" -> {:error, :invalid_work_item_id}
-      String.trim(work_item_id) != String.trim(expected_work_item_id) -> {:error, :work_item_mismatch}
-      not is_nil(workspace_id) and workspace_id != config.workspace_id -> {:error, :wrong_project}
-      not is_nil(project_id) and project_id != config.project_id -> {:error, :wrong_project}
-      true -> :ok
+    with :ok <- validate_work_item_id(work_item_id),
+         :ok <- validate_work_item_id_match(work_item_id, expected_work_item_id),
+         :ok <- validate_optional_scope(workspace_id, config.workspace_id) do
+      validate_optional_scope(project_id, config.project_id)
     end
   end
 
   defp validate_work_item_scope(_observation, _config, _expected_work_item_id),
     do: {:error, :invalid_work_item_observation}
+
+  defp validate_work_item_id(value) when is_binary(value) do
+    if String.trim(value) == "", do: {:error, :invalid_work_item_id}, else: :ok
+  end
+
+  defp validate_work_item_id(_value), do: {:error, :invalid_work_item_id}
+
+  defp validate_work_item_id_match(value, expected) when is_binary(value) and is_binary(expected) do
+    if String.trim(value) == String.trim(expected), do: :ok, else: {:error, :work_item_mismatch}
+  end
+
+  defp validate_work_item_id_match(_value, _expected), do: {:error, :work_item_mismatch}
+
+  defp validate_optional_scope(nil, _expected), do: :ok
+  defp validate_optional_scope(value, value), do: :ok
+  defp validate_optional_scope(_value, _expected), do: {:error, :wrong_project}
 
   defp provider_settings(%{provider: provider}) when is_map(provider), do: provider
   defp provider_settings(%{"provider" => provider}) when is_map(provider), do: provider

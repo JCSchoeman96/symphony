@@ -2,7 +2,13 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
   use ExUnit.Case, async: true
 
   alias SymphonyElixir.TransitionCoordinator
-  alias SymphonyElixir.WorkControl.{ProviderProjectContract, SemanticTransitionIntent, TransitionAttemptLedger, WorkflowLifecycle}
+
+  alias SymphonyElixir.WorkControl.{
+    ProviderProjectContract,
+    SemanticTransitionIntent,
+    TransitionAttemptLedger,
+    WorkflowLifecycle
+  }
 
   test "executes one prepared transition and verifies it without resubmitting" do
     test_pid = self()

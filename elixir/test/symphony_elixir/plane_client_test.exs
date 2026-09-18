@@ -603,14 +603,22 @@ defmodule SymphonyElixir.PlaneClientTest do
   test "accepts every successful mutation status without decoding its response body" do
     for status <- [200, 201, 202, 204, 299] do
       assert :ok =
-               Client.update_work_item_state(@config, "item-1", "state-uuid", request_fun: fn _request -> {:ok, %{status: status, body: :not_json}} end)
+               Client.update_work_item_state(@config, "item-1", "state-uuid",
+                 request_fun: fn _request ->
+                   {:ok, %{status: status, body: :not_json}}
+                 end
+               )
     end
   end
 
   test "keeps mutation status failures as errors and preserves transport failure classes" do
     for status <- [400, 401, 403, 404, 409, 500, 503] do
       assert {:error, _reason} =
-               Client.update_work_item_state(@config, "item-1", "state-uuid", request_fun: fn _request -> {:ok, %{status: status, body: %{"secret" => "hidden"}}} end)
+               Client.update_work_item_state(@config, "item-1", "state-uuid",
+                 request_fun: fn _request ->
+                   {:ok, %{status: status, body: %{"secret" => "hidden"}}}
+                 end
+               )
     end
 
     for reason <- [:econnrefused, :timeout, :closed] do

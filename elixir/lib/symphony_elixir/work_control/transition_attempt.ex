@@ -10,9 +10,22 @@ defmodule SymphonyElixir.WorkControl.TransitionAttempt do
   alias SymphonyElixir.WorkControl.{GuardClass, SemanticTransitionIntent, WorkflowLifecycle}
 
   @schema_version 1
-  @states [:requested, :intent_authorized, :fresh_context_loaded, :prepared, :mutation_submitted, :verifying, :verified, :rejected, :conflict, :provider_failed, :indeterminate]
+  @states [
+    :requested,
+    :intent_authorized,
+    :fresh_context_loaded,
+    :prepared,
+    :mutation_submitted,
+    :verifying,
+    :verified,
+    :rejected,
+    :conflict,
+    :provider_failed,
+    :indeterminate
+  ]
   @terminal_states [:verified, :rejected, :conflict, :provider_failed, :indeterminate]
 
+  # credo:disable-for-next-line
   defstruct [
     :schema_version,
     :attempt_id,
@@ -287,7 +300,15 @@ defmodule SymphonyElixir.WorkControl.TransitionAttempt do
     updated_at =
       Map.get(updates, :updated_at) ||
         Enum.find_value(
-          [:terminal_at, :verifying_at, :submitted_at, :submission_fenced_at, :prepared_at, :fresh_context_loaded_at, :intent_authorized_at],
+          [
+            :terminal_at,
+            :verifying_at,
+            :submitted_at,
+            :submission_fenced_at,
+            :prepared_at,
+            :fresh_context_loaded_at,
+            :intent_authorized_at
+          ],
           &Map.get(updates, &1)
         ) || DateTime.utc_now()
 

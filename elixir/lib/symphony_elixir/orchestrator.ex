@@ -3788,70 +3788,101 @@ defmodule SymphonyElixir.Orchestrator do
   defp transition_context_for_state(%State{} = state, work_item_id, opts) do
     case Map.get(state.work_control, work_item_id) do
       %WorkItem{} = work_item ->
-        contract_evidence = state.project_contract_evidence
-
-        cond do
-          WorkItem.suspended?(work_item) ->
-            {:error, :work_item_suspended}
-
-          not is_map(state.dependency_diagnostics) or
-              not is_map(Map.get(state.dependency_diagnostics, work_item_id)) ->
-            {:error, :dependency_context_unavailable}
-
-          not match?(%Graph{}, state.dependency_graph) or not Graph.complete?(state.dependency_graph) ->
-            {:error, :dependency_context_unavailable}
-
-          not match?(%ProviderObservation{}, work_item.provider_observation) or
-            not match?(%LifecycleAssessment{}, work_item.lifecycle_assessment) or
-              not WorkflowLifecycle.canonical?(work_item.validated_lifecycle_state) ->
-            {:error, :work_item_context_unavailable}
-
-          ProjectContractEvidence.reconciliation_required?(contract_evidence) ->
-            {:error, contract_evidence.reason || :provider_contract_reconciliation_required}
-
-          true ->
-            dependency_decision = Map.fetch!(state.dependency_diagnostics, work_item_id)
-            contract = contract_evidence && contract_evidence.contract
-            running = Map.get(state.running, work_item_id, %{})
-            observation = work_item.provider_observation
-            assessment = work_item.lifecycle_assessment
-
-            context = %{
-              work_item: work_item,
-              current_state: work_item.validated_lifecycle_state,
-              dependency_decision: dependency_decision,
-              dependency_epoch_evidence: %{
-                epoch: state.dependency_graph.epoch,
-                completeness: state.dependency_graph.completeness,
-                complete?: SymphonyElixir.Dependency.Graph.complete?(state.dependency_graph)
-              },
-              guard_evidence: assessment.satisfied_guards,
-              provider_observation: observation,
-              provider_project_contract: contract,
-              provider_contract_fingerprint:
-                if(
-                  match?(%ProviderProjectContract{}, contract),
-                  do: ProviderProjectContract.fingerprint(contract),
-                  else: nil
-                ),
-              runtime_attempt_id: Map.get(running, :attempt),
-              lineage_id: Map.get(running, :lineage_id),
-              lineage_generation: Map.get(running, :lineage_generation),
-              responsibility: WorkflowLifecycle.responsibility(work_item.validated_lifecycle_state),
-              context_token: transition_context_token(work_item, state, dependency_decision, contract)
-            }
-
-            case Keyword.get(opts, :expected_context_token) do
-              nil -> {:ok, context}
-              expected when expected == context.context_token -> {:ok, context}
-              _stale -> {:error, :context_token_mismatch}
-            end
-        end
+        with :ok <- transition_context_available?(state, work_item_id, work_item),
+             {:ok, context} <- build_transition_context(state, work_item_id, work_item),
+             do: validate_transition_context_token(context, opts)
 
       _missing ->
         {:error, :work_item_not_found}
     end
   end
+
+  defp transition_context_available?(%State{} = state, work_item_id, %WorkItem{} = work_item) do
+    with :ok <- validate_transition_work_item(work_item),
+         :ok <- validate_transition_dependency_context(state, work_item_id),
+         :ok <- validate_transition_work_item_context(work_item) do
+      validate_transition_contract_context(state.project_contract_evidence)
+    end
+  end
+
+  defp validate_transition_work_item(%WorkItem{} = work_item) do
+    if WorkItem.suspended?(work_item), do: {:error, :work_item_suspended}, else: :ok
+  end
+
+  defp validate_transition_dependency_context(%State{} = state, work_item_id) do
+    cond do
+      not is_map(state.dependency_diagnostics) or
+          not is_map(Map.get(state.dependency_diagnostics, work_item_id)) ->
+        {:error, :dependency_context_unavailable}
+
+      not match?(%Graph{}, state.dependency_graph) or not Graph.complete?(state.dependency_graph) ->
+        {:error, :dependency_context_unavailable}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_transition_work_item_context(%WorkItem{} = work_item) do
+    if match?(%ProviderObservation{}, work_item.provider_observation) and
+         match?(%LifecycleAssessment{}, work_item.lifecycle_assessment) and
+         WorkflowLifecycle.canonical?(work_item.validated_lifecycle_state) do
+      :ok
+    else
+      {:error, :work_item_context_unavailable}
+    end
+  end
+
+  defp validate_transition_contract_context(contract_evidence) do
+    if ProjectContractEvidence.reconciliation_required?(contract_evidence) do
+      {:error, contract_evidence.reason || :provider_contract_reconciliation_required}
+    else
+      :ok
+    end
+  end
+
+  defp build_transition_context(%State{} = state, work_item_id, %WorkItem{} = work_item) do
+    contract_evidence = state.project_contract_evidence
+    dependency_decision = Map.fetch!(state.dependency_diagnostics, work_item_id)
+    contract = contract_evidence && contract_evidence.contract
+    running = Map.get(state.running, work_item_id, %{})
+    observation = work_item.provider_observation
+    assessment = work_item.lifecycle_assessment
+
+    {:ok,
+     %{
+       work_item: work_item,
+       current_state: work_item.validated_lifecycle_state,
+       dependency_decision: dependency_decision,
+       dependency_epoch_evidence: %{
+         epoch: state.dependency_graph.epoch,
+         completeness: state.dependency_graph.completeness,
+         complete?: Graph.complete?(state.dependency_graph)
+       },
+       guard_evidence: assessment.satisfied_guards,
+       provider_observation: observation,
+       provider_project_contract: contract,
+       provider_contract_fingerprint: provider_contract_fingerprint(contract),
+       runtime_attempt_id: Map.get(running, :attempt),
+       lineage_id: Map.get(running, :lineage_id),
+       lineage_generation: Map.get(running, :lineage_generation),
+       responsibility: WorkflowLifecycle.responsibility(work_item.validated_lifecycle_state),
+       context_token: transition_context_token(work_item, state, dependency_decision, contract)
+     }}
+  end
+
+  defp validate_transition_context_token(context, opts) do
+    case Keyword.get(opts, :expected_context_token) do
+      nil -> {:ok, context}
+      expected when expected == context.context_token -> {:ok, context}
+      _stale -> {:error, :context_token_mismatch}
+    end
+  end
+
+  defp provider_contract_fingerprint(%ProviderProjectContract{} = contract),
+    do: ProviderProjectContract.fingerprint(contract)
+
+  defp provider_contract_fingerprint(_contract), do: nil
 
   defp transition_context_token(work_item, %State{} = state, dependency_decision, contract) do
     token_input = %{

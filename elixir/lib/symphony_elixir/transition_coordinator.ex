@@ -11,16 +11,17 @@ defmodule SymphonyElixir.TransitionCoordinator do
 
   use GenServer
 
-  alias SymphonyElixir.Tracker
-  alias SymphonyElixir.Tracker.TransitionPolicy
   alias SymphonyElixir.{Config, Orchestrator}
   alias SymphonyElixir.Plane.ProjectContract, as: PlaneProjectContract
+  alias SymphonyElixir.Tracker
   alias SymphonyElixir.Tracker.Issue
+  alias SymphonyElixir.Tracker.TransitionPolicy
 
   alias SymphonyElixir.WorkControl.{
-    ProviderProjectContract,
+    GuardClass,
     LifecycleAssessment,
     ProviderObservation,
+    ProviderProjectContract,
     SemanticTransitionIntent,
     TransitionAttempt,
     TransitionAttemptLedger,
@@ -268,36 +269,50 @@ defmodule SymphonyElixir.TransitionCoordinator do
   defp authorize_fresh_context(intent, context) do
     current_state = Map.get(context, :current_state, intent.requested_from)
 
+    with :ok <- validate_fresh_current_state(current_state, intent.requested_from),
+         policy_context <- fresh_policy_context(context, intent, current_state),
+         :ok <- authorize_fresh_policy(policy_context) do
+      authorize_fresh_dependencies(policy_context, context)
+    end
+  end
+
+  defp validate_fresh_current_state(current_state, expected_state) do
     cond do
       not is_atom(current_state) or not WorkflowLifecycle.canonical?(current_state) ->
         {:error, {:pre_submit, :non_canonical_current_state}}
 
-      current_state != intent.requested_from ->
+      current_state != expected_state ->
         {:error, {:pre_submit, :source_state_changed}}
 
       true ->
-        policy_context =
-          context
-          |> Map.put(:current_state, current_state)
-          |> Map.put(:target_state, intent.requested_to)
-          |> Map.put(:responsibility, intent.responsibility)
+        :ok
+    end
+  end
 
-        case TransitionPolicy.authorize_intent(policy_context) do
-          :ok ->
-            case Map.get(context, :dependency_decision) do
-              decision when is_map(decision) ->
-                case TransitionPolicy.authorize(Map.put(policy_context, :dependency_decision, decision)) do
-                  :ok -> :ok
-                  {:error, reason} -> {:error, {:pre_submit, {:policy_rejected, reason}}}
-                end
+  defp fresh_policy_context(context, intent, current_state) do
+    context
+    |> Map.put(:current_state, current_state)
+    |> Map.put(:target_state, intent.requested_to)
+    |> Map.put(:responsibility, intent.responsibility)
+  end
 
-              nil ->
-                {:error, {:pre_submit, :dependency_context_unavailable}}
-            end
+  defp authorize_fresh_policy(policy_context) do
+    case TransitionPolicy.authorize_intent(policy_context) do
+      :ok -> :ok
+      {:error, reason} -> {:error, {:pre_submit, {:policy_rejected, reason}}}
+    end
+  end
 
-          {:error, reason} ->
-            {:error, {:pre_submit, {:policy_rejected, reason}}}
+  defp authorize_fresh_dependencies(policy_context, context) do
+    case Map.get(context, :dependency_decision) do
+      decision when is_map(decision) ->
+        case TransitionPolicy.authorize(Map.put(policy_context, :dependency_decision, decision)) do
+          :ok -> :ok
+          {:error, reason} -> {:error, {:pre_submit, {:policy_rejected, reason}}}
         end
+
+      _missing ->
+        {:error, {:pre_submit, :dependency_context_unavailable}}
     end
   end
 
@@ -305,7 +320,10 @@ defmodule SymphonyElixir.TransitionCoordinator do
     requirements = WorkflowLifecycle.guard_requirements(intent.requested_from, intent.requested_to) || []
     evidence = Map.get(context, :guard_evidence, intent.guard_evidence)
 
-    if SymphonyElixir.WorkControl.GuardClass.all_satisfied?(requirements, evidence, %{subject: {:work_item, intent.work_item_id}, responsibility: intent.responsibility}) do
+    if GuardClass.all_satisfied?(requirements, evidence, %{
+         subject: {:work_item, intent.work_item_id},
+         responsibility: intent.responsibility
+       }) do
       :ok
     else
       {:error, {:pre_submit, :required_guard_missing}}
@@ -684,26 +702,30 @@ defmodule SymphonyElixir.TransitionCoordinator do
   defp refresh_contract_context(context, refresh_contract) when is_map(context) do
     case invoke(refresh_contract, [context]) do
       {:ok, %ProviderProjectContract{} = contract} ->
-        case Map.get(context, :provider_project_contract) do
-          %ProviderProjectContract{} = expected ->
-            if ProviderProjectContract.fingerprint(expected) == ProviderProjectContract.fingerprint(contract) do
-              {:ok,
-               context
-               |> Map.put(:provider_project_contract, contract)
-               |> Map.put(:provider_contract_fingerprint, ProviderProjectContract.fingerprint(contract))}
-            else
-              {:error, :provider_contract_drift}
-            end
-
-          _missing ->
-            {:error, :provider_project_contract_required}
-        end
+        update_refreshed_contract(context, contract)
 
       {:error, reason} ->
         {:error, {:provider_contract_unavailable, reason}}
 
       other ->
         {:error, {:provider_contract_unavailable, other}}
+    end
+  end
+
+  defp update_refreshed_contract(context, %ProviderProjectContract{} = contract) do
+    case Map.get(context, :provider_project_contract) do
+      %ProviderProjectContract{} = expected ->
+        if ProviderProjectContract.fingerprint(expected) == ProviderProjectContract.fingerprint(contract) do
+          {:ok,
+           context
+           |> Map.put(:provider_project_contract, contract)
+           |> Map.put(:provider_contract_fingerprint, ProviderProjectContract.fingerprint(contract))}
+        else
+          {:error, :provider_contract_drift}
+        end
+
+      _missing ->
+        {:error, :provider_project_contract_required}
     end
   end
 
@@ -829,30 +851,28 @@ defmodule SymphonyElixir.TransitionCoordinator do
              |> Map.put_new(:runtime_attempt_id, attempt.runtime_attempt_id)
              |> Map.put_new(:lineage_generation, attempt.lineage_generation)
            ) do
-      cond do
-        assessment.status == :validated and assessment.validated_state == attempt.requested_to ->
-          {:verified,
-           %{
-             assessment: assessment,
-             post_observation_evidence: observation,
-             provider_project_contract: Map.get(context, :provider_project_contract),
-             post_contract_fingerprint: contract_fingerprint(Map.get(context, :provider_project_contract)),
-             work_item: Map.get(context, :work_item),
-             context_token: Map.get(context, :context_token),
-             status: :validated
-           }}
-
-        true ->
-          {:indeterminate,
-           %{
-             reason: :target_not_confirmed,
-             assessment: assessment,
-             post_observation_evidence: observation,
-             provider_project_contract: Map.get(context, :provider_project_contract),
-             post_contract_fingerprint: contract_fingerprint(Map.get(context, :provider_project_contract)),
-             work_item: Map.get(context, :work_item),
-             context_token: Map.get(context, :context_token)
-           }}
+      if assessment.status == :validated and assessment.validated_state == attempt.requested_to do
+        {:verified,
+         %{
+           assessment: assessment,
+           post_observation_evidence: observation,
+           provider_project_contract: Map.get(context, :provider_project_contract),
+           post_contract_fingerprint: contract_fingerprint(Map.get(context, :provider_project_contract)),
+           work_item: Map.get(context, :work_item),
+           context_token: Map.get(context, :context_token),
+           status: :validated
+         }}
+      else
+        {:indeterminate,
+         %{
+           reason: :target_not_confirmed,
+           assessment: assessment,
+           post_observation_evidence: observation,
+           provider_project_contract: Map.get(context, :provider_project_contract),
+           post_contract_fingerprint: contract_fingerprint(Map.get(context, :provider_project_contract)),
+           work_item: Map.get(context, :work_item),
+           context_token: Map.get(context, :context_token)
+         }}
       end
     else
       {:ok, []} -> {:indeterminate, :work_item_not_found}
