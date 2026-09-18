@@ -24,6 +24,16 @@ defmodule SymphonyElixir.WorkControl.TransitionAttempt do
     :indeterminate
   ]
   @terminal_states [:verified, :rejected, :conflict, :provider_failed, :indeterminate]
+  @assessment_statuses [
+    :unassessed,
+    :mapping_resolved,
+    :validated,
+    :authority_reducing,
+    :validation_required,
+    :invalid,
+    :conflict,
+    :provider_failed
+  ]
 
   # credo:disable-for-next-line
   defstruct [
@@ -285,7 +295,8 @@ defmodule SymphonyElixir.WorkControl.TransitionAttempt do
 
   defp terminalize(attempt, state, reason) do
     with :ok <- available?(attempt),
-         :ok <- terminal_source_allowed?(attempt.state, state) do
+         :ok <- terminal_source_allowed?(attempt.state, state),
+         :ok <- terminal_reason_allowed?(attempt, state, reason) do
       {:ok, terminal_update(attempt, state, %{reason: reason})}
     end
   end
@@ -306,42 +317,110 @@ defmodule SymphonyElixir.WorkControl.TransitionAttempt do
     })
   end
 
-  defp verification_outcome(
-         %{
-           assessment: assessment,
-           post_observation_evidence: observation,
-           post_contract_fingerprint: fingerprint
-         },
-         attempt
-       )
-       when is_map(assessment) and is_map(observation) and is_binary(fingerprint) do
-    if valid_post_observation?(observation, attempt) do
-      case assessment do
-        %{status: :validated, validated_state: state} when state == attempt.requested_to ->
-          {:ok, :verified}
+  defp verification_outcome(context, attempt) do
+    if is_map(context) do
+      assessment = Map.get(context, :assessment)
+      observation = Map.get(context, :post_observation_evidence)
+      fingerprint = Map.get(context, :post_contract_fingerprint)
 
-        %{status: :conflict} ->
-          {:ok, :conflict}
-
-        %{status: :provider_failed} ->
-          {:ok, :provider_failed}
-
-        _other ->
-          {:ok, :indeterminate}
+      if is_map(assessment) and is_map(observation) and is_binary(fingerprint) do
+        verification_outcome(context, attempt, assessment, observation, fingerprint)
+      else
+        {:error, :invalid_verification_evidence}
       end
     else
       {:error, :invalid_verification_evidence}
     end
   end
 
-  defp verification_outcome(_context, _attempt), do: {:error, :invalid_verification_evidence}
+  defp verification_outcome(context, attempt, assessment, observation, fingerprint) do
+    with true <- valid_assessment?(assessment, attempt),
+         true <- valid_post_observation?(observation, attempt),
+         true <- fingerprint == attempt.provider_contract_fingerprint,
+         outcome <- Map.get(context, :outcome) || inferred_outcome(assessment, observation, context, attempt),
+         true <- valid_outcome?(outcome, assessment, observation, context, attempt) do
+      {:ok, outcome}
+    else
+      _ -> {:error, :invalid_verification_evidence}
+    end
+  end
 
   defp valid_post_observation?(observation, %__MODULE__{} = attempt) when is_map(observation) do
-    is_binary(Map.get(observation, :workspace_id)) and
-      is_binary(Map.get(observation, :project_id)) and
+    is_binary(attempt.workspace_id) and
+      is_binary(attempt.project_id) and
+      is_binary(attempt.provider_contract_fingerprint) and
+      Map.get(observation, :workspace_id) == attempt.workspace_id and
+      Map.get(observation, :project_id) == attempt.project_id and
       Map.get(observation, :work_item_id) == attempt.work_item_id and
       is_binary(Map.get(observation, :provider_state_id)) and
       match?(%DateTime{}, Map.get(observation, :observed_at))
+  end
+
+  defp valid_assessment?(assessment, %__MODULE__{} = attempt) when is_map(assessment) do
+    status = Map.get(assessment, :status)
+    work_item_id = Map.get(assessment, :work_item_id)
+    mapped_state = Map.get(assessment, :mapped_state)
+    validated_state = Map.get(assessment, :validated_state)
+
+    status in @assessment_statuses and
+      (is_nil(work_item_id) or work_item_id == attempt.work_item_id) and
+      (is_nil(mapped_state) or WorkflowLifecycle.canonical?(mapped_state)) and
+      (is_nil(validated_state) or WorkflowLifecycle.canonical?(validated_state))
+  end
+
+  defp valid_assessment?(_assessment, _attempt), do: false
+
+  defp inferred_outcome(assessment, observation, context, attempt) do
+    cond do
+      Map.get(assessment, :status) == :validated and
+        Map.get(assessment, :validated_state) == attempt.requested_to and
+          Map.get(observation, :provider_state_id) == attempt.target_provider_state_id ->
+        :verified
+
+      Map.get(assessment, :status) == :provider_failed and non_commit?(context) ->
+        :provider_failed
+
+      Map.get(assessment, :status) == :conflict and incompatible_assessment?(assessment, attempt) ->
+        :conflict
+
+      true ->
+        :indeterminate
+    end
+  end
+
+  defp valid_outcome?(:verified, assessment, observation, _context, attempt) do
+    Map.get(assessment, :status) == :validated and
+      Map.get(assessment, :validated_state) == attempt.requested_to and
+      Map.get(observation, :provider_state_id) == attempt.target_provider_state_id
+  end
+
+  defp valid_outcome?(:conflict, assessment, _observation, context, attempt) do
+    (Map.get(context, :authoritative_conflict?, false) or
+       Map.get(context, :non_commit?, Map.get(context, :non_commit, false)) or
+       Map.get(assessment, :status) == :conflict) and
+      incompatible_assessment?(assessment, attempt)
+  end
+
+  defp valid_outcome?(:provider_failed, assessment, _observation, context, attempt) do
+    non_commit?(context) and
+      (Map.get(assessment, :status) == :provider_failed or
+         (Map.get(assessment, :status) == :validated and
+            Map.get(assessment, :validated_state) == attempt.requested_from) or
+         Map.get(assessment, :status) in [:invalid, :validation_required])
+  end
+
+  defp valid_outcome?(:indeterminate, _assessment, _observation, _context, _attempt), do: true
+  defp valid_outcome?(_outcome, _assessment, _observation, _context, _attempt), do: false
+
+  defp incompatible_assessment?(assessment, attempt) do
+    mapped_state = Map.get(assessment, :mapped_state) || Map.get(assessment, :validated_state)
+
+    WorkflowLifecycle.canonical?(mapped_state) and
+      mapped_state not in [attempt.requested_from, attempt.requested_to]
+  end
+
+  defp non_commit?(context) do
+    Map.get(context, :non_commit?, Map.get(context, :non_commit, false)) == true
   end
 
   defp status_for(:mutation_submitted), do: :submitted
@@ -372,13 +451,33 @@ defmodule SymphonyElixir.WorkControl.TransitionAttempt do
   defp require_state(%__MODULE__{state: state}, state), do: :ok
   defp require_state(%__MODULE__{state: actual}, expected), do: {:error, {:invalid_attempt_state, actual, expected}}
 
+  defp terminal_source_allowed?(:requested, :rejected), do: :ok
+
   defp terminal_source_allowed?(source, target)
-       when source in [:intent_authorized, :fresh_context_loaded, :prepared, :mutation_submitted, :verifying] and
-              target in [:rejected, :conflict, :provider_failed, :indeterminate],
+       when source in [:intent_authorized, :fresh_context_loaded, :prepared] and
+              target in [:rejected, :conflict, :provider_failed],
+       do: :ok
+
+  defp terminal_source_allowed?(source, target)
+       when source in [:mutation_submitted, :verifying] and
+              target in [:conflict, :provider_failed, :indeterminate],
        do: :ok
 
   defp terminal_source_allowed?(source, _target),
     do: {:error, {:invalid_attempt_state, source, :terminal}}
+
+  defp terminal_reason_allowed?(%__MODULE__{state: state}, _target, _reason)
+       when state in [:requested, :intent_authorized, :fresh_context_loaded, :prepared],
+       do: :ok
+
+  defp terminal_reason_allowed?(%__MODULE__{} = attempt, target, reason) do
+    evidence = if is_map(reason), do: Map.put(reason, :outcome, target), else: reason
+
+    case verification_outcome(evidence, attempt) do
+      {:ok, ^target} -> :ok
+      _ -> {:error, :invalid_verification_evidence}
+    end
+  end
 
   defp canonical_atom(value) when is_atom(value) do
     if WorkflowLifecycle.canonical?(value), do: {:ok, value}, else: {:error, :invalid_state}

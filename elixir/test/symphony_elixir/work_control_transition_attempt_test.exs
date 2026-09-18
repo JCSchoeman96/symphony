@@ -180,15 +180,15 @@ defmodule SymphonyElixir.WorkControlTransitionAttemptTest do
   end
 
   test "terminal outcomes absorb every later mutation transition" do
-    for terminalizer <- [
-          &TransitionAttempt.reject/2,
-          &TransitionAttempt.conflict/2,
-          &TransitionAttempt.provider_failed/2,
-          &TransitionAttempt.indeterminate/2
+    assert {:ok, attempt} = verifying_attempt()
+    assert {:error, {:invalid_attempt_state, :verifying, :terminal}} = TransitionAttempt.reject(attempt, %{reason: :denied})
+
+    for {terminalizer, evidence} <- [
+          {&TransitionAttempt.conflict/2, conflict_verification_context()},
+          {&TransitionAttempt.provider_failed/2, provider_failed_verification_context()},
+          {&TransitionAttempt.indeterminate/2, indeterminate_verification_context()}
         ] do
-      assert {:ok, attempt} = verifying_attempt()
-      opts = if terminalizer == (&TransitionAttempt.provider_failed/2), do: %{}, else: %{reason: :denied}
-      assert {:ok, terminal} = terminalizer.(attempt, opts)
+      assert {:ok, terminal} = terminalizer.(attempt, evidence)
       assert TransitionAttempt.terminal?(terminal)
       refute TransitionAttempt.automatic_mutation_allowed?(terminal)
 
@@ -235,12 +235,11 @@ defmodule SymphonyElixir.WorkControlTransitionAttemptTest do
   test "records structured verification outcomes without manufacturing success" do
     {:ok, verifying} = verifying_attempt()
 
-    for {assessment, expected_state} <- [
-          {%{status: :conflict}, :conflict},
-          {%{status: :provider_failed}, :provider_failed},
-          {%{status: :validation_required}, :indeterminate}
+    for {context, expected_state} <- [
+          {conflict_verification_context(), :conflict},
+          {provider_failed_verification_context(), :provider_failed},
+          {indeterminate_verification_context(), :indeterminate}
         ] do
-      context = Map.put(verification_context(), :assessment, assessment)
       assert {:ok, terminal} = TransitionAttempt.verify(verifying, context)
       assert terminal.state == expected_state
     end
@@ -267,7 +266,7 @@ defmodule SymphonyElixir.WorkControlTransitionAttemptTest do
     {:ok, verifying} = TransitionAttempt.begin_verification(submitted, %{at: @now})
 
     assert {:ok, indeterminate} =
-             TransitionAttempt.indeterminate(verifying, %{reason: :verification_unavailable})
+             TransitionAttempt.indeterminate(verifying, indeterminate_verification_context())
 
     assert TransitionAttempt.submission_fenced?(indeterminate)
     refute TransitionAttempt.automatic_mutation_allowed?(indeterminate)
@@ -346,6 +345,34 @@ defmodule SymphonyElixir.WorkControlTransitionAttemptTest do
       },
       assessment: %{status: :validated, validated_state: :in_progress}
     }
+  end
+
+  defp conflict_verification_context do
+    verification_context()
+    |> Map.put(:outcome, :conflict)
+    |> Map.put(:non_commit?, true)
+    |> Map.put(:assessment, %{status: :invalid, work_item_id: "work-1", mapped_state: :canceled})
+    |> Map.put(
+      :post_observation_evidence,
+      Map.merge(Map.fetch!(verification_context(), :post_observation_evidence), %{provider_state_id: "state-canceled"})
+    )
+  end
+
+  defp provider_failed_verification_context do
+    verification_context()
+    |> Map.put(:outcome, :provider_failed)
+    |> Map.put(:non_commit?, true)
+    |> Map.put(:assessment, %{status: :invalid, work_item_id: "work-1"})
+    |> Map.put(
+      :post_observation_evidence,
+      Map.merge(Map.fetch!(verification_context(), :post_observation_evidence), %{provider_state_id: "unavailable"})
+    )
+  end
+
+  defp indeterminate_verification_context do
+    verification_context()
+    |> Map.put(:outcome, :indeterminate)
+    |> Map.put(:assessment, %{status: :validation_required, work_item_id: "work-1", mapped_state: :in_review})
   end
 
   defp verifying_attempt do

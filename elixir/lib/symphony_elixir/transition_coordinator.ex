@@ -466,8 +466,7 @@ defmodule SymphonyElixir.TransitionCoordinator do
          result <- invoke(state.verify, [attempt, context]) do
       case classify_verification(result) do
         {:verified, reason} ->
-          _ = invoke(state.apply_verified, [attempt, reason])
-          terminal_result(state, attempt, :verified, reason)
+          complete_verified_submission(state, attempt, reason)
 
         {:conflict, reason} ->
           terminal_result(state, attempt, :conflict, reason)
@@ -480,6 +479,17 @@ defmodule SymphonyElixir.TransitionCoordinator do
       end
     else
       {:error, reason} -> terminal_result(state, attempt, :indeterminate, {:verification_failed, reason})
+    end
+  end
+
+  defp complete_verified_submission(%State{} = state, attempt, reason) do
+    case terminal_result(state, attempt, :verified, reason) do
+      {{:ok, %TransitionAttempt{state: :verified} = terminal} = reply, next_state} ->
+        _ = invoke(state.apply_verified, [terminal, reason])
+        {reply, next_state}
+
+      result ->
+        result
     end
   end
 
@@ -514,40 +524,117 @@ defmodule SymphonyElixir.TransitionCoordinator do
   end
 
   defp classify_verification({:conflict, %{} = context}) do
-    if Map.get(context, :authoritative_conflict?, false) or
-         Map.get(context, :non_commit?, Map.get(context, :non_commit, false)),
+    if structured_verification?(context) and
+         (Map.get(context, :authoritative_conflict?, false) or
+            Map.get(context, :non_commit?, Map.get(context, :non_commit, false))),
        do: {:conflict, context},
-       else: {:indeterminate, context}
+       else: {:indeterminate, {:unproven_conflict, context}}
   end
 
   defp classify_verification({:conflict, reason}), do: {:indeterminate, {:unproven_conflict, reason}}
-  defp classify_verification({:conflict, reason, :non_commit}), do: {:conflict, reason}
 
   defp classify_verification({:provider_failed, %{} = context}) do
-    if Map.get(context, :non_commit?, Map.get(context, :non_commit, false)), do: {:provider_failed, context}, else: {:indeterminate, context}
+    if structured_verification?(context) and
+         Map.get(context, :non_commit?, Map.get(context, :non_commit, false)),
+       do: {:provider_failed, context},
+       else: {:indeterminate, {:unproven_failure, context}}
   end
 
   defp classify_verification({:provider_failed, reason}), do: {:indeterminate, {:unproven_failure, reason}}
-  defp classify_verification({:indeterminate, %{} = context}), do: {:indeterminate, context}
-  defp classify_verification({:provider_failed, reason, :non_commit}), do: {:provider_failed, reason}
+
+  defp classify_verification({:indeterminate, %{} = context}) do
+    if structured_verification?(context) do
+      {:indeterminate, context}
+    else
+      {:indeterminate, {:invalid_verification, context}}
+    end
+  end
+
   defp classify_verification({:error, reason}), do: {:indeterminate, reason}
   defp classify_verification(other), do: {:indeterminate, {:invalid_verification, other}}
 
   defp structured_verification?(context) when is_map(context) do
     is_map(Map.get(context, :assessment)) and
-      is_map(Map.get(context, :post_observation_evidence)) and
+      structured_observation?(Map.get(context, :post_observation_evidence)) and
       is_binary(Map.get(context, :post_contract_fingerprint))
   end
 
+  defp structured_verification?(_context), do: false
+
+  defp structured_observation?(observation) when is_map(observation) do
+    is_binary(Map.get(observation, :workspace_id)) and
+      is_binary(Map.get(observation, :project_id)) and
+      is_binary(Map.get(observation, :work_item_id)) and
+      is_binary(Map.get(observation, :provider_state_id)) and
+      match?(%DateTime{}, Map.get(observation, :observed_at))
+  end
+
+  defp structured_observation?(_observation), do: false
+
   defp terminal_result(%State{} = state, attempt, state_name, reason) do
+    {terminal_function, terminal_args} = terminal_transition(attempt, state_name, reason)
+
     with {:ok, terminal} <-
-           transition_attempt(attempt, terminal_function(state_name), terminal_args(state_name, reason)),
+           transition_attempt(attempt, terminal_function, terminal_args),
          :ok <- persist(state, terminal) do
       finalize_terminal(state, terminal, state_name, reason)
     else
       {:error, error} ->
         {{:error, error}, terminal_failure_state(state, attempt)}
     end
+  end
+
+  defp terminal_transition(%TransitionAttempt{state: :verifying} = attempt, state_name, reason) do
+    {:verify, [verification_context_for_terminal(attempt, state_name, reason)]}
+  end
+
+  defp terminal_transition(%TransitionAttempt{} = attempt, state_name, reason) do
+    {terminal_function(state_name), terminal_args(state_name, normalize_terminal_reason(attempt, state_name, reason))}
+  end
+
+  defp normalize_terminal_reason(%TransitionAttempt{} = attempt, state_name, reason)
+       when state_name in [:conflict, :provider_failed, :indeterminate] do
+    if structured_verification?(reason), do: Map.put(reason, :outcome, state_name), else: fallback_verification_evidence(attempt, reason)
+  end
+
+  defp normalize_terminal_reason(_attempt, _state_name, reason), do: reason
+
+  defp verification_context_for_terminal(%TransitionAttempt{} = attempt, state_name, reason) do
+    reason = normalize_terminal_reason(attempt, state_name, reason)
+
+    if state_name == :verified and is_map(reason) do
+      Map.delete(reason, :outcome)
+    else
+      if is_map(reason) do
+        Map.put(reason, :outcome, state_name)
+      else
+        fallback_verification_evidence(attempt, reason)
+      end
+    end
+  end
+
+  defp fallback_verification_evidence(%TransitionAttempt{} = attempt, reason) do
+    %{
+      outcome: :indeterminate,
+      reason: reason,
+      verification_unavailable?: true,
+      assessment: %{
+        status: :invalid,
+        work_item_id: attempt.work_item_id,
+        mapped_state: nil,
+        validated_state: nil,
+        reason: :verification_unavailable
+      },
+      post_observation_evidence: %{
+        workspace_id: attempt.workspace_id,
+        project_id: attempt.project_id,
+        work_item_id: attempt.work_item_id,
+        provider_state_id: "unavailable",
+        observed_at: DateTime.utc_now(),
+        availability: :unavailable
+      },
+      post_contract_fingerprint: attempt.provider_contract_fingerprint
+    }
   end
 
   defp terminal_args(:verified, %{} = context), do: [Map.put(context, :status, :verified)]
@@ -558,10 +645,10 @@ defmodule SymphonyElixir.TransitionCoordinator do
 
   defp terminal_args(_state, reason), do: [reason]
 
-  defp finalize_terminal(%State{} = state, terminal, state_name, reason) do
-    if safety_fence?(state_name, reason) do
+  defp finalize_terminal(%State{} = state, terminal, _state_name, reason) do
+    if safety_fence?(terminal.state, reason) do
       fenced_state = %{state | fenced_work_items: MapSet.put(state.fenced_work_items, terminal.work_item_id)}
-      finalize_fenced_terminal(fenced_state, terminal, state_name)
+      finalize_fenced_terminal(fenced_state, terminal, terminal.state)
     else
       {{:ok, terminal}, state}
     end
@@ -986,8 +1073,8 @@ defmodule SymphonyElixir.TransitionCoordinator do
       evidence = verification_evidence(assessment, observation, context)
       classify_default_verification(attempt, context, assessment, evidence)
     else
-      {:ok, []} -> verification_unavailable(context, :work_item_not_found)
-      {:error, reason} -> verification_unavailable(context, {:fresh_verification_unavailable, reason})
+      {:ok, []} -> verification_unavailable(attempt, context, :work_item_not_found)
+      {:error, reason} -> verification_unavailable(attempt, context, {:fresh_verification_unavailable, reason})
     end
   end
 
@@ -1043,11 +1130,13 @@ defmodule SymphonyElixir.TransitionCoordinator do
     end
   end
 
-  defp verification_unavailable(context, reason) do
+  defp verification_unavailable(%TransitionAttempt{} = attempt, context, reason) do
+    evidence = fallback_verification_evidence(attempt, reason)
+
     if Map.get(context, :provider_non_commit?, false) do
-      {:provider_failed, %{non_commit?: true, reason: reason}}
+      {:provider_failed, Map.merge(evidence, %{non_commit?: true, outcome: :provider_failed})}
     else
-      {:indeterminate, reason}
+      {:indeterminate, evidence}
     end
   end
 

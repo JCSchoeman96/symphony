@@ -121,30 +121,39 @@ defmodule SymphonyElixir.WorkControl.TransitionAttemptLedger do
     result =
       :dets.foldl(
         fn
-          {{:attempt, _attempt_id}, attempt}, {:ok, %{attempts: attempts, pointers: pointers}} ->
+          {{:attempt, _attempt_id}, attempt}, {:ok, %{attempts: attempts} = result} ->
             case validate_attempt(ledger, attempt) do
               {:ok, record, _attempt_id, _work_item_id} ->
-                {:ok, %{attempts: [record | attempts], pointers: pointers}}
+                {:ok, Map.put(result, :attempts, [record | attempts])}
 
               {:error, _reason} = error ->
                 error
             end
 
-          {{:latest, work_item_id}, attempt_id}, {:ok, %{attempts: attempts, pointers: pointers}}
+          {{:latest, work_item_id}, attempt_id}, {:ok, %{pointers: pointers} = result}
           when is_binary(work_item_id) and is_binary(attempt_id) ->
-            {:ok, %{attempts: attempts, pointers: [{work_item_id, attempt_id} | pointers]}}
+            {:ok, Map.put(result, :pointers, [{work_item_id, attempt_id} | pointers])}
 
           {{:latest, _work_item_id}, _attempt_id}, _result ->
             {:error, {:corrupt_transition_attempt, :invalid_record}}
 
-          _other, result ->
-            result
+          {{:meta, _stored_project}, metadata}, {:ok, %{metadata_seen: false} = result} ->
+            case validate_metadata(metadata, ledger) do
+              :ok -> {:ok, Map.put(result, :metadata_seen, true)}
+              {:error, _reason} = error -> error
+            end
+
+          {{:meta, _stored_project}, _metadata}, {:ok, _result} ->
+            {:error, {:corrupt_transition_attempt, :metadata}}
+
+          _other, _result ->
+            {:error, {:corrupt_transition_attempt, :invalid_record}}
         end,
-        {:ok, %{attempts: [], pointers: []}},
+        {:ok, %{attempts: [], pointers: [], metadata_seen: false}},
         ledger.table
       )
 
-    with {:ok, %{attempts: attempts, pointers: pointers}} <- result,
+    with {:ok, %{attempts: attempts, pointers: pointers, metadata_seen: true}} <- result,
          :ok <- validate_latest_pointers(attempts, pointers) do
       candidates = Enum.filter(attempts, &reconciliation_candidate?/1)
 
@@ -298,8 +307,7 @@ defmodule SymphonyElixir.WorkControl.TransitionAttemptLedger do
   defp reconciliation_candidate?(attempt) do
     status = Map.get(attempt, :status) || Map.get(attempt, :state)
 
-    status in @reconciliation_statuses or
-      (status == :prepared and TransitionAttempt.submission_fenced?(attempt))
+    status in @reconciliation_statuses or status == :prepared
   end
 
   defp validate_latest_pointers(attempts, pointers) do
@@ -317,9 +325,31 @@ defmodule SymphonyElixir.WorkControl.TransitionAttemptLedger do
   defp valid_state_pair?(record) do
     source = Map.get(record, :source_state) || Map.get(record, :requested_from)
     target = Map.get(record, :target_state) || Map.get(record, :requested_to)
+    state = Map.get(record, :state)
+    status = Map.get(record, :status)
 
-    WorkflowLifecycle.canonical?(source) and WorkflowLifecycle.canonical?(target)
+    WorkflowLifecycle.canonical?(source) and WorkflowLifecycle.canonical?(target) and
+      valid_state_status_pair(state, status)
   end
+
+  defp valid_state_status_pair(:mutation_submitted, :submitted), do: true
+
+  defp valid_state_status_pair(state, status)
+       when state in [
+              :requested,
+              :intent_authorized,
+              :fresh_context_loaded,
+              :prepared,
+              :verifying,
+              :verified,
+              :rejected,
+              :conflict,
+              :provider_failed,
+              :indeterminate
+            ],
+       do: state == status
+
+  defp valid_state_status_pair(_state, _status), do: false
 
   defp persist(%__MODULE__{table: table, write_fun: write_fun}, records) do
     case write_fun.(table, records) do

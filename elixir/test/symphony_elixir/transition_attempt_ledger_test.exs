@@ -181,6 +181,7 @@ defmodule SymphonyElixir.TransitionAttemptLedgerTest do
       Map.put(valid, :attempt_id, ""),
       Map.put(valid, :work_item_id, ""),
       Map.put(valid, :status, :unknown),
+      Map.put(valid, :status, :verified),
       Map.put(valid, :updated_at, -1),
       Map.put(valid, :unexpected, true),
       Map.put(valid, :source_state, :unknown_state)
@@ -208,10 +209,7 @@ defmodule SymphonyElixir.TransitionAttemptLedgerTest do
           {"verified", :verified},
           {"rejected", :rejected}
         ] do
-      record =
-        if status == :prepared,
-          do: Map.put(attempt(id, id, status), :submission_fenced_at, 1_700_000_000_000),
-          else: attempt(id, id, status)
+      record = attempt(id, id, status)
 
       assert :ok = TransitionAttemptLedger.put_sync(ledger, record)
     end
@@ -230,6 +228,19 @@ defmodule SymphonyElixir.TransitionAttemptLedgerTest do
   test "rejects a corrupt persisted attempt instead of treating the ledger as empty", %{path: path} do
     {:ok, ledger} = TransitionAttemptLedger.open("project-a", @identity, path: path)
     assert :ok = :dets.insert(ledger.table, {{:attempt, "corrupt"}, %{status: :indeterminate}})
+    assert :ok = :dets.sync(ledger.table)
+
+    assert {:error, {:corrupt_transition_attempt, :invalid_record}} =
+             TransitionAttemptLedger.list_reconciliation_candidates(ledger)
+
+    assert :ok = TransitionAttemptLedger.close(ledger)
+  end
+
+  test "rejects inconsistent state and status records and unknown table entries", %{path: path} do
+    {:ok, ledger} = TransitionAttemptLedger.open("project-a", @identity, path: path)
+    mismatched = Map.merge(attempt("mismatched", "work-a", :prepared), %{state: :mutation_submitted})
+    assert :ok = :dets.insert(ledger.table, {{:attempt, "mismatched"}, mismatched})
+    assert :ok = :dets.insert(ledger.table, {{:unknown, "record"}, :unexpected})
     assert :ok = :dets.sync(ledger.table)
 
     assert {:error, {:corrupt_transition_attempt, :invalid_record}} =
@@ -405,6 +416,7 @@ defmodule SymphonyElixir.TransitionAttemptLedgerTest do
       target_state: :in_progress,
       provider_observation_identity: "observation-#{work_item_id}",
       transition_identity: "transition-#{attempt_id}",
+      state: if(status == :submitted, do: :mutation_submitted, else: status),
       status: status,
       created_at: 1_700_000_000_000,
       updated_at: 1_700_000_000_000

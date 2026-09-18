@@ -6,6 +6,7 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
   alias SymphonyElixir.WorkControl.{
     ProviderProjectContract,
     SemanticTransitionIntent,
+    TransitionAttempt,
     TransitionAttemptLedger,
     WorkflowLifecycle
   }
@@ -110,6 +111,7 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
       TransitionAttemptLedger.open("project-a", %{tracker_kind: "plane", provider_scope: %{project_id: "project-a"}}, path: path)
 
     assert :ok = :dets.insert(ledger.table, {{:attempt, "corrupt"}, %{status: :indeterminate}})
+    assert :ok = :dets.insert(ledger.table, {{:unknown, "corrupt"}, :unexpected})
     assert :ok = :dets.sync(ledger.table)
     assert :ok = TransitionAttemptLedger.close(ledger)
 
@@ -319,6 +321,52 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
     assert Agent.get(submissions, & &1) == 1
   end
 
+  test "reopening a ledger with an ordinary Prepared marker blocks submission" do
+    root = Path.join(System.tmp_dir!(), "symphony-transition-prepared-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(root)
+    path = Path.join(root, "attempts.dets")
+    on_exit(fn -> File.rm_rf(root) end)
+
+    identity = %{tracker_kind: "plane", provider_scope: %{project_id: "project-a"}}
+    {:ok, ledger} = TransitionAttemptLedger.open("project-a", identity, path: path)
+    {:ok, intent} = SemanticTransitionIntent.new(intent_attrs())
+    {:ok, attempt} = TransitionAttempt.new(Map.from_struct(intent))
+    {:ok, attempt} = TransitionAttempt.authorize_intent(attempt, intent)
+    {:ok, attempt} = TransitionAttempt.fresh_context_loaded(attempt, context())
+
+    prepare_context =
+      context()
+      |> Map.merge(%{
+        workspace_id: "workspace-1",
+        project_id: "project-1",
+        target_provider_state_id: "state-in-progress",
+        target_provider_state_group: :started,
+        provider_contract_fingerprint: ProviderProjectContract.fingerprint(contract())
+      })
+
+    {:ok, prepared} = TransitionAttempt.prepare(attempt, prepare_context)
+    assert :ok = TransitionAttemptLedger.put_sync(ledger, prepared)
+    assert :ok = TransitionAttemptLedger.close(ledger)
+
+    {:ok, submissions} = Agent.start_link(fn -> 0 end)
+
+    {:ok, coordinator} =
+      TransitionCoordinator.start_link(
+        name: nil,
+        project_id: "project-a",
+        tracker_identity: identity,
+        ledger_opts: [path: path],
+        load_context: fn _intent -> {:ok, context()} end,
+        submit: fn _attempt, _context ->
+          Agent.update(submissions, &(&1 + 1))
+          :ok
+        end
+      )
+
+    assert {:error, :transition_fenced} = TransitionCoordinator.request_transition(coordinator, intent)
+    assert Agent.get(submissions, & &1) == 0
+  end
+
   test "rejects a concurrent request before the first provider call completes" do
     test_pid = self()
     {:ok, intent} = SemanticTransitionIntent.new(intent_attrs())
@@ -466,9 +514,9 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
         name: nil,
         load_context: fn _intent -> {:ok, context()} end,
         submit: fn _attempt, _context -> {:error, :econnrefused} end,
-        verify: fn _attempt, context ->
+        verify: fn attempt, context ->
           send(test_pid, {:verification_result, context.provider_non_commit?})
-          {:provider_failed, %{non_commit?: true, reason: :connection_refused}}
+          {:provider_failed, provider_failed_evidence(attempt, :connection_refused)}
         end,
         suspend: fn _work_item_id, _reason, _attempt -> :ok end,
         require_durable?: false
@@ -490,9 +538,15 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
            %{
              non_commit?: true,
              reason: :incompatible_concurrent_movement,
-             assessment: %{status: :invalid, mapped_state: :canceled},
-             post_observation_evidence: %{provider_state_id: "state-canceled"},
-             post_contract_fingerprint: "sha256:test"
+             assessment: %{status: :invalid, work_item_id: "work-1", mapped_state: :canceled},
+             post_observation_evidence: %{
+               workspace_id: "workspace-1",
+               project_id: "project-1",
+               work_item_id: "work-1",
+               provider_state_id: "state-canceled",
+               observed_at: DateTime.utc_now()
+             },
+             post_contract_fingerprint: ProviderProjectContract.fingerprint(contract())
            }}
         end,
         suspend: fn _work_item_id, _reason, _attempt -> :ok end,
@@ -724,7 +778,7 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
         suspend: fn _work_item_id, _reason, _attempt -> :ok end
       )
 
-    assert {:ok, %{state: :provider_failed}} =
+    assert {:ok, %{state: :indeterminate}} =
              TransitionCoordinator.request_transition(coordinator, intent_attrs())
   end
 
@@ -786,7 +840,47 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
         suspend: fn _work_item_id, _reason, _attempt -> :ok end
       )
 
-    assert {:ok, %{state: :provider_failed}} = TransitionCoordinator.request_transition(coordinator, intent_attrs())
+    assert {:ok, %{state: :indeterminate}} = TransitionCoordinator.request_transition(coordinator, intent_attrs())
+  end
+
+  test "fences a contradictory verified envelope when its authoritative assessment is Conflict" do
+    test_pid = self()
+    {:ok, submissions} = Agent.start_link(fn -> 0 end)
+
+    {:ok, coordinator} =
+      TransitionCoordinator.start_link(
+        name: nil,
+        require_durable?: false,
+        load_context: fn _intent -> {:ok, context()} end,
+        submit: fn _attempt, _context ->
+          Agent.update(submissions, &(&1 + 1))
+          :ok
+        end,
+        verify: fn _attempt, _context ->
+          {:verified,
+           %{
+             assessment: %{status: :conflict, work_item_id: "work-1", mapped_state: :canceled},
+             post_observation_evidence: %{
+               workspace_id: "workspace-1",
+               project_id: "project-1",
+               work_item_id: "work-1",
+               provider_state_id: "state-canceled",
+               observed_at: DateTime.utc_now()
+             },
+             post_contract_fingerprint: ProviderProjectContract.fingerprint(contract())
+           }}
+        end,
+        suspend: fn _work_item_id, reason, _attempt ->
+          send(test_pid, {:suspended, reason})
+          :ok
+        end
+      )
+
+    assert {:ok, %{state: :conflict}} = TransitionCoordinator.request_transition(coordinator, intent_attrs())
+    assert_received {:suspended, :conflict}
+    assert Agent.get(submissions, & &1) == 1
+    assert {:error, :transition_fenced} = TransitionCoordinator.request_transition(coordinator, intent_attrs())
+    assert Agent.get(submissions, & &1) == 1
   end
 
   test "suspension outcomes fail closed regardless of callback shape" do
@@ -902,8 +996,9 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
           suspend: fn _work_item_id, _reason, _attempt -> :ok end
         )
 
-      expected = elem(verification, 0)
-      assert {:ok, %{state: ^expected}} = TransitionCoordinator.request_transition(coordinator, intent_attrs())
+      assert {:ok, %{state: :indeterminate}} =
+               TransitionCoordinator.request_transition(coordinator, intent_attrs())
+
       GenServer.stop(coordinator)
     end
 
@@ -989,10 +1084,26 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
         workspace_id: "workspace-1",
         project_id: "project-1",
         work_item_id: "work-1",
-        provider_state_id: "state-in-progress",
+        provider_state_id: "state-in_progress",
         observed_at: DateTime.utc_now()
       },
-      post_contract_fingerprint: "sha256:test"
+      post_contract_fingerprint: ProviderProjectContract.fingerprint(contract())
+    }
+  end
+
+  defp provider_failed_evidence(attempt, reason) do
+    %{
+      non_commit?: true,
+      reason: reason,
+      assessment: %{status: :invalid, work_item_id: attempt.work_item_id},
+      post_observation_evidence: %{
+        workspace_id: attempt.workspace_id,
+        project_id: attempt.project_id,
+        work_item_id: attempt.work_item_id,
+        provider_state_id: "unavailable",
+        observed_at: DateTime.utc_now()
+      },
+      post_contract_fingerprint: attempt.provider_contract_fingerprint
     }
   end
 

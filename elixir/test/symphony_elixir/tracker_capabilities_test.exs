@@ -206,10 +206,10 @@ defmodule SymphonyElixir.TrackerCapabilitiesTest do
                workspace_id: "workspace-1",
                project_id: "project-1",
                work_item_id: "work-1",
-               provider_state_id: "state-in-progress",
+               provider_state_id: "state-in_progress",
                observed_at: DateTime.utc_now()
              },
-             post_contract_fingerprint: "sha256:test"
+             post_contract_fingerprint: ProviderProjectContract.fingerprint(contract())
            }}
         end,
         require_durable?: false
