@@ -18,15 +18,15 @@ defmodule SymphonyElixir.PlaneDependencyReaderTest do
     secret_environment_names: ["PLANE_API_KEY"]
   }
 
-  test "normalizes blocked_by and blocking observations into one canonical edge" do
+  test "accepts provider issue_id relations and normalizes both directions" do
     requests = start_request_log()
 
     assert {:ok, %Graph{} = graph} =
              Adapter.fetch_dependency_graph_for_test(
                @settings,
                dependency_request_fun(requests, %{
-                 "a" => %{"blocked_by" => [%{"id" => "b", "project_id" => "project-1"}], "blocking" => []},
-                 "b" => %{"blocked_by" => [], "blocking" => [%{"id" => "a", "project_id" => "project-1"}]}
+                 "a" => %{"blocked_by" => [%{"issue_id" => "b", "project_id" => "project-1"}], "blocking" => []},
+                 "b" => %{"blocked_by" => [], "blocking" => [%{"issue_id" => "a", "project_id" => "project-1"}]}
                })
              )
 
@@ -130,7 +130,7 @@ defmodule SymphonyElixir.PlaneDependencyReaderTest do
   test "retains more than one hundred prerequisites without truncation" do
     ids = Enum.map(1..106, &"b-#{&1}")
     items = [item("dependent") | Enum.map(ids, &item/1)]
-    relations = %{"dependent" => %{"blocked_by" => Enum.map(ids, &%{"id" => &1, "project_id" => "project-1"}), "blocking" => []}}
+    relations = %{"dependent" => %{"blocked_by" => Enum.map(ids, &%{"issue_id" => &1, "project_id" => "project-1"}), "blocking" => []}}
     requests = start_request_log()
 
     assert {:ok, graph} =
@@ -192,9 +192,12 @@ defmodule SymphonyElixir.PlaneDependencyReaderTest do
     for relation_body <- [
           %{"blocked_by" => %{}, "blocking" => []},
           %{"blocked_by" => ["not-a-target"], "blocking" => []},
-          %{"blocked_by" => [%{"id" => "b"}], "blocking" => []},
-          %{"blocked_by" => [%{"id" => "b", "project_id" => "other-project"}], "blocking" => []},
-          %{"blocked_by" => [%{"id" => "missing", "project_id" => "project-1"}], "blocking" => []}
+          %{"blocked_by" => [%{"issue_id" => "b"}], "blocking" => []},
+          %{"blocked_by" => [%{"issue_id" => "", "project_id" => "project-1"}], "blocking" => []},
+          %{"blocked_by" => [%{"issue_id" => 123, "project_id" => "project-1"}], "blocking" => []},
+          %{"blocked_by" => [%{"id" => "b", "project_id" => "project-1"}], "blocking" => []},
+          %{"blocked_by" => [%{"issue_id" => "b", "project_id" => "other-project"}], "blocking" => []},
+          %{"blocked_by" => [%{"issue_id" => "missing", "project_id" => "project-1"}], "blocking" => []}
         ] do
       requests = start_request_log()
 
@@ -216,12 +219,12 @@ defmodule SymphonyElixir.PlaneDependencyReaderTest do
                @settings,
                dependency_request_fun(requests, %{
                  "a" => %{
-                   "blocked_by" => [%{"id" => "b", "project_id" => "project-1"}],
-                   "blocking" => [%{"id" => "b", "project_id" => "project-1"}]
+                   "blocked_by" => [%{"issue_id" => "b", "project_id" => "project-1"}],
+                   "blocking" => [%{"issue_id" => "b", "project_id" => "project-1"}]
                  },
                  "b" => %{
-                   "blocked_by" => [%{"id" => "a", "project_id" => "project-1"}],
-                   "blocking" => [%{"id" => "a", "project_id" => "project-1"}]
+                   "blocked_by" => [%{"issue_id" => "a", "project_id" => "project-1"}],
+                   "blocking" => [%{"issue_id" => "a", "project_id" => "project-1"}]
                  }
                })
              )
@@ -258,7 +261,7 @@ defmodule SymphonyElixir.PlaneDependencyReaderTest do
                  requests,
                  %{
                    "a" => %{
-                     "blocked_by" => [%{"id" => "foreign-id", "project_id" => "project-1"}],
+                     "blocked_by" => [%{"issue_id" => "foreign-id", "project_id" => "project-1"}],
                      "blocking" => []
                    }
                  },
@@ -305,7 +308,7 @@ defmodule SymphonyElixir.PlaneDependencyReaderTest do
     assert {:ok, graph} =
              Adapter.fetch_dependency_graph_for_test(
                @settings,
-               dependency_request_fun(requests, %{"a" => Map.merge(empty_relations(), %{"relates_to" => [%{"id" => "b", "project_id" => "project-1"}]})})
+               dependency_request_fun(requests, %{"a" => Map.merge(empty_relations(), %{"relates_to" => [%{"issue_id" => "b", "project_id" => "project-1"}]})})
              )
 
     assert graph.nodes["a"].blocked_by == []
@@ -364,12 +367,12 @@ defmodule SymphonyElixir.PlaneDependencyReaderTest do
                dependency_request_fun(requests, %{
                  "a" => %{
                    "blocked_by" => [
-                     %{"id" => "b", "project_id" => "project-1"},
-                     %{"id" => "b", "project_id" => "project-1"}
+                     %{"issue_id" => "b", "project_id" => "project-1"},
+                     %{"issue_id" => "b", "project_id" => "project-1"}
                    ],
                    "blocking" => []
                  },
-                 "b" => %{"blocked_by" => [], "blocking" => [%{"id" => "a", "project_id" => "project-1"}]}
+                 "b" => %{"blocked_by" => [], "blocking" => [%{"issue_id" => "a", "project_id" => "project-1"}]}
                })
              )
 
@@ -378,7 +381,7 @@ defmodule SymphonyElixir.PlaneDependencyReaderTest do
   end
 
   test "bounds relation fan-out and task timeouts" do
-    entries = Enum.map(1..10_001, &%{"id" => "target-#{&1}", "project_id" => "project-1"})
+    entries = Enum.map(1..10_001, &%{"issue_id" => "target-#{&1}", "project_id" => "project-1"})
     requests = start_request_log()
 
     assert {:error, :relation_fanout_exceeded} =

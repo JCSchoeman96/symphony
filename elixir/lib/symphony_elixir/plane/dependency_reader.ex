@@ -265,7 +265,7 @@ defmodule SymphonyElixir.Plane.DependencyReader do
   end
 
   defp relation_target(entry, project_id) when is_map(entry) do
-    with {:ok, target_id} <- required_relation_string(entry, :id),
+    with {:ok, target_id} <- required_relation_string(entry, :issue_id),
          {:ok, target_project_id} <- required_relation_string(entry, :project_id),
          true <- target_project_id == project_id do
       {:ok, target_id}
