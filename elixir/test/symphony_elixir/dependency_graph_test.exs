@@ -11,8 +11,7 @@ defmodule SymphonyElixir.DependencyGraphTest do
         issue("c", [])
       ])
 
-    assert graph.edges == %{"a" => ["b"], "b" => ["c"], "c" => []}
-    assert graph.reverse_edges == %{"a" => [], "b" => ["a"], "c" => ["b"]}
+    assert graph.edges == %{"a" => [], "b" => ["a"], "c" => ["b"]}
     assert Graph.cycles(graph) == []
   end
 
@@ -42,6 +41,26 @@ defmodule SymphonyElixir.DependencyGraphTest do
     refute Graph.cyclic?(graph, "independent")
   end
 
+  test "freezes cycle analysis in each immutable epoch" do
+    graph =
+      Graph.build([
+        issue("left", [%{id: "right", state: "Ready"}]),
+        issue("right", [%{id: "left", state: "Ready"}]),
+        issue("other", [])
+      ])
+
+    assert graph.cycles == [["left", "right"]]
+    assert graph.cycle_members == MapSet.new(["left", "right"])
+    assert Graph.cycles(graph) == graph.cycles
+    assert Graph.cycle_members(graph) == graph.cycle_members
+    assert Graph.cyclic?(graph, "left")
+    refute Graph.cyclic?(graph, "other")
+
+    rebuilt = Graph.build(Map.values(graph.nodes))
+    refute rebuilt.epoch == graph.epoch
+    assert Graph.cycles(graph) == [["left", "right"]]
+  end
+
   test "keeps independent branches separate and orders multiple blockers" do
     graph =
       Graph.build([
@@ -54,7 +73,8 @@ defmodule SymphonyElixir.DependencyGraphTest do
         issue("independent", [])
       ])
 
-    assert graph.edges["dependent"] == ["a", "z"]
+    assert graph.edges["a"] == ["dependent"]
+    assert graph.edges["z"] == ["dependent"]
     assert graph.edges["independent"] == []
     assert Graph.cycles(graph) == []
   end
@@ -118,6 +138,14 @@ defmodule SymphonyElixir.DependencyGraphTest do
 
     assert Graph.complete?(Graph.build([issue("complete", [])]))
     refute Graph.complete?(Graph.unavailable(:provider_unavailable))
+    refute Graph.complete?(%Graph{})
+
+    malformed = Graph.build([issue("malformed", [:bad])])
+    refute Graph.complete?(malformed)
+
+    refute Graph.complete?(%Graph{completeness: :complete, nodes: %{"malformed" => :not_an_issue}})
+
+    refute Graph.complete?(Graph.build([issue("provider-failed", [])], diagnostics: [%{kind: :relation_read_failed}]))
 
     assert Graph.incompleteness_reason(Graph.unavailable(:provider_unavailable), "complete") ==
              {:unavailable, :provider_unavailable}

@@ -3,6 +3,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
   alias Ecto.Changeset
   alias SymphonyElixir.Config.Schema
   alias SymphonyElixir.Config.Schema.{Codex, StringOrMap}
+  alias SymphonyElixir.Dependency.Graph
   alias SymphonyElixir.Linear.Client
   alias SymphonyElixir.WorkControl.{GuardClass, WorkItem}
 
@@ -748,6 +749,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
   test "provider-marked blocked issue is not dispatch-eligible" do
     state = %Orchestrator.State{
       max_concurrent_agents: 3,
+      dependency_graph: Graph.build([]),
       running: %{},
       claimed: MapSet.new(),
       codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
@@ -771,6 +773,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     state = %Orchestrator.State{
       max_concurrent_agents: 3,
+      dependency_graph: Graph.build([]),
       running: %{},
       claimed: MapSet.new(),
       codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
@@ -795,6 +798,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     state = %Orchestrator.State{
       max_concurrent_agents: 3,
+      dependency_graph: Graph.build([]),
       running: %{},
       claimed: MapSet.new(),
       codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
@@ -817,6 +821,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
   test "provider-marked ready issue remains dispatch-eligible" do
     state = %Orchestrator.State{
       max_concurrent_agents: 3,
+      dependency_graph: Graph.build([]),
       running: %{},
       claimed: MapSet.new(),
       codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
@@ -872,6 +877,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     state = %Orchestrator.State{
       max_concurrent_agents: 3,
+      dependency_graph: Graph.build([]),
       running: %{},
       claimed: MapSet.new(),
       codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},

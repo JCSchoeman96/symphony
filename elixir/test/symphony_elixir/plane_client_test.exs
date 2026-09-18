@@ -28,6 +28,22 @@ defmodule SymphonyElixir.PlaneClientTest do
     assert {"X-API-Key", "secret"} in headers
   end
 
+  test "reads relations through the fixed scoped GET path without pagination" do
+    parent = self()
+
+    assert {:ok, %{"blocked_by" => []}} =
+             Client.get_work_item_relations(@config, "item/one",
+               request_fun: fn request ->
+                 send(parent, {:request, request})
+                 {:ok, %{status: 200, body: %{"blocked_by" => [], "blocking" => []}}}
+               end
+             )
+
+    assert_receive {:request, %{method: :get, path: path, params: %{}, headers: headers}}
+    assert path == "/api/v1/workspaces/workspace-1/projects/project-1/work-items/item%2Fone/relations/"
+    assert {"X-API-Key", "secret"} in headers
+  end
+
   test "requests the factual fields required for project work items and states" do
     parent = self()
 

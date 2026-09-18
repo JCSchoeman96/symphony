@@ -5,6 +5,7 @@ end
 defmodule SymphonyElixir.RetryRefreshTest do
   use SymphonyElixir.TestSupport
   alias SymphonyElixir.AgentRuntime.AttemptPolicy
+  alias SymphonyElixir.Dependency.Graph
   alias SymphonyElixir.WorkControl.{GuardClass, WorkItem}
 
   setup do
@@ -59,6 +60,7 @@ defmodule SymphonyElixir.RetryRefreshTest do
           delay_type: :continuation
         }
       },
+      dependency_graph: Graph.build(issues),
       work_control: trusted_work_control(issues)
     }
 

@@ -3,20 +3,20 @@ defmodule SymphonyElixir.DependencyCompletenessTest do
 
   alias SymphonyElixir.Dependency.{Graph, Guard}
 
-  defmodule FinalRefreshLinearClient do
+  defmodule EpochLinearClient do
     alias SymphonyElixir.Tracker.Issue
 
     def fetch_issues_by_states(_states), do: {:ok, [candidate([])]}
     def fetch_issues_by_ids(_ids), do: {:ok, [candidate([])]}
 
     def fetch_dependency_graph do
-      case Process.get(:final_refresh_graph_calls, 0) do
-        0 ->
-          Process.put(:final_refresh_graph_calls, 1)
-          {:ok, [candidate([])]}
+      calls = Process.get(:epoch_graph_calls, 0) + 1
+      Process.put(:epoch_graph_calls, calls)
 
-        _ ->
-          {:ok, [candidate([%{id: "late-blocker", identifier: "SYM-LATE-BLOCKER", state: "In Progress"}]), blocker()]}
+      if Process.get(:next_epoch_has_blocker, false) do
+        {:ok, [candidate([%{id: "late-blocker", identifier: "SYM-LATE-BLOCKER", state: "In Progress"}]), blocker()]}
+      else
+        {:ok, [candidate([])]}
       end
     end
 
@@ -252,13 +252,15 @@ defmodule SymphonyElixir.DependencyCompletenessTest do
     if is_reference(updated_state.tick_timer_ref), do: Process.cancel_timer(updated_state.tick_timer_ref)
   end
 
-  test "final graph refresh denies a candidate whose blocker appears after selection" do
+  test "one epoch is reused during dispatch and a later reconciliation observes dependency changes" do
     previous_client = Application.get_env(:symphony_elixir, :linear_client_module)
-    Application.put_env(:symphony_elixir, :linear_client_module, FinalRefreshLinearClient)
-    Process.delete(:final_refresh_graph_calls)
+    Application.put_env(:symphony_elixir, :linear_client_module, EpochLinearClient)
+    Process.delete(:epoch_graph_calls)
+    Process.delete(:next_epoch_has_blocker)
 
     on_exit(fn ->
-      Process.delete(:final_refresh_graph_calls)
+      Process.delete(:epoch_graph_calls)
+      Process.delete(:next_epoch_has_blocker)
 
       if is_nil(previous_client) do
         Application.delete_env(:symphony_elixir, :linear_client_module)
@@ -280,10 +282,15 @@ defmodule SymphonyElixir.DependencyCompletenessTest do
       agent_runner: SymphonyElixir.AgentRouterOrchestratorRunnerFake
     }
 
-    {:noreply, updated_state} = Orchestrator.handle_info(:run_poll_cycle, state)
+    {:noreply, first_epoch_state} = Orchestrator.handle_info(:run_poll_cycle, state)
 
-    assert updated_state.running == %{}
-    refute MapSet.member?(updated_state.claimed, "final-refresh-candidate")
+    assert Process.get(:epoch_graph_calls) == 1
+    assert first_epoch_state.dependency_graph.completeness == :complete
+
+    Process.put(:next_epoch_has_blocker, true)
+    {:noreply, updated_state} = Orchestrator.handle_info(:run_poll_cycle, first_epoch_state)
+
+    assert Process.get(:epoch_graph_calls) == 2
 
     assert updated_state.dependency_diagnostics["final-refresh-candidate"].reason ==
              :unresolved_hard_dependency

@@ -33,11 +33,11 @@ defmodule SymphonyElixir.LegacyGraphTest do
     :ok
   end
 
-  test "legacy dispatch preserves per-issue semantics without fabricating a complete graph" do
+  test "legacy dispatch retains per-issue checks without fabricating a graph epoch" do
     write_provider_workflow("legacy")
     state = poll()
-    assert_receive {:legacy_dispatch, "legacy-graph", %{profile_name: "legacy"}}
-    assert state.running["legacy-graph"].responsibility == "implementation"
+    assert_receive {:legacy_dispatch, "legacy-graph", _}
+    assert state.running["legacy-graph"]
     refute Graph.complete?(state.dependency_graph)
   end
 

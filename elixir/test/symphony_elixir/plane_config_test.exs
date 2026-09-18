@@ -111,8 +111,6 @@ defmodule SymphonyElixir.PlaneConfigTest do
              Config.validate_settings(settings)
 
     assert missing == [
-             :dependency_graph,
-             :dependency_completeness,
              :controlled_transition,
              :transition_verification,
              :agent_read_tools,

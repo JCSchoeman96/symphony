@@ -73,12 +73,15 @@ other adapters remain provider-specific permission boundaries.
 Linear handoffs revalidate current issue state and the dependency graph with the session's bound
 provider settings. A session may attempt one handoff; an uncertain mutation response requires a
 fresh attempt. This is a fresh authorization check, not an atomic transaction with concurrent
-tracker edits. Retry dispatch also rechecks eligibility, capacity, and role after its final graph
-refresh, and counts review-to-correction transitions observed while waiting for retry.
+tracker edits. Dispatch and retry paths consume the immutable dependency epoch built during
+reconciliation; a later reconciliation publishes a new epoch when provider relations change.
+Incomplete or unavailable dependency data fails routed dispatch closed until reconciliation
+succeeds. Legacy adapters retain their accepted per-issue blocker checks and do not claim a
+complete graph epoch.
 
-Legacy adapters without graph support retain their per-issue dependency checks. Explicit routed
-work still requires authoritative graph support for implementation and correction. Built-in prompt
-names must match the configured responsibility; custom prompt content remains operator-controlled.
+Explicit routed work still requires authoritative graph support for implementation and correction.
+Built-in prompt names must match the configured responsibility; custom prompt content remains
+operator-controlled.
 
 ## Live proof
 

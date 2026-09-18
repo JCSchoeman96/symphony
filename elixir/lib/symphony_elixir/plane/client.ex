@@ -46,6 +46,16 @@ defmodule SymphonyElixir.Plane.Client do
     end
   end
 
+  @spec get_work_item_relations(config(), String.t(), keyword()) :: {:ok, map()} | {:error, term()}
+  def get_work_item_relations(config, work_item_id, opts \\ [])
+      when is_map(config) and is_binary(work_item_id) and is_list(opts) do
+    with {:ok, config} <- normalize_config(config, opts),
+         {:ok, id} <- identifier(work_item_id),
+         {:ok, response} <- request(config, relation_path(config, id), %{}, opts) do
+      successful_body(response, :object)
+    end
+  end
+
   @spec list_work_items(config(), keyword()) :: {:ok, [map()]} | {:error, term()}
   def list_work_items(config, opts \\ []) when is_map(config) and is_list(opts) do
     with {:ok, config} <- normalize_config(config, opts) do
@@ -434,6 +444,7 @@ defmodule SymphonyElixir.Plane.Client do
 
   defp project_path(config), do: "/api/v1/workspaces/#{encoded(config.workspace_slug)}/projects/#{encoded(config.project_id)}/"
   defp work_item_path(config, id), do: work_items_path(config) <> encoded(id) <> "/"
+  defp relation_path(config, id), do: work_items_path(config) <> encoded(id) <> "/relations/"
   defp work_items_path(config), do: project_path(config) <> "work-items/"
   defp states_path(config), do: project_path(config) <> "states/"
 

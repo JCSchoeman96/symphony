@@ -12,8 +12,8 @@ defmodule SymphonyElixir.PlaneAdapterTest do
     secret_environment_names: ["PLANE_API_KEY"]
   }
 
-  test "declares only the current refresh capability" do
-    assert Adapter.capabilities() == [:current_issue_refresh]
+  test "declares only the graduated read capabilities" do
+    assert Adapter.capabilities() == [:current_issue_refresh, :dependency_graph, :dependency_completeness]
     assert Adapter.secret_environment_names(@settings) == ["PLANE_API_KEY"]
   end
 
@@ -160,7 +160,9 @@ defmodule SymphonyElixir.PlaneAdapterTest do
            }
 
     assert snapshot.capability_statuses.current_issue_refresh == :supported
-    assert snapshot.capability_statuses.dependency_graph == :unsupported
+    assert snapshot.capability_statuses.dependency_graph == :supported
+    assert snapshot.capability_statuses.dependency_completeness == :supported
+    assert snapshot.capability_statuses.controlled_transition == :unsupported
   end
 
   test "rejects a project response with a contradictory stable workspace or project ID" do

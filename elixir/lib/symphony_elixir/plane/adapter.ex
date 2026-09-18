@@ -4,14 +4,14 @@ defmodule SymphonyElixir.Plane.Adapter do
   @behaviour SymphonyElixir.Tracker
 
   alias SymphonyElixir.Config
-  alias SymphonyElixir.Plane.{Client, StateProjection}
+  alias SymphonyElixir.Plane.{Client, DependencyReader, StateProjection}
   alias SymphonyElixir.Tracker.Capabilities
   alias SymphonyElixir.Tracker.Issue
 
   @plane_api_key_env "PLANE_API_KEY"
 
   @spec capabilities() :: [Capabilities.capability()]
-  def capabilities, do: [:current_issue_refresh]
+  def capabilities, do: [:current_issue_refresh, :dependency_graph, :dependency_completeness]
 
   @spec validate_config(map()) :: :ok | {:error, term()}
   def validate_config(tracker_settings) when is_map(tracker_settings) do
@@ -37,6 +37,12 @@ defmodule SymphonyElixir.Plane.Adapter do
   @spec fetch_project_snapshot() :: {:ok, map()} | {:error, term()}
   def fetch_project_snapshot do
     fetch_project_snapshot(Config.settings!().tracker, nil)
+  end
+
+  @spec fetch_dependency_graph() ::
+          {:ok, SymphonyElixir.Dependency.Graph.t()} | {:error, term()}
+  def fetch_dependency_graph do
+    fetch_dependency_graph(Config.settings!().tracker, nil)
   end
 
   @spec secret_environment_names(map()) :: [String.t()]
@@ -70,6 +76,22 @@ defmodule SymphonyElixir.Plane.Adapter do
   def fetch_project_snapshot_for_test(tracker_settings, request_fun)
       when is_map(tracker_settings) and is_function(request_fun, 1) do
     fetch_project_snapshot(tracker_settings, request_fun)
+  end
+
+  @doc false
+  @spec fetch_dependency_graph_for_test(map(), Client.request_fun()) ::
+          {:ok, SymphonyElixir.Dependency.Graph.t()} | {:error, term()}
+  def fetch_dependency_graph_for_test(tracker_settings, request_fun)
+      when is_map(tracker_settings) and is_function(request_fun, 1) do
+    fetch_dependency_graph(tracker_settings, request_fun)
+  end
+
+  @doc false
+  @spec fetch_dependency_graph_for_test(map(), Client.request_fun(), keyword()) ::
+          {:ok, SymphonyElixir.Dependency.Graph.t()} | {:error, term()}
+  def fetch_dependency_graph_for_test(tracker_settings, request_fun, opts)
+      when is_map(tracker_settings) and is_function(request_fun, 1) and is_list(opts) do
+    fetch_dependency_graph(tracker_settings, request_fun, opts)
   end
 
   defp fetch_issues_by_states(states, tracker_settings, request_fun) do
@@ -135,6 +157,17 @@ defmodule SymphonyElixir.Plane.Adapter do
          capability_statuses: capability_statuses(),
          completeness: :complete
        }}
+    end
+  end
+
+  defp fetch_dependency_graph(tracker_settings, request_fun) do
+    fetch_dependency_graph(tracker_settings, request_fun, [])
+  end
+
+  defp fetch_dependency_graph(tracker_settings, request_fun, opts) do
+    with :ok <- validate_config(tracker_settings),
+         {:ok, config} <- client_config(tracker_settings) do
+      DependencyReader.fetch(config, Keyword.merge(opts, request_opts(request_fun)))
     end
   end
 
@@ -307,7 +340,11 @@ defmodule SymphonyElixir.Plane.Adapter do
 
   defp capability_statuses do
     Map.new(Capabilities.vocabulary(), fn capability ->
-      {capability, if(capability == :current_issue_refresh, do: :supported, else: :unsupported)}
+      {capability,
+       if(capability in [:current_issue_refresh, :dependency_graph, :dependency_completeness],
+         do: :supported,
+         else: :unsupported
+       )}
     end)
   end
 
