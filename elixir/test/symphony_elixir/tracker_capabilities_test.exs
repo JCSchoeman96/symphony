@@ -29,6 +29,8 @@ defmodule SymphonyElixir.TrackerCapabilitiesTest do
   alias SymphonyElixir.Config.Schema
   alias SymphonyElixir.Tracker
   alias SymphonyElixir.Tracker.Capabilities
+  alias SymphonyElixir.TransitionCoordinator
+  alias SymphonyElixir.WorkControl.{ProviderProjectContract, SemanticTransitionIntent, WorkflowLifecycle}
 
   test "owns the complete ordered routed capability requirement set" do
     assert Capabilities.required_routed() == [
@@ -161,7 +163,7 @@ defmodule SymphonyElixir.TrackerCapabilitiesTest do
 
   test "tracker capability facade follows the configured adapter" do
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
-    assert {:ok, declared} = Tracker.capabilities()
+    assert {:ok, declared} = Tracker.capabilities_for_kind("memory")
     assert :agent_read_tools in declared
 
     assert {:error, {:unsupported_tracker_kind, "future-tracker"}} =
@@ -169,6 +171,82 @@ defmodule SymphonyElixir.TrackerCapabilitiesTest do
 
     assert :ok = Tracker.validate_routed_capabilities(%{agent: %{routing: "legacy"}})
     assert :ok = Tracker.validate_routed_capabilities(%{})
+  end
+
+  test "tracker exposes the memory capability declaration and unsupported snapshot path" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+    assert {:ok, capabilities} = Tracker.capabilities()
+    assert :controlled_transition in capabilities
+    assert {:error, :project_snapshot_unsupported} = Tracker.fetch_project_snapshot()
+  end
+
+  test "controlled transition requires a complete semantic intent before coordinator dispatch" do
+    assert {:error, :invalid_requested_from} = Tracker.controlled_transition("work-1", :in_progress)
+    assert {:error, :invalid_intent} = Tracker.controlled_transition("work-1", :in_progress, intent: :invalid)
+  end
+
+  test "controlled_transition routes through the complete coordinator protocol" do
+    {:ok, coordinator} =
+      TransitionCoordinator.start_link(
+        name: nil,
+        load_context: fn _intent ->
+          {:ok,
+           %{
+             provider_project_contract: contract(),
+             dependency_decision: %{allowed?: true, dependency_completeness: :complete, dependency_status: :none},
+             dependency_epoch_evidence: %{complete?: true}
+           }}
+        end,
+        submit: fn _attempt, _context -> :ok end,
+        verify: fn _attempt, _context ->
+          {:verified,
+           %{
+             assessment: %{status: :validated, validated_state: :in_progress},
+             post_observation_evidence: %{
+               workspace_id: "workspace-1",
+               project_id: "project-1",
+               work_item_id: "work-1",
+               provider_state_id: "state-in-progress",
+               observed_at: DateTime.utc_now()
+             },
+             post_contract_fingerprint: "sha256:test"
+           }}
+        end,
+        require_durable?: false
+      )
+
+    assert {:ok, %{state: :verified}} =
+             Tracker.controlled_transition("work-1", :in_progress,
+               coordinator: coordinator,
+               adapter: SymphonyElixir.TrackerCapabilitiesUnknownAdapter,
+               intent_attrs: intent_attrs()
+             )
+  end
+
+  test "controlled transition rejects missing and mismatched semantic intent" do
+    assert {:error, :invalid_intent} =
+             Tracker.controlled_transition("work-1", :in_progress, intent_attrs: :invalid)
+
+    {:ok, intent} =
+      SemanticTransitionIntent.new(%{
+        work_item_id: "other-work",
+        requested_from: :ready,
+        requested_to: :in_progress,
+        responsibility: "symphony",
+        guard_evidence: []
+      })
+
+    assert {:error, :intent_mismatch} =
+             Tracker.controlled_transition("work-1", :in_progress, intent: intent)
+  end
+
+  test "submission transport refuses adapters without the declared host capability" do
+    assert {:error, {:invalid_provider_capability_declaration, _, _}} =
+             Tracker.submit_controlled_transition(
+               "work-1",
+               :in_progress,
+               adapter: SymphonyElixir.TrackerCapabilitiesUnknownAdapter
+             )
   end
 
   test "tracker rejects bound tools when the adapter lacks an executor" do
@@ -181,6 +259,33 @@ defmodule SymphonyElixir.TrackerCapabilitiesTest do
 
     assert response["success"] == false
     assert Jason.decode!(response["output"])["error"]["supportedTools"] == []
+  end
+
+  defp contract do
+    state_mappings =
+      Map.new(WorkflowLifecycle.states(), fn state ->
+        {state, %{state_id: "state-#{state}", name: WorkflowLifecycle.display(state)}}
+      end)
+
+    {:ok, contract} =
+      ProviderProjectContract.new(%{
+        schema_version: 1,
+        provider: :plane,
+        workspace_id: "workspace-1",
+        project_id: "project-1",
+        state_mappings: state_mappings,
+        dependency_relation_semantics: %{blocked_by: :blocked_by, blocking: :blocking}
+      })
+
+    contract
+  end
+
+  defp intent_attrs do
+    %{
+      requested_from: :ready,
+      responsibility: "symphony",
+      guard_evidence: [%{class: :mechanical_guard, name: :dispatch_guard}]
+    }
   end
 end
 

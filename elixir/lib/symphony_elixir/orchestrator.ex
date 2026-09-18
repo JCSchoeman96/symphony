@@ -1,4 +1,5 @@
 defmodule SymphonyElixir.Orchestrator do
+  @dialyzer {:nowarn_function, validate_transition_work_item_context: 1}
   @moduledoc """
   Polls the configured issue tracker and dispatches repository copies to Codex-backed workers.
   """
@@ -1473,19 +1474,21 @@ defmodule SymphonyElixir.Orchestrator do
   defp refresh_running_dependency_state(%State{} = state, %Issue{} = issue, running_entry, route) do
     decision = dependency_decision_for_state(issue, route, state)
 
-    if decision.allowed? == true do
-      %{state | running: Map.put(state.running, issue.id, %{running_entry | issue: issue})}
-    else
-      Logger.warning(
-        "Stopping active agent after dependency refresh for #{issue_context(issue)}: " <>
-          dependency_blocker_error(decision)
-      )
+    case decision.allowed? do
+      true ->
+        %{state | running: Map.put(state.running, issue.id, %{running_entry | issue: issue})}
 
-      updated_entry = %{running_entry | issue: issue}
+      _ ->
+        Logger.warning(
+          "Stopping active agent after dependency refresh for #{issue_context(issue)}: " <>
+            dependency_blocker_error(decision)
+        )
 
-      state
-      |> record_session_completion_totals(running_entry)
-      |> stop_and_block_issue(issue.id, updated_entry, dependency_blocker_error(decision), decision)
+        updated_entry = %{running_entry | issue: issue}
+
+        state
+        |> record_session_completion_totals(running_entry)
+        |> stop_and_block_issue(issue.id, updated_entry, dependency_blocker_error(decision), decision)
     end
   end
 

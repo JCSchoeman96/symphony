@@ -59,8 +59,8 @@ defmodule SymphonyElixir.Plane.Adapter do
   the bound project contract. No provider name, endpoint, method, or request
   body is accepted from the caller.
   """
-  @spec controlled_transition(String.t(), term(), keyword()) :: :ok | {:error, term()}
-  def controlled_transition(work_item_id, requested_to, opts \\ [])
+  @spec submit_controlled_transition(String.t(), term(), keyword()) :: :ok | {:error, term()}
+  def submit_controlled_transition(work_item_id, requested_to, opts \\ [])
       when is_binary(work_item_id) and is_list(opts) do
     tracker_settings = Keyword.get_lazy(opts, :tracker_settings, fn -> Config.settings!().tracker end)
     contract = Keyword.get(opts, :provider_project_contract) || contract_from_settings(tracker_settings)
@@ -137,7 +137,7 @@ defmodule SymphonyElixir.Plane.Adapter do
   def controlled_transition_for_test(work_item_id, requested_to, tracker_settings, contract, request_fun)
       when is_binary(work_item_id) and is_map(tracker_settings) and
              is_struct(contract, ProviderProjectContract) and is_function(request_fun, 1) do
-    controlled_transition(work_item_id, requested_to,
+    submit_controlled_transition(work_item_id, requested_to,
       tracker_settings: tracker_settings,
       provider_project_contract: contract,
       request_fun: request_fun
@@ -446,8 +446,6 @@ defmodule SymphonyElixir.Plane.Adapter do
       _ -> {:error, :invalid_target_mapping}
     end
   end
-
-  defp validate_target_mapping(_mapping, _contract, _requested_to), do: {:error, :invalid_target_mapping}
 
   defp validate_work_item_scope(nil, _config, _expected_work_item_id), do: :ok
 

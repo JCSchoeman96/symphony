@@ -57,8 +57,8 @@ defmodule SymphonyElixir.Linear.Adapter do
   end
 
   @doc false
-  @spec controlled_transition(String.t(), term(), keyword()) :: {:error, term()}
-  def controlled_transition(_work_item_id, _target_state, _opts),
+  @spec submit_controlled_transition(String.t(), term(), keyword()) :: {:error, term()}
+  def submit_controlled_transition(_work_item_id, _target_state, _opts),
     do: {:error, :controlled_transition_unsupported}
 
   @spec secret_environment_names(map()) :: [String.t()]

@@ -80,11 +80,21 @@ defmodule SymphonyElixir.WorkControl.TransitionAttemptLedger do
   def put_sync(_ledger, _attempt), do: {:error, {:corrupt_transition_attempt, :invalid_record}}
 
   @spec get(t(), String.t()) :: {:ok, term()} | :not_found | {:error, term()}
-  def get(%__MODULE__{table: table}, attempt_id) when is_binary(attempt_id) do
+  def get(%__MODULE__{} = ledger, attempt_id) when is_binary(attempt_id) do
+    table = ledger.table
+
     case :dets.lookup(table, {:attempt, attempt_id}) do
-      [{{:attempt, ^attempt_id}, attempt}] -> {:ok, attempt}
-      [] -> :not_found
-      _ -> {:error, {:corrupt_transition_attempt, :invalid_record}}
+      [{{:attempt, ^attempt_id}, attempt}] ->
+        case validate_attempt(ledger, attempt) do
+          {:ok, _record, _stored_attempt_id, _work_item_id} -> {:ok, attempt}
+          {:error, _reason} = error -> error
+        end
+
+      [] ->
+        :not_found
+
+      _ ->
+        {:error, {:corrupt_transition_attempt, :invalid_record}}
     end
   rescue
     _error -> {:error, {:corrupt_transition_attempt, :ledger_unavailable}}
@@ -107,40 +117,65 @@ defmodule SymphonyElixir.WorkControl.TransitionAttemptLedger do
   def latest_for_work_item(_ledger, _work_item_id), do: {:error, {:corrupt_transition_attempt, :invalid_record}}
 
   @spec list_reconciliation_candidates(t()) :: {:ok, [term()]} | {:error, term()}
-  def list_reconciliation_candidates(%__MODULE__{table: table}) do
-    candidates =
+  def list_reconciliation_candidates(%__MODULE__{} = ledger) do
+    result =
       :dets.foldl(
         fn
-          {{:attempt, _attempt_id}, attempt}, acc ->
-            if reconciliation_candidate?(attempt), do: [attempt | acc], else: acc
+          {{:attempt, _attempt_id}, attempt}, {:ok, %{attempts: attempts, pointers: pointers}} ->
+            case validate_attempt(ledger, attempt) do
+              {:ok, record, _attempt_id, _work_item_id} ->
+                {:ok, %{attempts: [record | attempts], pointers: pointers}}
 
-          _other, acc ->
-            acc
+              {:error, _reason} = error ->
+                error
+            end
+
+          {{:latest, work_item_id}, attempt_id}, {:ok, %{attempts: attempts, pointers: pointers}}
+          when is_binary(work_item_id) and is_binary(attempt_id) ->
+            {:ok, %{attempts: attempts, pointers: [{work_item_id, attempt_id} | pointers]}}
+
+          {{:latest, _work_item_id}, _attempt_id}, _result ->
+            {:error, {:corrupt_transition_attempt, :invalid_record}}
+
+          _other, result ->
+            result
         end,
-        [],
-        table
+        {:ok, %{attempts: [], pointers: []}},
+        ledger.table
       )
 
-    rank = %{submitted: 0, mutation_submitted: 0, verifying: 1, conflict: 2, indeterminate: 3}
+    with {:ok, %{attempts: attempts, pointers: pointers}} <- result,
+         :ok <- validate_latest_pointers(attempts, pointers) do
+      candidates = Enum.filter(attempts, &reconciliation_candidate?/1)
 
-    sorted =
-      Enum.sort_by(candidates, fn attempt ->
-        {
-          Map.get(rank, Map.get(attempt, :status) || Map.get(attempt, :state), 99),
-          Map.get(attempt, :updated_at, 0),
-          attempt_identifier(attempt)
-        }
-      end)
+      rank = %{
+        prepared: 0,
+        submitted: 1,
+        mutation_submitted: 1,
+        verifying: 2,
+        conflict: 3,
+        indeterminate: 4
+      }
 
-    {:ok, sorted}
+      sorted =
+        Enum.sort_by(candidates, fn attempt ->
+          {
+            Map.get(rank, Map.get(attempt, :status) || Map.get(attempt, :state), 99),
+            Map.get(attempt, :updated_at, 0),
+            attempt_identifier(attempt)
+          }
+        end)
+
+      {:ok, sorted}
+    end
   rescue
     _error -> {:error, {:corrupt_transition_attempt, :invalid_record}}
   end
 
   @spec resubmit_allowed?(term()) :: boolean()
-  def resubmit_allowed?(%TransitionAttempt{} = attempt), do: TransitionAttempt.automatic_mutation_allowed?(attempt)
-  def resubmit_allowed?(%{status: :prepared}), do: true
-  def resubmit_allowed?(%{state: :prepared}), do: true
+  def resubmit_allowed?(%TransitionAttempt{}), do: false
+  def resubmit_allowed?(%{status: :prepared}), do: false
+  def resubmit_allowed?(%{state: :prepared}), do: false
   def resubmit_allowed?(_attempt), do: false
 
   defp initialize_or_validate(%__MODULE__{} = ledger) do
@@ -262,7 +297,19 @@ defmodule SymphonyElixir.WorkControl.TransitionAttemptLedger do
 
   defp reconciliation_candidate?(attempt) do
     status = Map.get(attempt, :status) || Map.get(attempt, :state)
-    status in @reconciliation_statuses
+
+    status in @reconciliation_statuses or
+      (status == :prepared and TransitionAttempt.submission_fenced?(attempt))
+  end
+
+  defp validate_latest_pointers(attempts, pointers) do
+    attempt_ids = MapSet.new(attempts, &attempt_identifier/1)
+
+    if Enum.all?(pointers, fn {_work_item_id, attempt_id} -> MapSet.member?(attempt_ids, attempt_id) end) do
+      :ok
+    else
+      {:error, {:corrupt_transition_attempt, :invalid_record}}
+    end
   end
 
   defp attempt_identifier(attempt), do: Map.get(attempt, :attempt_id) || Map.get(attempt, :transition_attempt_id) || ""

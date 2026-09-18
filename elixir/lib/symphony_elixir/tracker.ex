@@ -10,7 +10,8 @@ defmodule SymphonyElixir.Tracker do
   alias SymphonyElixir.Config
   alias SymphonyElixir.Tracker.Capabilities
   alias SymphonyElixir.Tracker.Issue
-  alias SymphonyElixir.WorkControl.WorkflowLifecycle
+  alias SymphonyElixir.TransitionCoordinator
+  alias SymphonyElixir.WorkControl.{SemanticTransitionIntent, WorkflowLifecycle}
 
   @adapters %{
     "asana" => SymphonyElixir.Asana.Adapter,
@@ -26,8 +27,6 @@ defmodule SymphonyElixir.Tracker do
   @callback fetch_issues_by_ids([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
   @callback fetch_dependency_graph() :: {:ok, term()} | {:error, term()}
   @callback fetch_project_snapshot() :: {:ok, map()} | {:error, term()}
-  @callback controlled_transition(String.t(), WorkflowLifecycle.state(), keyword()) ::
-              :ok | {:ok, term()} | {:error, term()}
   @callback agent_tool_specs() :: [map()]
   @callback execute_agent_tool(String.t(), term(), keyword()) :: map()
   @callback secret_environment_names(map()) :: [String.t()]
@@ -35,7 +34,6 @@ defmodule SymphonyElixir.Tracker do
   @callback capabilities() :: [Capabilities.capability()]
 
   @optional_callbacks agent_tool_specs: 0,
-                      controlled_transition: 3,
                       execute_agent_tool: 3,
                       fetch_dependency_graph: 0,
                       fetch_project_snapshot: 0,
@@ -75,23 +73,35 @@ defmodule SymphonyElixir.Tracker do
   end
 
   @doc """
-  Executes the host-owned controlled transition callback for the selected
-  tracker adapter.
-
-  This is intentionally separate from `execute_agent_tool/3`: a lifecycle
-  mutation performed by the transition coordinator must never inherit agent
-  tool authority or routing semantics.
+  Executes one complete host-owned controlled transition through the durable
+  transition coordinator.
   """
   @spec controlled_transition(String.t(), WorkflowLifecycle.state(), keyword()) ::
-          :ok | {:ok, term()} | {:error, term()}
+          {:ok, term()} | {:error, term()}
   def controlled_transition(work_item_id, target_state, opts \\ [])
+      when is_binary(work_item_id) and is_list(opts) do
+    coordinator = Keyword.get(opts, :coordinator, TransitionCoordinator)
+
+    with {:ok, intent} <- semantic_transition_intent(work_item_id, target_state, opts) do
+      TransitionCoordinator.request_transition(coordinator, intent)
+    end
+  end
+
+  @doc false
+  @spec submit_controlled_transition(String.t(), WorkflowLifecycle.state(), keyword()) ::
+          :ok | {:ok, term()} | {:error, term()}
+  def submit_controlled_transition(work_item_id, target_state, opts \\ [])
       when is_binary(work_item_id) and is_list(opts) do
     adapter = Keyword.get_lazy(opts, :adapter, &adapter/0)
 
-    if Code.ensure_loaded?(adapter) and function_exported?(adapter, :controlled_transition, 3) do
-      adapter.controlled_transition(work_item_id, target_state, opts)
+    with {:ok, declared} <- Capabilities.validate_adapter(adapter),
+         true <- :controlled_transition in declared,
+         true <- Code.ensure_loaded?(adapter),
+         true <- function_exported?(adapter, :submit_controlled_transition, 3) do
+      adapter.submit_controlled_transition(work_item_id, target_state, opts)
     else
-      {:error, :controlled_transition_unsupported}
+      false -> {:error, :controlled_transition_unsupported}
+      {:error, _reason} = error -> error
     end
   end
 
@@ -208,6 +218,31 @@ defmodule SymphonyElixir.Tracker do
   defp adapter_for_settings!(%{kind: kind}) do
     {:ok, adapter} = adapter_for_kind(kind)
     adapter
+  end
+
+  defp semantic_transition_intent(work_item_id, target_state, opts) do
+    case Keyword.get(opts, :intent) do
+      %SemanticTransitionIntent{} = intent ->
+        if intent.work_item_id == work_item_id and intent.requested_to == target_state do
+          {:ok, intent}
+        else
+          {:error, :intent_mismatch}
+        end
+
+      nil ->
+        attrs = Keyword.get(opts, :intent_attrs, %{})
+
+        if is_map(attrs) do
+          attrs
+          |> Map.merge(%{work_item_id: work_item_id, requested_to: target_state})
+          |> SemanticTransitionIntent.new()
+        else
+          {:error, :invalid_intent}
+        end
+
+      _other ->
+        {:error, :invalid_intent}
+    end
   end
 
   defp provider_scope("linear", tracker_settings) do

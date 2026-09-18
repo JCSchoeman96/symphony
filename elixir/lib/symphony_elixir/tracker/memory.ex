@@ -80,8 +80,8 @@ defmodule SymphonyElixir.Tracker.Memory do
   end
 
   @doc false
-  @spec controlled_transition(String.t(), term(), keyword()) :: {:error, :unsupported}
-  def controlled_transition(_work_item_id, _target_state, _opts),
+  @spec submit_controlled_transition(String.t(), term(), keyword()) :: {:error, :controlled_transition_unsupported}
+  def submit_controlled_transition(_work_item_id, _target_state, _opts),
     do: {:error, :controlled_transition_unsupported}
 
   @spec capabilities() :: [SymphonyElixir.Tracker.Capabilities.capability()]

@@ -466,6 +466,96 @@ defmodule SymphonyElixir.PlaneClientTest do
              )
   end
 
+  test "covers mutation transport fallbacks and default option arities" do
+    invalid_config = %{@config | workspace_slug: ""}
+    assert {:error, :invalid_scope} = Client.get_work_item(invalid_config, "item-1")
+    assert {:error, :invalid_scope} = Client.get_work_item_relations(invalid_config, "item-1")
+    assert {:error, :invalid_scope} = Client.update_work_item_state(invalid_config, "item-1", "state-1")
+    assert {:error, :invalid_scope} = Client.list_work_items(invalid_config)
+    assert {:error, :invalid_scope} = Client.list_states(invalid_config)
+
+    assert {:error, :provider_unavailable} =
+             Client.update_work_item_state(@config, "item-1", "state-1", request_fun: fn _request -> :invalid end)
+
+    assert {:error, :provider_unavailable} =
+             Client.update_work_item_state(@config, "item-1", "state-1", request_fun: fn _request -> raise "transport" end)
+
+    assert {:error, :provider_unavailable} =
+             Client.update_work_item_state(@config, "item-1", "state-1", request_fun: fn _request -> throw(:transport) end)
+
+    assert {:error, :timeout} =
+             Client.update_work_item_state(
+               @config,
+               "item-1",
+               "state-1",
+               request_fun: fn _request -> {:error, %{reason: :timeout}} end
+             )
+
+    assert {:error, :closed} =
+             Client.update_work_item_state(
+               @config,
+               "item-1",
+               "state-1",
+               request_fun: fn _request -> {:error, %{reason: %{reason: :closed}}} end
+             )
+
+    assert {:error, :provider_unavailable} =
+             Client.update_work_item_state(@config, "item-1", "state-1", request_fun: :invalid)
+
+    assert {:error, :provider_unavailable} =
+             Client.update_work_item_state(@config, "item-1", "state-1", request_fun: fn _one, _two -> :ok end)
+
+    assert {:error, :rate_limited} =
+             Client.update_work_item_state(
+               @config,
+               "item-1",
+               "state-1",
+               request_fun: fn _request -> {:ok, %{status: 429, body: %{}}} end
+             )
+
+    assert {:error, :timeout} =
+             Client.update_work_item_state(
+               @config,
+               "item-1",
+               "state-1",
+               request_fun: fn _request -> {:error, %Client.Error{kind: :timeout}} end
+             )
+
+    assert {:error, :provider_malformed} =
+             Client.list_work_items(@config,
+               request_fun: fn _request ->
+                 {:ok,
+                  %{
+                    status: 200,
+                    body: %{
+                      "results" => [:invalid],
+                      "count" => 1,
+                      "total_results" => 1,
+                      "next_page_results" => false,
+                      "next_cursor" => nil
+                    }
+                  }}
+               end
+             )
+
+    assert {:error, :snapshot_incomplete} =
+             Client.list_work_items(@config,
+               request_fun: fn _request ->
+                 {:ok,
+                  %{
+                    status: 200,
+                    body: %{
+                      "results" => Enum.map(1..10_001, &%{"id" => "item-#{&1}"}),
+                      "count" => 10_001,
+                      "total_results" => 10_001,
+                      "next_page_results" => false,
+                      "next_cursor" => nil
+                    }
+                  }}
+               end
+             )
+  end
+
   test "rejects non-map client configuration before transport" do
     assert {:error, :invalid_configuration} = Client.validate_config(:invalid)
   end

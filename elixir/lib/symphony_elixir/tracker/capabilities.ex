@@ -47,7 +47,8 @@ defmodule SymphonyElixir.Tracker.Capabilities do
   @spec validate_adapter(module()) :: {:ok, [capability()]} | {:error, term()}
   def validate_adapter(adapter) when is_atom(adapter) do
     with {:ok, declared} <- declared_by(adapter),
-         :ok <- validate_structural_support(adapter, declared) do
+         :ok <- validate_structural_support(adapter, declared),
+         :ok <- validate_host_transition_support(adapter, declared) do
       {:ok, declared}
     else
       {:error, _reason} = error ->
@@ -95,6 +96,15 @@ defmodule SymphonyElixir.Tracker.Capabilities do
     Enum.reduce_while(declared, :ok, &validate_declared_capability(adapter, &1, &2))
   end
 
+  defp validate_host_transition_support(adapter, declared) do
+    if :controlled_transition in declared and
+         not function_exported?(adapter, :submit_controlled_transition, 3) do
+      {:error, {:missing_callback, :controlled_transition, :submit_controlled_transition, 3}}
+    else
+      :ok
+    end
+  end
+
   defp validate_declared_capability(_adapter, _capability, {:error, _reason} = error), do: {:halt, error}
 
   defp validate_declared_capability(adapter, capability, :ok) do
@@ -120,9 +130,9 @@ defmodule SymphonyElixir.Tracker.Capabilities do
   defp required_callback(:current_issue_refresh), do: {:fetch_issues_by_ids, 1}
   defp required_callback(:dependency_graph), do: {:fetch_dependency_graph, 0}
   defp required_callback(:dependency_completeness), do: {:fetch_dependency_graph, 0}
-  # Host lifecycle mutation is deliberately a separate adapter callback. It
-  # must not be satisfied by an agent-facing dynamic tool implementation.
-  defp required_callback(:controlled_transition), do: {:controlled_transition, 3}
+  # The coordinator owns the semantic operation. Adapters expose only the
+  # narrow provider submission transport used after the durable fence.
+  defp required_callback(:controlled_transition), do: nil
   # Verification is an authoritative exact-read capability. The coordinator
   # performs the fresh post-read and canonical assessment itself.
   defp required_callback(:transition_verification), do: {:fetch_issues_by_ids, 1}

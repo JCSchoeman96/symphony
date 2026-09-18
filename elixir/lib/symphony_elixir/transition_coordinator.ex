@@ -45,6 +45,7 @@ defmodule SymphonyElixir.TransitionCoordinator do
       :clock,
       :orchestrator,
       require_durable?: true,
+      transition_disabled?: false,
       active_work_items: MapSet.new(),
       fenced_work_items: MapSet.new()
     ]
@@ -60,6 +61,7 @@ defmodule SymphonyElixir.TransitionCoordinator do
             clock: (-> DateTime.t()),
             orchestrator: GenServer.server(),
             require_durable?: boolean(),
+            transition_disabled?: boolean(),
             active_work_items: MapSet.t(),
             fenced_work_items: MapSet.t()
           }
@@ -123,20 +125,41 @@ defmodule SymphonyElixir.TransitionCoordinator do
          default_apply = fn attempt, context -> default_apply_verified(orchestrator, attempt, context) end,
          {:ok, apply_verified} <- callback(opts, :apply_verified, default_apply),
          {:ok, suspend} <- callback(opts, :suspend, default_suspend) do
-      {:ok,
-       %State{
-         ledger: ledger,
-         load_context: load_context,
-         refresh_contract: refresh_contract,
-         submit: submit,
-         verify: verify,
-         apply_verified: apply_verified,
-         suspend: suspend,
-         clock: Keyword.get(opts, :clock, &DateTime.utc_now/0),
-         orchestrator: orchestrator,
-         require_durable?: Keyword.get(opts, :require_durable?, true),
-         fenced_work_items: load_fenced_work_items(ledger)
-       }}
+      base_state = %State{
+        ledger: ledger,
+        load_context: load_context,
+        refresh_contract: refresh_contract,
+        submit: submit,
+        verify: verify,
+        apply_verified: apply_verified,
+        suspend: suspend,
+        clock: Keyword.get(opts, :clock, &DateTime.utc_now/0),
+        orchestrator: orchestrator,
+        require_durable?: Keyword.get(opts, :require_durable?, true)
+      }
+
+      fenced_result =
+        if is_nil(ledger) and not Keyword.get(opts, :require_durable?, true) do
+          {:ok, MapSet.new()}
+        else
+          load_fenced_work_items(ledger)
+        end
+
+      case fenced_result do
+        {:ok, fenced_work_items} ->
+          {:ok,
+           %{
+             base_state
+             | fenced_work_items: fenced_work_items,
+               transition_disabled?: is_nil(ledger) and Keyword.get(opts, :require_durable?, true)
+           }}
+
+        {:error, _reason} ->
+          _ = close_ledger(ledger)
+          {:ok, %{base_state | ledger: nil, transition_disabled?: true}}
+      end
+    else
+      {:error, reason} -> {:stop, reason}
     end
   end
 
@@ -156,6 +179,9 @@ defmodule SymphonyElixir.TransitionCoordinator do
     work_item_id = intent.work_item_id
 
     cond do
+      state.transition_disabled? ->
+        {:reply, {:error, :transitions_disabled}, state}
+
       MapSet.member?(state.active_work_items, work_item_id) ->
         {:reply, {:error, :transition_in_progress}, state}
 
@@ -198,14 +224,14 @@ defmodule SymphonyElixir.TransitionCoordinator do
   defp execute(%State{} = state, %SemanticTransitionIntent{} = intent) do
     with {:ok, attempt} <- new_attempt(intent, state.clock),
          {:ok, attempt} <- authorize_attempt(attempt, intent),
-         {:ok, context} <- load_context(state, intent),
-         :ok <- authorize_fresh_context(intent, context),
-         :ok <- guard_context(intent, context),
-         {:ok, context} <- bind_target(context, intent),
+         {:ok, context} <- load_context_with_attempt(state, intent, attempt),
+         {:ok, attempt} <- ensure_pre_submit(attempt, fn -> authorize_fresh_context(intent, context) end),
+         {:ok, attempt} <- ensure_pre_submit(attempt, fn -> guard_context(intent, context) end),
+         {:ok, context} <- bind_target_with_attempt(context, intent, attempt),
          {:ok, attempt} <- transition_attempt(attempt, :fresh_context_loaded, [context]),
          {:ok, attempt} <- transition_attempt(attempt, :prepare, [context]),
          {:ok, attempt} <- persist_attempt(state, attempt),
-         {:ok, attempt} <- transition_attempt(attempt, :mark_mutation_submitted, []),
+         {:ok, attempt} <- transition_attempt(attempt, :arm_submission_fence, []),
          {:ok, attempt} <- persist_attempt(state, attempt),
          {submit_result, attempt} <- submit_once(state, attempt, context),
          {reply, state} <- reconcile_submission(state, attempt, context, submit_result) do
@@ -233,9 +259,7 @@ defmodule SymphonyElixir.TransitionCoordinator do
 
     case TransitionAttempt.new(attrs) do
       {:ok, attempt} -> {:ok, attempt}
-      %TransitionAttempt{} = attempt -> {:ok, attempt}
-      {:error, reason} -> {:error, {:pre_submit, reason}, attrs}
-      other -> {:error, {:pre_submit, {:invalid_attempt, other}}, attrs}
+      {:error, reason} -> {:error, {:new_attempt_failed, reason}}
     end
   end
 
@@ -266,12 +290,27 @@ defmodule SymphonyElixir.TransitionCoordinator do
     end
   end
 
+  defp load_context_with_attempt(%State{} = state, intent, %TransitionAttempt{} = attempt) do
+    case load_context(state, intent) do
+      {:ok, context} -> {:ok, context}
+      {:error, {:pre_submit, reason}} -> {:error, {:pre_submit, reason, attempt}}
+    end
+  end
+
+  defp ensure_pre_submit(%TransitionAttempt{} = attempt, check) when is_function(check, 0) do
+    case check.() do
+      :ok -> {:ok, attempt}
+      {:error, {:pre_submit, reason}} -> {:error, {:pre_submit, reason, attempt}}
+      {:error, reason} -> {:error, {:pre_submit, reason, attempt}}
+    end
+  end
+
   defp authorize_fresh_context(intent, context) do
     current_state = Map.get(context, :current_state, intent.requested_from)
 
     with :ok <- validate_fresh_current_state(current_state, intent.requested_from),
          policy_context <- fresh_policy_context(context, intent, current_state),
-         :ok <- authorize_fresh_policy(policy_context) do
+         :ok <- authorize_fresh_policy(policy_context, intent.responsibility) do
       authorize_fresh_dependencies(policy_context, context)
     end
   end
@@ -296,7 +335,18 @@ defmodule SymphonyElixir.TransitionCoordinator do
     |> Map.put(:responsibility, intent.responsibility)
   end
 
-  defp authorize_fresh_policy(policy_context) do
+  defp canonical_transition_responsibility(%SemanticTransitionIntent{} = intent) do
+    canonical_transition_responsibility(intent.requested_from, intent.requested_to, intent.responsibility)
+  end
+
+  defp canonical_transition_responsibility(source, target, fallback) do
+    case WorkflowLifecycle.transition(source, target) do
+      {:ok, %{responsibility: responsibility}} when is_binary(responsibility) -> responsibility
+      _ -> fallback
+    end
+  end
+
+  defp authorize_fresh_policy(policy_context, _responsibility) do
     case TransitionPolicy.authorize_intent(policy_context) do
       :ok -> :ok
       {:error, reason} -> {:error, {:pre_submit, {:policy_rejected, reason}}}
@@ -356,6 +406,13 @@ defmodule SymphonyElixir.TransitionCoordinator do
     end
   end
 
+  defp bind_target_with_attempt(context, intent, %TransitionAttempt{} = attempt) do
+    case bind_target(context, intent) do
+      {:ok, bound} -> {:ok, bound}
+      {:error, {:pre_submit, reason}} -> {:error, {:pre_submit, reason, attempt}}
+    end
+  end
+
   defp validate_bound_contract(context, %ProviderProjectContract{} = contract) do
     expected_fingerprint = ProviderProjectContract.fingerprint(contract)
     observed_fingerprint = Map.get(context, :provider_contract_fingerprint)
@@ -382,21 +439,25 @@ defmodule SymphonyElixir.TransitionCoordinator do
   end
 
   defp submit_once(%State{submit: submit}, attempt, context) do
-    result = invoke(submit, [attempt, context])
-    {result, attempt}
+    case transition_attempt(attempt, :mark_mutation_submitted, []) do
+      {:ok, submitted} ->
+        result = invoke(submit, [submitted, context])
+        {result, submitted}
+
+      {:error, reason} ->
+        {{:error, {:submission_start_failed, reason}}, attempt}
+    end
   end
 
   defp reconcile_submission(%State{} = state, attempt, context, result) do
     ack_status = provider_ack_status(result)
-    reconcile_submission_with_ack(state, attempt, context, result, ack_status)
-  end
 
-  defp reconcile_submission_with_ack(%State{} = state, attempt, _context, {:error, :econnrefused}, ack_status) do
-    terminal_result(state, %{attempt | provider_ack_status: ack_status}, :provider_failed, :connection_refused)
-  end
+    verification_context =
+      context
+      |> Map.put(:provider_result, result)
+      |> Map.put(:provider_non_commit?, result == {:error, :econnrefused})
 
-  defp reconcile_submission_with_ack(%State{} = state, attempt, context, _result, ack_status) do
-    verify_submission(state, attempt, context, ack_status)
+    verify_submission(state, %{attempt | provider_ack_status: ack_status}, verification_context, ack_status)
   end
 
   defp verify_submission(%State{} = state, attempt, context, ack_status) do
@@ -431,59 +492,120 @@ defmodule SymphonyElixir.TransitionCoordinator do
   defp provider_ack_status({:error, _reason}), do: :ambiguous
   defp provider_ack_status(_result), do: :ambiguous
 
-  defp classify_verification(:verified), do: {:verified, :target_confirmed}
-  defp classify_verification({:verified, %{} = context}), do: {:verified, context}
-  defp classify_verification({:verified, reason}), do: {:verified, reason}
-  defp classify_verification({:ok, :verified}), do: {:verified, :target_confirmed}
-  defp classify_verification({:ok, %{status: :verified} = context}), do: {:verified, context}
-  defp classify_verification({:conflict, %{} = context}), do: {:indeterminate, context}
+  defp classify_verification(:verified), do: {:indeterminate, {:invalid_verification, :verified}}
+
+  defp classify_verification({:verified, %{} = context}) do
+    if structured_verification?(context) do
+      {:verified, context}
+    else
+      {:indeterminate, {:invalid_verification, context}}
+    end
+  end
+
+  defp classify_verification({:verified, reason}), do: {:indeterminate, {:invalid_verification, reason}}
+  defp classify_verification({:ok, :verified}), do: {:indeterminate, {:invalid_verification, :verified}}
+
+  defp classify_verification({:ok, %{status: :verified} = context}) do
+    if structured_verification?(context) do
+      {:verified, context}
+    else
+      {:indeterminate, {:invalid_verification, context}}
+    end
+  end
+
+  defp classify_verification({:conflict, %{} = context}) do
+    if Map.get(context, :authoritative_conflict?, false) or
+         Map.get(context, :non_commit?, Map.get(context, :non_commit, false)),
+       do: {:conflict, context},
+       else: {:indeterminate, context}
+  end
+
   defp classify_verification({:conflict, reason}), do: {:indeterminate, {:unproven_conflict, reason}}
   defp classify_verification({:conflict, reason, :non_commit}), do: {:conflict, reason}
-  defp classify_verification({:provider_failed, %{} = context}), do: {:indeterminate, context}
+
+  defp classify_verification({:provider_failed, %{} = context}) do
+    if Map.get(context, :non_commit?, Map.get(context, :non_commit, false)), do: {:provider_failed, context}, else: {:indeterminate, context}
+  end
+
   defp classify_verification({:provider_failed, reason}), do: {:indeterminate, {:unproven_failure, reason}}
   defp classify_verification({:indeterminate, %{} = context}), do: {:indeterminate, context}
   defp classify_verification({:provider_failed, reason, :non_commit}), do: {:provider_failed, reason}
   defp classify_verification({:error, reason}), do: {:indeterminate, reason}
   defp classify_verification(other), do: {:indeterminate, {:invalid_verification, other}}
 
+  defp structured_verification?(context) when is_map(context) do
+    is_map(Map.get(context, :assessment)) and
+      is_map(Map.get(context, :post_observation_evidence)) and
+      is_binary(Map.get(context, :post_contract_fingerprint))
+  end
+
   defp terminal_result(%State{} = state, attempt, state_name, reason) do
-    terminal_args =
-      case {state_name, reason} do
-        {:verified, %{} = context} -> [Map.put(context, :status, :verified)]
-        {:verified, reason} -> [%{status: :verified, reason: reason}]
-        {_state, %{} = context} -> [Map.put_new(context, :reason, Map.get(context, :reason, reason))]
-        {_state, reason} -> [reason]
-      end
-
-    with {:ok, terminal} <- transition_attempt(attempt, terminal_function(state_name), terminal_args),
+    with {:ok, terminal} <-
+           transition_attempt(attempt, terminal_function(state_name), terminal_args(state_name, reason)),
          :ok <- persist(state, terminal) do
-      state =
-        if safety_fence?(state_name, reason) do
-          fenced = MapSet.put(state.fenced_work_items, terminal.work_item_id)
-          _ = invoke_suspend(state.suspend, [terminal.work_item_id, state_name, terminal])
-          %{state | fenced_work_items: fenced}
-        else
-          state
-        end
-
-      {{:ok, terminal}, state}
+      finalize_terminal(state, terminal, state_name, reason)
     else
       {:error, error} ->
-        state =
-          if TransitionAttempt.submission_fenced?(attempt) do
-            fence_work_item(state, attempt, :durability_failed)
-          else
-            state
-          end
+        {{:error, error}, terminal_failure_state(state, attempt)}
+    end
+  end
 
-        {{:error, error}, state}
+  defp terminal_args(:verified, %{} = context), do: [Map.put(context, :status, :verified)]
+  defp terminal_args(:verified, reason), do: [%{status: :verified, reason: reason}]
+
+  defp terminal_args(_state, %{} = context),
+    do: [Map.put_new(context, :reason, Map.get(context, :reason, context))]
+
+  defp terminal_args(_state, reason), do: [reason]
+
+  defp finalize_terminal(%State{} = state, terminal, state_name, reason) do
+    if safety_fence?(state_name, reason) do
+      fenced_state = %{state | fenced_work_items: MapSet.put(state.fenced_work_items, terminal.work_item_id)}
+      finalize_fenced_terminal(fenced_state, terminal, state_name)
+    else
+      {{:ok, terminal}, state}
+    end
+  end
+
+  defp finalize_fenced_terminal(%State{} = state, terminal, state_name) do
+    case suspend_canonically(state, terminal, state_name) do
+      {:ok, state} ->
+        {{:ok, terminal}, state}
+
+      {:error, state, suspend_reason} ->
+        {{:error, {:suspension_failed, suspend_reason}}, state}
+    end
+  end
+
+  defp terminal_failure_state(%State{} = state, %TransitionAttempt{} = attempt) do
+    if TransitionAttempt.submission_fenced?(attempt) do
+      fence_work_item(state, attempt, :durability_failed)
+    else
+      state
     end
   end
 
   defp fence_work_item(%State{} = state, %TransitionAttempt{} = attempt, reason) do
     fenced = MapSet.put(state.fenced_work_items, attempt.work_item_id)
-    _ = invoke_suspend(state.suspend, [attempt.work_item_id, reason, attempt])
-    %{state | fenced_work_items: fenced}
+    state = %{state | fenced_work_items: fenced}
+
+    case invoke_suspend(state.suspend, [attempt.work_item_id, reason, attempt]) do
+      :ok -> state
+      {:ok, _value} -> state
+      {:error, _suspend_reason} -> %{state | transition_disabled?: true}
+      :unavailable -> %{state | transition_disabled?: true}
+      _other -> %{state | transition_disabled?: true}
+    end
+  end
+
+  defp suspend_canonically(%State{} = state, %TransitionAttempt{} = attempt, reason) do
+    case invoke_suspend(state.suspend, [attempt.work_item_id, reason, attempt]) do
+      :ok -> {:ok, state}
+      {:ok, _value} -> {:ok, state}
+      {:error, suspend_reason} -> {:error, %{state | transition_disabled?: true}, suspend_reason}
+      :unavailable -> {:error, %{state | transition_disabled?: true}, :unavailable}
+      other -> {:error, %{state | transition_disabled?: true}, other}
+    end
   end
 
   defp terminal_function(:verified), do: :verify
@@ -503,9 +625,6 @@ defmodule SymphonyElixir.TransitionCoordinator do
     end
   end
 
-  defp finish_rejected(%State{} = state, _attempt, reason),
-    do: {{:error, {:rejected, reason}}, state}
-
   defp finish_pre_submit(%State{} = state, %TransitionAttempt{} = attempt, reason) do
     case pre_submit_outcome(reason) do
       :conflict -> terminal_result(state, attempt, :conflict, reason)
@@ -513,9 +632,6 @@ defmodule SymphonyElixir.TransitionCoordinator do
       :rejected -> finish_rejected(state, attempt, reason)
     end
   end
-
-  defp finish_pre_submit(%State{} = state, _attempt, reason),
-    do: {{:error, {:rejected, reason}}, state}
 
   defp pre_submit_outcome(:source_state_changed), do: :conflict
   defp pre_submit_outcome({:context_unavailable, :source_state_changed}), do: :conflict
@@ -534,7 +650,7 @@ defmodule SymphonyElixir.TransitionCoordinator do
   defp finish_without_submission(%State{} = state, %SemanticTransitionIntent{} = intent, reason) do
     case new_attempt(intent, state.clock) do
       {:ok, attempt} -> finish_pre_submit(state, attempt, reason)
-      {:error, _error, _attrs} -> {{:error, {:rejected, reason}}, state}
+      {:error, _error} -> {{:error, {:rejected, reason}}, state}
     end
   end
 
@@ -590,20 +706,36 @@ defmodule SymphonyElixir.TransitionCoordinator do
   end
 
   defp open_ledger(opts) do
+    require_durable? = Keyword.get(opts, :require_durable?, true)
+
     case Keyword.fetch(opts, :ledger) do
-      {:ok, ledger} ->
-        {:ok, ledger}
+      {:ok, ledger} -> normalize_explicit_ledger(ledger, require_durable?)
+      :error -> open_configured_ledger(opts, require_durable?)
+    end
+  end
 
-      :error ->
-        {project_id, tracker_identity} = configured_ledger_identity(opts)
+  defp normalize_explicit_ledger(%TransitionAttemptLedger{} = ledger, _require_durable?), do: {:ok, ledger}
+  defp normalize_explicit_ledger(nil, _require_durable?), do: {:ok, nil}
+  defp normalize_explicit_ledger(_ledger, _require_durable?), do: {:error, {:ledger_unavailable, :invalid_ledger}}
 
-        with project_id when is_binary(project_id) <- project_id,
-             tracker_identity when is_map(tracker_identity) <- tracker_identity,
-             {:ok, ledger} <- TransitionAttemptLedger.open(project_id, tracker_identity, Keyword.get(opts, :ledger_opts, [])) do
-          {:ok, ledger}
-        else
-          _ -> {:ok, nil}
-        end
+  defp open_configured_ledger(opts, require_durable?) do
+    if require_durable? do
+      case configured_ledger_identity(opts) do
+        {project_id, tracker_identity} when is_binary(project_id) and is_map(tracker_identity) ->
+          open_configured_ledger_for_identity(project_id, tracker_identity, opts)
+
+        _missing ->
+          {:ok, nil}
+      end
+    else
+      {:ok, nil}
+    end
+  end
+
+  defp open_configured_ledger_for_identity(project_id, tracker_identity, opts) do
+    case TransitionAttemptLedger.open(project_id, tracker_identity, Keyword.get(opts, :ledger_opts, [])) do
+      {:ok, ledger} -> {:ok, ledger}
+      {:error, reason} -> {:error, {:ledger_unavailable, reason}}
     end
   end
 
@@ -635,23 +767,24 @@ defmodule SymphonyElixir.TransitionCoordinator do
     _error -> nil
   end
 
-  defp load_fenced_work_items(nil), do: MapSet.new()
+  defp load_fenced_work_items(nil), do: {:error, {:ledger_unavailable, :ledger_not_configured}}
 
   defp load_fenced_work_items(ledger) do
     case TransitionAttemptLedger.list_reconciliation_candidates(ledger) do
       {:ok, attempts} ->
-        attempts
-        |> Enum.map(&Map.get(&1, :work_item_id))
-        |> Enum.filter(&is_binary/1)
-        |> MapSet.new()
+        {:ok,
+         attempts
+         |> Enum.map(&Map.get(&1, :work_item_id))
+         |> Enum.filter(&is_binary/1)
+         |> MapSet.new()}
 
-      {:error, _reason} ->
-        # A corrupt or unreadable safety ledger must fail closed. The caller
-        # still owns the process lifecycle; no work item is authorized until a
-        # fresh request can establish a durable record.
-        MapSet.new()
+      {:error, reason} ->
+        {:error, {:ledger_unavailable, reason}}
     end
   end
+
+  defp close_ledger(nil), do: :ok
+  defp close_ledger(%TransitionAttemptLedger{} = ledger), do: TransitionAttemptLedger.close(ledger)
 
   defp callback(opts, key, default) do
     callback = Keyword.get(opts, key, default)
@@ -691,9 +824,6 @@ defmodule SymphonyElixir.TransitionCoordinator do
 
       {:error, reason} ->
         {:error, reason}
-
-      other ->
-        {:error, {:invalid_transition_context, other}}
     end
   rescue
     _error -> {:error, :transition_context_unavailable}
@@ -706,9 +836,6 @@ defmodule SymphonyElixir.TransitionCoordinator do
 
       {:error, reason} ->
         {:error, {:provider_contract_unavailable, reason}}
-
-      other ->
-        {:error, {:provider_contract_unavailable, other}}
     end
   end
 
@@ -743,9 +870,6 @@ defmodule SymphonyElixir.TransitionCoordinator do
 
       {:error, reason} ->
         {:error, reason}
-
-      other ->
-        {:error, {:invalid_provider_snapshot, other}}
     end
   end
 
@@ -762,7 +886,7 @@ defmodule SymphonyElixir.TransitionCoordinator do
              observation,
              intent.requested_from,
              intent.guard_evidence,
-             Map.put(context, :responsibility, intent.responsibility)
+             Map.put(context, :responsibility, canonical_transition_responsibility(intent))
            ),
          true <- LifecycleAssessment.validated?(assessment) do
       {:ok,
@@ -771,23 +895,24 @@ defmodule SymphonyElixir.TransitionCoordinator do
        |> Map.put(:pre_observation_evidence, observation)
        |> Map.put(:current_state, canonical_state)
        |> Map.put(:pre_assessment_evidence, assessment)
-       |> Map.put(:guard_evidence, assessment.satisfied_guards)
+       |> Map.put(:guard_evidence, transition_guard_evidence(context, intent))
        |> Map.put(:fresh_read_at, observation.observed_at)}
     else
       {:ok, []} -> {:error, :work_item_not_found}
       false -> {:error, :source_state_changed}
       {:error, reason} -> {:error, {:fresh_context_unavailable, reason}}
-      _other -> {:error, :fresh_context_unavailable}
     end
   end
 
-  defp fresh_pre_context(_intent, _context), do: {:error, :fresh_context_unavailable}
-
   defp provider_observation_opts(_context) do
-    [
-      provider: :plane,
-      observed_at: DateTime.utc_now()
-    ]
+    %{provider: :plane, observed_at: DateTime.utc_now()}
+  end
+
+  defp transition_guard_evidence(context, %SemanticTransitionIntent{} = intent) do
+    case Map.get(context, :guard_evidence) do
+      evidence when is_list(evidence) and evidence != [] -> evidence
+      _ -> intent.guard_evidence
+    end
   end
 
   defp fresh_canonical_state(%ProviderObservation{} = observation, context) do
@@ -830,7 +955,7 @@ defmodule SymphonyElixir.TransitionCoordinator do
       |> maybe_put_option(:provider_project_contract, Map.get(context, :provider_project_contract))
       |> maybe_put_option(:pre_observation, Map.get(context, :provider_observation))
 
-    Tracker.controlled_transition(attempt.work_item_id, attempt.requested_to, opts)
+    Tracker.submit_controlled_transition(attempt.work_item_id, attempt.requested_to, opts)
   end
 
   defp maybe_put_option(opts, _key, nil), do: opts
@@ -847,37 +972,82 @@ defmodule SymphonyElixir.TransitionCoordinator do
              attempt.requested_from,
              attempt.guard_evidence,
              context
-             |> Map.put(:responsibility, attempt.responsibility)
+             |> Map.put(
+               :responsibility,
+               canonical_transition_responsibility(
+                 attempt.requested_from,
+                 attempt.requested_to,
+                 attempt.responsibility
+               )
+             )
              |> Map.put_new(:runtime_attempt_id, attempt.runtime_attempt_id)
              |> Map.put_new(:lineage_generation, attempt.lineage_generation)
            ) do
-      if assessment.status == :validated and assessment.validated_state == attempt.requested_to do
-        {:verified,
-         %{
-           assessment: assessment,
-           post_observation_evidence: observation,
-           provider_project_contract: Map.get(context, :provider_project_contract),
-           post_contract_fingerprint: contract_fingerprint(Map.get(context, :provider_project_contract)),
-           work_item: Map.get(context, :work_item),
-           context_token: Map.get(context, :context_token),
-           status: :validated
-         }}
-      else
-        {:indeterminate,
-         %{
-           reason: :target_not_confirmed,
-           assessment: assessment,
-           post_observation_evidence: observation,
-           provider_project_contract: Map.get(context, :provider_project_contract),
-           post_contract_fingerprint: contract_fingerprint(Map.get(context, :provider_project_contract)),
-           work_item: Map.get(context, :work_item),
-           context_token: Map.get(context, :context_token)
-         }}
-      end
+      evidence = verification_evidence(assessment, observation, context)
+      classify_default_verification(attempt, context, assessment, evidence)
     else
-      {:ok, []} -> {:indeterminate, :work_item_not_found}
-      {:error, reason} -> {:indeterminate, {:fresh_verification_unavailable, reason}}
-      _other -> {:indeterminate, :fresh_verification_unavailable}
+      {:ok, []} -> verification_unavailable(context, :work_item_not_found)
+      {:error, reason} -> verification_unavailable(context, {:fresh_verification_unavailable, reason})
+    end
+  end
+
+  defp verification_evidence(assessment, observation, context) do
+    %{
+      assessment: assessment,
+      post_observation_evidence: observation,
+      provider_project_contract: Map.get(context, :provider_project_contract),
+      post_contract_fingerprint: contract_fingerprint(Map.get(context, :provider_project_contract)),
+      work_item: Map.get(context, :work_item),
+      context_token: Map.get(context, :context_token)
+    }
+  end
+
+  defp classify_default_verification(attempt, context, assessment, evidence) do
+    cond do
+      target_verified?(attempt, assessment) ->
+        {:verified, Map.put(evidence, :status, :validated)}
+
+      source_unchanged?(attempt, context, assessment) ->
+        {:provider_failed, Map.merge(evidence, %{non_commit?: true, reason: :source_state_unchanged})}
+
+      incompatible_movement?(attempt, assessment) ->
+        conflict_verification(context, evidence)
+
+      true ->
+        {:indeterminate, Map.put(evidence, :reason, :target_not_confirmed)}
+    end
+  end
+
+  defp target_verified?(attempt, assessment),
+    do: assessment.status == :validated and assessment.validated_state == attempt.requested_to
+
+  defp source_unchanged?(attempt, context, assessment) do
+    Map.get(context, :provider_non_commit?, false) and
+      assessment.status == :validated and assessment.validated_state == attempt.requested_from
+  end
+
+  defp incompatible_movement?(attempt, %{mapped_state: mapped_state}) do
+    WorkflowLifecycle.canonical?(mapped_state) and
+      mapped_state not in [attempt.requested_from, attempt.requested_to]
+  end
+
+  defp conflict_verification(context, evidence) do
+    if Map.get(context, :provider_non_commit?, false) do
+      {:conflict, Map.merge(evidence, %{non_commit?: true, reason: :incompatible_concurrent_movement})}
+    else
+      {:conflict,
+       Map.merge(evidence, %{
+         authoritative_conflict?: true,
+         reason: :incompatible_concurrent_movement
+       })}
+    end
+  end
+
+  defp verification_unavailable(context, reason) do
+    if Map.get(context, :provider_non_commit?, false) do
+      {:provider_failed, %{non_commit?: true, reason: reason}}
+    else
+      {:indeterminate, reason}
     end
   end
 

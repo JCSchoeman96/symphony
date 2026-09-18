@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.TransitionAttemptLedgerTest do
   use ExUnit.Case
 
-  alias SymphonyElixir.WorkControl.TransitionAttemptLedger
+  alias SymphonyElixir.WorkControl.{TransitionAttempt, TransitionAttemptLedger}
 
   @identity %{tracker_kind: "plane", provider_scope: %{project_id: "project-a"}}
 
@@ -29,6 +29,70 @@ defmodule SymphonyElixir.TransitionAttemptLedgerTest do
     assert {:ok, ^attempt} = TransitionAttemptLedger.get(reopened, "attempt-a")
     assert {:ok, ^attempt} = TransitionAttemptLedger.latest_for_work_item(reopened, "work-a")
     assert :ok = TransitionAttemptLedger.close(reopened)
+  end
+
+  test "rejects invalid ledger identities and malformed lookups", %{path: path} do
+    assert {:error, {:invalid_project_id, ""}} = TransitionAttemptLedger.open("", @identity, path: path)
+    assert {:error, :invalid_tracker_identity} = TransitionAttemptLedger.open("project-a", %{}, path: path)
+
+    assert {:error, {:corrupt_transition_attempt, :invalid_record}} =
+             TransitionAttemptLedger.put_sync(nil, :invalid)
+
+    {:ok, ledger} = TransitionAttemptLedger.open("project-a", @identity, path: path)
+    assert :ok = :dets.insert(ledger.table, {{:attempt, "bad"}, :invalid})
+    assert {:error, {:corrupt_transition_attempt, :invalid_record}} = TransitionAttemptLedger.get(ledger, "bad")
+
+    assert :ok = :dets.insert(ledger.table, {{:latest, "work-a"}, :invalid})
+
+    assert {:error, {:corrupt_transition_attempt, :invalid_record}} =
+             TransitionAttemptLedger.latest_for_work_item(ledger, "work-a")
+
+    assert :ok = TransitionAttemptLedger.close(ledger)
+  end
+
+  test "covers ledger defaults, unreadable tables, and malformed table entries", %{path: path} do
+    assert TransitionAttemptLedger.schema_version() == 1
+    assert String.ends_with?(TransitionAttemptLedger.path_for("project-a"), "project-a-transition-ledger.dets")
+
+    unreadable = %TransitionAttemptLedger{table: make_ref(), project_id: "project-a", tracker_identity: @identity}
+
+    assert {:error, {:corrupt_transition_attempt, :ledger_unavailable}} =
+             TransitionAttemptLedger.get(unreadable, "attempt")
+
+    assert {:error, {:corrupt_transition_attempt, :ledger_unavailable}} =
+             TransitionAttemptLedger.latest_for_work_item(unreadable, "work")
+
+    assert {:error, {:corrupt_transition_attempt, :invalid_record}} =
+             TransitionAttemptLedger.list_reconciliation_candidates(unreadable)
+
+    assert :ok = TransitionAttemptLedger.close(unreadable)
+    assert TransitionAttemptLedger.resubmit_allowed?(%TransitionAttempt{}) == false
+
+    {:ok, ledger} = TransitionAttemptLedger.open("project-a", @identity, path: path)
+    assert :ok = :dets.insert(ledger.table, {{:latest, 123}, "attempt"})
+    assert :ok = :dets.insert(ledger.table, {{:other, "key"}, :ignored})
+
+    assert {:error, {:corrupt_transition_attempt, :invalid_record}} =
+             TransitionAttemptLedger.list_reconciliation_candidates(ledger)
+
+    assert :ok = TransitionAttemptLedger.close(ledger)
+  end
+
+  test "opens using the configured default ledger root", %{root: root} do
+    previous_root = Application.get_env(:symphony_elixir, :transition_attempt_ledger_root)
+    Application.put_env(:symphony_elixir, :transition_attempt_ledger_root, root)
+
+    on_exit(fn ->
+      if is_nil(previous_root) do
+        Application.delete_env(:symphony_elixir, :transition_attempt_ledger_root)
+      else
+        Application.put_env(:symphony_elixir, :transition_attempt_ledger_root, previous_root)
+      end
+    end)
+
+    assert {:ok, ledger} = TransitionAttemptLedger.open("project-a", @identity)
+    assert ledger.path == Path.join(root, "project-a-transition-ledger.dets")
+    assert :ok = TransitionAttemptLedger.close(ledger)
   end
 
   test "binds a table to its project and tracker identity", %{path: path, root: root} do
@@ -136,6 +200,7 @@ defmodule SymphonyElixir.TransitionAttemptLedgerTest do
     {:ok, ledger} = TransitionAttemptLedger.open("project-a", @identity, path: path)
 
     for {id, status} <- [
+          {"prepared", :prepared},
           {"submitted", :submitted},
           {"verifying", :verifying},
           {"conflict", :conflict},
@@ -143,17 +208,44 @@ defmodule SymphonyElixir.TransitionAttemptLedgerTest do
           {"verified", :verified},
           {"rejected", :rejected}
         ] do
-      assert :ok = TransitionAttemptLedger.put_sync(ledger, attempt(id, id, status))
+      record =
+        if status == :prepared,
+          do: Map.put(attempt(id, id, status), :submission_fenced_at, 1_700_000_000_000),
+          else: attempt(id, id, status)
+
+      assert :ok = TransitionAttemptLedger.put_sync(ledger, record)
     end
 
     assert {:ok, candidates} = TransitionAttemptLedger.list_reconciliation_candidates(ledger)
-    assert Enum.map(candidates, & &1.status) == [:submitted, :verifying, :conflict, :indeterminate]
+    assert Enum.map(candidates, & &1.status) == [:prepared, :submitted, :verifying, :conflict, :indeterminate]
 
     for candidate <- candidates do
       refute TransitionAttemptLedger.resubmit_allowed?(candidate)
     end
 
-    assert TransitionAttemptLedger.resubmit_allowed?(attempt("new", "new", :prepared))
+    refute TransitionAttemptLedger.resubmit_allowed?(attempt("new", "new", :prepared))
+    assert :ok = TransitionAttemptLedger.close(ledger)
+  end
+
+  test "rejects a corrupt persisted attempt instead of treating the ledger as empty", %{path: path} do
+    {:ok, ledger} = TransitionAttemptLedger.open("project-a", @identity, path: path)
+    assert :ok = :dets.insert(ledger.table, {{:attempt, "corrupt"}, %{status: :indeterminate}})
+    assert :ok = :dets.sync(ledger.table)
+
+    assert {:error, {:corrupt_transition_attempt, :invalid_record}} =
+             TransitionAttemptLedger.list_reconciliation_candidates(ledger)
+
+    assert :ok = TransitionAttemptLedger.close(ledger)
+  end
+
+  test "rejects latest pointers that do not reference a persisted attempt", %{path: path} do
+    {:ok, ledger} = TransitionAttemptLedger.open("project-a", @identity, path: path)
+    assert :ok = :dets.insert(ledger.table, {{:latest, "work-a"}, "missing-attempt"})
+    assert :ok = :dets.sync(ledger.table)
+
+    assert {:error, {:corrupt_transition_attempt, :invalid_record}} =
+             TransitionAttemptLedger.list_reconciliation_candidates(ledger)
+
     assert :ok = TransitionAttemptLedger.close(ledger)
   end
 
@@ -162,6 +254,142 @@ defmodule SymphonyElixir.TransitionAttemptLedgerTest do
     refute function_exported?(TransitionAttemptLedger, :delete, 2)
     refute function_exported?(TransitionAttemptLedger, :delete_all, 1)
     assert :ok = TransitionAttemptLedger.close(ledger)
+  end
+
+  test "normalizes missing records and permanently disallows resubmission", %{path: path} do
+    {:ok, ledger} = TransitionAttemptLedger.open("project-a", @identity, path: path)
+    assert :not_found = TransitionAttemptLedger.get(ledger, "missing")
+    assert :not_found = TransitionAttemptLedger.latest_for_work_item(ledger, "missing")
+    assert {:error, {:corrupt_transition_attempt, :invalid_record}} = TransitionAttemptLedger.get(ledger, :invalid)
+
+    assert {:error, {:corrupt_transition_attempt, :invalid_record}} =
+             TransitionAttemptLedger.latest_for_work_item(ledger, :invalid)
+
+    assert TransitionAttemptLedger.resubmit_allowed?(%{state: :prepared}) == false
+    assert TransitionAttemptLedger.resubmit_allowed?(%{status: :prepared}) == false
+    assert TransitionAttemptLedger.resubmit_allowed?(:invalid) == false
+    assert :ok = TransitionAttemptLedger.close(ledger)
+  end
+
+  test "rejects invalid callbacks, unexpected callback results, and callback exceptions", %{path: path} do
+    assert {:error, :invalid_ledger_callbacks} =
+             TransitionAttemptLedger.open("project-a", @identity, path: path, write_fun: :invalid)
+
+    {:ok, initialized} = TransitionAttemptLedger.open("project-a", @identity, path: path)
+    assert :ok = TransitionAttemptLedger.close(initialized)
+
+    {:ok, unexpected_write} =
+      TransitionAttemptLedger.open("project-a", @identity,
+        path: path,
+        write_fun: fn _table, _records -> :unexpected end
+      )
+
+    assert {:error, {:ledger_write_failed, :unexpected}} =
+             TransitionAttemptLedger.put_sync(unexpected_write, attempt("unexpected", "work-a", :prepared))
+
+    assert :ok = TransitionAttemptLedger.close(unexpected_write)
+
+    {:ok, raising_write} =
+      TransitionAttemptLedger.open("project-a", @identity,
+        path: path,
+        write_fun: fn _table, _records -> raise "write failed" end
+      )
+
+    assert {:error, {:ledger_write_failed, :write_failed}} =
+             TransitionAttemptLedger.put_sync(raising_write, attempt("raising", "work-a", :prepared))
+
+    assert :ok = TransitionAttemptLedger.close(raising_write)
+
+    {:ok, unexpected_sync} =
+      TransitionAttemptLedger.open("project-a", @identity,
+        path: path,
+        sync_fun: fn _table -> :unexpected end
+      )
+
+    assert {:error, {:ledger_sync_failed, :unexpected}} =
+             TransitionAttemptLedger.put_sync(unexpected_sync, attempt("sync", "work-a", :prepared))
+
+    assert :ok = TransitionAttemptLedger.close(unexpected_sync)
+
+    {:ok, raising_sync} =
+      TransitionAttemptLedger.open("project-a", @identity,
+        path: path,
+        sync_fun: fn _table -> raise "sync failed" end
+      )
+
+    assert {:error, {:ledger_sync_failed, :sync_failed}} =
+             TransitionAttemptLedger.put_sync(raising_sync, attempt("sync-raise", "work-a", :prepared))
+
+    assert :ok = TransitionAttemptLedger.close(raising_sync)
+  end
+
+  test "fails closed when a ledger path cannot be created", %{root: root} do
+    blocker = Path.join(root, "not-a-directory")
+    File.write!(blocker, "blocker")
+
+    assert {:error, {:ledger_directory_failed, _reason}} =
+             TransitionAttemptLedger.open("project-a", @identity, path: Path.join(blocker, "attempts.dets"))
+  end
+
+  test "rejects a second opener and malformed metadata", %{path: path} do
+    {:ok, ledger} = TransitionAttemptLedger.open("project-a", @identity, path: path)
+
+    assert :ok = TransitionAttemptLedger.close(ledger)
+
+    table = String.to_atom(path)
+    {:ok, _} = :dets.open_file(table, file: String.to_charlist(path), type: :set, auto_save: :infinity)
+    assert :ok = :dets.insert(table, {{:meta, "project-a"}, %{schema_version: 999}})
+    assert :ok = :dets.sync(table)
+    assert :ok = :dets.close(table)
+
+    assert {:error, {:corrupt_transition_attempt, :metadata}} =
+             TransitionAttemptLedger.open("project-a", @identity, path: path)
+  end
+
+  test "rejects a ledger with multiple metadata records", %{path: path} do
+    {:ok, ledger} = TransitionAttemptLedger.open("project-a", @identity, path: path)
+    assert :ok = TransitionAttemptLedger.close(ledger)
+
+    table = String.to_atom(path)
+    {:ok, _} = :dets.open_file(table, file: String.to_charlist(path), type: :set, auto_save: :infinity)
+
+    metadata = %{
+      schema_version: TransitionAttemptLedger.schema_version(),
+      project_namespace: "project-a",
+      tracker_identity: @identity
+    }
+
+    assert :ok = :dets.insert(table, {{:meta, "project-a"}, metadata})
+    assert :ok = :dets.insert(table, {{:meta, "other"}, metadata})
+    assert :ok = :dets.sync(table)
+    assert :ok = :dets.close(table)
+
+    assert {:error, {:corrupt_transition_attempt, :metadata}} =
+             TransitionAttemptLedger.open("project-a", @identity, path: path)
+  end
+
+  test "rejects legacy metadata from another project namespace", %{path: path} do
+    {:ok, ledger} = TransitionAttemptLedger.open("project-a", @identity, path: path)
+    assert :ok = TransitionAttemptLedger.close(ledger)
+
+    table = String.to_atom(path)
+    {:ok, _} = :dets.open_file(table, file: String.to_charlist(path), type: :set, auto_save: :infinity)
+    assert :ok = :dets.insert(table, {{:meta, "project-a"}, %{project_namespace: "other-project"}})
+    assert :ok = :dets.sync(table)
+    assert :ok = :dets.close(table)
+
+    assert {:error, {:ledger_project_namespace_mismatch, "other-project", "project-a"}} =
+             TransitionAttemptLedger.open("project-a", @identity, path: path)
+  end
+
+  test "returns the DETS open error for a directory path", %{root: root} do
+    assert {:error, _reason} =
+             TransitionAttemptLedger.open("project-a", @identity, path: root)
+  end
+
+  test "closes malformed table handles fail closed" do
+    assert :ok =
+             TransitionAttemptLedger.close(%TransitionAttemptLedger{table: %{not_a_table: true}})
   end
 
   defp attempt(attempt_id, work_item_id, status) do

@@ -117,6 +117,7 @@ defmodule SymphonyElixir.WorkControl.TransitionAttempt do
   @spec authorize_intent(t(), SemanticTransitionIntent.t() | map()) :: {:ok, t()} | {:error, atom()}
   def authorize_intent(%__MODULE__{} = attempt, %SemanticTransitionIntent{} = intent) do
     with :ok <- available?(attempt),
+         :ok <- require_state(attempt, :requested),
          true <- attempt.work_item_id == intent.work_item_id,
          true <- attempt.requested_from == intent.requested_from,
          true <- attempt.requested_to == intent.requested_to do
@@ -148,22 +149,35 @@ defmodule SymphonyElixir.WorkControl.TransitionAttempt do
     transition_from(attempt, :fresh_context_loaded, :prepared, context, :prepared_at)
   end
 
-  @spec mark_mutation_submitted(t(), map()) :: {:ok, t()} | {:error, atom()}
-  def mark_mutation_submitted(%__MODULE__{} = attempt, opts \\ %{}) when is_map(opts) do
+  @spec arm_submission_fence(t(), map()) :: {:ok, t()} | {:error, atom()}
+  def arm_submission_fence(%__MODULE__{} = attempt, opts \\ %{}) when is_map(opts) do
     with :ok <- available?(attempt),
          :ok <- require_state(attempt, :prepared) do
       at = Map.get(opts, :at, DateTime.utc_now())
-      submitted_at = Map.get(opts, :submitted_at, at)
 
-      with {:ok, at} <- timestamp(at),
-           {:ok, submitted_at} <- timestamp(submitted_at) do
+      with {:ok, at} <- timestamp(at) do
+        {:ok, advance(attempt, :prepared, %{submission_fenced_at: at})}
+      end
+    end
+  end
+
+  @spec mark_mutation_submitted(t(), map()) :: {:ok, t()} | {:error, atom()}
+  def mark_mutation_submitted(%__MODULE__{} = attempt, opts \\ %{}) when is_map(opts) do
+    with :ok <- available?(attempt),
+         :ok <- require_state(attempt, :prepared),
+         true <- submission_fenced?(attempt) do
+      at = Map.get(opts, :at, DateTime.utc_now())
+
+      with {:ok, at} <- timestamp(at) do
         {:ok,
          advance(attempt, :mutation_submitted, %{
            status: :submitted,
-           submission_fenced_at: at,
-           submitted_at: submitted_at
+           submitted_at: at
          })}
       end
+    else
+      false -> {:error, :submission_not_fenced}
+      {:error, _reason} = error -> error
     end
   end
 
@@ -186,8 +200,8 @@ defmodule SymphonyElixir.WorkControl.TransitionAttempt do
   @spec verify(t(), map() | atom()) :: {:ok, t()} | {:error, atom()}
   def verify(%__MODULE__{} = attempt, context) do
     with :ok <- available?(attempt),
-         :ok <- require_state(attempt, :verifying) do
-      outcome = verification_outcome(context, attempt)
+         :ok <- require_state(attempt, :verifying),
+         {:ok, outcome} <- verification_outcome(context, attempt) do
       {:ok, terminal_update(attempt, outcome, context)}
     end
   end
@@ -225,9 +239,15 @@ defmodule SymphonyElixir.WorkControl.TransitionAttempt do
   def submission_fenced?(_attempt), do: false
 
   @spec automatic_mutation_allowed?(t() | map()) :: boolean()
-  def automatic_mutation_allowed?(%__MODULE__{state: :prepared}), do: true
-  def automatic_mutation_allowed?(%{state: :prepared}), do: true
-  def automatic_mutation_allowed?(%{status: :prepared}), do: true
+  def automatic_mutation_allowed?(%__MODULE__{state: :prepared} = attempt),
+    do: is_nil(attempt.submission_fenced_at)
+
+  def automatic_mutation_allowed?(%{state: :prepared} = attempt),
+    do: is_nil(Map.get(attempt, :submission_fenced_at))
+
+  def automatic_mutation_allowed?(%{status: :prepared} = attempt),
+    do: is_nil(Map.get(attempt, :submission_fenced_at))
+
   def automatic_mutation_allowed?(_attempt), do: false
 
   defp transition_from(attempt, expected, next, context, timestamp_key) do
@@ -264,12 +284,14 @@ defmodule SymphonyElixir.WorkControl.TransitionAttempt do
   end
 
   defp terminalize(attempt, state, reason) do
-    with :ok <- available?(attempt) do
+    with :ok <- available?(attempt),
+         :ok <- terminal_source_allowed?(attempt.state, state) do
       {:ok, terminal_update(attempt, state, %{reason: reason})}
     end
   end
 
   defp terminal_update(attempt, state, context) do
+    context = if is_map(context), do: context, else: %{reason: context}
     now = Map.get(context, :at, DateTime.utc_now())
     reason = Map.get(context, :reason, Map.get(context, "reason"))
 
@@ -284,14 +306,43 @@ defmodule SymphonyElixir.WorkControl.TransitionAttempt do
     })
   end
 
-  defp verification_outcome(:verified, _attempt), do: :verified
-  defp verification_outcome({:verified, _reason}, _attempt), do: :verified
-  defp verification_outcome(%{assessment: assessment}, attempt), do: verification_outcome(assessment, attempt)
-  defp verification_outcome(%{status: :validated, validated_state: state}, %{requested_to: target}) when state == target, do: :verified
-  defp verification_outcome(%{status: :verified}, _attempt), do: :verified
-  defp verification_outcome(%{status: :conflict}, _attempt), do: :conflict
-  defp verification_outcome(%{status: :provider_failed}, _attempt), do: :provider_failed
-  defp verification_outcome(_, _attempt), do: :indeterminate
+  defp verification_outcome(
+         %{
+           assessment: assessment,
+           post_observation_evidence: observation,
+           post_contract_fingerprint: fingerprint
+         },
+         attempt
+       )
+       when is_map(assessment) and is_map(observation) and is_binary(fingerprint) do
+    if valid_post_observation?(observation, attempt) do
+      case assessment do
+        %{status: :validated, validated_state: state} when state == attempt.requested_to ->
+          {:ok, :verified}
+
+        %{status: :conflict} ->
+          {:ok, :conflict}
+
+        %{status: :provider_failed} ->
+          {:ok, :provider_failed}
+
+        _other ->
+          {:ok, :indeterminate}
+      end
+    else
+      {:error, :invalid_verification_evidence}
+    end
+  end
+
+  defp verification_outcome(_context, _attempt), do: {:error, :invalid_verification_evidence}
+
+  defp valid_post_observation?(observation, %__MODULE__{} = attempt) when is_map(observation) do
+    is_binary(Map.get(observation, :workspace_id)) and
+      is_binary(Map.get(observation, :project_id)) and
+      Map.get(observation, :work_item_id) == attempt.work_item_id and
+      is_binary(Map.get(observation, :provider_state_id)) and
+      match?(%DateTime{}, Map.get(observation, :observed_at))
+  end
 
   defp status_for(:mutation_submitted), do: :submitted
   defp status_for(state), do: state
@@ -319,8 +370,15 @@ defmodule SymphonyElixir.WorkControl.TransitionAttempt do
   defp available?(%__MODULE__{}), do: :ok
 
   defp require_state(%__MODULE__{state: state}, state), do: :ok
-  defp require_state(%__MODULE__{state: :requested}, :intent_authorized), do: {:error, :intent_not_authorized}
   defp require_state(%__MODULE__{state: actual}, expected), do: {:error, {:invalid_attempt_state, actual, expected}}
+
+  defp terminal_source_allowed?(source, target)
+       when source in [:intent_authorized, :fresh_context_loaded, :prepared, :mutation_submitted, :verifying] and
+              target in [:rejected, :conflict, :provider_failed, :indeterminate],
+       do: :ok
+
+  defp terminal_source_allowed?(source, _target),
+    do: {:error, {:invalid_attempt_state, source, :terminal}}
 
   defp canonical_atom(value) when is_atom(value) do
     if WorkflowLifecycle.canonical?(value), do: {:ok, value}, else: {:error, :invalid_state}
