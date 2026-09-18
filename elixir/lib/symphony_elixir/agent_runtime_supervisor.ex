@@ -18,6 +18,20 @@ defmodule SymphonyElixir.AgentRuntimeSupervisor do
 
     orchestrator_name = Keyword.get(opts, :orchestrator_name, SymphonyElixir.Orchestrator)
 
+    transition_coordinator_name =
+      Keyword.get_lazy(opts, :transition_coordinator_name, fn ->
+        case Keyword.get(opts, :name, __MODULE__) do
+          runtime_name when runtime_name == __MODULE__ -> SymphonyElixir.TransitionCoordinator
+          runtime_name when is_atom(runtime_name) -> Module.concat(runtime_name, "TransitionCoordinator")
+          _other -> SymphonyElixir.TransitionCoordinator
+        end
+      end)
+
+    transition_coordinator_opts =
+      opts
+      |> Keyword.get(:transition_coordinator_opts, [])
+      |> Keyword.merge(name: transition_coordinator_name, orchestrator: orchestrator_name)
+
     children = [
       Supervisor.child_spec(
         {Task.Supervisor, name: task_supervisor_name},
@@ -26,6 +40,10 @@ defmodule SymphonyElixir.AgentRuntimeSupervisor do
       Supervisor.child_spec(
         {SymphonyElixir.Orchestrator, name: orchestrator_name, task_supervisor: task_supervisor_name},
         id: orchestrator_name
+      ),
+      Supervisor.child_spec(
+        {SymphonyElixir.TransitionCoordinator, transition_coordinator_opts},
+        id: transition_coordinator_name
       )
     ]
 

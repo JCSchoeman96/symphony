@@ -581,4 +581,59 @@ defmodule SymphonyElixir.PlaneClientTest do
 
     assert Enum.all?(requests, fn {method, path} -> method == :get and not String.contains?(path, ["dependency", "relation", "transition", "webhook"]) end)
   end
+
+  test "updates a work item through the exact scoped PATCH with only its target state" do
+    parent = self()
+
+    request_fun = fn request ->
+      send(parent, {:request, request})
+      {:ok, %{status: 200, body: %{"ignored" => "response"}}}
+    end
+
+    assert :ok =
+             Client.update_work_item_state(@config, "item/one", "state-uuid", request_fun: request_fun)
+
+    assert_receive {:request, %{method: :patch, path: path, params: %{}, body: body, headers: headers}}
+    assert path == "/api/v1/workspaces/workspace-1/projects/project-1/work-items/item%2Fone/"
+    assert body == %{"state" => "state-uuid"}
+    assert {"X-API-Key", "secret"} in headers
+    assert {"Content-Type", "application/json"} in headers
+  end
+
+  test "accepts every successful mutation status without decoding its response body" do
+    for status <- [200, 201, 202, 204, 299] do
+      assert :ok =
+               Client.update_work_item_state(@config, "item-1", "state-uuid", request_fun: fn _request -> {:ok, %{status: status, body: :not_json}} end)
+    end
+  end
+
+  test "keeps mutation status failures as errors and preserves transport failure classes" do
+    for status <- [400, 401, 403, 404, 409, 500, 503] do
+      assert {:error, _reason} =
+               Client.update_work_item_state(@config, "item-1", "state-uuid", request_fun: fn _request -> {:ok, %{status: status, body: %{"secret" => "hidden"}}} end)
+    end
+
+    for reason <- [:econnrefused, :timeout, :closed] do
+      assert {:error, ^reason} =
+               Client.update_work_item_state(@config, "item-1", "state-uuid", request_fun: fn _request -> {:error, reason} end)
+    end
+  end
+
+  test "passes mutation bodies through the supported positional request function arities" do
+    assert :ok =
+             Client.update_work_item_state(@config, "item-1", "state-uuid",
+               request_fun: fn :patch, path, %{}, %{"state" => "state-uuid"} ->
+                 assert path == "/api/v1/workspaces/workspace-1/projects/project-1/work-items/item-1/"
+                 {:ok, %{status: 204, body: nil}}
+               end
+             )
+
+    assert :ok =
+             Client.update_work_item_state(@config, "item-1", "state-uuid",
+               request_fun: fn :patch, _path, %{}, %{"state" => "state-uuid"}, config ->
+                 assert config.api_key == "secret"
+                 {:ok, %{status: 204, body: nil}}
+               end
+             )
+  end
 end

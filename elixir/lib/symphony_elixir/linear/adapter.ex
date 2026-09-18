@@ -56,6 +56,11 @@ defmodule SymphonyElixir.Linear.Adapter do
     AgentTool.execute(tool, arguments, opts)
   end
 
+  @doc false
+  @spec controlled_transition(String.t(), term(), keyword()) :: {:error, term()}
+  def controlled_transition(_work_item_id, _target_state, _opts),
+    do: {:error, :controlled_transition_unsupported}
+
   @spec secret_environment_names(map()) :: [String.t()]
   def secret_environment_names(tracker_settings), do: tracker_settings.secret_environment_names
 

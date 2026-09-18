@@ -120,7 +120,12 @@ defmodule SymphonyElixir.Tracker.Capabilities do
   defp required_callback(:current_issue_refresh), do: {:fetch_issues_by_ids, 1}
   defp required_callback(:dependency_graph), do: {:fetch_dependency_graph, 0}
   defp required_callback(:dependency_completeness), do: {:fetch_dependency_graph, 0}
-  defp required_callback(:controlled_transition), do: {:execute_agent_tool, 3}
+  # Host lifecycle mutation is deliberately a separate adapter callback. It
+  # must not be satisfied by an agent-facing dynamic tool implementation.
+  defp required_callback(:controlled_transition), do: {:controlled_transition, 3}
+  # Verification is an authoritative exact-read capability. The coordinator
+  # performs the fresh post-read and canonical assessment itself.
+  defp required_callback(:transition_verification), do: {:fetch_issues_by_ids, 1}
   defp required_callback(:agent_read_tools), do: {:agent_tool_specs, 0}
   defp required_callback(:agent_transition_tools), do: {:execute_agent_tool, 3}
   defp required_callback(_capability), do: nil

@@ -3,6 +3,7 @@ defmodule SymphonyElixir.PlaneAdapterTest do
 
   alias SymphonyElixir.Plane.Adapter
   alias SymphonyElixir.Tracker.Issue
+  alias SymphonyElixir.WorkControl.{ProviderProjectContract, WorkflowLifecycle}
 
   @settings %{
     kind: "plane",
@@ -12,8 +13,15 @@ defmodule SymphonyElixir.PlaneAdapterTest do
     secret_environment_names: ["PLANE_API_KEY"]
   }
 
-  test "declares only the graduated read capabilities" do
-    assert Adapter.capabilities() == [:current_issue_refresh, :dependency_graph, :dependency_completeness]
+  test "declares only the graduated host capabilities" do
+    assert Adapter.capabilities() == [
+             :current_issue_refresh,
+             :dependency_graph,
+             :dependency_completeness,
+             :controlled_transition,
+             :transition_verification
+           ]
+
     assert Adapter.secret_environment_names(@settings) == ["PLANE_API_KEY"]
   end
 
@@ -162,7 +170,71 @@ defmodule SymphonyElixir.PlaneAdapterTest do
     assert snapshot.capability_statuses.current_issue_refresh == :supported
     assert snapshot.capability_statuses.dependency_graph == :supported
     assert snapshot.capability_statuses.dependency_completeness == :supported
-    assert snapshot.capability_statuses.controlled_transition == :unsupported
+    assert snapshot.capability_statuses.controlled_transition == :supported
+    assert snapshot.capability_statuses.transition_verification == :supported
+  end
+
+  test "performs a host-only stable-UUID transition through the scoped PATCH" do
+    contract = contract()
+    parent = self()
+
+    assert :ok =
+             Adapter.controlled_transition_for_test(
+               "item-1",
+               :in_progress,
+               @settings,
+               contract,
+               fn request ->
+                 send(parent, {:request, request})
+                 {:ok, %{status: 204, body: nil}}
+               end
+             )
+
+    assert_receive {:request, %{method: :patch, body: %{"state" => "state-in_progress"}}}
+  end
+
+  test "does not resolve provider targets by display name or cross-scope observation" do
+    contract = contract()
+
+    request_fun = fn _request ->
+      flunk("the adapter must reject before issuing a provider request")
+    end
+
+    assert {:error, :unknown_canonical_state} =
+             Adapter.controlled_transition_for_test("item-1", "In Progress", @settings, contract, request_fun)
+
+    assert {:error, :wrong_project} =
+             Adapter.controlled_transition(
+               "item-1",
+               :in_progress,
+               tracker_settings: @settings,
+               provider_project_contract: contract,
+               pre_observation: %{work_item_id: "item-1", project_id: "other-project"},
+               request_fun: request_fun
+             )
+  end
+
+  defp contract do
+    state_mappings =
+      Map.new(WorkflowLifecycle.states(), fn state ->
+        {state,
+         %{
+           state_id: "state-#{state}",
+           name: WorkflowLifecycle.display(state)
+         }}
+      end)
+
+    {:ok, contract} =
+      ProviderProjectContract.new(%{
+        schema_version: 1,
+        provider: :plane,
+        workspace_id: "workspace-stable-1",
+        project_id: "project-1",
+        state_mappings: state_mappings,
+        dependency_relation_semantics: %{blocked_by: :blocked_by, blocking: :blocking}
+      })
+
+    contract
   end
 
   test "rejects a project response with a contradictory stable workspace or project ID" do
