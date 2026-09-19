@@ -246,6 +246,89 @@ defmodule SymphonyElixir.OrchestratorProjectContractTest do
              )
   end
 
+  test "semantic tool context returns current canonical work and graph evidence" do
+    {state, work_item} = handoff_state()
+    contract = contract!()
+    graph = Graph.build([issue_for("work-1")], epoch: :semantic_epoch)
+    evidence = ProjectContractEvidence.new(contract)
+    from = {self(), make_ref()}
+    state = %{state | dependency_graph: graph, project_contract_evidence: evidence}
+
+    assert {:reply, {:ok, context}, _state} =
+             Orchestrator.handle_call({:semantic_tool_context, "work-1"}, from, state)
+
+    assert context.work_item == work_item
+    assert context.dependency_decision == %{allowed?: true}
+
+    assert context.dependency_epoch_evidence == %{
+             epoch: :semantic_epoch,
+             completeness: :complete,
+             complete?: true
+           }
+
+    assert context.provider_project_contract == contract
+    assert context.provider_contract_fingerprint == ProviderProjectContract.fingerprint(contract)
+    assert context.project_contract_evidence == ProjectContractEvidence.observability(evidence)
+  end
+
+  test "semantic tool context preserves suspended and incomplete local facts" do
+    {state, work_item} = handoff_state()
+    contract = contract!()
+    {:ok, suspended} = WorkItem.suspend(work_item, :provider_failed)
+
+    graph =
+      Graph.build([issue_for("work-1")],
+        epoch: :incomplete_epoch,
+        completeness: {:incomplete, :relation_read_failed}
+      )
+
+    evidence = %ProjectContractEvidence{
+      contract: contract,
+      reconciliation_required?: true,
+      reason: :provider_configuration_drift
+    }
+
+    from = {self(), make_ref()}
+
+    state = %{
+      state
+      | work_control: %{"work-1" => suspended},
+        dependency_diagnostics: %{},
+        dependency_graph: graph,
+        project_contract_evidence: evidence
+    }
+
+    assert {:reply, {:ok, context}, _state} =
+             Orchestrator.handle_call({:semantic_tool_context, "work-1"}, from, state)
+
+    assert context.work_item == suspended
+    assert WorkItem.suspended?(context.work_item)
+    assert context.dependency_decision == nil
+
+    assert context.dependency_epoch_evidence == %{
+             epoch: :incomplete_epoch,
+             completeness: {:incomplete, :relation_read_failed},
+             complete?: false
+           }
+
+    assert context.provider_project_contract == contract
+    assert context.project_contract_evidence == ProjectContractEvidence.observability(evidence)
+  end
+
+  test "semantic tool context reports missing work items" do
+    from = {self(), make_ref()}
+    state = %Orchestrator.State{}
+
+    assert {:reply, {:error, :work_item_not_found}, _state} =
+             Orchestrator.handle_call({:semantic_tool_context, "missing"}, from, state)
+  end
+
+  test "semantic tool context reports an unavailable server" do
+    server = Module.concat(__MODULE__, "MissingSemanticContextServer#{System.unique_integer([:positive])}")
+
+    assert :unavailable == Orchestrator.semantic_tool_context(server, "work-1")
+  end
+
   test "fails closed when transition context dependencies or authority are unsafe" do
     {state, work_item} = handoff_state()
     from = {self(), make_ref()}
@@ -329,13 +412,7 @@ defmodule SymphonyElixir.OrchestratorProjectContractTest do
   end
 
   defp handoff_state do
-    issue = %Issue{
-      id: "work-1",
-      identifier: "SYM-1",
-      title: "Transition handoff",
-      state: "Ready",
-      dependency_completeness: :complete
-    }
+    issue = issue_for("work-1")
 
     {:ok, work_item} =
       WorkItem.from_issue(issue, %{
@@ -351,6 +428,16 @@ defmodule SymphonyElixir.OrchestratorProjectContractTest do
     }
 
     {state, work_item}
+  end
+
+  defp issue_for(id) when is_binary(id) do
+    %Issue{
+      id: id,
+      identifier: "SYM-#{id}",
+      title: "Transition handoff",
+      state: "Ready",
+      dependency_completeness: :complete
+    }
   end
 
   defp contract! do
