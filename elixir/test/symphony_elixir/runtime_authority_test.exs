@@ -174,6 +174,16 @@ defmodule SymphonyElixir.RuntimeAuthorityTest do
     assert_denied(Authority.validate_profile(malformed), :invalid_profile, :unsupported_responsibility)
   end
 
+  test "forged incomplete profile structs deny without raising" do
+    forged_profile = %{__struct__: Profile}
+
+    assert_denied(
+      Authority.validate_profile(forged_profile),
+      :invalid_profile,
+      :malformed_profile
+    )
+  end
+
   test "validate_profile accepts the effective policies for the standard profiles" do
     profiles = Profile.default_profiles("codex app-server", 20)
 
@@ -213,6 +223,16 @@ defmodule SymphonyElixir.RuntimeAuthorityTest do
     )
 
     assert Authority.authorize_lifecycle_command(route, :planning, :ready) == :ok
+  end
+
+  test "forged incomplete route structs deny without raising" do
+    forged_route = %{__struct__: Route, profile: default_profile("planner")}
+
+    assert_denied(
+      Authority.authorize_lifecycle_command(forged_route, :planning, :ready),
+      :invalid_subject,
+      :malformed_route
+    )
   end
 
   test "route and profile metadata must match and the fingerprint must be current" do

@@ -63,6 +63,8 @@ defmodule SymphonyElixir.AgentRuntime.Authority do
     end)
   end
 
+  defp profile_shape_reason(_subject), do: :malformed_profile
+
   defp nonempty_binary?(value), do: is_binary(value) and String.trim(value) != ""
 
   defp optional_string?(value), do: is_nil(value) or is_binary(value)
@@ -82,11 +84,13 @@ defmodule SymphonyElixir.AgentRuntime.Authority do
   end
 
   defp validate_route(%Route{} = route) do
+    profile = Map.get(route, :profile)
+
     cond do
-      is_nil(route.profile) -> invalid_subject(:missing_profile)
-      not match?(%Profile{}, route.profile) -> invalid_subject(:invalid_profile)
+      is_nil(profile) -> invalid_subject(:missing_profile)
+      not match?(%Profile{}, profile) -> invalid_subject(:invalid_profile)
       not valid_route_shape?(route) -> invalid_subject(:malformed_route)
-      true -> validate_route_profile(route, route.profile)
+      true -> validate_route_profile(route, profile)
     end
   end
 
@@ -110,6 +114,8 @@ defmodule SymphonyElixir.AgentRuntime.Authority do
     ]
     |> Enum.all?(& &1)
   end
+
+  defp valid_route_shape?(_subject), do: false
 
   defp canonical_state_string?(value),
     do: nonempty_binary?(value) and WorkflowLifecycle.canonical?(value)
