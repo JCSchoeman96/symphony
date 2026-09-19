@@ -11,6 +11,7 @@ defmodule SymphonyElixir.TransitionCoordinator do
 
   use GenServer
 
+  alias SymphonyElixir.AgentRuntime.{Authority, Route}
   alias SymphonyElixir.{Config, Orchestrator}
   alias SymphonyElixir.Plane.ProjectContract, as: PlaneProjectContract
   alias SymphonyElixir.Tracker
@@ -30,6 +31,16 @@ defmodule SymphonyElixir.TransitionCoordinator do
   }
 
   @claims_table :symphony_transition_coordinator_claims
+  @runtime_responsibilities ["planning", "implementation", "review", "correction", "merge"]
+  @transition_policy_owner_tokens %{
+    planner: "planning",
+    symphony: "symphony",
+    builder: "implementation",
+    independent_reviewer: "review",
+    fixer: "correction",
+    human: "human",
+    system: "system"
+  }
 
   defmodule State do
     @moduledoc false
@@ -74,16 +85,24 @@ defmodule SymphonyElixir.TransitionCoordinator do
     GenServer.start_link(__MODULE__, opts, start_opts)
   end
 
+  @spec request_transition(SemanticTransitionIntent.t() | map()) ::
+          {:ok, TransitionAttempt.t()} | {:error, term()}
+  def request_transition(intent), do: request_transition(__MODULE__, intent, [])
+
   @spec request_transition(GenServer.server(), SemanticTransitionIntent.t() | map()) ::
           {:ok, TransitionAttempt.t()} | {:error, term()}
-  def request_transition(server \\ __MODULE__, intent) do
+  def request_transition(server, intent), do: request_transition(server, intent, [])
+
+  @spec request_transition(GenServer.server(), SemanticTransitionIntent.t() | map(), keyword()) ::
+          {:ok, TransitionAttempt.t()} | {:error, term()}
+  def request_transition(server, intent, opts) when is_list(opts) do
     case request_claim_key(server, intent) do
       {:ok, claim_key} ->
         table = claims_table()
 
         if :ets.insert_new(table, {claim_key, self()}) do
           try do
-            call_transition(server, intent)
+            call_transition(server, intent, opts)
           after
             :ets.delete(table, claim_key)
           end
@@ -92,12 +111,14 @@ defmodule SymphonyElixir.TransitionCoordinator do
         end
 
       :skip ->
-        call_transition(server, intent)
+        call_transition(server, intent, opts)
     end
   end
 
-  defp call_transition(server, intent) do
-    GenServer.call(server, {:request_transition, intent}, :infinity)
+  def request_transition(_server, _intent, _opts), do: {:error, :invalid_request_options}
+
+  defp call_transition(server, intent, opts) do
+    GenServer.call(server, {:request_transition, intent, opts}, :infinity)
   catch
     :exit, _reason -> {:error, :coordinator_unavailable}
   end
@@ -168,15 +189,20 @@ defmodule SymphonyElixir.TransitionCoordinator do
   def terminate(_reason, %State{ledger: ledger}), do: TransitionAttemptLedger.close(ledger)
 
   @impl true
-  def handle_call({:request_transition, raw_intent}, _from, %State{} = state) do
+  def handle_call({:request_transition, raw_intent, opts}, _from, %State{} = state) do
     case normalize_intent(raw_intent) do
-      {:ok, intent} -> execute_if_claimed(state, intent)
+      {:ok, intent} -> execute_if_claimed(state, intent, opts)
       {:error, reason} -> {:reply, {:error, {:rejected, reason}}, state}
     end
   end
 
-  defp execute_if_claimed(%State{} = state, %SemanticTransitionIntent{} = intent) do
+  def handle_call({:request_transition, raw_intent}, from, %State{} = state) do
+    handle_call({:request_transition, raw_intent, []}, from, state)
+  end
+
+  defp execute_if_claimed(%State{} = state, %SemanticTransitionIntent{} = intent, opts) do
     work_item_id = intent.work_item_id
+    route = Keyword.get(opts, :route, Keyword.get(opts, :trusted_route))
 
     cond do
       state.transition_disabled? ->
@@ -190,7 +216,7 @@ defmodule SymphonyElixir.TransitionCoordinator do
 
       true ->
         state = %{state | active_work_items: MapSet.put(state.active_work_items, work_item_id)}
-        {reply, state} = execute(state, intent)
+        {reply, state} = execute(state, intent, route)
         {:reply, reply, %{state | active_work_items: MapSet.delete(state.active_work_items, work_item_id)}}
     end
   end
@@ -221,9 +247,9 @@ defmodule SymphonyElixir.TransitionCoordinator do
     end
   end
 
-  defp execute(%State{} = state, %SemanticTransitionIntent{} = intent) do
+  defp execute(%State{} = state, %SemanticTransitionIntent{} = intent, route) do
     with {:ok, attempt} <- new_attempt(intent, state.clock),
-         {:ok, attempt} <- authorize_attempt(attempt, intent),
+         {:ok, attempt} <- authorize_attempt(attempt, intent, route),
          {:ok, context} <- load_context_with_attempt(state, intent, attempt),
          {:ok, attempt} <- ensure_pre_submit(attempt, fn -> authorize_fresh_context(intent, context) end),
          {:ok, attempt} <- ensure_pre_submit(attempt, fn -> guard_context(intent, context) end),
@@ -263,23 +289,63 @@ defmodule SymphonyElixir.TransitionCoordinator do
     end
   end
 
-  defp authorize_attempt(%TransitionAttempt{} = attempt, %SemanticTransitionIntent{} = intent) do
+  defp authorize_attempt(
+         %TransitionAttempt{} = attempt,
+         %SemanticTransitionIntent{} = intent,
+         route
+       ) do
     case transition_attempt(attempt, :authorize_intent, [intent]) do
       {:ok, authorized} ->
-        policy_context = %{
-          current_state: intent.requested_from,
-          target_state: intent.requested_to,
-          responsibility: intent.responsibility
-        }
+        with :ok <- authorize_runtime_route(route, intent),
+             :ok <- TransitionPolicy.authorize_intent(policy_context(intent)) do
+          {:ok, authorized}
+        else
+          {:error, {:authority_rejected, reason}} ->
+            {:error, {:pre_submit, {:authority_rejected, reason}, authorized}}
 
-        case TransitionPolicy.authorize_intent(policy_context) do
-          :ok -> {:ok, authorized}
-          {:error, reason} -> {:error, {:pre_submit, {:policy_rejected, reason}, authorized}}
+          {:error, reason} ->
+            {:error, {:pre_submit, {:policy_rejected, reason}, authorized}}
         end
 
       {:error, _reason} = error ->
         {:error, {:pre_submit, elem(error, 1)}, attempt}
     end
+  end
+
+  defp authorize_runtime_route(route, %SemanticTransitionIntent{} = intent) do
+    if runtime_responsibility?(intent.responsibility) do
+      with :ok <- Authority.authorize_lifecycle_command(route, intent.requested_from, intent.requested_to),
+           :ok <- bind_runtime_route(route, intent) do
+        :ok
+      else
+        {:error, reason} -> {:error, {:authority_rejected, reason}}
+      end
+    else
+      :ok
+    end
+  end
+
+  defp bind_runtime_route(%Route{} = route, %SemanticTransitionIntent{} = intent) do
+    cond do
+      route.issue_id != intent.work_item_id ->
+        {:error, %{code: :invalid_subject, reason: :route_work_item_mismatch}}
+
+      route.responsibility != intent.responsibility ->
+        {:error, %{code: :invalid_subject, reason: :route_responsibility_mismatch}}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp bind_runtime_route(_route, _intent), do: :ok
+
+  defp policy_context(%SemanticTransitionIntent{} = intent) do
+    %{
+      current_state: intent.requested_from,
+      target_state: intent.requested_to,
+      responsibility: transition_policy_responsibility(intent)
+    }
   end
 
   defp load_context(%State{load_context: load_context}, intent) do
@@ -332,8 +398,28 @@ defmodule SymphonyElixir.TransitionCoordinator do
     context
     |> Map.put(:current_state, current_state)
     |> Map.put(:target_state, intent.requested_to)
-    |> Map.put(:responsibility, intent.responsibility)
+    |> Map.put(:responsibility, transition_policy_responsibility(intent))
   end
+
+  defp transition_policy_responsibility(%SemanticTransitionIntent{responsibility: responsibility} = intent) do
+    if runtime_responsibility?(responsibility) do
+      case WorkflowLifecycle.transition(intent.requested_from, intent.requested_to) do
+        {:ok, %{owner: owner}} when is_atom(owner) ->
+          Map.get(@transition_policy_owner_tokens, owner, responsibility)
+
+        _invalid ->
+          responsibility
+      end
+    else
+      responsibility
+    end
+  end
+
+  defp runtime_responsibility?(responsibility) when is_binary(responsibility) do
+    String.downcase(String.trim(responsibility)) in @runtime_responsibilities
+  end
+
+  defp runtime_responsibility?(_responsibility), do: false
 
   defp canonical_transition_responsibility(%SemanticTransitionIntent{} = intent) do
     canonical_transition_responsibility(intent.requested_from, intent.requested_to, intent.responsibility)
@@ -370,10 +456,14 @@ defmodule SymphonyElixir.TransitionCoordinator do
     requirements = WorkflowLifecycle.guard_requirements(intent.requested_from, intent.requested_to) || []
     evidence = Map.get(context, :guard_evidence, intent.guard_evidence)
 
-    if GuardClass.all_satisfied?(requirements, evidence, %{
-         subject: {:work_item, intent.work_item_id},
-         responsibility: intent.responsibility
-       }) do
+    guard_context = %{
+      subject: {:work_item, intent.work_item_id},
+      responsibility: intent.responsibility,
+      runtime_attempt_id: intent.runtime_attempt_id || :transition_coordinator,
+      lineage_generation: intent.lineage_generation || 0
+    }
+
+    if GuardClass.all_satisfied?(requirements, evidence, guard_context) do
       :ok
     else
       {:error, {:pre_submit, :required_guard_missing}}
