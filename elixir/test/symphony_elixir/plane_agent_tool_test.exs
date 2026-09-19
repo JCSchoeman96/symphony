@@ -4,6 +4,7 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
   alias SymphonyElixir.AgentRuntime.{Profile, Route}
   alias SymphonyElixir.Plane.AgentTool
   alias SymphonyElixir.Tracker.Issue
+  alias SymphonyElixir.TransitionCoordinator
 
   alias SymphonyElixir.WorkControl.{
     GuardClass,
@@ -125,31 +126,272 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
     refute_received :semantic_context_must_not_run
   end
 
-  test "transition request is bounded unsupported and never loads context" do
+  test "transition request delegates an authorized canonical intent to H-040" do
     parent = self()
+    work_item = work_item(:in_progress)
+    contract = contract()
+    coordinator = transition_coordinator(parent)
 
     response =
       AgentTool.execute(
         "plane_request_lifecycle_transition",
         %{"targetState" => "In Review"},
+        host_opts(
+          route(:in_progress, "implementation"),
+          semantic_context(work_item, contract),
+          nil,
+          @settings
+        )
+        |> Keyword.put(:coordinator, coordinator)
+        |> Keyword.put(:agent_tool_context, %{
+          route: route(:in_progress, "implementation"),
+          guard_evidence: transition_guard_evidence()
+        })
+      )
+
+    assert response["success"]
+
+    assert Jason.decode!(response["output"]) == %{
+             "status" => "verified",
+             "targetState" => "In Review"
+           }
+
+    assert_receive {:transition_context_loaded, intent}
+    assert intent.work_item_id == "work-1"
+    assert intent.requested_from == :in_progress
+    assert intent.requested_to == :in_review
+    assert intent.responsibility == "implementation"
+
+    assert Enum.map(intent.guard_evidence, &Map.get(&1, :name)) == [
+             :implementation_attested,
+             :implementation_checks_verified
+           ]
+
+    assert is_nil(intent.runtime_attempt_id)
+    assert is_nil(intent.lineage_id)
+    assert is_nil(intent.lineage_generation)
+    assert_received :transition_submitted
+    refute response["output"] =~ "attempt"
+    refute response["output"] =~ "provider_state_id"
+
+    GenServer.stop(coordinator)
+  end
+
+  test "transition request validates exact arguments before loading context" do
+    parent = self()
+
+    for arguments <- [
+          %{},
+          %{"targetState" => "In Review", "extra" => "rejected"},
+          %{"target_state" => "In Review"},
+          %{"targetState" => :in_review},
+          %{"targetState" => "state-in_review"},
+          %{"targetState" => "Done"},
+          :invalid,
+          nil
+        ] do
+      response =
+        AgentTool.execute(
+          "plane_request_lifecycle_transition",
+          arguments,
+          semantic_tool_context: fn _issue_id ->
+            send(parent, :transition_context_must_not_run)
+            {:error, :unexpected}
+          end,
+          tracker_settings: @settings,
+          agent_tool_context: %{route: route(:in_progress, "implementation")}
+        )
+
+      refute response["success"]
+    end
+
+    refute_received :transition_context_must_not_run
+  end
+
+  test "transition request parses only WorkflowLifecycle display targets" do
+    parent = self()
+
+    response =
+      AgentTool.execute(
+        "plane_request_lifecycle_transition",
+        %{"targetState" => "in_review"},
         semantic_tool_context: fn _issue_id ->
-          send(parent, :must_not_run)
-          :ok
+          send(parent, :transition_context_must_not_run)
+          {:ok, semantic_context(work_item(:in_progress), contract())}
         end,
         tracker_settings: @settings,
         agent_tool_context: %{route: route(:in_progress, "implementation")}
       )
 
     refute response["success"]
+    assert Jason.decode!(response["output"])["error"]["code"] == "invalid_target_state"
+    refute_received :transition_context_must_not_run
+  end
+
+  test "transition request lets Runtime.Authority reject a canonical but disallowed target" do
+    parent = self()
+
+    response =
+      AgentTool.execute(
+        "plane_request_lifecycle_transition",
+        %{"targetState" => "Blocked"},
+        semantic_tool_context: fn _issue_id ->
+          send(parent, :transition_context_must_not_run)
+          {:error, :unexpected}
+        end,
+        tracker_settings: @settings,
+        agent_tool_context: %{route: route(:in_progress, "implementation")}
+      )
+
+    refute response["success"]
+    assert Jason.decode!(response["output"])["error"]["code"] == "unauthorized_transition"
+    refute_received :transition_context_must_not_run
+  end
+
+  test "transition request rejects missing host guard evidence without submitting" do
+    parent = self()
+    coordinator = transition_coordinator(parent)
+
+    response =
+      AgentTool.execute(
+        "plane_request_lifecycle_transition",
+        %{"targetState" => "In Review"},
+        host_opts(
+          route(:in_progress, "implementation"),
+          semantic_context(work_item(:in_progress), contract())
+        )
+        |> Keyword.put(:coordinator, coordinator)
+      )
+
+    refute response["success"]
 
     assert Jason.decode!(response["output"]) == %{
              "error" => %{
-               "code" => "transition_unsupported",
-               "message" => "Plane semantic tool request was rejected."
+               "code" => "required_guard_missing",
+               "message" => "Plane lifecycle transition was rejected.",
+               "status" => "rejected"
              }
            }
 
-    refute_received :must_not_run
+    refute_received :transition_submitted
+
+    GenServer.stop(coordinator)
+  end
+
+  test "transition request ignores semantic-context guard evidence" do
+    parent = self()
+    coordinator = transition_coordinator(parent)
+
+    response =
+      AgentTool.execute(
+        "plane_request_lifecycle_transition",
+        %{"targetState" => "In Review"},
+        host_opts(
+          route(:in_progress, "implementation"),
+          semantic_context(
+            work_item(:in_progress),
+            contract(),
+            %{guard_evidence: transition_guard_evidence()}
+          )
+        )
+        |> Keyword.put(:coordinator, coordinator)
+      )
+
+    refute response["success"]
+    assert Jason.decode!(response["output"])["error"]["code"] == "required_guard_missing"
+    refute_received :transition_submitted
+
+    GenServer.stop(coordinator)
+  end
+
+  test "transition request does not invoke provider request callbacks" do
+    parent = self()
+    coordinator = transition_coordinator(parent)
+
+    response =
+      AgentTool.execute(
+        "plane_request_lifecycle_transition",
+        %{"targetState" => "In Review"},
+        host_opts(
+          route(:in_progress, "implementation"),
+          semantic_context(work_item(:in_progress), contract())
+        )
+        |> Keyword.put(:coordinator, coordinator)
+        |> Keyword.put(:request_fun, fn request ->
+          send(parent, {:provider_request, request})
+          {:ok, %{status: 200}}
+        end)
+        |> Keyword.put(:agent_tool_context, %{
+          route: route(:in_progress, "implementation"),
+          guard_evidence: transition_guard_evidence()
+        })
+      )
+
+    assert response["success"]
+    refute_received {:provider_request, _request}
+    GenServer.stop(coordinator)
+  end
+
+  test "transition request rejects cross-role and stale routes before context loading" do
+    parent = self()
+    semantic_context = semantic_context(work_item(:in_review), contract())
+
+    cross_role =
+      AgentTool.execute(
+        "plane_request_lifecycle_transition",
+        %{"targetState" => "Ready to Merge"},
+        host_opts(
+          route(:in_review, "implementation"),
+          semantic_context,
+          fn _issue_id ->
+            send(parent, :transition_context_must_not_run)
+            {:ok, semantic_context}
+          end
+        )
+      )
+
+    stale = %{route(:in_review, "review") | starting_state: "ready"}
+
+    stale_response =
+      AgentTool.execute(
+        "plane_request_lifecycle_transition",
+        %{"targetState" => "Ready to Merge"},
+        host_opts(
+          stale,
+          semantic_context,
+          fn _issue_id ->
+            send(parent, :transition_context_must_not_run)
+            {:ok, semantic_context}
+          end
+        )
+      )
+
+    refute cross_role["success"]
+    refute stale_response["success"]
+    refute_received :transition_context_must_not_run
+  end
+
+  test "transition request rejects a live source that differs from the trusted route" do
+    parent = self()
+    semantic_context = semantic_context(work_item(:ready), contract())
+    coordinator = transition_coordinator(parent)
+
+    response =
+      AgentTool.execute(
+        "plane_request_lifecycle_transition",
+        %{"targetState" => "In Review"},
+        host_opts(
+          route(:in_progress, "implementation"),
+          semantic_context
+        )
+        |> Keyword.put(:coordinator, coordinator)
+      )
+
+    refute response["success"]
+    refute_received {:transition_context_loaded, _intent}
+    refute_received :transition_submitted
+
+    GenServer.stop(coordinator)
   end
 
   test "dependency read requires a complete epoch and returns bounded blocker classifications" do
@@ -167,7 +409,10 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
     }
 
     complete_context =
-      semantic_context(work_item, contract, %{dependency_decision: decision, work_control: %{"blocker-1" => blocker}})
+      semantic_context(work_item, contract, %{
+        dependency_decision: decision,
+        work_control: %{"blocker-1" => blocker}
+      })
 
     complete =
       AgentTool.execute(
@@ -183,10 +428,17 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
              "completeness" => "complete",
              "status" => "satisfied",
              "reason" => "dependencies_satisfied",
-             "blockers" => [%{"id" => "blocker-1", "identifier" => "SYM-BLOCKER", "classification" => "satisfied"}]
+             "blockers" => [
+               %{
+                 "id" => "blocker-1",
+                 "identifier" => "SYM-BLOCKER",
+                 "classification" => "satisfied"
+               }
+             ]
            }
 
-    incomplete_context = Map.put(complete_context, :dependency_epoch_evidence, %{complete?: false})
+    incomplete_context =
+      Map.put(complete_context, :dependency_epoch_evidence, %{complete?: false})
 
     incomplete =
       AgentTool.execute(
@@ -225,7 +477,11 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
     assert response["success"]
 
     assert Jason.decode!(response["output"])["blockers"] == [
-             %{"id" => "canceled", "identifier" => "SYM-CANCELED", "classification" => "invalidated"},
+             %{
+               "id" => "canceled",
+               "identifier" => "SYM-CANCELED",
+               "classification" => "invalidated"
+             },
              %{"id" => "raw-done", "identifier" => "SYM-DONE", "classification" => "unavailable"}
            ]
   end
@@ -239,7 +495,16 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
     disposition = AgentTool.execute("plane_get_authority_disposition", %{}, opts)
 
     assert Map.keys(Jason.decode!(assessment["output"])) |> Enum.sort() ==
-             ["assessedAt", "mappedState", "missingGuards", "reason", "requiredGuards", "status", "validatedState"] |> Enum.sort()
+             [
+               "assessedAt",
+               "mappedState",
+               "missingGuards",
+               "reason",
+               "requiredGuards",
+               "status",
+               "validatedState"
+             ]
+             |> Enum.sort()
 
     assert Map.keys(Jason.decode!(disposition["output"])) |> Enum.sort() ==
              ["lifecycleState", "reason", "resumeTarget", "status", "updatedAt"] |> Enum.sort()
@@ -302,11 +567,79 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
         work_item: work_item,
         provider_project_contract: contract,
         provider_contract_fingerprint: ProviderProjectContract.fingerprint(contract),
-        dependency_decision: %{allowed?: true, dependency_status: :none, reason: :no_hard_dependencies, blockers: []},
+        dependency_decision: %{
+          allowed?: true,
+          dependency_status: :none,
+          reason: :no_hard_dependencies,
+          blockers: []
+        },
         dependency_epoch_evidence: %{epoch: "epoch-1", completeness: :complete, complete?: true}
       },
       overrides
     )
+  end
+
+  defp transition_coordinator(parent) do
+    {:ok, coordinator} =
+      TransitionCoordinator.start_link(
+        name: nil,
+        ledger: nil,
+        require_durable?: false,
+        load_context: fn intent ->
+          send(parent, {:transition_context_loaded, intent})
+
+          {:ok,
+           %{
+             provider_project_contract: contract(),
+             dependency_decision: %{
+               allowed?: true,
+               dependency_completeness: :complete,
+               dependency_status: :none,
+               merge_permitted?: true
+             },
+             dependency_epoch_evidence: %{complete?: true},
+             guard_evidence: intent.guard_evidence
+           }}
+        end,
+        submit: fn _attempt, _context ->
+          send(parent, :transition_submitted)
+          :ok
+        end,
+        verify: fn attempt, _context ->
+          {:verified,
+           %{
+             assessment: %{status: :validated, validated_state: attempt.requested_to},
+             post_observation_evidence: %{
+               workspace_id: "workspace-1",
+               project_id: "project-1",
+               work_item_id: attempt.work_item_id,
+               provider_state_id: attempt.target_provider_state_id,
+               observed_at: DateTime.utc_now()
+             },
+             post_contract_fingerprint: ProviderProjectContract.fingerprint(contract())
+           }}
+        end,
+        apply_verified: fn _attempt, _context -> :ok end,
+        suspend: fn _work_item_id, _reason, _attempt -> :ok end
+      )
+
+    coordinator
+  end
+
+  defp transition_guard_evidence do
+    {:ok, attestation} =
+      GuardClass.semantic_attestation(:implementation_attested, %{
+        responsibility: "implementation",
+        runtime_attempt_id: :transition_coordinator,
+        lineage_generation: 0,
+        subject: {:work_item, "work-1"},
+        timestamp: DateTime.utc_now()
+      })
+
+    [
+      attestation,
+      %{class: :mechanical_guard, name: :implementation_checks_verified}
+    ]
   end
 
   defp route(state, responsibility) do

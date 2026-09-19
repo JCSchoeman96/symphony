@@ -2,14 +2,15 @@ defmodule SymphonyElixir.Plane.AgentTool do
   @moduledoc """
   Host-owned semantic Plane tools for one trusted routed work item.
 
-  The tools read canonical state held by the orchestrator. They do not issue
-  provider requests, and the lifecycle request tool remains intentionally
-  unsupported until the transition path is graduated.
+  The tools read canonical state held by the orchestrator. Lifecycle requests
+  delegate to the host-owned transition coordinator and never accept provider
+  transport details from the runtime.
   """
 
   alias SymphonyElixir.AgentRuntime.{Authority, Route}
   alias SymphonyElixir.Dependency.Policy
   alias SymphonyElixir.Orchestrator
+  alias SymphonyElixir.Tracker
 
   alias SymphonyElixir.WorkControl.{
     AuthorityDisposition,
@@ -86,8 +87,8 @@ defmodule SymphonyElixir.Plane.AgentTool do
     execute_read(@authority_disposition_tool, arguments, opts)
   end
 
-  def execute(@transition_request_tool, _arguments, _opts) do
-    failure_response(:transition_unsupported)
+  def execute(@transition_request_tool, arguments, opts) when is_list(opts) do
+    execute_transition(arguments, opts)
   end
 
   def execute(_tool, _arguments, _opts) do
@@ -137,7 +138,7 @@ defmodule SymphonyElixir.Plane.AgentTool do
   defp transition_spec(input_schema) do
     %{
       "name" => @transition_request_tool,
-      "description" => "Request a responsibility-authorized Plane lifecycle transition. Execution is currently unavailable.",
+      "description" => "Request a responsibility-authorized Plane lifecycle transition.",
       "inputSchema" => input_schema
     }
   end
@@ -187,6 +188,206 @@ defmodule SymphonyElixir.Plane.AgentTool do
   end
 
   defp validate_empty_arguments(_arguments), do: {:error, :invalid_arguments}
+
+  defp execute_transition(arguments, opts) do
+    with {:ok, target} <- normalize_transition_arguments(arguments),
+         {:ok, host_context} <- valid_host_context(Keyword.get(opts, :agent_tool_context)),
+         {:ok, route} <- trusted_route(host_context),
+         {:ok, route_source} <- route_source(route),
+         :ok <- Authority.authorize_lifecycle_command(route, route_source, target),
+         {:ok, context} <- trusted_context(opts),
+         {:ok, work_item} <- fetch_work_item(context),
+         {:ok, source} <- work_item_source(work_item),
+         :ok <- Authority.authorize_lifecycle_command(route, source, target),
+         {:ok, result} <- request_transition(work_item, route, source, target, host_context, opts) do
+      transition_result_response(result, target)
+    else
+      {:error, reason} -> transition_failure_response(reason)
+    end
+  end
+
+  defp normalize_transition_arguments(arguments) when is_map(arguments) do
+    if map_size(arguments) == 1 do
+      normalize_transition_target(Map.get(arguments, "targetState"))
+    else
+      {:error, :invalid_transition_arguments}
+    end
+  end
+
+  defp normalize_transition_arguments(_arguments), do: {:error, :invalid_transition_arguments}
+
+  defp normalize_transition_target(target_state) when is_binary(target_state) do
+    target_state = String.trim(target_state)
+
+    if target_state == "" do
+      {:error, :invalid_transition_arguments}
+    else
+      parse_and_validate_transition_target(target_state)
+    end
+  end
+
+  defp normalize_transition_target(_target_state), do: {:error, :invalid_transition_arguments}
+
+  defp parse_and_validate_transition_target(target_state) do
+    case parse_transition_target(target_state) do
+      {:ok, target} ->
+        {:ok, target}
+
+      {:error, _reason} ->
+        {:error, :invalid_target_state}
+    end
+  end
+
+  defp parse_transition_target(target_state) when is_binary(target_state),
+    do: WorkflowLifecycle.parse(target_state)
+
+  defp route_source(%Route{starting_state: starting_state}) do
+    case WorkflowLifecycle.parse(starting_state) do
+      {:ok, source} -> {:ok, source}
+      {:error, _reason} -> {:error, :invalid_context}
+    end
+  end
+
+  defp work_item_source(%WorkItem{validated_lifecycle_state: state}) do
+    case WorkflowLifecycle.parse(state) do
+      {:ok, source} -> {:ok, source}
+      {:error, _reason} -> {:error, :invalid_context}
+    end
+  end
+
+  defp request_transition(
+         %WorkItem{id: work_item_id},
+         %Route{} = route,
+         source,
+         target,
+         host_context,
+         opts
+       ) do
+    intent_attrs = %{
+      work_item_id: work_item_id,
+      requested_from: source,
+      requested_to: target,
+      responsibility: route.responsibility,
+      guard_evidence: host_guard_evidence(host_context)
+    }
+
+    transition_opts =
+      [route: route, intent_attrs: intent_attrs]
+      |> maybe_put_transition_option(opts, :coordinator)
+
+    try do
+      case Tracker.controlled_transition(work_item_id, target, transition_opts) do
+        {:ok, _attempt} = result -> {:ok, result}
+        {:error, _reason} = error -> error
+      end
+    rescue
+      _error -> {:error, :coordinator_unavailable}
+    catch
+      _kind, _reason -> {:error, :coordinator_unavailable}
+    end
+  end
+
+  defp host_guard_evidence(context) when is_map(context) do
+    case Map.get(context, :guard_evidence) do
+      evidence when is_list(evidence) -> evidence
+      evidence when is_map(evidence) -> [evidence]
+      _missing -> []
+    end
+  end
+
+  defp maybe_put_transition_option(options, opts, key) do
+    case Keyword.get(opts, key) do
+      nil -> options
+      value -> Keyword.put(options, key, value)
+    end
+  end
+
+  defp transition_result_response({:ok, %{state: :verified}}, target) do
+    success_response(%{
+      "status" => "verified",
+      "targetState" => WorkflowLifecycle.display(target)
+    })
+  end
+
+  defp transition_result_response({:ok, %{state: state, outcome_reason: reason}}, target)
+       when state in [:rejected, :conflict, :provider_failed, :indeterminate] do
+    transition_terminal_response(state, reason, target)
+  end
+
+  defp transition_result_response({:ok, %{state: state}}, target)
+       when state in [
+              :requested,
+              :intent_authorized,
+              :fresh_context_loaded,
+              :prepared,
+              :mutation_submitted,
+              :verifying
+            ] do
+    transition_terminal_response(:indeterminate, :non_terminal_result, target)
+  end
+
+  defp transition_result_response(_result, _target),
+    do: transition_failure_response(:invalid_transition_result)
+
+  defp transition_terminal_response(state, reason, _target) do
+    status = Atom.to_string(state)
+    code = transition_reason_code(state, reason)
+
+    tool_response(false, %{
+      "error" => %{
+        "code" => code,
+        "message" => "Plane lifecycle transition was rejected.",
+        "status" => status
+      }
+    })
+  end
+
+  defp transition_failure_response(reason) do
+    tool_response(false, %{
+      "error" => %{
+        "code" => transition_reason_code(:rejected, reason),
+        "message" => "Plane lifecycle transition was rejected."
+      }
+    })
+  end
+
+  defp transition_reason_code(_state, :required_guard_missing), do: "required_guard_missing"
+
+  defp transition_reason_code(_state, :dependency_context_unavailable),
+    do: "dependency_context_unavailable"
+
+  defp transition_reason_code(_state, :transitions_disabled), do: "transitions_disabled"
+  defp transition_reason_code(_state, :transition_in_progress), do: "transition_in_progress"
+  defp transition_reason_code(_state, :transition_fenced), do: "transition_fenced"
+  defp transition_reason_code(_state, :coordinator_unavailable), do: "coordinator_unavailable"
+
+  defp transition_reason_code(_state, :invalid_transition_arguments),
+    do: "invalid_transition_arguments"
+
+  defp transition_reason_code(_state, :invalid_target_state), do: "invalid_target_state"
+  defp transition_reason_code(_state, :invalid_transition_target), do: "invalid_transition_target"
+  defp transition_reason_code(_state, :invalid_context), do: "invalid_transition_context"
+  defp transition_reason_code(_state, :invalid_intent), do: "invalid_intent"
+  defp transition_reason_code(_state, :invalid_transition_result), do: "invalid_transition_result"
+  defp transition_reason_code(_state, %{code: :not_permitted}), do: "unauthorized_transition"
+  defp transition_reason_code(_state, %{code: :invalid_subject}), do: "invalid_transition_context"
+
+  defp transition_reason_code(_state, {:authority_rejected, %{code: :not_permitted}}),
+    do: "unauthorized_transition"
+
+  defp transition_reason_code(_state, {:authority_rejected, %{code: :invalid_subject}}),
+    do: "invalid_transition_context"
+
+  defp transition_reason_code(_state, {:policy_rejected, %{code: :dependency_transition_denied}}),
+    do: "dependency_transition_denied"
+
+  defp transition_reason_code(_state, {:policy_rejected, :dependency_transition_denied}),
+    do: "dependency_transition_denied"
+
+  defp transition_reason_code(:conflict, _reason), do: "transition_conflict"
+  defp transition_reason_code(:provider_failed, _reason), do: "provider_failed"
+  defp transition_reason_code(:indeterminate, _reason), do: "transition_indeterminate"
+  defp transition_reason_code(:rejected, _reason), do: "transition_rejected"
 
   defp trusted_context(opts) do
     host_context = Keyword.get(opts, :agent_tool_context)
@@ -264,7 +465,6 @@ defmodule SymphonyElixir.Plane.AgentTool do
         {:ok, context} when is_map(context) -> {:ok, context}
         {:error, _reason} -> {:error, :context_unavailable}
         :unavailable -> {:error, :context_unavailable}
-        _invalid -> {:error, :invalid_context}
       end
     rescue
       _error -> {:error, :context_unavailable}
@@ -274,7 +474,6 @@ defmodule SymphonyElixir.Plane.AgentTool do
   end
 
   defp validate_semantic_context(context) when is_map(context), do: {:ok, context}
-  defp validate_semantic_context(_context), do: {:error, :invalid_context}
 
   defp validate_binding(%Route{} = route, context, opts) do
     with true <- route_fingerprints_match?(route),
@@ -285,8 +484,18 @@ defmodule SymphonyElixir.Plane.AgentTool do
          {:ok, configured_scope} <- configured_scope(Keyword.get(opts, :tracker_settings)),
          :ok <- validate_scope(configured_scope, contract),
          :ok <- validate_observation(work_item.provider_observation, work_item.id, contract),
-         :ok <- validate_assessment(work_item.lifecycle_assessment, work_item.id, work_item.provider_observation, work_item.validated_lifecycle_state),
-         :ok <- validate_disposition(work_item.authority_disposition, work_item.validated_lifecycle_state) do
+         :ok <-
+           validate_assessment(
+             work_item.lifecycle_assessment,
+             work_item.id,
+             work_item.provider_observation,
+             work_item.validated_lifecycle_state
+           ),
+         :ok <-
+           validate_disposition(
+             work_item.authority_disposition,
+             work_item.validated_lifecycle_state
+           ) do
       :ok
     else
       false -> {:error, :invalid_context}
@@ -311,7 +520,8 @@ defmodule SymphonyElixir.Plane.AgentTool do
          {:ok, starting_state} <- WorkflowLifecycle.parse(route.starting_state),
          true <- work_item.id == route.issue_id,
          true <- current_state == starting_state,
-         true <- route.starting_state == Route.normalize_state(WorkflowLifecycle.display(current_state)),
+         true <-
+           route.starting_state == Route.normalize_state(WorkflowLifecycle.display(current_state)),
          true <- route.responsibility == WorkflowLifecycle.responsibility(current_state),
          true <- LifecycleAssessment.validated?(work_item.lifecycle_assessment) do
       :ok
@@ -334,13 +544,11 @@ defmodule SymphonyElixir.Plane.AgentTool do
     context_fingerprint = map_value(context, :provider_contract_fingerprint)
 
     cond do
-      contract.provider != :plane ->
-        {:error, :wrong_provider}
-
       not valid_fingerprint? ->
         {:error, :contract_fingerprint_mismatch}
 
-      is_binary(context_fingerprint) and context_fingerprint != ProviderProjectContract.fingerprint(contract) ->
+      is_binary(context_fingerprint) and
+          context_fingerprint != ProviderProjectContract.fingerprint(contract) ->
         {:error, :contract_fingerprint_mismatch}
 
       true ->
@@ -365,10 +573,14 @@ defmodule SymphonyElixir.Plane.AgentTool do
   defp configured_scope(_settings), do: {:error, :invalid_tracker_scope}
 
   defp first_scope_value(provider, settings, key) do
-    Map.get(provider, key) || Map.get(provider, Atom.to_string(key)) || Map.get(settings, key) || Map.get(settings, Atom.to_string(key))
+    Map.get(provider, key) || Map.get(provider, Atom.to_string(key)) || Map.get(settings, key) ||
+      Map.get(settings, Atom.to_string(key))
   end
 
-  defp validate_scope(%{workspace_id: workspace_id, project_id: project_id}, %ProviderProjectContract{} = contract) do
+  defp validate_scope(
+         %{workspace_id: workspace_id, project_id: project_id},
+         %ProviderProjectContract{} = contract
+       ) do
     if contract.workspace_id == workspace_id and contract.project_id == project_id do
       :ok
     else
@@ -382,15 +594,18 @@ defmodule SymphonyElixir.Plane.AgentTool do
          %ProviderProjectContract{} = contract
        ) do
     if observation.provider == :plane and present_text?(observation.work_item_id) and
-         observation.work_item_id == work_item_id and present_text?(observation.provider_state_name) and
-         observation.workspace_id == contract.workspace_id and observation.project_id == contract.project_id do
+         observation.work_item_id == work_item_id and
+         present_text?(observation.provider_state_name) and
+         observation.workspace_id == contract.workspace_id and
+         observation.project_id == contract.project_id do
       :ok
     else
       {:error, :observation_mismatch}
     end
   end
 
-  defp validate_observation(_observation, _work_item_id, _contract), do: {:error, :observation_mismatch}
+  defp validate_observation(_observation, _work_item_id, _contract),
+    do: {:error, :observation_mismatch}
 
   defp validate_assessment(
          %LifecycleAssessment{} = assessment,
@@ -425,17 +640,20 @@ defmodule SymphonyElixir.Plane.AgentTool do
 
   defp valid_assessment_identity?(assessment, work_item_id, observation, validated_state) do
     assessment.work_item_id == work_item_id and
-      assessment.provider_observation == observation and assessment.validated_state == validated_state
+      assessment.provider_observation == observation and
+      assessment.validated_state == validated_state
   end
 
   defp valid_assessment_states?(%LifecycleAssessment{} = assessment) do
     (is_nil(assessment.mapped_state) or WorkflowLifecycle.canonical?(assessment.mapped_state)) and
-      (is_nil(assessment.validated_state) or WorkflowLifecycle.canonical?(assessment.validated_state))
+      (is_nil(assessment.validated_state) or
+         WorkflowLifecycle.canonical?(assessment.validated_state))
   end
 
-  defp valid_assessment_states?(_assessment), do: false
-
-  defp valid_guard_requirements?(%LifecycleAssessment{required_guards: required, missing_guards: missing})
+  defp valid_guard_requirements?(%LifecycleAssessment{
+         required_guards: required,
+         missing_guards: missing
+       })
        when is_list(required) and is_list(missing) do
     Enum.all?(required ++ missing, &GuardClass.valid?/1)
   end
@@ -445,7 +663,8 @@ defmodule SymphonyElixir.Plane.AgentTool do
   defp validate_disposition(%AuthorityDisposition{} = disposition, validated_state) do
     if disposition.status in [:none, :eligible, :active, :suspended, :escalated] and
          (is_nil(disposition.lifecycle_state) or disposition.lifecycle_state == validated_state) and
-         (is_nil(disposition.resume_target) or WorkflowLifecycle.canonical?(disposition.resume_target)) do
+         (is_nil(disposition.resume_target) or
+            WorkflowLifecycle.canonical?(disposition.resume_target)) do
       :ok
     else
       {:error, :disposition_mismatch}
@@ -558,9 +777,16 @@ defmodule SymphonyElixir.Plane.AgentTool do
 
   defp normalize_blockers(decision) do
     case map_value(decision, :blockers) do
-      nil -> if has_key?(decision, :blockers), do: {:error, :dependency_decision_unavailable}, else: {:ok, []}
-      blockers when is_list(blockers) -> {:ok, blockers}
-      _invalid -> {:error, :dependency_decision_unavailable}
+      nil ->
+        if has_key?(decision, :blockers),
+          do: {:error, :dependency_decision_unavailable},
+          else: {:ok, []}
+
+      blockers when is_list(blockers) ->
+        {:ok, blockers}
+
+      _invalid ->
+        {:error, :dependency_decision_unavailable}
     end
   end
 
