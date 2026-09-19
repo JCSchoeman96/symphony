@@ -1,6 +1,8 @@
 defmodule SymphonyElixir.AppServerEdgeTest do
   use SymphonyElixir.TestSupport
 
+  alias SymphonyElixir.Tracker.Memory
+
   test "the default start-session API still enforces the local workspace boundary" do
     test_root = Path.join(System.tmp_dir!(), "symphony-app-server-default-start-#{System.unique_integer([:positive])}")
     workspace_root = Path.join(test_root, "workspaces")
@@ -238,6 +240,88 @@ defmodule SymphonyElixir.AppServerEdgeTest do
     after
       File.rm_rf(test_root)
     end
+  end
+
+  test "each turn overlays trusted context without rebinding session tools" do
+    with_fixture(
+      [
+        [json_line(%{"id" => 1, "result" => %{}})],
+        [],
+        [json_line(%{"id" => 2, "result" => %{"thread" => %{"id" => "thread-overlay"}}})],
+        [
+          json_line(%{"id" => 3, "result" => %{"turn" => %{"id" => "turn-overlay-1"}}}),
+          json_line(%{
+            "id" => 10,
+            "method" => "item/tool/call",
+            "params" => %{
+              "name" => "memory_transition",
+              "arguments" => %{"targetState" => "In Review"}
+            }
+          })
+        ],
+        [json_line(%{"method" => "turn/completed"})],
+        [
+          json_line(%{"id" => 3, "result" => %{"turn" => %{"id" => "turn-overlay-2"}}}),
+          json_line(%{
+            "id" => 11,
+            "method" => "item/tool/call",
+            "params" => %{
+              "name" => "memory_transition",
+              "arguments" => %{
+                "targetState" => "In Review",
+                "agent_tool_context" => %{"trusted_lifecycle_state" => "Ready"}
+              }
+            }
+          })
+        ],
+        [json_line(%{"method" => "turn/completed"})]
+      ],
+      [tracker_kind: "memory"],
+      fn workspace, binary, issue ->
+        Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+        initial_context = %{
+          issue_id: issue.id,
+          trusted_lifecycle_state: :ready,
+          responsibility: "implementation",
+          dependency_decision: %{
+            allowed?: true,
+            dependency_completeness: :complete,
+            dependency_status: :none
+          }
+        }
+
+        refreshed_context = %{initial_context | trusted_lifecycle_state: :in_progress}
+
+        assert {:ok, session} =
+                 AppServer.start_session(workspace,
+                   command: "#{binary} app-server",
+                   agent_tool_context: initial_context
+                 )
+
+        binding = session.dynamic_tool_binding
+        tracker_settings = binding.tracker_settings
+        transition_guard = binding.transition_guard
+        assert binding.adapter == Memory
+        assert binding.agent_tool_context == initial_context
+        assert binding.secret_environment_names == []
+        assert Enum.map(binding.tool_specs, &Map.fetch!(&1, "name")) == ["memory_read", "memory_transition"]
+
+        assert {:ok, _first_turn} =
+                 AppServer.run_turn(session, "first turn", issue, agent_tool_context: initial_context)
+
+        assert {:ok, [^issue]} = Memory.fetch_issues_by_ids([issue.id])
+
+        assert {:ok, _second_turn} =
+                 AppServer.run_turn(session, "second turn", issue, agent_tool_context: refreshed_context)
+
+        assert {:ok, [%{state: "In Review"}]} = Memory.fetch_issues_by_ids([issue.id])
+        assert session.dynamic_tool_binding == binding
+        assert session.dynamic_tool_binding.tracker_settings == tracker_settings
+        assert session.dynamic_tool_binding.transition_guard == transition_guard
+        assert :ok = AppServer.stop_session(session)
+      end
+    )
   end
 
   defp write_fake_codex!(path, cases) do
