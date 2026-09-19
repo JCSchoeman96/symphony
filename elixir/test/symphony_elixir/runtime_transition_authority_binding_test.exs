@@ -102,10 +102,10 @@ defmodule SymphonyElixir.RuntimeTransitionAuthorityBindingTest do
   test "a trusted builder route denies a claimed reviewer command before the provider" do
     assert_cross_role_denied(
       "builder-claimed-reviewer",
-      :in_review,
+      :ready,
       "implementation",
-      :in_review,
-      :changes_requested,
+      :ready,
+      :in_progress,
       "review"
     )
   end
@@ -113,10 +113,10 @@ defmodule SymphonyElixir.RuntimeTransitionAuthorityBindingTest do
   test "a trusted reviewer route denies a claimed fixer command before the provider" do
     assert_cross_role_denied(
       "reviewer-claimed-fixer",
-      :changes_requested,
-      "review",
-      :changes_requested,
       :in_review,
+      "review",
+      :in_review,
+      :ready_to_merge,
       "correction"
     )
   end
