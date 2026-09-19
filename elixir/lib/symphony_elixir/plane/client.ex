@@ -1,9 +1,9 @@
 defmodule SymphonyElixir.Plane.Client do
   @moduledoc """
-  Bounded, read-only Plane REST transport.
+  Bounded Plane REST transport.
 
-  This module performs only scoped GET requests. It does not retry, mutate
-  provider state, follow relations, or expose response bodies in errors.
+  Read operations remain scoped and bounded. The only mutation operation is a
+  state-ID PATCH used by the host transition coordinator.
   """
 
   @default_base_url "https://api.plane.so"
@@ -25,8 +25,11 @@ defmodule SymphonyElixir.Plane.Client do
   end
 
   @type config :: map()
-  @type request :: %{method: :get, path: String.t(), params: map(), headers: [{String.t(), String.t()}]}
-  @type request_fun :: (request() -> {:ok, map()} | {:error, term()})
+  @type request :: map()
+  @type request_fun ::
+          (request() -> {:ok, map()} | {:error, term()})
+          | (atom(), String.t(), map(), term() -> {:ok, map()} | {:error, term()})
+          | (atom(), String.t(), map(), term(), config() -> {:ok, map()} | {:error, term()})
 
   @spec get_project(config(), keyword()) :: {:ok, map()} | {:error, term()}
   def get_project(config, opts \\ []) when is_map(config) and is_list(opts) do
@@ -53,6 +56,17 @@ defmodule SymphonyElixir.Plane.Client do
          {:ok, id} <- identifier(work_item_id),
          {:ok, response} <- request(config, relation_path(config, id), %{}, opts) do
       successful_body(response, :object)
+    end
+  end
+
+  @spec update_work_item_state(config(), String.t(), String.t(), keyword()) :: :ok | {:error, term()}
+  def update_work_item_state(config, work_item_id, target_state_id, opts \\ [])
+      when is_map(config) and is_binary(work_item_id) and is_binary(target_state_id) and is_list(opts) do
+    with {:ok, config} <- normalize_config(config, opts),
+         {:ok, id} <- identifier(work_item_id),
+         {:ok, state_id} <- identifier(target_state_id),
+         {:ok, response} <- mutation_request(config, work_item_path(config, id), %{"state" => state_id}, opts) do
+      mutation_acknowledgement(response)
     end
   end
 
@@ -281,6 +295,90 @@ defmodule SymphonyElixir.Plane.Client do
         {:error, :provider_unavailable}
     end
   end
+
+  defp mutation_request(config, path, body, opts) do
+    request = %{
+      method: :patch,
+      path: path,
+      params: %{},
+      body: body,
+      headers: [
+        {"X-API-Key", config.api_key},
+        {"Accept", "application/json"},
+        {"Content-Type", "application/json"}
+      ]
+    }
+
+    case Keyword.get(opts, :request_fun) do
+      fun when is_function(fun) ->
+        case invoke_mutation_request_fun(fun, request, config) do
+          {:ok, response} when is_map(response) -> normalize_mutation_response(response)
+          {:error, reason} -> {:error, mutation_transport_error(reason)}
+          _invalid -> {:error, :provider_unavailable}
+        end
+
+      nil ->
+        perform_mutation_request(config, request)
+
+      _invalid ->
+        {:error, :provider_unavailable}
+    end
+  end
+
+  defp invoke_mutation_request_fun(fun, request, config) do
+    cond do
+      is_function(fun, 1) -> invoke_request_fun(fun, request, config)
+      is_function(fun, 5) -> fun.(request.method, request.path, request.params, request.body, config)
+      is_function(fun, 4) -> fun.(request.method, request.path, request.params, request.body)
+      true -> {:error, :invalid_request_fun}
+    end
+  rescue
+    _error -> {:error, :request_fun_failed}
+  catch
+    _kind, _reason -> {:error, :request_fun_failed}
+  end
+
+  defp perform_mutation_request(config, %{path: path, body: body, headers: headers}) do
+    req_options = [
+      method: :patch,
+      url: config.base_url <> path,
+      headers: headers,
+      body: Jason.encode!(body),
+      connect_options: [timeout: @connect_timeout_ms],
+      receive_timeout: @receive_timeout_ms,
+      compressed: false,
+      raw: true,
+      retry: false,
+      redirect: false,
+      into: &bounded_response_body/2
+    ]
+
+    case Req.request(req_options) do
+      {:ok, %{status: status, headers: response_headers, body: response_body}} ->
+        normalize_mutation_response(%{status: status, headers: response_headers, body: response_body})
+
+      {:error, reason} ->
+        {:error, mutation_transport_error(reason)}
+    end
+  end
+
+  defp normalize_mutation_response(response) do
+    status = Map.get(response, :status, Map.get(response, "status"))
+
+    case valid_status(status) do
+      {:ok, status} when status in 200..299 -> {:ok, %{status: status}}
+      {:ok, 401} -> {:error, :unauthorized}
+      {:ok, 403} -> {:error, :unauthorized}
+      {:ok, 404} -> {:error, :not_found}
+      {:ok, 429} -> {:error, :rate_limited}
+      {:ok, status} when status in 500..599 -> {:error, :provider_unavailable}
+      {:ok, status} -> {:error, {:provider_status, status}}
+      {:error, _reason} -> {:error, :provider_unavailable}
+    end
+  end
+
+  defp mutation_acknowledgement(%{status: status}) when status in 200..299, do: :ok
+  defp mutation_acknowledgement(_response), do: {:error, :provider_malformed}
 
   defp invoke_request_fun(fun, request, config) do
     do_invoke_request_fun(fun, request, config)
@@ -513,4 +611,10 @@ defmodule SymphonyElixir.Plane.Client do
 
   defp transport_error(%Error{kind: kind}), do: kind
   defp transport_error(_reason), do: :provider_unavailable
+
+  defp mutation_transport_error(%Error{kind: kind}), do: kind
+  defp mutation_transport_error(kind) when kind in [:econnrefused, :timeout, :closed], do: kind
+  defp mutation_transport_error(%{reason: reason}) when reason in [:econnrefused, :timeout, :closed], do: reason
+  defp mutation_transport_error(%{reason: %{reason: reason}}) when reason in [:econnrefused, :timeout, :closed], do: reason
+  defp mutation_transport_error(_reason), do: :provider_unavailable
 end

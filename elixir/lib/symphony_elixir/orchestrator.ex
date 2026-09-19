@@ -1,4 +1,5 @@
 defmodule SymphonyElixir.Orchestrator do
+  @dialyzer {:nowarn_function, validate_transition_work_item_context: 1}
   @moduledoc """
   Polls the configured issue tracker and dispatches repository copies to Codex-backed workers.
   """
@@ -17,6 +18,7 @@ defmodule SymphonyElixir.Orchestrator do
     AuthorityDisposition,
     LifecycleAssessment,
     ProjectContractEvidence,
+    ProviderObservation,
     ProviderProjectContract,
     SuspensionContext,
     WorkflowLifecycle,
@@ -1472,19 +1474,21 @@ defmodule SymphonyElixir.Orchestrator do
   defp refresh_running_dependency_state(%State{} = state, %Issue{} = issue, running_entry, route) do
     decision = dependency_decision_for_state(issue, route, state)
 
-    if decision.allowed? == true do
-      %{state | running: Map.put(state.running, issue.id, %{running_entry | issue: issue})}
-    else
-      Logger.warning(
-        "Stopping active agent after dependency refresh for #{issue_context(issue)}: " <>
-          dependency_blocker_error(decision)
-      )
+    case decision.allowed? do
+      true ->
+        %{state | running: Map.put(state.running, issue.id, %{running_entry | issue: issue})}
 
-      updated_entry = %{running_entry | issue: issue}
+      _ ->
+        Logger.warning(
+          "Stopping active agent after dependency refresh for #{issue_context(issue)}: " <>
+            dependency_blocker_error(decision)
+        )
 
-      state
-      |> record_session_completion_totals(running_entry)
-      |> stop_and_block_issue(issue.id, updated_entry, dependency_blocker_error(decision), decision)
+        updated_entry = %{running_entry | issue: issue}
+
+        state
+        |> record_session_completion_totals(running_entry)
+        |> stop_and_block_issue(issue.id, updated_entry, dependency_blocker_error(decision), decision)
     end
   end
 
@@ -3784,6 +3788,125 @@ defmodule SymphonyElixir.Orchestrator do
     ]
   end
 
+  defp transition_context_for_state(%State{} = state, work_item_id, opts) do
+    case Map.get(state.work_control, work_item_id) do
+      %WorkItem{} = work_item ->
+        with :ok <- transition_context_available?(state, work_item_id, work_item),
+             {:ok, context} <- build_transition_context(state, work_item_id, work_item),
+             do: validate_transition_context_token(context, opts)
+
+      _missing ->
+        {:error, :work_item_not_found}
+    end
+  end
+
+  defp transition_context_available?(%State{} = state, work_item_id, %WorkItem{} = work_item) do
+    with :ok <- validate_transition_work_item(work_item),
+         :ok <- validate_transition_dependency_context(state, work_item_id),
+         :ok <- validate_transition_work_item_context(work_item) do
+      validate_transition_contract_context(state.project_contract_evidence)
+    end
+  end
+
+  defp validate_transition_work_item(%WorkItem{} = work_item) do
+    if WorkItem.suspended?(work_item), do: {:error, :work_item_suspended}, else: :ok
+  end
+
+  defp validate_transition_dependency_context(%State{} = state, work_item_id) do
+    cond do
+      not is_map(state.dependency_diagnostics) or
+          not is_map(Map.get(state.dependency_diagnostics, work_item_id)) ->
+        {:error, :dependency_context_unavailable}
+
+      not match?(%Graph{}, state.dependency_graph) or not Graph.complete?(state.dependency_graph) ->
+        {:error, :dependency_context_unavailable}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_transition_work_item_context(%WorkItem{} = work_item) do
+    if match?(%ProviderObservation{}, work_item.provider_observation) and
+         match?(%LifecycleAssessment{}, work_item.lifecycle_assessment) and
+         WorkflowLifecycle.canonical?(work_item.validated_lifecycle_state) do
+      :ok
+    else
+      {:error, :work_item_context_unavailable}
+    end
+  end
+
+  defp validate_transition_contract_context(contract_evidence) do
+    if ProjectContractEvidence.reconciliation_required?(contract_evidence) do
+      {:error, contract_evidence.reason || :provider_contract_reconciliation_required}
+    else
+      :ok
+    end
+  end
+
+  defp build_transition_context(%State{} = state, work_item_id, %WorkItem{} = work_item) do
+    contract_evidence = state.project_contract_evidence
+    dependency_decision = Map.fetch!(state.dependency_diagnostics, work_item_id)
+    contract = contract_evidence && contract_evidence.contract
+    running = Map.get(state.running, work_item_id, %{})
+    observation = work_item.provider_observation
+    assessment = work_item.lifecycle_assessment
+
+    {:ok,
+     %{
+       work_item: work_item,
+       current_state: work_item.validated_lifecycle_state,
+       dependency_decision: dependency_decision,
+       dependency_epoch_evidence: %{
+         epoch: state.dependency_graph.epoch,
+         completeness: state.dependency_graph.completeness,
+         complete?: Graph.complete?(state.dependency_graph)
+       },
+       guard_evidence: assessment.satisfied_guards,
+       provider_observation: observation,
+       provider_project_contract: contract,
+       provider_contract_fingerprint: provider_contract_fingerprint(contract),
+       runtime_attempt_id: Map.get(running, :attempt),
+       lineage_id: Map.get(running, :lineage_id),
+       lineage_generation: Map.get(running, :lineage_generation),
+       responsibility: WorkflowLifecycle.responsibility(work_item.validated_lifecycle_state),
+       context_token: transition_context_token(work_item, state, dependency_decision, contract)
+     }}
+  end
+
+  defp validate_transition_context_token(context, opts) do
+    case Keyword.get(opts, :expected_context_token) do
+      nil -> {:ok, context}
+      expected when expected == context.context_token -> {:ok, context}
+      _stale -> {:error, :context_token_mismatch}
+    end
+  end
+
+  defp provider_contract_fingerprint(%ProviderProjectContract{} = contract),
+    do: ProviderProjectContract.fingerprint(contract)
+
+  defp provider_contract_fingerprint(_contract), do: nil
+
+  defp transition_context_token(work_item, %State{} = state, dependency_decision, contract) do
+    token_input = %{
+      work_item_id: work_item.id,
+      validated_state: work_item.validated_lifecycle_state,
+      provider_observation: work_item.provider_observation,
+      lifecycle_status: work_item.lifecycle_assessment.status,
+      dependency_epoch: state.dependency_graph.epoch,
+      dependency_decision: dependency_decision,
+      contract_fingerprint:
+        if(
+          match?(%ProviderProjectContract{}, contract),
+          do: ProviderProjectContract.fingerprint(contract),
+          else: nil
+        )
+    }
+
+    digest = :crypto.hash(:sha256, :erlang.term_to_binary(token_input))
+    "sha256:" <> Base.encode16(digest, case: :lower)
+  end
+
   defp route_diagnostic(%Issue{} = issue, reason) do
     %{
       allowed?: false,
@@ -3839,6 +3962,51 @@ defmodule SymphonyElixir.Orchestrator do
         :exit, {:timeout, _} -> :timeout
         :exit, _ -> :unavailable
       end
+    else
+      :unavailable
+    end
+  end
+
+  @doc """
+  Returns the trusted, read-only host context for one routed work item.
+
+  The result contains only local canonical evidence and the current provider
+  contract. It is a handoff boundary for `TransitionCoordinator`; it is not a
+  provider mutation API.
+  """
+  @spec transition_context(GenServer.server(), String.t(), keyword()) ::
+          {:ok, map()} | {:error, term()} | :unavailable
+  def transition_context(server \\ __MODULE__, work_item_id, opts \\ [])
+      when is_binary(work_item_id) and is_list(opts) do
+    if server_available?(server) do
+      GenServer.call(server, {:transition_context, work_item_id, opts})
+    else
+      :unavailable
+    end
+  end
+
+  @doc """
+  Applies a verified canonical projection to the orchestrator-owned work
+  control map. Only a trusted host caller should use this function.
+  """
+  @spec apply_transition_result(GenServer.server(), String.t(), WorkItem.t(), keyword()) ::
+          :ok | {:error, term()} | :unavailable
+  def apply_transition_result(server \\ __MODULE__, work_item_id, %WorkItem{} = work_item, opts \\ [])
+      when is_binary(work_item_id) and is_list(opts) do
+    if server_available?(server) do
+      GenServer.call(server, {:apply_transition_result, work_item_id, work_item, opts})
+    else
+      :unavailable
+    end
+  end
+
+  @doc "Suspends one canonical work item after an unsafe transition outcome."
+  @spec suspend_work_item(GenServer.server(), String.t(), atom()) ::
+          {:ok, WorkItem.t()} | {:error, term()} | :unavailable
+  def suspend_work_item(server \\ __MODULE__, work_item_id, reason)
+      when is_binary(work_item_id) and is_atom(reason) do
+    if server_available?(server) do
+      GenServer.call(server, {:suspend_work_item, work_item_id, reason})
     else
       :unavailable
     end
@@ -4058,6 +4226,67 @@ defmodule SymphonyElixir.Orchestrator do
        operations: ["poll", "reconcile"]
      }, state}
   end
+
+  def handle_call({:transition_context, work_item_id, opts}, _from, %State{} = state)
+      when is_binary(work_item_id) and is_list(opts) do
+    case transition_context_for_state(state, work_item_id, opts) do
+      {:ok, context} -> {:reply, {:ok, context}, state}
+      {:error, _reason} = error -> {:reply, error, state}
+    end
+  end
+
+  def handle_call(
+        {:apply_transition_result, work_item_id, %WorkItem{} = work_item, opts},
+        _from,
+        %State{} = state
+      )
+      when is_binary(work_item_id) and is_list(opts) do
+    cond do
+      work_item.id != work_item_id ->
+        {:reply, {:error, :work_item_id_mismatch}, state}
+
+      transition_context_token_matches?(state, work_item_id, Keyword.get(opts, :expected_context_token)) ->
+        {:reply, :ok, %{state | work_control: Map.put(state.work_control, work_item_id, work_item)}}
+
+      true ->
+        {:reply, {:error, :context_token_mismatch}, state}
+    end
+  end
+
+  def handle_call({:suspend_work_item, work_item_id, reason}, _from, %State{} = state)
+      when is_binary(work_item_id) and is_atom(reason) do
+    case Map.get(state.work_control, work_item_id) do
+      %WorkItem{} = work_item ->
+        case WorkItem.suspend(work_item, reason) do
+          {:ok, suspended} ->
+            {:reply, {:ok, suspended}, %{state | work_control: Map.put(state.work_control, work_item_id, suspended)}}
+
+          {:error, _reason} = error ->
+            {:reply, error, state}
+        end
+
+      _missing ->
+        {:reply, {:error, :work_item_not_found}, state}
+    end
+  end
+
+  defp transition_context_token_matches?(_state, _work_item_id, nil), do: true
+
+  defp transition_context_token_matches?(%State{} = state, work_item_id, expected) do
+    case Map.get(state.work_control, work_item_id) do
+      %WorkItem{} = current ->
+        decision = Map.get(state.dependency_diagnostics, work_item_id, %{})
+        contract = state.project_contract_evidence && state.project_contract_evidence.contract
+        transition_context_token(current, state, decision, contract) == expected
+
+      _missing ->
+        false
+    end
+  end
+
+  defp server_available?(server) when is_pid(server), do: Process.alive?(server)
+  defp server_available?(server) when is_atom(server), do: not is_nil(Process.whereis(server))
+  defp server_available?(server), do: not is_nil(GenServer.whereis(server))
 
   defp blocked_issue_state(%{issue: %Issue{state: state}}), do: state
   defp blocked_issue_state(_metadata), do: nil

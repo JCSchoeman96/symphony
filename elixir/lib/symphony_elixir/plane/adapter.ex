@@ -1,5 +1,5 @@
 defmodule SymphonyElixir.Plane.Adapter do
-  @moduledoc "Read-only Plane tracker adapter."
+  @moduledoc "Scoped Plane tracker adapter for host reads and controlled transitions."
 
   @behaviour SymphonyElixir.Tracker
 
@@ -7,11 +7,20 @@ defmodule SymphonyElixir.Plane.Adapter do
   alias SymphonyElixir.Plane.{Client, DependencyReader, StateProjection}
   alias SymphonyElixir.Tracker.Capabilities
   alias SymphonyElixir.Tracker.Issue
+  alias SymphonyElixir.WorkControl.ProviderProjectContract
 
   @plane_api_key_env "PLANE_API_KEY"
 
   @spec capabilities() :: [Capabilities.capability()]
-  def capabilities, do: [:current_issue_refresh, :dependency_graph, :dependency_completeness]
+  def capabilities do
+    [
+      :current_issue_refresh,
+      :dependency_graph,
+      :dependency_completeness,
+      :controlled_transition,
+      :transition_verification
+    ]
+  end
 
   @spec validate_config(map()) :: :ok | {:error, term()}
   def validate_config(tracker_settings) when is_map(tracker_settings) do
@@ -43,6 +52,34 @@ defmodule SymphonyElixir.Plane.Adapter do
           {:ok, SymphonyElixir.Dependency.Graph.t()} | {:error, term()}
   def fetch_dependency_graph do
     fetch_dependency_graph(Config.settings!().tracker, nil)
+  end
+
+  @doc """
+  Applies one host-owned lifecycle transition using the stable state UUID from
+  the bound project contract. No provider name, endpoint, method, or request
+  body is accepted from the caller.
+  """
+  @spec submit_controlled_transition(String.t(), term(), keyword()) :: :ok | {:error, term()}
+  def submit_controlled_transition(work_item_id, requested_to, opts \\ [])
+      when is_binary(work_item_id) and is_list(opts) do
+    tracker_settings = Keyword.get_lazy(opts, :tracker_settings, fn -> Config.settings!().tracker end)
+    contract = Keyword.get(opts, :provider_project_contract) || contract_from_settings(tracker_settings)
+
+    with {:ok, %ProviderProjectContract{} = contract} <- normalize_contract(contract),
+         tracker_settings <- bind_contract_scope(tracker_settings, contract),
+         :ok <- validate_config(tracker_settings),
+         {:ok, config} <- client_config(tracker_settings),
+         :ok <- validate_contract_scope(config, contract),
+         :ok <- validate_work_item_scope(Keyword.get(opts, :pre_observation), config, work_item_id),
+         {:ok, mapping} <- ProviderProjectContract.provider_mapping_for(contract, requested_to),
+         :ok <- validate_target_mapping(mapping, contract, requested_to) do
+      Client.update_work_item_state(
+        config,
+        work_item_id,
+        mapping.state_id,
+        request_opts(Keyword.get(opts, :request_fun))
+      )
+    end
   end
 
   @spec secret_environment_names(map()) :: [String.t()]
@@ -92,6 +129,19 @@ defmodule SymphonyElixir.Plane.Adapter do
   def fetch_dependency_graph_for_test(tracker_settings, request_fun, opts)
       when is_map(tracker_settings) and is_function(request_fun, 1) and is_list(opts) do
     fetch_dependency_graph(tracker_settings, request_fun, opts)
+  end
+
+  @doc false
+  @spec controlled_transition_for_test(String.t(), term(), map(), ProviderProjectContract.t(), Client.request_fun()) ::
+          :ok | {:error, term()}
+  def controlled_transition_for_test(work_item_id, requested_to, tracker_settings, contract, request_fun)
+      when is_binary(work_item_id) and is_map(tracker_settings) and
+             is_struct(contract, ProviderProjectContract) and is_function(request_fun, 1) do
+    submit_controlled_transition(work_item_id, requested_to,
+      tracker_settings: tracker_settings,
+      provider_project_contract: contract,
+      request_fun: request_fun
+    )
   end
 
   defp fetch_issues_by_states(states, tracker_settings, request_fun) do
@@ -341,7 +391,14 @@ defmodule SymphonyElixir.Plane.Adapter do
   defp capability_statuses do
     Map.new(Capabilities.vocabulary(), fn capability ->
       {capability,
-       if(capability in [:current_issue_refresh, :dependency_graph, :dependency_completeness],
+       if(
+         capability in [
+           :current_issue_refresh,
+           :dependency_graph,
+           :dependency_completeness,
+           :controlled_transition,
+           :transition_verification
+         ],
          do: :supported,
          else: :unsupported
        )}
@@ -350,6 +407,78 @@ defmodule SymphonyElixir.Plane.Adapter do
 
   defp request_opts(nil), do: []
   defp request_opts(request_fun), do: [request_fun: request_fun]
+
+  defp normalize_contract(%ProviderProjectContract{} = contract), do: {:ok, contract}
+  defp normalize_contract(nil), do: {:error, :provider_project_contract_required}
+  defp normalize_contract(_contract), do: {:error, :invalid_provider_project_contract}
+
+  defp contract_from_settings(settings) when is_map(settings) do
+    Map.get(settings, :provider_project_contract) || Map.get(settings, "provider_project_contract")
+  end
+
+  defp contract_from_settings(_settings), do: nil
+
+  defp bind_contract_scope(settings, %ProviderProjectContract{} = contract) when is_map(settings) do
+    case Map.get(settings, :provider_project_contract, Map.get(settings, "provider_project_contract")) do
+      nil -> Map.put(settings, :provider_project_contract, contract)
+      _existing -> settings
+    end
+  end
+
+  defp bind_contract_scope(settings, _contract), do: settings
+
+  defp validate_contract_scope(config, %ProviderProjectContract{} = contract) do
+    cond do
+      config.workspace_id != contract.workspace_id -> {:error, :wrong_project}
+      config.project_id != contract.project_id -> {:error, :wrong_project}
+      true -> :ok
+    end
+  end
+
+  defp validate_target_mapping(mapping, %ProviderProjectContract{} = contract, requested_to)
+       when is_map(mapping) do
+    with {:ok, expected} <- ProviderProjectContract.provider_mapping_for(contract, requested_to),
+         true <- mapping.state_id == expected.state_id,
+         true <- mapping.group == expected.group,
+         true <- is_binary(mapping.state_id) and String.trim(mapping.state_id) != "" do
+      :ok
+    else
+      _ -> {:error, :invalid_target_mapping}
+    end
+  end
+
+  defp validate_work_item_scope(nil, _config, _expected_work_item_id), do: :ok
+
+  defp validate_work_item_scope(observation, config, expected_work_item_id) when is_map(observation) do
+    workspace_id = Map.get(observation, :workspace_id) || Map.get(observation, "workspace_id")
+    project_id = Map.get(observation, :project_id) || Map.get(observation, "project_id")
+    work_item_id = Map.get(observation, :work_item_id) || Map.get(observation, "work_item_id")
+
+    with :ok <- validate_work_item_id(work_item_id),
+         :ok <- validate_work_item_id_match(work_item_id, expected_work_item_id),
+         :ok <- validate_optional_scope(workspace_id, config.workspace_id) do
+      validate_optional_scope(project_id, config.project_id)
+    end
+  end
+
+  defp validate_work_item_scope(_observation, _config, _expected_work_item_id),
+    do: {:error, :invalid_work_item_observation}
+
+  defp validate_work_item_id(value) when is_binary(value) do
+    if String.trim(value) == "", do: {:error, :invalid_work_item_id}, else: :ok
+  end
+
+  defp validate_work_item_id(_value), do: {:error, :invalid_work_item_id}
+
+  defp validate_work_item_id_match(value, expected) when is_binary(value) and is_binary(expected) do
+    if String.trim(value) == String.trim(expected), do: :ok, else: {:error, :work_item_mismatch}
+  end
+
+  defp validate_work_item_id_match(_value, _expected), do: {:error, :work_item_mismatch}
+
+  defp validate_optional_scope(nil, _expected), do: :ok
+  defp validate_optional_scope(value, value), do: :ok
+  defp validate_optional_scope(_value, _expected), do: {:error, :wrong_project}
 
   defp provider_settings(%{provider: provider}) when is_map(provider), do: provider
   defp provider_settings(%{"provider" => provider}) when is_map(provider), do: provider

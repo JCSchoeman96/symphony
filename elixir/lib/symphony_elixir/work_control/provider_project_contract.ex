@@ -251,6 +251,20 @@ defmodule SymphonyElixir.WorkControl.ProviderProjectContract do
     end
   end
 
+  @spec provider_mapping_for(t(), WorkflowLifecycle.state()) ::
+          {:ok, map()} | {:error, :unknown_canonical_state | :missing_state_mapping}
+  def provider_mapping_for(%__MODULE__{} = contract, canonical_state) when is_atom(canonical_state) do
+    with {:ok, state} <- WorkflowLifecycle.parse(canonical_state),
+         {:ok, mapping} <- Map.fetch(contract.state_mappings, state) do
+      {:ok, mapping}
+    else
+      {:error, _reason} -> {:error, :unknown_canonical_state}
+      :error -> {:error, :missing_state_mapping}
+    end
+  end
+
+  def provider_mapping_for(%__MODULE__{}, _canonical_state), do: {:error, :unknown_canonical_state}
+
   defp validate_schema_version({:ok, @schema_version}), do: :ok
 
   defp validate_schema_version({:ok, value}),

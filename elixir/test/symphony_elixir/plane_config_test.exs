@@ -110,12 +110,7 @@ defmodule SymphonyElixir.PlaneConfigTest do
     assert {:error, {:routed_provider_capabilities_missing, "plane", missing}} =
              Config.validate_settings(settings)
 
-    assert missing == [
-             :controlled_transition,
-             :transition_verification,
-             :agent_read_tools,
-             :agent_transition_tools
-           ]
+    assert missing == [:agent_read_tools, :agent_transition_tools]
   end
 
   test "missing Plane credentials and repository endpoints fail before transport" do

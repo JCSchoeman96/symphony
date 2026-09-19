@@ -3,6 +3,7 @@ defmodule SymphonyElixir.PlaneAdapterTest do
 
   alias SymphonyElixir.Plane.Adapter
   alias SymphonyElixir.Tracker.Issue
+  alias SymphonyElixir.WorkControl.{ProviderProjectContract, WorkflowLifecycle}
 
   @settings %{
     kind: "plane",
@@ -12,8 +13,15 @@ defmodule SymphonyElixir.PlaneAdapterTest do
     secret_environment_names: ["PLANE_API_KEY"]
   }
 
-  test "declares only the graduated read capabilities" do
-    assert Adapter.capabilities() == [:current_issue_refresh, :dependency_graph, :dependency_completeness]
+  test "declares only the graduated host capabilities" do
+    assert Adapter.capabilities() == [
+             :current_issue_refresh,
+             :dependency_graph,
+             :dependency_completeness,
+             :controlled_transition,
+             :transition_verification
+           ]
+
     assert Adapter.secret_environment_names(@settings) == ["PLANE_API_KEY"]
   end
 
@@ -162,7 +170,162 @@ defmodule SymphonyElixir.PlaneAdapterTest do
     assert snapshot.capability_statuses.current_issue_refresh == :supported
     assert snapshot.capability_statuses.dependency_graph == :supported
     assert snapshot.capability_statuses.dependency_completeness == :supported
-    assert snapshot.capability_statuses.controlled_transition == :unsupported
+    assert snapshot.capability_statuses.controlled_transition == :supported
+    assert snapshot.capability_statuses.transition_verification == :supported
+  end
+
+  test "performs a host-only stable-UUID transition through the scoped PATCH" do
+    contract = contract()
+    parent = self()
+
+    assert :ok =
+             Adapter.controlled_transition_for_test(
+               "item-1",
+               :in_progress,
+               @settings,
+               contract,
+               fn request ->
+                 send(parent, {:request, request})
+                 {:ok, %{status: 204, body: nil}}
+               end
+             )
+
+    assert_receive {:request, %{method: :patch, body: %{"state" => "state-in_progress"}}}
+  end
+
+  test "does not resolve provider targets by display name or cross-scope observation" do
+    contract = contract()
+
+    request_fun = fn _request ->
+      flunk("the adapter must reject before issuing a provider request")
+    end
+
+    assert {:error, :unknown_canonical_state} =
+             Adapter.controlled_transition_for_test("item-1", "In Progress", @settings, contract, request_fun)
+
+    assert {:error, :wrong_project} =
+             Adapter.submit_controlled_transition(
+               "item-1",
+               :in_progress,
+               tracker_settings: @settings,
+               provider_project_contract: contract,
+               pre_observation: %{work_item_id: "item-1", project_id: "other-project"},
+               request_fun: request_fun
+             )
+  end
+
+  test "normalizes string and atom settings while enforcing submission scope" do
+    atom_settings = %{
+      kind: "plane",
+      api_key: "$PLANE_API_KEY",
+      provider: %{
+        api_key: "$PLANE_API_KEY",
+        endpoint: "https://api.plane.so",
+        workspace_slug: "workspace-1",
+        workspace_id: "workspace-stable-1",
+        project_id: "project-1"
+      },
+      secret_environment_names: ["CUSTOM_TOKEN", "literal"]
+    }
+
+    assert :ok = Adapter.validate_config(atom_settings)
+    assert "CUSTOM_TOKEN" in Adapter.secret_environment_names(atom_settings)
+
+    contract = contract()
+
+    assert {:error, :provider_project_contract_required} =
+             Adapter.submit_controlled_transition("item-1", :in_progress,
+               tracker_settings: @settings,
+               request_fun: fn _request -> flunk("must reject without a contract") end
+             )
+
+    assert {:error, :invalid_provider_project_contract} =
+             Adapter.submit_controlled_transition("item-1", :in_progress,
+               tracker_settings: @settings,
+               provider_project_contract: :invalid,
+               request_fun: fn _request -> flunk("must reject malformed contract") end
+             )
+
+    assert {:error, :invalid_work_item_observation} =
+             Adapter.submit_controlled_transition("item-1", :in_progress,
+               tracker_settings: @settings,
+               provider_project_contract: contract,
+               pre_observation: :invalid,
+               request_fun: fn _request -> flunk("must reject malformed observation") end
+             )
+
+    assert {:error, :invalid_work_item_id} =
+             Adapter.submit_controlled_transition("item-1", :in_progress,
+               tracker_settings: @settings,
+               provider_project_contract: contract,
+               pre_observation: %{work_item_id: 123},
+               request_fun: fn _request -> flunk("must reject malformed item id") end
+             )
+
+    assert {:error, :work_item_mismatch} =
+             Adapter.submit_controlled_transition("item-1", :in_progress,
+               tracker_settings: @settings,
+               provider_project_contract: contract,
+               pre_observation: %{work_item_id: "other-item"},
+               request_fun: fn _request -> flunk("must reject mismatched item id") end
+             )
+
+    assert {:error, :wrong_project} =
+             Adapter.submit_controlled_transition("item-1", :in_progress,
+               tracker_settings: @settings,
+               provider_project_contract: contract,
+               pre_observation: %{work_item_id: "item-1", workspace_id: "other-workspace"},
+               request_fun: fn _request -> flunk("must reject wrong workspace") end
+             )
+  end
+
+  test "rejects a snapshot with states from multiple workspaces" do
+    assert {:error, :wrong_project} =
+             Adapter.fetch_project_snapshot_for_test(@settings, fn request ->
+               case request.path do
+                 "/api/v1/workspaces/workspace-1/projects/project-1/" ->
+                   {:ok, %{status: 200, body: %{"id" => "project-1", "workspace" => "workspace-stable-1"}}}
+
+                 _states_path ->
+                   {:ok,
+                    %{
+                      status: 200,
+                      body: %{
+                        "results" => [
+                          %{"id" => "state-1", "name" => "Ready", "group" => "unstarted", "project" => "project-1", "workspace" => "workspace-stable-1"},
+                          %{"id" => "state-2", "name" => "Done", "group" => "completed", "project" => "project-1", "workspace" => "workspace-other"}
+                        ],
+                        "count" => 2,
+                        "total_results" => 2,
+                        "next_page_results" => false,
+                        "next_cursor" => nil
+                      }
+                    }}
+               end
+             end)
+  end
+
+  defp contract do
+    state_mappings =
+      Map.new(WorkflowLifecycle.states(), fn state ->
+        {state,
+         %{
+           state_id: "state-#{state}",
+           name: WorkflowLifecycle.display(state)
+         }}
+      end)
+
+    {:ok, contract} =
+      ProviderProjectContract.new(%{
+        schema_version: 1,
+        provider: :plane,
+        workspace_id: "workspace-stable-1",
+        project_id: "project-1",
+        state_mappings: state_mappings,
+        dependency_relation_semantics: %{blocked_by: :blocked_by, blocking: :blocking}
+      })
+
+    contract
   end
 
   test "rejects a project response with a contradictory stable workspace or project ID" do

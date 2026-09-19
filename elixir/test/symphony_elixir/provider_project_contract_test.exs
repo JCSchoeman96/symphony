@@ -67,6 +67,16 @@ defmodule SymphonyElixir.ProviderProjectContractTest do
            }
   end
 
+  test "maps only canonical states to stable provider IDs" do
+    assert {:ok, contract} = ProviderProjectContract.new(valid_attrs())
+
+    assert {:ok, %{state_id: "state-in_progress", group: :started}} =
+             ProviderProjectContract.provider_mapping_for(contract, :in_progress)
+
+    assert {:error, :unknown_canonical_state} =
+             ProviderProjectContract.provider_mapping_for(contract, "In Progress")
+  end
+
   test "accepts string capability names from workflow configuration" do
     attrs =
       string_keyed_attrs()

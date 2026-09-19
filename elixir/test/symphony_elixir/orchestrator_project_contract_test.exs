@@ -1,11 +1,13 @@
 defmodule SymphonyElixir.OrchestratorProjectContractTest do
   use ExUnit.Case, async: true
 
+  alias SymphonyElixir.Dependency.Graph
   alias SymphonyElixir.Orchestrator
   alias SymphonyElixir.Tracker.Capabilities
   alias SymphonyElixir.Tracker.Issue
 
   alias SymphonyElixir.WorkControl.{
+    AuthorityDisposition,
     ProjectContractEvidence,
     ProviderProjectContract,
     WorkflowLifecycle,
@@ -214,6 +216,141 @@ defmodule SymphonyElixir.OrchestratorProjectContractTest do
     refute Orchestrator.autonomous_dispatch_allowed_for_test?(removed)
     assert removed.project_contract_evidence.reason == :provider_contract_removed
     assert ProjectContractEvidence.reconciliation_required?(removed.project_contract_evidence)
+  end
+
+  test "builds trusted transition context and enforces its context token" do
+    {state, _work_item} = handoff_state()
+    from = {self(), make_ref()}
+
+    assert {:reply, {:ok, context}, _state} =
+             Orchestrator.handle_call({:transition_context, "work-1", []}, from, state)
+
+    assert context.current_state == :ready
+    assert context.dependency_decision == %{allowed?: true}
+    assert context.dependency_epoch_evidence.complete? == true
+    assert context.provider_observation.work_item_id == "work-1"
+    assert is_binary(context.context_token)
+
+    assert {:reply, {:ok, _same_context}, _state} =
+             Orchestrator.handle_call(
+               {:transition_context, "work-1", [expected_context_token: context.context_token]},
+               from,
+               state
+             )
+
+    assert {:reply, {:error, :context_token_mismatch}, _state} =
+             Orchestrator.handle_call(
+               {:transition_context, "work-1", [expected_context_token: "sha256:stale"]},
+               from,
+               state
+             )
+  end
+
+  test "fails closed when transition context dependencies or authority are unsafe" do
+    {state, work_item} = handoff_state()
+    from = {self(), make_ref()}
+
+    cases = [
+      {%{state | dependency_diagnostics: nil}, :dependency_context_unavailable},
+      {%{state | dependency_graph: Graph.unavailable(:provider_timeout)}, :dependency_context_unavailable},
+      {%{state | work_control: %{"work-1" => %{work_item | provider_observation: nil}}}, :work_item_context_unavailable},
+      {%{
+         state
+         | project_contract_evidence: %ProjectContractEvidence{
+             reconciliation_required?: true,
+             reason: :provider_configuration_drift
+           }
+       }, :provider_configuration_drift}
+    ]
+
+    for {unsafe_state, reason} <- cases do
+      assert {:reply, {:error, ^reason}, _state} =
+               Orchestrator.handle_call({:transition_context, "work-1", []}, from, unsafe_state)
+    end
+
+    {:ok, suspended} = WorkItem.suspend(work_item, :provider_failed)
+    suspended_state = %{state | work_control: %{"work-1" => suspended}}
+
+    assert {:reply, {:error, :work_item_suspended}, _state} =
+             Orchestrator.handle_call({:transition_context, "work-1", []}, from, suspended_state)
+  end
+
+  test "guards transition result application and suspension handoffs" do
+    {state, work_item} = handoff_state()
+    from = {self(), make_ref()}
+
+    assert {:reply, {:error, :work_item_id_mismatch}, _state} =
+             Orchestrator.handle_call(
+               {:apply_transition_result, "other-work", work_item, []},
+               from,
+               state
+             )
+
+    assert {:reply, :ok, applied_state} =
+             Orchestrator.handle_call(
+               {:apply_transition_result, "work-1", work_item, []},
+               from,
+               state
+             )
+
+    assert applied_state.work_control["work-1"] == work_item
+
+    assert {:reply, {:error, :context_token_mismatch}, _state} =
+             Orchestrator.handle_call(
+               {:apply_transition_result, "work-1", work_item, [expected_context_token: "sha256:stale"]},
+               from,
+               state
+             )
+
+    assert {:reply, {:ok, suspended}, suspended_state} =
+             Orchestrator.handle_call(
+               {:suspend_work_item, "work-1", :provider_failed},
+               from,
+               state
+             )
+
+    assert WorkItem.suspended?(suspended)
+    assert suspended_state.work_control["work-1"] == suspended
+
+    escalated = %{
+      work_item
+      | authority_disposition: AuthorityDisposition.new(%{status: :escalated})
+    }
+
+    assert {:reply, {:error, :terminal_disposition}, _state} =
+             Orchestrator.handle_call(
+               {:suspend_work_item, "work-1", :provider_failed},
+               from,
+               %{state | work_control: %{"work-1" => escalated}}
+             )
+
+    assert {:reply, {:error, :work_item_not_found}, _state} =
+             Orchestrator.handle_call({:suspend_work_item, "missing", :provider_failed}, from, state)
+  end
+
+  defp handoff_state do
+    issue = %Issue{
+      id: "work-1",
+      identifier: "SYM-1",
+      title: "Transition handoff",
+      state: "Ready",
+      dependency_completeness: :complete
+    }
+
+    {:ok, work_item} =
+      WorkItem.from_issue(issue, %{
+        provider: :memory,
+        observed_at: ~U[2026-09-18 00:00:00Z],
+        prior_validated_lifecycle_state: :ready
+      })
+
+    state = %Orchestrator.State{
+      work_control: %{issue.id => work_item},
+      dependency_diagnostics: %{issue.id => %{allowed?: true}},
+      dependency_graph: Graph.build([issue])
+    }
+
+    {state, work_item}
   end
 
   defp contract! do
