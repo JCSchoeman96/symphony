@@ -4,7 +4,7 @@ defmodule SymphonyElixir.Plane.Adapter do
   @behaviour SymphonyElixir.Tracker
 
   alias SymphonyElixir.Config
-  alias SymphonyElixir.Plane.{Client, DependencyReader, StateProjection}
+  alias SymphonyElixir.Plane.{AgentTool, Client, DependencyReader, StateProjection}
   alias SymphonyElixir.Tracker.Capabilities
   alias SymphonyElixir.Tracker.Issue
   alias SymphonyElixir.WorkControl.ProviderProjectContract
@@ -20,6 +20,21 @@ defmodule SymphonyElixir.Plane.Adapter do
       :controlled_transition,
       :transition_verification
     ]
+  end
+
+  @spec agent_tool_specs() :: [map()]
+  def agent_tool_specs do
+    AgentTool.agent_tool_specs()
+  end
+
+  @spec agent_tool_specs(map()) :: [map()]
+  def agent_tool_specs(context) when is_map(context) do
+    AgentTool.agent_tool_specs(context)
+  end
+
+  @spec execute_agent_tool(String.t() | nil, term(), keyword()) :: map()
+  def execute_agent_tool(tool, arguments, opts) when is_list(opts) do
+    AgentTool.execute(tool, arguments, opts)
   end
 
   @spec validate_config(map()) :: :ok | {:error, term()}

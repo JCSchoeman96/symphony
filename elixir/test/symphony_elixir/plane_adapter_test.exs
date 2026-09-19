@@ -2,6 +2,7 @@ defmodule SymphonyElixir.PlaneAdapterTest do
   use ExUnit.Case, async: true
 
   alias SymphonyElixir.Plane.Adapter
+  alias SymphonyElixir.Plane.AgentTool
   alias SymphonyElixir.Tracker.Issue
   alias SymphonyElixir.WorkControl.{ProviderProjectContract, WorkflowLifecycle}
 
@@ -23,6 +24,16 @@ defmodule SymphonyElixir.PlaneAdapterTest do
            ]
 
     assert Adapter.secret_environment_names(@settings) == ["PLANE_API_KEY"]
+  end
+
+  test "forwards semantic Plane tool callbacks without changing capabilities" do
+    assert Adapter.agent_tool_specs() == AgentTool.agent_tool_specs()
+
+    assert Adapter.agent_tool_specs(%{}) == []
+
+    assert Adapter.execute_agent_tool("plane_request_lifecycle_transition", %{}, [])[
+             "success"
+           ] == false
   end
 
   test "fresh ID refresh returns factual Plane fields and performs a fresh request" do
