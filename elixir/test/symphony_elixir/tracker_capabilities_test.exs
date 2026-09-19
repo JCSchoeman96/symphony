@@ -41,6 +41,12 @@ defmodule SymphonyElixir.TrackerLegacySpecsProbeAdapter do
   end
 end
 
+defmodule SymphonyElixir.TrackerContextualOnlyCapabilityAdapter do
+  def capabilities, do: [:agent_read_tools]
+
+  def agent_tool_specs(_context), do: [%{"name" => "contextual_probe"}]
+end
+
 defmodule SymphonyElixir.TrackerCapabilitiesTest do
   use SymphonyElixir.TestSupport
 
@@ -131,6 +137,14 @@ defmodule SymphonyElixir.TrackerCapabilitiesTest do
 
     assert adapter == SymphonyElixir.TrackerCapabilitiesContradictoryAdapter
     assert reason == {:missing_callback, :dependency_graph, :fetch_dependency_graph, 0}
+  end
+
+  test "agent_read_tools keeps agent_tool_specs/0 structural while /1 adds contextual catalogue support" do
+    assert {:error, {:invalid_provider_capability_declaration, adapter, reason}} =
+             Capabilities.validate_adapter(SymphonyElixir.TrackerContextualOnlyCapabilityAdapter)
+
+    assert adapter == SymphonyElixir.TrackerContextualOnlyCapabilityAdapter
+    assert reason == {:missing_callback, :agent_read_tools, :agent_tool_specs, 0}
   end
 
   test "unknown and duplicate declarations are rejected" do
