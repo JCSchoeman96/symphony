@@ -1,3 +1,12 @@
+defmodule SymphonyElixir.RuntimeAuthoritySupportingProbe do
+  def capabilities, do: [:controlled_transition]
+
+  def submit_controlled_transition(work_item_id, target_state, opts) do
+    send(opts[:recipient], {:provider_request, work_item_id, target_state})
+    :ok
+  end
+end
+
 defmodule SymphonyElixir.RuntimeTransitionAuthorityBindingTest do
   use ExUnit.Case, async: false
 
@@ -88,6 +97,39 @@ defmodule SymphonyElixir.RuntimeTransitionAuthorityBindingTest do
 
     refute_received :context_loaded
     refute_received :submitted
+  end
+
+  test "a trusted builder route denies a claimed reviewer command before the provider" do
+    assert_cross_role_denied(
+      "builder-claimed-reviewer",
+      :in_review,
+      "implementation",
+      :in_review,
+      :changes_requested,
+      "review"
+    )
+  end
+
+  test "a trusted reviewer route denies a claimed fixer command before the provider" do
+    assert_cross_role_denied(
+      "reviewer-claimed-fixer",
+      :changes_requested,
+      "review",
+      :changes_requested,
+      :in_review,
+      "correction"
+    )
+  end
+
+  test "a trusted fixer route denies a claimed reviewer merge handoff before the provider" do
+    assert_cross_role_denied(
+      "fixer-claimed-reviewer",
+      :in_review,
+      "correction",
+      :in_review,
+      :ready_to_merge,
+      "review"
+    )
   end
 
   test "the six H-050A grants reach H-040 only with a matching trusted route" do
@@ -220,6 +262,47 @@ defmodule SymphonyElixir.RuntimeTransitionAuthorityBindingTest do
       )
 
     coordinator
+  end
+
+  defp assert_cross_role_denied(
+         work_item_id,
+         route_source,
+         route_responsibility,
+         requested_from,
+         requested_to,
+         claimed_responsibility
+       ) do
+    test_pid = self()
+
+    coordinator =
+      coordinator(test_pid,
+        submit: fn _attempt, _context ->
+          send(test_pid, :provider_callback)
+
+          Tracker.submit_controlled_transition(work_item_id, requested_to,
+            adapter: SymphonyElixir.RuntimeAuthoritySupportingProbe,
+            recipient: test_pid
+          )
+        end
+      )
+
+    assert {:ok, %{state: :rejected}} =
+             Tracker.controlled_transition(work_item_id, requested_to,
+               coordinator: coordinator,
+               route: route(work_item_id, route_source, route_responsibility),
+               intent_attrs:
+                 intent_attrs(
+                   requested_from,
+                   claimed_responsibility,
+                   requested_to,
+                   work_item_id
+                 )
+             )
+
+    refute_received :context_loaded
+    refute_received :provider_callback
+    refute_received {:provider_request, ^work_item_id, ^requested_to}
+    GenServer.stop(coordinator)
   end
 
   defp intent_attrs(source, responsibility, target \\ nil, work_item_id \\ "work-1") do
