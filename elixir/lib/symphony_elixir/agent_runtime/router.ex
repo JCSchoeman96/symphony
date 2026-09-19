@@ -67,9 +67,9 @@ defmodule SymphonyElixir.AgentRuntime.Router do
     with {:ok, canonical_state} <- canonical_route_state(work_item),
          {:ok, profile_name} <- profile_name_for_state(canonical_state, routes),
          {:ok, profile} <- fetch_profile(profiles, profile_name),
+         :ok <- validate_profile_shape(profile),
          :ok <- validate_responsibility(canonical_state, profile),
-         :ok <- Profile.validate_effective_policy(profile),
-         :ok <- Authority.validate_profile(profile) do
+         :ok <- Profile.validate_effective_policy(profile) do
       issue = %Issue{id: work_item.id, state: WorkflowLifecycle.display(canonical_state), dispatchable: true}
       {:ok, Route.new(issue, profile)}
     else
@@ -210,6 +210,14 @@ defmodule SymphonyElixir.AgentRuntime.Router do
       %Profile{} = profile -> {:ok, profile}
       nil -> {:error, {:missing_profile, profile_name}}
       _profile -> {:error, {:invalid_profile, profile_name}}
+    end
+  end
+
+  defp validate_profile_shape(profile) do
+    case Authority.validate_profile(profile) do
+      :ok -> :ok
+      {:error, %{code: :invalid_profile, reason: :malformed_profile}} = error -> error
+      {:error, _reason} -> :ok
     end
   end
 

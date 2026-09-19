@@ -10,8 +10,16 @@ defmodule SymphonyElixir.RuntimeAuthorityCapabilityProbe do
     ]
   end
 
-  def fetch_issues_by_ids(_issue_ids), do: {:ok, []}
-  def fetch_dependency_graph, do: {:ok, []}
+  def fetch_issues_by_ids(_issue_ids) do
+    send(self(), :provider_request)
+    {:ok, []}
+  end
+
+  def fetch_dependency_graph do
+    send(self(), :provider_request)
+    {:ok, []}
+  end
+
   def agent_tool_specs, do: []
   def execute_agent_tool(_tool, _arguments, _opts), do: %{}
 end
@@ -247,6 +255,19 @@ defmodule SymphonyElixir.RuntimeAuthorityTest do
              Router.resolve(trusted_work_item("Ready"), Map.put(profiles, "builder", malformed_builder))
   end
 
+  test "canonical routing denies forged incomplete profile subjects without raising" do
+    profiles = Profile.default_profiles("codex app-server", 20)
+    forged_builder = %{__struct__: Profile}
+    work_item = trusted_work_item("Ready")
+    profiles = Map.put(profiles, "builder", forged_builder)
+
+    assert {:error, %{code: :invalid_profile, reason: :malformed_profile}} =
+             Router.resolve(work_item, profiles)
+
+    assert {:error, %{code: :invalid_profile, reason: :malformed_profile}} =
+             Router.resolve(work_item, profiles, %{})
+  end
+
   test "custom routed profiles keep their responsibility command set" do
     assert {:ok, profiles} =
              Profile.resolve_profiles(
@@ -321,9 +342,19 @@ defmodule SymphonyElixir.RuntimeAuthorityTest do
     )
   end
 
-  test "a provider declaration can omit controlled transition without invoking a provider" do
+  test "a provider declaration reports a missing controlled transition" do
     assert {:ok, declared} = Capabilities.validate_adapter(SymphonyElixir.RuntimeAuthorityCapabilityProbe)
     assert Capabilities.missing(declared) == [:controlled_transition]
+  end
+
+  test "runtime authority checks do not invoke provider callbacks" do
+    profiles = Profile.default_profiles("codex app-server", 20)
+    route = routed_route("Ready", profiles)
+
+    assert {:ok, []} = SymphonyElixir.RuntimeAuthorityCapabilityProbe.fetch_dependency_graph()
+    assert_received :provider_request
+
+    assert Authority.authorize_lifecycle_command(route, :ready, :in_progress) == :ok
     refute_received :provider_request
   end
 
