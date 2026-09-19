@@ -83,7 +83,11 @@ defmodule SymphonyElixir.Tracker do
     coordinator = Keyword.get(opts, :coordinator, TransitionCoordinator)
 
     with {:ok, intent} <- semantic_transition_intent(work_item_id, target_state, opts) do
-      TransitionCoordinator.request_transition(coordinator, intent)
+      TransitionCoordinator.request_transition(
+        coordinator,
+        intent,
+        route: Keyword.get(opts, :route, Keyword.get(opts, :trusted_route))
+      )
     end
   end
 

@@ -13,7 +13,8 @@ defmodule SymphonyElixir.AgentRuntime.Route do
     :runtime_name,
     :responsibility,
     :profile,
-    :fingerprint
+    :fingerprint,
+    :starting_state_fingerprint
   ]
 
   @type t :: %__MODULE__{
@@ -23,7 +24,8 @@ defmodule SymphonyElixir.AgentRuntime.Route do
           runtime_name: String.t(),
           responsibility: String.t(),
           profile: Profile.t() | nil,
-          fingerprint: String.t()
+          fingerprint: String.t(),
+          starting_state_fingerprint: String.t()
         }
 
   @spec new(Issue.routable_t(), Profile.t()) :: t()
@@ -36,10 +38,15 @@ defmodule SymphonyElixir.AgentRuntime.Route do
       runtime_name: profile.runtime,
       responsibility: profile.responsibility,
       profile: profile,
-      fingerprint: ""
+      fingerprint: "",
+      starting_state_fingerprint: ""
     }
 
-    %{route | fingerprint: fingerprint(route)}
+    %{
+      route
+      | fingerprint: fingerprint(route),
+        starting_state_fingerprint: starting_state_fingerprint(route)
+    }
   end
 
   @doc false
@@ -53,10 +60,15 @@ defmodule SymphonyElixir.AgentRuntime.Route do
       runtime_name: "codex",
       responsibility: "implementation",
       profile: nil,
-      fingerprint: ""
+      fingerprint: "",
+      starting_state_fingerprint: ""
     }
 
-    %{route | fingerprint: fingerprint(route)}
+    %{
+      route
+      | fingerprint: fingerprint(route),
+        starting_state_fingerprint: starting_state_fingerprint(route)
+    }
   end
 
   @spec fingerprint(t()) :: String.t()
@@ -69,10 +81,11 @@ defmodule SymphonyElixir.AgentRuntime.Route do
       profile_fingerprint(route.profile)
     }
 
-    :crypto.hash(:sha256, :erlang.term_to_binary(data))
-    |> Base.encode16(case: :lower)
-    |> then(&("sha256:" <> &1))
+    digest(data)
   end
+
+  @spec starting_state_fingerprint(t()) :: String.t()
+  def starting_state_fingerprint(%__MODULE__{starting_state: starting_state}), do: digest(starting_state)
 
   @spec same?(t(), t()) :: boolean()
   def same?(%__MODULE__{fingerprint: left}, %__MODULE__{fingerprint: right}), do: left == right
@@ -101,4 +114,10 @@ defmodule SymphonyElixir.AgentRuntime.Route do
   end
 
   defp profile_fingerprint(nil), do: :legacy
+
+  defp digest(data) do
+    :crypto.hash(:sha256, :erlang.term_to_binary(data))
+    |> Base.encode16(case: :lower)
+    |> then(&("sha256:" <> &1))
+  end
 end
