@@ -1,9 +1,32 @@
+defmodule SymphonyElixir.RuntimeAuthorityCapabilityProbe do
+  def capabilities do
+    [
+      :current_issue_refresh,
+      :dependency_graph,
+      :dependency_completeness,
+      :transition_verification,
+      :agent_read_tools,
+      :agent_transition_tools
+    ]
+  end
+
+  def fetch_issues_by_ids(_issue_ids), do: {:ok, []}
+  def fetch_dependency_graph, do: {:ok, []}
+  def agent_tool_specs, do: []
+  def execute_agent_tool(_tool, _arguments, _opts), do: %{}
+end
+
 defmodule SymphonyElixir.RuntimeAuthorityTest do
   use ExUnit.Case, async: true
 
   alias SymphonyElixir.AgentRuntime.{Authority, Profile, Route}
+  alias SymphonyElixir.AgentRuntime.Router
+  alias SymphonyElixir.Plane.Adapter
   alias SymphonyElixir.Tracker.Issue
-  alias SymphonyElixir.WorkControl.WorkflowLifecycle
+  alias SymphonyElixir.Tracker.{Capabilities, TransitionPolicy}
+  alias SymphonyElixir.WorkControl.{WorkflowLifecycle, WorkItem}
+
+  @now ~U[2026-09-19 00:00:00Z]
 
   @states WorkflowLifecycle.states()
   @responsibilities ["planning", "implementation", "review", "correction", "merge"]
@@ -30,6 +53,8 @@ defmodule SymphonyElixir.RuntimeAuthorityTest do
     "correction" => "Changes Requested",
     "merge" => "Ready to Merge"
   }
+
+  @routed_starting_states Map.take(@starting_states, ["planning", "implementation", "review", "correction"])
 
   test "planner authorizes planning to ready" do
     assert :ok == authorize("planner", :planning, :ready)
@@ -192,6 +217,158 @@ defmodule SymphonyElixir.RuntimeAuthorityTest do
     end
   end
 
+  test "canonical routing embeds authority-valid profiles with only static grants" do
+    profiles = Profile.default_profiles("codex app-server", 20)
+
+    for {responsibility, starting_state} <- @routed_starting_states do
+      assert {:ok, %Route{profile: profile} = route} =
+               Router.resolve(trusted_work_item(starting_state), profiles)
+
+      assert Authority.validate_profile(profile) == :ok
+
+      for source <- @states, target <- @states do
+        result = Authority.authorize_lifecycle_command(route, source, target)
+
+        if {source, target} in Map.fetch!(@grants, responsibility) do
+          assert result == :ok,
+                 "expected #{responsibility} to authorize #{inspect({source, target})}, got #{inspect(result)}"
+        else
+          assert_denied(result, :not_permitted, :command_not_permitted)
+        end
+      end
+    end
+  end
+
+  test "canonical routing validates the selected profile authority shape" do
+    profiles = Profile.default_profiles("codex app-server", 20)
+    malformed_builder = %{profiles["builder"] | name: ""}
+
+    assert {:error, %{code: :invalid_profile, reason: :malformed_profile}} =
+             Router.resolve(trusted_work_item("Ready"), Map.put(profiles, "builder", malformed_builder))
+  end
+
+  test "custom routed profiles keep their responsibility command set" do
+    assert {:ok, profiles} =
+             Profile.resolve_profiles(
+               %{
+                 "custom builder" => %{
+                   "responsibility" => "implementation",
+                   "runtime" => "codex",
+                   "command" => "custom-codex",
+                   "sandbox" => "workspace-write"
+                 }
+               },
+               "codex app-server",
+               20
+             )
+
+    custom_builder = Map.put(profiles["custom_builder"], :allowed_commands, [{:planning, :ready}])
+    profiles = Map.put(profiles, "custom_builder", custom_builder)
+
+    assert {:ok, %Route{profile: ^custom_builder, responsibility: "implementation"} = route} =
+             Router.resolve(trusted_work_item("Ready"), profiles, %{"ready" => "custom builder"})
+
+    assert Authority.validate_profile(custom_builder) == :ok
+    assert Authority.authorize_lifecycle_command(route, :ready, :in_progress) == :ok
+
+    assert_denied(
+      Authority.authorize_lifecycle_command(route, :planning, :ready),
+      :not_permitted,
+      :command_not_permitted
+    )
+
+    custom_reviewer = %{profiles["reviewer"] | name: "custom_reviewer", prompt: "custom-reviewer"}
+    profiles = Map.put(profiles, "custom_reviewer", custom_reviewer)
+
+    assert {:error, {:route_responsibility_mismatch, "ready", "implementation"}} =
+             Router.resolve(trusted_work_item("Ready"), profiles, %{"ready" => "custom reviewer"})
+  end
+
+  test "legacy resolver remains compatible while legacy routes stay outside authority" do
+    profiles = Profile.default_profiles("codex app-server", 20)
+    issue = %Issue{id: "legacy-authority", state: "Planning"}
+
+    assert {:ok, %Route{profile: %Profile{}, starting_state: "planning"}} =
+             Router.resolve_legacy(issue, profiles)
+
+    legacy_route = Route.legacy(issue)
+
+    assert_denied(
+      Authority.authorize_lifecycle_command(legacy_route, :planning, :ready),
+      :invalid_subject,
+      :missing_profile
+    )
+  end
+
+  test "provider capabilities do not grant runtime lifecycle authority" do
+    capabilities = Adapter.capabilities()
+
+    assert :controlled_transition in capabilities
+    refute :agent_read_tools in capabilities
+    refute :agent_transition_tools in capabilities
+    refute :conditional_transition in capabilities
+
+    profiles = Profile.default_profiles("codex app-server", 20)
+    builder_route = routed_route("Ready", profiles)
+    reviewer_route = routed_route("In Review", profiles)
+
+    assert Authority.authorize_lifecycle_command(builder_route, :ready, :in_progress) == :ok
+
+    assert_denied(
+      Authority.authorize_lifecycle_command(reviewer_route, :ready, :in_progress),
+      :not_permitted,
+      :command_not_permitted
+    )
+  end
+
+  test "a provider declaration can omit controlled transition without invoking a provider" do
+    assert {:ok, declared} = Capabilities.validate_adapter(SymphonyElixir.RuntimeAuthorityCapabilityProbe)
+    assert Capabilities.missing(declared) == [:controlled_transition]
+    refute_received :provider_request
+  end
+
+  test "runtime authority and dependency transition policy remain separate" do
+    profiles = Profile.default_profiles("codex app-server", 20)
+    builder_route = routed_route("Ready", profiles)
+    reviewer_route = routed_route("In Review", profiles)
+
+    assert Authority.authorize_lifecycle_command(builder_route, :in_progress, :in_review) == :ok
+
+    assert :ok =
+             TransitionPolicy.authorize(%{
+               responsibility: builder_route.responsibility,
+               current_state: :in_progress,
+               target_state: :in_review,
+               dependency_decision: allowed_dependency()
+             })
+
+    assert {:error, %{code: :dependency_transition_denied}} =
+             TransitionPolicy.authorize(%{
+               responsibility: builder_route.responsibility,
+               current_state: :in_progress,
+               target_state: :in_review,
+               dependency_decision: %{
+                 allowed?: false,
+                 dependency_status: :unavailable,
+                 dependency_completeness: {:unavailable, :provider_error}
+               }
+             })
+
+    assert_denied(
+      Authority.authorize_lifecycle_command(reviewer_route, :in_progress, :in_review),
+      :not_permitted,
+      :command_not_permitted
+    )
+
+    assert {:error, %{code: :unauthorized_transition}} =
+             TransitionPolicy.authorize(%{
+               responsibility: reviewer_route.responsibility,
+               current_state: :in_progress,
+               target_state: :in_review,
+               dependency_decision: allowed_dependency()
+             })
+  end
+
   test "raw, arbitrary, malformed, and legacy routes deny by default" do
     profile = default_profile("planner")
     route = route_for(profile)
@@ -313,6 +490,32 @@ defmodule SymphonyElixir.RuntimeAuthorityTest do
     }
 
     Route.new(issue, profile)
+  end
+
+  defp routed_route(state, profiles, routes \\ nil) do
+    assert {:ok, route} = Router.resolve(trusted_work_item(state), profiles, routes)
+    route
+  end
+
+  defp trusted_work_item(state) do
+    issue = %Issue{id: "routed-#{state}", state: state, dispatchable: true}
+
+    {:ok, work_item} =
+      WorkItem.from_issue(issue, %{
+        provider: :memory,
+        observed_at: @now,
+        prior_validated_lifecycle_state: state
+      })
+
+    work_item
+  end
+
+  defp allowed_dependency do
+    %{
+      allowed?: true,
+      dependency_status: :none,
+      dependency_completeness: :complete
+    }
   end
 
   defp assert_denied({:error, %{code: code, reason: reason}}, code, reason), do: :ok

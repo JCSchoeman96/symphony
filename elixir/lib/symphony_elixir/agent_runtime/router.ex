@@ -6,7 +6,7 @@ defmodule SymphonyElixir.AgentRuntime.Router do
   legacy resolver retains provider aliases for the legacy workflow path.
   """
 
-  alias SymphonyElixir.AgentRuntime.{Profile, Route}
+  alias SymphonyElixir.AgentRuntime.{Authority, Profile, Route}
   alias SymphonyElixir.Tracker.Issue
 
   alias SymphonyElixir.WorkControl.{LifecycleAssessment, WorkflowLifecycle, WorkItem}
@@ -68,7 +68,8 @@ defmodule SymphonyElixir.AgentRuntime.Router do
          {:ok, profile_name} <- profile_name_for_state(canonical_state, routes),
          {:ok, profile} <- fetch_profile(profiles, profile_name),
          :ok <- validate_responsibility(canonical_state, profile),
-         :ok <- Profile.validate_effective_policy(profile) do
+         :ok <- Profile.validate_effective_policy(profile),
+         :ok <- Authority.validate_profile(profile) do
       issue = %Issue{id: work_item.id, state: WorkflowLifecycle.display(canonical_state), dispatchable: true}
       {:ok, Route.new(issue, profile)}
     else
