@@ -28,12 +28,14 @@ defmodule SymphonyElixir.Tracker do
   @callback fetch_dependency_graph() :: {:ok, term()} | {:error, term()}
   @callback fetch_project_snapshot() :: {:ok, map()} | {:error, term()}
   @callback agent_tool_specs() :: [map()]
+  @callback agent_tool_specs(map()) :: [map()]
   @callback execute_agent_tool(String.t(), term(), keyword()) :: map()
   @callback secret_environment_names(map()) :: [String.t()]
   @callback validate_config(map()) :: :ok | {:error, term()}
   @callback capabilities() :: [Capabilities.capability()]
 
   @optional_callbacks agent_tool_specs: 0,
+                      agent_tool_specs: 1,
                       execute_agent_tool: 3,
                       fetch_dependency_graph: 0,
                       fetch_project_snapshot: 0,
@@ -119,16 +121,23 @@ defmodule SymphonyElixir.Tracker do
     settings = Config.settings!()
     tracker_settings = settings.tracker
     adapter = adapter_for_settings!(tracker_settings)
+    agent_tool_context = Keyword.get(opts, :agent_tool_context, %{})
 
     %{
       adapter: adapter,
       agent_routing: settings.agent.routing,
       tracker_settings: tracker_settings,
-      tool_specs: adapter_agent_tool_specs(adapter),
+      tool_specs: agent_tool_specs_for_adapter(adapter, agent_tool_context),
       secret_environment_names: adapter_secret_environment_names(adapter, tracker_settings),
       transition_guard: :atomics.new(1, []),
-      agent_tool_context: Keyword.get(opts, :agent_tool_context, %{})
+      agent_tool_context: agent_tool_context
     }
+  end
+
+  @doc false
+  @spec agent_tool_specs_for_adapter(module(), map()) :: [map()]
+  def agent_tool_specs_for_adapter(adapter, agent_tool_context) when is_map(agent_tool_context) do
+    adapter_agent_tool_specs(adapter, agent_tool_context)
   end
 
   @spec execute_bound_agent_tool(map(), String.t(), term(), keyword()) :: map()
@@ -328,11 +337,16 @@ defmodule SymphonyElixir.Tracker do
     end)
   end
 
-  defp adapter_agent_tool_specs(adapter) do
-    if Code.ensure_loaded?(adapter) and function_exported?(adapter, :agent_tool_specs, 0) do
-      adapter.agent_tool_specs()
-    else
-      []
+  defp adapter_agent_tool_specs(adapter, agent_tool_context) do
+    cond do
+      Code.ensure_loaded?(adapter) and function_exported?(adapter, :agent_tool_specs, 1) ->
+        adapter.agent_tool_specs(agent_tool_context)
+
+      Code.ensure_loaded?(adapter) and function_exported?(adapter, :agent_tool_specs, 0) ->
+        adapter.agent_tool_specs()
+
+      true ->
+        []
     end
   end
 

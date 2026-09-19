@@ -22,6 +22,25 @@ defmodule SymphonyElixir.TrackerCapabilitiesThrowingAdapter do
   def capabilities, do: throw(:capability_declaration_failed)
 end
 
+defmodule SymphonyElixir.TrackerContextualSpecsProbeAdapter do
+  def agent_tool_specs(context) do
+    send(self(), {:contextual_agent_tool_specs, context})
+    [%{"name" => "contextual_probe"}]
+  end
+
+  def agent_tool_specs do
+    send(self(), :legacy_agent_tool_specs_should_not_run)
+    [%{"name" => "legacy_probe"}]
+  end
+end
+
+defmodule SymphonyElixir.TrackerLegacySpecsProbeAdapter do
+  def agent_tool_specs do
+    send(self(), :legacy_agent_tool_specs)
+    [%{"name" => "legacy_probe"}]
+  end
+end
+
 defmodule SymphonyElixir.TrackerCapabilitiesTest do
   use SymphonyElixir.TestSupport
 
@@ -31,6 +50,16 @@ defmodule SymphonyElixir.TrackerCapabilitiesTest do
   alias SymphonyElixir.Tracker.Capabilities
   alias SymphonyElixir.TransitionCoordinator
   alias SymphonyElixir.WorkControl.{ProviderProjectContract, SemanticTransitionIntent, WorkflowLifecycle}
+
+  test "tracker keeps both legacy and contextual catalogue callbacks optional" do
+    callbacks = Tracker.behaviour_info(:callbacks)
+    optional_callbacks = Tracker.behaviour_info(:optional_callbacks)
+
+    assert {:agent_tool_specs, 0} in callbacks
+    assert {:agent_tool_specs, 1} in callbacks
+    assert {:agent_tool_specs, 0} in optional_callbacks
+    assert {:agent_tool_specs, 1} in optional_callbacks
+  end
 
   test "owns the complete ordered routed capability requirement set" do
     assert Capabilities.required_routed() == [
@@ -121,6 +150,29 @@ defmodule SymphonyElixir.TrackerCapabilitiesTest do
 
     assert {:error, {:invalid_provider_capability_declaration, _, :capabilities_callback_failed}} =
              Capabilities.validate_adapter(SymphonyElixir.TrackerCapabilitiesThrowingAdapter)
+  end
+
+  test "contextual agent tool catalogues receive the trusted host context" do
+    context = %{issue_id: "work-1", route: :trusted_route}
+
+    assert [%{"name" => "contextual_probe"}] =
+             Tracker.agent_tool_specs_for_adapter(
+               SymphonyElixir.TrackerContextualSpecsProbeAdapter,
+               context
+             )
+
+    assert_received {:contextual_agent_tool_specs, ^context}
+    refute_received :legacy_agent_tool_specs_should_not_run
+  end
+
+  test "legacy agent tool catalogue callbacks remain supported" do
+    assert [%{"name" => "legacy_probe"}] =
+             Tracker.agent_tool_specs_for_adapter(
+               SymphonyElixir.TrackerLegacySpecsProbeAdapter,
+               %{issue_id: "work-1"}
+             )
+
+    assert_received :legacy_agent_tool_specs
   end
 
   test "tracker identity projects each provider scope without secrets" do

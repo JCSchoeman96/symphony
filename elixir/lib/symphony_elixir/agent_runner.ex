@@ -136,6 +136,7 @@ defmodule SymphonyElixir.AgentRunner do
       |> Keyword.put(:worker_host, worker_host)
       |> profile_runtime_options(route)
       |> Keyword.put(:agent_tool_context, agent_tool_context(issue, route, opts))
+      |> Keyword.delete(:route)
 
     role_prompt = PromptBuilder.role_prompt(route)
 
@@ -160,7 +161,11 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp do_run_codex_turns(context, turn_number, max_turns) do
-    prompt_opts = Keyword.put(context.opts, :role_prompt, context.role_prompt)
+    prompt_opts =
+      context.opts
+      |> Keyword.put(:role_prompt, context.role_prompt)
+      |> Keyword.put(:route, context.route)
+
     prompt = build_turn_prompt(context.issue, prompt_opts, turn_number, max_turns)
 
     with {:ok, _turn_result} <-
@@ -529,6 +534,7 @@ defmodule SymphonyElixir.AgentRunner do
     context = %{
       issue_id: issue.id,
       current_issue_state: issue.state,
+      route: route,
       responsibility: route.responsibility,
       dependency_decision: dependency_decision_from_options(issue, route, opts),
       work_control: Keyword.get(opts, :work_control, %{}),

@@ -347,8 +347,20 @@ defmodule SymphonyElixir.AgentRuntimeTest do
                issue_state_fetcher: fn [_issue_id] -> {:ok, [refreshed_issue]} end
              )
 
+    assert_receive {:runtime_started, _workspace, start_opts}
+    assert start_opts[:agent_tool_context].route == route
+    refute Keyword.has_key?(start_opts, :route)
+    assert_receive {:runtime_turn, _session, first_prompt, ^issue}
+    refute first_prompt =~ route.fingerprint
     assert_receive {:runtime_turn_options, first_turn_opts}
     assert_receive {:runtime_turn_options, second_turn_opts}
+    refute Keyword.has_key?(first_turn_opts, :route)
+    assert first_turn_opts[:agent_tool_context].route == route
+    assert first_turn_opts[:agent_tool_context].route.starting_state == "ready"
+    refute Keyword.has_key?(second_turn_opts, :route)
+    assert second_turn_opts[:agent_tool_context].route.starting_state == "in progress"
+    assert second_turn_opts[:agent_tool_context].route.profile_name == route.profile_name
+    assert second_turn_opts[:agent_tool_context].route.responsibility == route.responsibility
     assert first_turn_opts[:agent_tool_context].trusted_lifecycle_state == :ready
     assert second_turn_opts[:agent_tool_context].trusted_lifecycle_state == :in_progress
     assert second_turn_opts[:agent_tool_context].work_item.validated_lifecycle_state == :in_progress
