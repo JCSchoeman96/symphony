@@ -99,6 +99,30 @@ defmodule SymphonyElixir.RuntimeTransitionAuthorityBindingTest do
     refute_received :submitted
   end
 
+  test "a stale route fingerprint rejects an altered starting state before context loading" do
+    coordinator = coordinator(self())
+    route = route("stale-starting-state", :ready, "implementation")
+    stale_route = %{route | starting_state: "in progress"}
+
+    assert stale_route.fingerprint == route.fingerprint
+    assert stale_route.starting_state_fingerprint == route.starting_state_fingerprint
+    refute stale_route.starting_state_fingerprint == Route.starting_state_fingerprint(stale_route)
+
+    assert {:ok,
+            %{
+              state: :rejected,
+              outcome_reason: {:authority_rejected, %{code: :invalid_subject, reason: :route_fingerprint_mismatch}}
+            }} =
+             Tracker.controlled_transition("stale-starting-state", :in_review,
+               coordinator: coordinator,
+               route: stale_route,
+               intent_attrs: intent_attrs(:in_progress, "implementation", :in_review, "stale-starting-state")
+             )
+
+    refute_received :context_loaded
+    refute_received :submitted
+  end
+
   test "a trusted builder route denies a claimed reviewer command before the provider" do
     assert_cross_role_denied(
       "builder-claimed-reviewer",

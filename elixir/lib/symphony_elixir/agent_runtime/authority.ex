@@ -99,7 +99,8 @@ defmodule SymphonyElixir.AgentRuntime.Authority do
          profile_name: profile_name,
          runtime_name: runtime_name,
          responsibility: responsibility,
-         fingerprint: fingerprint
+         fingerprint: fingerprint,
+         starting_state_fingerprint: starting_state_fingerprint
        }) do
     [
       nonempty_binary?(issue_id),
@@ -107,7 +108,8 @@ defmodule SymphonyElixir.AgentRuntime.Authority do
       nonempty_binary?(profile_name),
       nonempty_binary?(runtime_name),
       nonempty_binary?(responsibility),
-      nonempty_binary?(fingerprint)
+      nonempty_binary?(fingerprint),
+      nonempty_binary?(starting_state_fingerprint)
     ]
     |> Enum.all?(& &1)
   end
@@ -134,7 +136,8 @@ defmodule SymphonyElixir.AgentRuntime.Authority do
   end
 
   defp validate_route_fingerprint(%Route{} = route) do
-    if route.fingerprint == Route.fingerprint(route) do
+    if route.fingerprint == Route.fingerprint(route) and
+         route.starting_state_fingerprint == Route.starting_state_fingerprint(route) do
       :ok
     else
       invalid_subject(:route_fingerprint_mismatch)
