@@ -75,7 +75,6 @@ defmodule SymphonyElixir.AgentRuntime.Authority do
     case Profile.validate_effective_policy(profile) do
       :ok -> :ok
       {:error, message} -> invalid_profile(:effective_policy_invalid, message)
-      _other -> invalid_profile(:effective_policy_invalid)
     end
   rescue
     _error -> invalid_profile(:effective_policy_invalid)
