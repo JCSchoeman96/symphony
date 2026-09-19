@@ -6,7 +6,13 @@ defmodule SymphonyElixir.RuntimeTransitionAuthorityBindingTest do
   alias SymphonyElixir.Tracker
   alias SymphonyElixir.Tracker.Issue
   alias SymphonyElixir.TransitionCoordinator
-  alias SymphonyElixir.WorkControl.{GuardClass, ProviderProjectContract, WorkflowLifecycle}
+
+  alias SymphonyElixir.WorkControl.{
+    GuardClass,
+    ProviderProjectContract,
+    SemanticTransitionIntent,
+    WorkflowLifecycle
+  }
 
   test "canonical runtime responsibility without a trusted route fails before context loading" do
     coordinator = coordinator(self())
@@ -44,6 +50,40 @@ defmodule SymphonyElixir.RuntimeTransitionAuthorityBindingTest do
                coordinator: coordinator,
                route: route,
                intent_attrs: intent_attrs(:ready, "implementation")
+             )
+
+    refute_received :context_loaded
+    refute_received :submitted
+  end
+
+  test "an atom runtime responsibility is normalized before route authority" do
+    coordinator = coordinator(self())
+
+    {:ok, intent} =
+      intent_attrs(:in_progress, "implementation", :in_review, "atom-claim")
+      |> SemanticTransitionIntent.new()
+
+    atom_claim = %{intent | responsibility: :implementation}
+
+    assert {:ok, %{state: :rejected}} =
+             Tracker.controlled_transition("atom-claim", :in_review,
+               coordinator: coordinator,
+               intent: atom_claim
+             )
+
+    refute_received :context_loaded
+    refute_received :submitted
+  end
+
+  test "a trusted route with a different starting state fails closed" do
+    coordinator = coordinator(self())
+    route = route("source-mismatch", :in_progress, "implementation")
+
+    assert {:ok, %{state: :rejected}} =
+             Tracker.controlled_transition("source-mismatch", :in_progress,
+               coordinator: coordinator,
+               route: route,
+               intent_attrs: intent_attrs(:ready, "implementation", nil, "source-mismatch")
              )
 
     refute_received :context_loaded

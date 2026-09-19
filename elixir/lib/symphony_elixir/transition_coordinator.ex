@@ -326,12 +326,20 @@ defmodule SymphonyElixir.TransitionCoordinator do
   end
 
   defp bind_runtime_route(%Route{} = route, %SemanticTransitionIntent{} = intent) do
+    expected_starting_state =
+      intent.requested_from
+      |> WorkflowLifecycle.display()
+      |> Route.normalize_state()
+
     cond do
       route.issue_id != intent.work_item_id ->
         {:error, %{code: :invalid_subject, reason: :route_work_item_mismatch}}
 
       route.responsibility != intent.responsibility ->
         {:error, %{code: :invalid_subject, reason: :route_responsibility_mismatch}}
+
+      Route.normalize_state(route.starting_state) != expected_starting_state ->
+        {:error, %{code: :invalid_subject, reason: :route_starting_state_mismatch}}
 
       true ->
         :ok
@@ -415,11 +423,9 @@ defmodule SymphonyElixir.TransitionCoordinator do
     end
   end
 
-  defp runtime_responsibility?(responsibility) when is_binary(responsibility) do
+  defp runtime_responsibility?(responsibility) do
     String.downcase(String.trim(responsibility)) in @runtime_responsibilities
   end
-
-  defp runtime_responsibility?(_responsibility), do: false
 
   defp canonical_transition_responsibility(%SemanticTransitionIntent{} = intent) do
     canonical_transition_responsibility(intent.requested_from, intent.requested_to, intent.responsibility)
@@ -866,10 +872,7 @@ defmodule SymphonyElixir.TransitionCoordinator do
   end
 
   defp normalize_intent(%SemanticTransitionIntent{} = intent) do
-    case SemanticTransitionIntent.validate(intent) do
-      :ok -> {:ok, intent}
-      {:error, reason} -> {:error, reason}
-    end
+    SemanticTransitionIntent.new(Map.from_struct(intent))
   end
 
   defp normalize_intent(attrs) when is_map(attrs), do: SemanticTransitionIntent.new(attrs)
