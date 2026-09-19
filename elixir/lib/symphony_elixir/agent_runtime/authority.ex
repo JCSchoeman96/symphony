@@ -72,15 +72,13 @@ defmodule SymphonyElixir.AgentRuntime.Authority do
   defp positive_integer?(value), do: is_integer(value) and value > 0
 
   defp validate_effective_policy(%Profile{} = profile) do
-    try do
-      case Profile.validate_effective_policy(profile) do
-        :ok -> :ok
-        {:error, message} -> invalid_profile(:effective_policy_invalid, message)
-        _other -> invalid_profile(:effective_policy_invalid)
-      end
-    rescue
-      _error -> invalid_profile(:effective_policy_invalid)
+    case Profile.validate_effective_policy(profile) do
+      :ok -> :ok
+      {:error, message} -> invalid_profile(:effective_policy_invalid, message)
+      _other -> invalid_profile(:effective_policy_invalid)
     end
+  rescue
+    _error -> invalid_profile(:effective_policy_invalid)
   end
 
   defp validate_route(%Route{} = route) do

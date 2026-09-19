@@ -30,8 +30,7 @@ defmodule SymphonyElixir.RuntimeAuthorityTest do
   alias SymphonyElixir.AgentRuntime.{Authority, Profile, Route}
   alias SymphonyElixir.AgentRuntime.Router
   alias SymphonyElixir.Plane.Adapter
-  alias SymphonyElixir.Tracker.Issue
-  alias SymphonyElixir.Tracker.{Capabilities, TransitionPolicy}
+  alias SymphonyElixir.Tracker.{Capabilities, Issue, TransitionPolicy}
   alias SymphonyElixir.WorkControl.{WorkflowLifecycle, WorkItem}
 
   @now ~U[2026-09-19 00:00:00Z]
