@@ -130,13 +130,21 @@ defmodule SymphonyElixir.AgentRouterDependencyProofTest do
         assert start_opts[:sandbox] == sandbox
         assert_receive {:worker_runtime_info, "lifecycle-proof", _runtime_info}, 1_000
 
-        turn_count = length(refreshed_states)
+        turn_states = [state | Enum.take(refreshed_states, max(length(refreshed_states) - 1, 0))]
 
-        turns =
-          Enum.map(1..turn_count, fn _turn ->
-            assert_receive {:proof_turn, ^session_id, refreshed_state, prompt}, 1_000
+        {session_id, turns, session_ids} =
+          Enum.reduce(turn_states, {session_id, [], [session_id]}, fn expected_state, {current_session, turns, session_ids} ->
+            {next_session, refreshed_state, prompt} =
+              receive_proof_turn(current_session, expected_state)
+
             assert is_binary(prompt)
-            {refreshed_state, prompt}
+
+            next_session_ids =
+              if next_session == current_session,
+                do: session_ids,
+                else: session_ids ++ [next_session]
+
+            {next_session, turns ++ [{refreshed_state, prompt}], next_session_ids}
           end)
 
         if List.last(refreshed_states) == "Ready to Merge" do
@@ -156,7 +164,7 @@ defmodule SymphonyElixir.AgentRouterDependencyProofTest do
           profile: profile_name,
           responsibility: responsibility,
           sandbox: sandbox,
-          session_id: session_id,
+          session_ids: session_ids,
           turns: turns,
           route_fingerprint: route.fingerprint,
           evidence: evidence
@@ -187,7 +195,8 @@ defmodule SymphonyElixir.AgentRouterDependencyProofTest do
              "read-only"
            ]
 
-    assert length(Enum.uniq(Enum.map(stage_evidence, & &1.session_id))) == length(stage_evidence)
+    assert Enum.map(stage_evidence, &length(&1.session_ids)) == [1, 2, 1, 1, 1]
+    assert length(Enum.uniq(Enum.flat_map(stage_evidence, & &1.session_ids))) == 6
     assert Enum.at(stage_evidence, 1).turns |> length() == 2
     assert Enum.count(stage_evidence, &(&1.profile == "reviewer")) <= 3
 
@@ -230,6 +239,21 @@ defmodule SymphonyElixir.AgentRouterDependencyProofTest do
     assert {:error, :authority_unavailable} = Router.resolve(merge_work_item, Config.settings!().agent.profiles)
     refute Config.settings!().agent.profiles["merge_gatekeeper"].command
     refute Map.has_key?(Map.from_struct(Config.settings!().agent), :auto_merge)
+  end
+
+  defp receive_proof_turn(session_id, expected_state) do
+    receive do
+      {:proof_turn, ^session_id, ^expected_state, prompt} ->
+        {session_id, expected_state, prompt}
+
+      {:proof_session_stopped, ^session_id} ->
+        assert_receive {:proof_session_started, next_session, _workspace, _start_opts}, 1_000
+        assert_receive {:proof_turn, ^next_session, ^expected_state, prompt}, 1_000
+        {next_session, expected_state, prompt}
+    after
+      1_000 ->
+        flunk("timed out waiting for proof turn #{expected_state}")
+    end
   end
 
   test "SYM-15 proves the dependency frontier, unlocks, cancellation safety, and cycle refusal" do

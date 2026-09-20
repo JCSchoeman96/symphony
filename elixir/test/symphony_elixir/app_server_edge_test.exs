@@ -1,6 +1,7 @@
 defmodule SymphonyElixir.AppServerEdgeTest do
   use SymphonyElixir.TestSupport
 
+  alias SymphonyElixir.AgentRuntime.Route
   alias SymphonyElixir.Tracker.Memory
 
   test "the default start-session API still enforces the local workspace boundary" do
@@ -324,6 +325,73 @@ defmodule SymphonyElixir.AppServerEdgeTest do
     )
   end
 
+  test "a refreshed Plane route gets a new thread catalogue after a session boundary" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-plane-thread-catalogue-#{System.unique_integer([:positive])}")
+    workspace_root = Path.join(test_root, "workspaces")
+    workspace = Path.join(workspace_root, "SYNTHETIC")
+    binary = Path.join(test_root, "fake-codex")
+    trace = Path.join(test_root, "codex-trace.jsonl")
+    previous_plane_api_key = System.get_env("PLANE_API_KEY")
+    System.put_env("PLANE_API_KEY", "test-plane-secret")
+    File.mkdir_p!(workspace)
+    write_plane_workflow!(Workflow.workflow_file_path(), workspace_root)
+    write_tracing_fake_codex!(binary, trace)
+
+    try do
+      profile = Config.settings!().agent.profiles["builder"]
+      ready_route = Route.new(%Issue{id: "plane-thread-catalogue", state: "Ready"}, profile)
+      in_progress_route = Route.new(%Issue{id: "plane-thread-catalogue", state: "In Progress"}, profile)
+
+      ready_context = %{
+        issue_id: "plane-thread-catalogue",
+        current_issue_state: "Ready",
+        route: ready_route,
+        responsibility: "implementation",
+        trusted_lifecycle_state: :ready
+      }
+
+      in_progress_context = %{
+        ready_context
+        | current_issue_state: "In Progress",
+          route: in_progress_route,
+          trusted_lifecycle_state: :in_progress
+      }
+
+      assert {:ok, ready_session} =
+               AppServer.start_session(workspace,
+                 command: "#{binary} app-server",
+                 agent_tool_context: ready_context
+               )
+
+      assert transition_target_enum(ready_session.dynamic_tool_binding.tool_specs) == ["In Progress"]
+      assert :ok = AppServer.stop_session(ready_session)
+
+      assert {:ok, in_progress_session} =
+               AppServer.start_session(workspace,
+                 command: "#{binary} app-server",
+                 agent_tool_context: in_progress_context
+               )
+
+      assert transition_target_enum(in_progress_session.dynamic_tool_binding.tool_specs) == ["In Review"]
+      assert :ok = AppServer.stop_session(in_progress_session)
+
+      thread_starts =
+        trace
+        |> File.read!()
+        |> String.split("\n", trim: true)
+        |> Enum.map(&Jason.decode!/1)
+        |> Enum.filter(&(&1["method"] == "thread/start"))
+
+      assert Enum.map(thread_starts, &transition_target_enum(&1["params"]["dynamicTools"])) == [
+               ["In Progress"],
+               ["In Review"]
+             ]
+    after
+      restore_env("PLANE_API_KEY", previous_plane_api_key)
+      File.rm_rf(test_root)
+    end
+  end
+
   defp write_fake_codex!(path, cases) do
     case_clauses =
       cases
@@ -346,6 +414,68 @@ defmodule SymphonyElixir.AppServerEdgeTest do
     """
 
     File.write!(path, script)
+    File.chmod!(path, 0o755)
+  end
+
+  defp transition_target_enum(specs) do
+    specs
+    |> Enum.find(&(&1["name"] == "plane_request_lifecycle_transition"))
+    |> get_in(["inputSchema", "properties", "targetState", "enum"])
+  end
+
+  defp write_plane_workflow!(path, workspace_root) do
+    File.write!(path, """
+    ---
+    tracker:
+      kind: "plane"
+      active_states: ["Ready", "In Progress"]
+      terminal_states: ["Done", "Cancelled"]
+      provider:
+        workspace_slug: "workspace-1"
+        workspace_id: "workspace-stable-1"
+        project_id: "project-1"
+        api_key: "$PLANE_API_KEY"
+    symphony:
+      project_id: "symphony-plane"
+    workspace:
+      root: "#{workspace_root}"
+    agent:
+      routing: "routed"
+    codex:
+      command: "codex app-server"
+    ---
+    You are a Plane test agent.
+    """)
+
+    SymphonyElixir.WorkflowStore.force_reload()
+    :ok
+  end
+
+  defp write_tracing_fake_codex!(path, trace) do
+    trace = String.replace(trace, "'", "'\\''")
+
+    File.write!(path, """
+    #!/bin/sh
+    count=0
+    while IFS= read -r line; do
+      count=$((count + 1))
+      printf '%s\\n' "$line" >> '#{trace}'
+      case "$count" in
+        1)
+          printf '%s\\n' '{"id":1,"result":{}}'
+          ;;
+        2)
+          ;;
+        3)
+          printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-plane"}}}'
+          ;;
+        *)
+          exit 0
+          ;;
+      esac
+    done
+    """)
+
     File.chmod!(path, 0o755)
   end
 
