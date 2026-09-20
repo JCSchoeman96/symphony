@@ -7,6 +7,7 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
   alias SymphonyElixir.TransitionCoordinator
 
   alias SymphonyElixir.WorkControl.{
+    AuthorityDisposition,
     GuardClass,
     ProviderProjectContract,
     WorkflowLifecycle,
@@ -357,6 +358,39 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
     refute_received :transition_submitted
 
     GenServer.stop(coordinator)
+  end
+
+  test "transition request rejects unavailable authority before H-040" do
+    parent = self()
+    route = route(:in_progress, "implementation")
+
+    for status <- [:none, :escalated, :suspended] do
+      work_item = %{
+        work_item(:in_progress)
+        | authority_disposition: AuthorityDisposition.new(%{status: status, lifecycle_state: :in_progress})
+      }
+
+      coordinator = transition_coordinator(parent)
+
+      response =
+        AgentTool.execute(
+          "plane_request_lifecycle_transition",
+          %{"targetState" => "In Review"},
+          host_opts(route, semantic_context(work_item, contract()))
+          |> Keyword.put(:coordinator, coordinator)
+          |> Keyword.put(:agent_tool_context, %{
+            route: route,
+            guard_evidence: transition_guard_evidence()
+          })
+        )
+
+      refute response["success"]
+      assert Jason.decode!(response["output"])["error"]["code"] == "authority_unavailable"
+      refute_received {:transition_context_loaded, _intent}
+      refute_received :transition_submitted
+
+      GenServer.stop(coordinator)
+    end
   end
 
   test "transition request rejects cross-role and stale routes before context loading" do

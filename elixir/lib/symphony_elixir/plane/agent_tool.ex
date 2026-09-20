@@ -199,6 +199,7 @@ defmodule SymphonyElixir.Plane.AgentTool do
          {:ok, work_item} <- fetch_work_item(context),
          {:ok, source} <- work_item_source(work_item),
          :ok <- Authority.authorize_lifecycle_command(route, source, target),
+         :ok <- require_transition_authority(work_item),
          {:ok, result} <- request_transition(work_item, route, source, target, host_context, opts) do
       transition_result_response(result, target)
     else
@@ -287,6 +288,10 @@ defmodule SymphonyElixir.Plane.AgentTool do
     end
   end
 
+  defp require_transition_authority(%WorkItem{} = work_item) do
+    if WorkItem.authority_available?(work_item), do: :ok, else: {:error, :authority_unavailable}
+  end
+
   defp host_guard_evidence(context) when is_map(context) do
     case Map.get(context, :guard_evidence) do
       evidence when is_list(evidence) -> evidence
@@ -367,6 +372,7 @@ defmodule SymphonyElixir.Plane.AgentTool do
   defp transition_reason_code(_state, :invalid_target_state), do: "invalid_target_state"
   defp transition_reason_code(_state, :invalid_transition_target), do: "invalid_transition_target"
   defp transition_reason_code(_state, :invalid_context), do: "invalid_transition_context"
+  defp transition_reason_code(_state, :authority_unavailable), do: "authority_unavailable"
   defp transition_reason_code(_state, :invalid_intent), do: "invalid_intent"
   defp transition_reason_code(_state, :invalid_transition_result), do: "invalid_transition_result"
   defp transition_reason_code(_state, %{code: :not_permitted}), do: "unauthorized_transition"
