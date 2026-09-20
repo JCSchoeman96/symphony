@@ -541,9 +541,13 @@ defmodule SymphonyElixir.Plane.AgentTool do
     valid_fingerprint? =
       contract.configuration_fingerprint == ProviderProjectContract.fingerprint(contract)
 
+    provider = Map.get(contract, :provider)
     context_fingerprint = map_value(context, :provider_contract_fingerprint)
 
     cond do
+      provider != :plane ->
+        {:error, :wrong_provider}
+
       not valid_fingerprint? ->
         {:error, :contract_fingerprint_mismatch}
 
