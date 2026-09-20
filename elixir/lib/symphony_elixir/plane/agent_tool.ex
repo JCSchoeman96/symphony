@@ -153,14 +153,16 @@ defmodule SymphonyElixir.Plane.AgentTool do
   end
 
   defp permitted_targets(%Route{} = route) do
-    with {:ok, source} <- WorkflowLifecycle.parse(route.starting_state) do
-      WorkflowLifecycle.states()
-      |> Enum.filter(fn target ->
-        Authority.authorize_lifecycle_command(route, source, target) == :ok
-      end)
-      |> Enum.map(&WorkflowLifecycle.display/1)
-    else
-      {:error, _reason} -> []
+    case WorkflowLifecycle.parse(route.starting_state) do
+      {:ok, source} ->
+        WorkflowLifecycle.states()
+        |> Enum.filter(fn target ->
+          Authority.authorize_lifecycle_command(route, source, target) == :ok
+        end)
+        |> Enum.map(&WorkflowLifecycle.display/1)
+
+      {:error, _reason} ->
+        []
     end
   end
 
