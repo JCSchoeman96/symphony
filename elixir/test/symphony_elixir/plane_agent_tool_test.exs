@@ -78,11 +78,12 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
     assert transition["inputSchema"]["additionalProperties"] == false
   end
 
-  test "catalogue exposes only responsibility-authorized targets" do
-    assert target_enum("planning", :backlog) == ["Ready"]
+  test "catalogue exposes only targets authorized from the route source" do
+    assert target_enum("planning", :backlog) == nil
     assert target_enum("planning", :planning) == ["Ready"]
 
-    assert target_enum("implementation", :ready) == ["In Progress", "In Review"]
+    assert target_enum("implementation", :ready) == ["In Progress"]
+    assert target_enum("implementation", :in_progress) == ["In Review"]
 
     assert target_enum("review", :in_review) == ["Changes Requested", "Ready to Merge"]
     assert target_enum("correction", :changes_requested) == ["In Review"]
@@ -99,7 +100,7 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
   test "catalogue accepts a valid planning route and rejects a forged route" do
     planning_route = route(:backlog, "planning")
 
-    assert Enum.count(AgentTool.agent_tool_specs(%{route: planning_route})) == 5
+    assert Enum.count(AgentTool.agent_tool_specs(%{route: planning_route})) == 4
 
     forged_route = %{planning_route | fingerprint: "sha256:forged"}
     assert AgentTool.agent_tool_specs(%{route: forged_route}) == []
@@ -1366,8 +1367,11 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
     route = route(state, responsibility)
 
     AgentTool.agent_tool_specs(%{route: route})
-    |> List.last()
-    |> get_in(["inputSchema", "properties", "targetState", "enum"])
+    |> Enum.find(&(&1["name"] == "plane_request_lifecycle_transition"))
+    |> case do
+      nil -> nil
+      transition -> get_in(transition, ["inputSchema", "properties", "targetState", "enum"])
+    end
   end
 
   defp host_opts(route, context, callback \\ nil, settings \\ @settings) do
