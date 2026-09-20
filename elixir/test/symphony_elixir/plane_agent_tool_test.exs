@@ -1,8 +1,21 @@
+defmodule SymphonyElixir.PlaneAgentToolTest.CoordinatorStub do
+  use GenServer
+
+  def start_link(reply), do: GenServer.start_link(__MODULE__, reply)
+
+  @impl true
+  def init(reply), do: {:ok, reply}
+
+  @impl true
+  def handle_call(_request, _from, reply), do: {:reply, reply, reply}
+end
+
 defmodule SymphonyElixir.PlaneAgentToolTest do
   use ExUnit.Case, async: true
 
   alias SymphonyElixir.AgentRuntime.{Profile, Route}
   alias SymphonyElixir.Plane.AgentTool
+  alias SymphonyElixir.PlaneAgentToolTest.CoordinatorStub
   alias SymphonyElixir.Tracker.Issue
   alias SymphonyElixir.TransitionCoordinator
 
@@ -50,6 +63,7 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
   end
 
   test "catalogue exposes only responsibility-authorized targets" do
+    assert target_enum("planning", :backlog) == ["Ready"]
     assert target_enum("planning", :planning) == ["Ready"]
 
     assert target_enum("implementation", :ready) == ["In Progress", "In Review"]
@@ -63,6 +77,38 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
 
     assert AgentTool.agent_tool_specs(%{}) == []
     assert AgentTool.agent_tool_specs(%{route: %Route{}}) == []
+    assert AgentTool.agent_tool_specs(:not_a_context) == []
+  end
+
+  test "rejects unsupported tools and malformed read options with bounded responses" do
+    unsupported = AgentTool.execute("plane_delete_work_item", %{}, [])
+
+    refute unsupported["success"]
+
+    assert Jason.decode!(unsupported["output"]) == %{
+             "error" => %{
+               "code" => "unsupported_tool",
+               "message" => "Unsupported Plane semantic tool.",
+               "supportedTools" => [
+                 "plane_get_current_work_item",
+                 "plane_get_dependencies",
+                 "plane_get_lifecycle_assessment",
+                 "plane_get_authority_disposition",
+                 "plane_request_lifecycle_transition"
+               ]
+             }
+           }
+
+    malformed_options = AgentTool.execute("plane_get_current_work_item", %{}, :not_a_keyword_list)
+
+    refute malformed_options["success"]
+
+    assert Jason.decode!(malformed_options["output"]) == %{
+             "error" => %{
+               "code" => "invalid_options",
+               "message" => "Plane semantic tool request was rejected."
+             }
+           }
   end
 
   test "current work-item read uses the injected trusted semantic context" do
@@ -125,6 +171,61 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
     end
 
     refute_received :semantic_context_must_not_run
+  end
+
+  test "reads fail closed for unavailable, malformed, and raised semantic context callbacks" do
+    context = semantic_context(work_item(:in_progress), contract())
+    route = route(:in_progress, "implementation")
+    base_opts = [agent_tool_context: %{route: route}, tracker_settings: @settings]
+
+    direct_context =
+      AgentTool.execute(
+        "plane_get_current_work_item",
+        %{},
+        Keyword.put(base_opts, :semantic_tool_context, fn _issue_id -> context end)
+      )
+
+    assert direct_context["success"]
+
+    for {callback, code} <- [
+          {fn _issue_id -> {:error, :orchestrator_down} end, "context_unavailable"},
+          {fn _issue_id -> :invalid_context_payload end, "invalid_context"},
+          {fn _issue_id -> raise "context callback failed" end, "context_unavailable"},
+          {fn _issue_id -> throw(:context_callback_failed) end, "context_unavailable"}
+        ] do
+      response =
+        AgentTool.execute(
+          "plane_get_current_work_item",
+          %{},
+          Keyword.put(base_opts, :semantic_tool_context, callback)
+        )
+
+      refute response["success"]
+      assert Jason.decode!(response["output"])["error"]["code"] == code
+    end
+
+    unavailable_server =
+      Module.concat(__MODULE__, "MissingContextServer#{System.unique_integer([:positive])}")
+
+    response =
+      AgentTool.execute(
+        "plane_get_current_work_item",
+        %{},
+        Keyword.put(base_opts, :orchestrator_server, unavailable_server)
+      )
+
+    refute response["success"]
+    assert Jason.decode!(response["output"])["error"]["code"] == "context_unavailable"
+
+    host_map_context =
+      AgentTool.execute(
+        "plane_get_current_work_item",
+        %{},
+        agent_tool_context: %{route: route, semantic_context: context},
+        tracker_settings: @settings
+      )
+
+    assert host_map_context["success"]
   end
 
   test "transition request delegates an authorized canonical intent to H-040" do
@@ -331,6 +432,117 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
     assert response["success"]
     refute_received {:provider_request, _request}
     GenServer.stop(coordinator)
+  end
+
+  test "transition request serializes coordinator terminal outcomes by status and reason" do
+    route = route(:in_progress, "implementation")
+    context = semantic_context(work_item(:in_progress), contract())
+
+    replies = [
+      {{:ok, %{state: :requested}}, %{"status" => "indeterminate", "code" => "transition_indeterminate"}},
+      {{:ok, %{state: :unknown}}, %{"code" => "invalid_transition_result"}},
+      {{:ok, %{state: :conflict, outcome_reason: :stale_context}}, %{"status" => "conflict", "code" => "transition_conflict"}},
+      {{:ok, %{state: :provider_failed, outcome_reason: :timeout}}, %{"status" => "provider_failed", "code" => "provider_failed"}},
+      {{:ok, %{state: :indeterminate, outcome_reason: :unknown}}, %{"status" => "indeterminate", "code" => "transition_indeterminate"}},
+      {{:ok, %{state: :rejected, outcome_reason: :required_guard_missing}}, %{"status" => "rejected", "code" => "required_guard_missing"}},
+      {{:ok, %{state: :rejected, outcome_reason: :dependency_context_unavailable}}, %{"status" => "rejected", "code" => "dependency_context_unavailable"}},
+      {{:ok, %{state: :rejected, outcome_reason: :transitions_disabled}}, %{"status" => "rejected", "code" => "transitions_disabled"}},
+      {{:ok, %{state: :rejected, outcome_reason: :transition_in_progress}}, %{"status" => "rejected", "code" => "transition_in_progress"}},
+      {{:ok, %{state: :rejected, outcome_reason: :transition_fenced}}, %{"status" => "rejected", "code" => "transition_fenced"}},
+      {{:ok, %{state: :rejected, outcome_reason: :coordinator_unavailable}}, %{"status" => "rejected", "code" => "coordinator_unavailable"}},
+      {{:ok, %{state: :rejected, outcome_reason: :invalid_transition_arguments}}, %{"status" => "rejected", "code" => "invalid_transition_arguments"}},
+      {{:ok, %{state: :rejected, outcome_reason: :invalid_target_state}}, %{"status" => "rejected", "code" => "invalid_target_state"}},
+      {{:ok, %{state: :rejected, outcome_reason: :invalid_transition_target}}, %{"status" => "rejected", "code" => "invalid_transition_target"}},
+      {{:ok, %{state: :rejected, outcome_reason: :invalid_context}}, %{"status" => "rejected", "code" => "invalid_transition_context"}},
+      {{:ok, %{state: :rejected, outcome_reason: :authority_unavailable}}, %{"status" => "rejected", "code" => "authority_unavailable"}},
+      {{:ok, %{state: :rejected, outcome_reason: :invalid_intent}}, %{"status" => "rejected", "code" => "invalid_intent"}},
+      {{:ok, %{state: :rejected, outcome_reason: :invalid_transition_result}}, %{"status" => "rejected", "code" => "invalid_transition_result"}},
+      {{:ok, %{state: :rejected, outcome_reason: %{code: :not_permitted}}}, %{"status" => "rejected", "code" => "unauthorized_transition"}},
+      {{:ok, %{state: :rejected, outcome_reason: %{code: :invalid_subject}}}, %{"status" => "rejected", "code" => "invalid_transition_context"}},
+      {
+        {:ok, %{state: :rejected, outcome_reason: {:authority_rejected, %{code: :not_permitted}}}},
+        %{"status" => "rejected", "code" => "unauthorized_transition"}
+      },
+      {
+        {:ok, %{state: :rejected, outcome_reason: {:authority_rejected, %{code: :invalid_subject}}}},
+        %{"status" => "rejected", "code" => "invalid_transition_context"}
+      },
+      {
+        {:ok, %{state: :rejected, outcome_reason: {:policy_rejected, %{code: :dependency_transition_denied}}}},
+        %{"status" => "rejected", "code" => "dependency_transition_denied"}
+      },
+      {
+        {:ok, %{state: :rejected, outcome_reason: {:policy_rejected, :dependency_transition_denied}}},
+        %{"status" => "rejected", "code" => "dependency_transition_denied"}
+      }
+    ]
+
+    for {reply, expected} <- replies do
+      {:ok, coordinator} = CoordinatorStub.start_link(reply)
+
+      response =
+        AgentTool.execute(
+          "plane_request_lifecycle_transition",
+          %{"targetState" => "In Review"},
+          transition_opts(route, context, coordinator)
+        )
+
+      refute response["success"]
+      error = Jason.decode!(response["output"])["error"]
+      assert error["code"] == expected["code"]
+
+      if expected["status"] do
+        assert error["status"] == expected["status"]
+      else
+        refute Map.has_key?(error, "status")
+      end
+
+      GenServer.stop(coordinator)
+    end
+  end
+
+  test "transition request reports an unavailable coordinator without provider access" do
+    parent = self()
+    route = route(:in_progress, "implementation")
+    context = semantic_context(work_item(:in_progress), contract())
+
+    response =
+      AgentTool.execute(
+        "plane_request_lifecycle_transition",
+        %{"targetState" => "In Review"},
+        transition_opts(route, context, self())
+        |> Keyword.put(:agent_tool_context, %{
+          route: route,
+          guard_evidence: %{class: :mechanical_guard, name: :implementation_checks_verified}
+        })
+        |> Keyword.put(:request_fun, fn request ->
+          send(parent, {:provider_request, request})
+          {:ok, %{status: 200}}
+        end)
+      )
+
+    refute response["success"]
+    assert Jason.decode!(response["output"])["error"]["code"] == "coordinator_unavailable"
+    refute_received {:provider_request, _request}
+
+    default_response =
+      AgentTool.execute(
+        "plane_request_lifecycle_transition",
+        %{"targetState" => "In Review"},
+        transition_opts(route, context, self())
+        |> Keyword.delete(:coordinator)
+        |> Keyword.put(:agent_tool_context, %{
+          route: route,
+          guard_evidence: %{class: :mechanical_guard, name: :implementation_checks_verified}
+        })
+      )
+
+    refute default_response["success"]
+
+    assert Jason.decode!(default_response["output"])["error"]["code"] in [
+             "coordinator_unavailable",
+             "transitions_disabled"
+           ]
   end
 
   test "transition request rejects a forged non-Plane contract before H-040" do
@@ -547,6 +759,117 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
            ]
   end
 
+  test "dependency read classifies WorkItems and unknown raw blockers without leaking provider state" do
+    canceled = %{work_item(:canceled) | id: "canceled", identifier: "SYM-CANCELED"}
+    active = %{work_item(:in_progress) | id: "active", identifier: "SYM-ACTIVE"}
+
+    decision = %{
+      allowed?: false,
+      dependency_status: "invalidated",
+      reason: 42,
+      blockers: [
+        canceled,
+        active,
+        %{"id" => "unknown"},
+        %{"id" => "unresolved", "identifier" => "SYM-UNRESOLVED"}
+      ],
+      invalidated_blockers: [:ignored, %{"id" => "unknown"}],
+      unresolved_blockers: [active, %{"id" => "unresolved"}]
+    }
+
+    response =
+      AgentTool.execute(
+        "plane_get_dependencies",
+        %{},
+        host_opts(
+          route(:in_progress, "implementation"),
+          semantic_context(work_item(:in_progress), contract(), %{
+            dependency_epoch_evidence: %{epoch: 42, completeness: "complete", complete?: true},
+            dependency_decision: decision,
+            work_control: %{}
+          })
+        )
+      )
+
+    assert response["success"]
+
+    assert Jason.decode!(response["output"]) == %{
+             "epoch" => "42",
+             "completeness" => "complete",
+             "status" => "invalidated",
+             "reason" => "42",
+             "blockers" => [
+               %{"id" => "canceled", "identifier" => "SYM-CANCELED", "classification" => "invalidated"},
+               %{"id" => "active", "identifier" => "SYM-ACTIVE", "classification" => "unavailable"},
+               %{"id" => "unknown", "identifier" => nil, "classification" => "invalidated"},
+               %{"id" => "unresolved", "identifier" => "SYM-UNRESOLVED", "classification" => "unavailable"}
+             ]
+           }
+
+    malformed =
+      AgentTool.execute(
+        "plane_get_dependencies",
+        %{},
+        host_opts(
+          route(:in_progress, "implementation"),
+          semantic_context(work_item(:in_progress), contract(), %{
+            dependency_decision: %{allowed?: false, blockers: [:not_a_blocker]}
+          })
+        )
+      )
+
+    refute malformed["success"]
+    assert Jason.decode!(malformed["output"])["error"]["code"] == "malformed_dependency_blocker"
+
+    incomplete_item = %{work_item(:in_progress) | dependency_completeness: {:incomplete, :stale}}
+
+    incomplete =
+      AgentTool.execute(
+        "plane_get_dependencies",
+        %{},
+        host_opts(
+          route(:in_progress, "implementation"),
+          semantic_context(incomplete_item, contract())
+        )
+      )
+
+    refute incomplete["success"]
+    assert Jason.decode!(incomplete["output"])["error"]["code"] == "dependency_epoch_unavailable"
+  end
+
+  test "dependency read rejects missing and malformed dependency decisions" do
+    route = route(:in_progress, "implementation")
+    work_item = work_item(:in_progress)
+
+    for decision <- [nil, %{allowed?: true, blockers: nil}, %{allowed?: true, blockers: %{}}] do
+      response =
+        AgentTool.execute(
+          "plane_get_dependencies",
+          %{},
+          host_opts(route, semantic_context(work_item, contract(), %{dependency_decision: decision}))
+        )
+
+      refute response["success"]
+      assert Jason.decode!(response["output"])["error"]["code"] == "dependency_decision_unavailable"
+    end
+
+    invalid_work_control =
+      AgentTool.execute(
+        "plane_get_dependencies",
+        %{},
+        host_opts(
+          route,
+          semantic_context(work_item, contract(), %{
+            dependency_decision: %{allowed?: true, blockers: []},
+            work_control: :not_a_map
+          })
+        )
+      )
+
+    refute invalid_work_control["success"]
+    assert Jason.decode!(invalid_work_control["output"])["error"]["code"] == "dependency_decision_unavailable"
+  end
+
   test "assessment and disposition reads expose only allowlisted fields" do
     work_item = work_item(:in_progress)
     contract = contract()
@@ -620,6 +943,15 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
         end
       end
     ]
+  end
+
+  defp transition_opts(route, context, coordinator) do
+    host_opts(route, context)
+    |> Keyword.put(:coordinator, coordinator)
+    |> Keyword.put(:agent_tool_context, %{
+      route: route,
+      guard_evidence: transition_guard_evidence()
+    })
   end
 
   defp semantic_context(work_item, contract, overrides \\ %{}) do
