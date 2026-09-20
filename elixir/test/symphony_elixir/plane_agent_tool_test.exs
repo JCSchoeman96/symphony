@@ -10,12 +10,25 @@ defmodule SymphonyElixir.PlaneAgentToolTest.CoordinatorStub do
   def handle_call(_request, _from, reply), do: {:reply, reply, reply}
 end
 
+defmodule SymphonyElixir.PlaneAgentToolTest.ThrowingContextStub do
+  use GenServer
+
+  def start, do: GenServer.start(__MODULE__, :ok)
+
+  @impl true
+  def init(state), do: {:ok, state}
+
+  @impl true
+  def handle_call(_request, _from, _state), do: throw(:context_call_failed)
+end
+
 defmodule SymphonyElixir.PlaneAgentToolTest do
   use ExUnit.Case, async: true
 
   alias SymphonyElixir.AgentRuntime.{Profile, Route}
   alias SymphonyElixir.Plane.AgentTool
   alias SymphonyElixir.PlaneAgentToolTest.CoordinatorStub
+  alias SymphonyElixir.PlaneAgentToolTest.ThrowingContextStub
   alias SymphonyElixir.Tracker.Issue
   alias SymphonyElixir.TransitionCoordinator
 
@@ -78,6 +91,15 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
     assert AgentTool.agent_tool_specs(%{}) == []
     assert AgentTool.agent_tool_specs(%{route: %Route{}}) == []
     assert AgentTool.agent_tool_specs(:not_a_context) == []
+  end
+
+  test "catalogue accepts a valid planning route and rejects a forged route" do
+    planning_route = route(:backlog, "planning")
+
+    assert Enum.count(AgentTool.agent_tool_specs(%{route: planning_route})) == 5
+
+    forged_route = %{planning_route | fingerprint: "sha256:forged"}
+    assert AgentTool.agent_tool_specs(%{route: forged_route}) == []
   end
 
   test "rejects unsupported tools and malformed read options with bounded responses" do
@@ -226,6 +248,138 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
       )
 
     assert host_map_context["success"]
+  end
+
+  test "reads handle orchestrator errors and malformed replies without leaking context" do
+    route = route(:in_progress, "implementation")
+    context = semantic_context(work_item(:in_progress), contract())
+    base_opts = [agent_tool_context: %{route: route}, tracker_settings: @settings]
+
+    {:ok, reply_server} = CoordinatorStub.start_link({:ok, context})
+
+    reply_response =
+      AgentTool.execute(
+        "plane_get_current_work_item",
+        %{},
+        Keyword.put(base_opts, :orchestrator_server, reply_server)
+      )
+
+    assert reply_response["success"]
+    GenServer.stop(reply_server)
+
+    for reply <- [{:error, :orchestrator_down}, {:ok, :malformed_context}] do
+      {:ok, server} = CoordinatorStub.start_link(reply)
+
+      response =
+        AgentTool.execute(
+          "plane_get_current_work_item",
+          %{},
+          Keyword.put(base_opts, :orchestrator_server, server)
+        )
+
+      refute response["success"]
+      assert Jason.decode!(response["output"])["error"]["code"] == "context_unavailable"
+      GenServer.stop(server)
+    end
+
+    {:ok, throwing_server} = ThrowingContextStub.start()
+
+    throwing_response =
+      AgentTool.execute(
+        "plane_get_current_work_item",
+        %{},
+        Keyword.put(base_opts, :orchestrator_server, throwing_server)
+      )
+
+    refute throwing_response["success"]
+    assert Jason.decode!(throwing_response["output"])["error"]["code"] == "context_unavailable"
+  end
+
+  test "reads reject malformed host contexts and binding evidence" do
+    route = route(:in_progress, "implementation")
+    context = semantic_context(work_item(:in_progress), contract())
+
+    invalid_host =
+      AgentTool.execute(
+        "plane_get_current_work_item",
+        %{},
+        agent_tool_context: :not_a_context,
+        tracker_settings: @settings
+      )
+
+    refute invalid_host["success"]
+    assert Jason.decode!(invalid_host["output"])["error"]["code"] == "invalid_context"
+
+    assessment = context.work_item.lifecycle_assessment
+    disposition = context.work_item.authority_disposition
+
+    malformed_contexts = [
+      Map.delete(context, :work_item),
+      Map.delete(context, :provider_project_contract),
+      %{context | provider_contract_fingerprint: "sha256:forged"},
+      %{context | work_item: %{context.work_item | provider_observation: nil}},
+      %{context | work_item: %{context.work_item | lifecycle_assessment: nil}},
+      %{
+        context
+        | work_item: %{
+            context.work_item
+            | lifecycle_assessment: %{assessment | status: :unsupported_status}
+          }
+      },
+      %{
+        context
+        | work_item: %{
+            context.work_item
+            | lifecycle_assessment: %{assessment | required_guards: :not_a_list}
+          }
+      },
+      %{context | work_item: %{context.work_item | authority_disposition: nil}}
+    ]
+
+    for malformed_context <- malformed_contexts do
+      response =
+        AgentTool.execute(
+          "plane_get_current_work_item",
+          %{},
+          host_opts(route, malformed_context)
+        )
+
+      refute response["success"]
+      assert Jason.decode!(response["output"])["error"]["code"] == "invalid_context"
+    end
+
+    invalid_scope =
+      AgentTool.execute(
+        "plane_get_current_work_item",
+        %{},
+        host_opts(route, context, nil, [])
+      )
+
+    refute invalid_scope["success"]
+    assert Jason.decode!(invalid_scope["output"])["error"]["code"] == "invalid_context"
+
+    top_level_scope = %{
+      "kind" => "plane",
+      "workspace_id" => "workspace-1",
+      "project_id" => "project-1"
+    }
+
+    assert AgentTool.execute(
+             "plane_get_current_work_item",
+             %{},
+             host_opts(route, context, nil, top_level_scope)
+           )["success"]
+
+    valid_resume =
+      %{disposition | status: :active, lifecycle_state: :in_progress, resume_target: :ready}
+
+    resume_context = %{context | work_item: %{context.work_item | authority_disposition: valid_resume}}
+
+    assert AgentTool.execute(
+             "plane_get_current_work_item",
+             %{},
+             host_opts(route, resume_context)
+           )["success"]
   end
 
   test "transition request delegates an authorized canonical intent to H-040" do
@@ -497,6 +651,29 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
         refute Map.has_key?(error, "status")
       end
 
+      GenServer.stop(coordinator)
+    end
+  end
+
+  test "transition request bounds unknown terminal and coordinator error reasons" do
+    route = route(:in_progress, "implementation")
+    context = semantic_context(work_item(:in_progress), contract())
+
+    for {reply, expected_code} <- [
+          {{:ok, %{state: :rejected, outcome_reason: :unclassified}}, "transition_rejected"},
+          {{:error, %{unexpected: :reason}}, "transition_rejected"}
+        ] do
+      {:ok, coordinator} = CoordinatorStub.start_link(reply)
+
+      response =
+        AgentTool.execute(
+          "plane_request_lifecycle_transition",
+          %{"targetState" => "In Review"},
+          transition_opts(route, context, coordinator)
+        )
+
+      refute response["success"]
+      assert Jason.decode!(response["output"])["error"]["code"] == expected_code
       GenServer.stop(coordinator)
     end
   end
@@ -868,6 +1045,199 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
 
     refute invalid_work_control["success"]
     assert Jason.decode!(invalid_work_control["output"])["error"]["code"] == "dependency_decision_unavailable"
+  end
+
+  test "dependency read serializes raw blockers, scalar epochs, and scalar reasons" do
+    route = route(:in_progress, "implementation")
+    work_item = work_item(:in_progress)
+    contract = contract()
+    blocker = blocker_work_item(:done)
+
+    known_blocker = %{
+      id: blocker.id,
+      identifier: blocker.identifier
+    }
+
+    known_blocker_context =
+      semantic_context(work_item, contract, %{
+        dependency_decision: %{
+          allowed?: false,
+          dependency_status: :satisfied,
+          reason: :known_work_item,
+          blockers: [known_blocker]
+        },
+        work_control: %{blocker.id => blocker}
+      })
+
+    known_blocker_response =
+      AgentTool.execute(
+        "plane_get_dependencies",
+        %{},
+        host_opts(route, known_blocker_context)
+      )
+
+    assert known_blocker_response["success"]
+
+    assert Jason.decode!(known_blocker_response["output"])["blockers"] == [
+             %{
+               "id" => "blocker-1",
+               "identifier" => "SYM-BLOCKER",
+               "classification" => "satisfied"
+             }
+           ]
+
+    fallback_context =
+      semantic_context(work_item, contract, %{
+        dependency_decision: %{
+          allowed?: false,
+          dependency_status: :unknown,
+          reason: :fallback,
+          blockers: [%{"id" => "fallback"}],
+          invalidated_blockers: :not_a_list,
+          unresolved_blockers: :not_a_list
+        }
+      })
+
+    fallback_response =
+      AgentTool.execute(
+        "plane_get_dependencies",
+        %{},
+        host_opts(route, fallback_context)
+      )
+
+    assert fallback_response["success"]
+
+    assert Jason.decode!(fallback_response["output"])["blockers"] == [
+             %{"id" => "fallback", "identifier" => nil, "classification" => "unavailable"}
+           ]
+
+    for {epoch, expected} <- [
+          {:epoch_atom, "epoch_atom"},
+          {1.5, "1.5"},
+          {{:epoch_tuple, 1}, "{:epoch_tuple, 1}"}
+        ] do
+      context =
+        semantic_context(work_item, contract, %{
+          dependency_epoch_evidence: %{epoch: epoch, completeness: :complete, complete?: true}
+        })
+
+      response = AgentTool.execute("plane_get_dependencies", %{}, host_opts(route, context))
+      assert response["success"]
+      assert Jason.decode!(response["output"])["epoch"] == expected
+    end
+
+    invalid_epoch =
+      AgentTool.execute(
+        "plane_get_dependencies",
+        %{},
+        host_opts(
+          route,
+          semantic_context(work_item, contract, %{dependency_epoch_evidence: :malformed})
+        )
+      )
+
+    refute invalid_epoch["success"]
+    assert Jason.decode!(invalid_epoch["output"])["error"]["code"] == "dependency_epoch_unavailable"
+
+    for {reason, expected} <- [
+          {"text_reason", "text_reason"},
+          {1.5, "1.5"},
+          {true, "true"},
+          {%{unexpected: :shape}, "unavailable"}
+        ] do
+      context =
+        semantic_context(work_item, contract, %{
+          dependency_decision: %{
+            allowed?: true,
+            dependency_status: :none,
+            reason: reason,
+            blockers: []
+          }
+        })
+
+      response = AgentTool.execute("plane_get_dependencies", %{}, host_opts(route, context))
+      assert response["success"]
+      assert Jason.decode!(response["output"])["reason"] == expected
+    end
+  end
+
+  test "dependency read maps string and fallback dependency statuses" do
+    route = route(:in_progress, "implementation")
+    work_item = work_item(:in_progress)
+    contract = contract()
+
+    for status <- ["none", "satisfied", "unresolved", "unavailable"] do
+      context =
+        semantic_context(work_item, contract, %{
+          dependency_decision: %{allowed?: true, dependency_status: status, blockers: []}
+        })
+
+      response = AgentTool.execute("plane_get_dependencies", %{}, host_opts(route, context))
+      assert response["success"]
+      assert Jason.decode!(response["output"])["status"] == status
+    end
+
+    for {allowed?, blockers, expected} <- [
+          {true, [], "none"},
+          {false, [%{"id" => "active", "state" => "In Progress"}], "unavailable"}
+        ] do
+      context =
+        semantic_context(work_item, contract, %{
+          dependency_decision: %{
+            allowed?: allowed?,
+            dependency_status: :unsupported,
+            blockers: blockers
+          }
+        })
+
+      response = AgentTool.execute("plane_get_dependencies", %{}, host_opts(route, context))
+      assert response["success"]
+      assert Jason.decode!(response["output"])["status"] == expected
+    end
+  end
+
+  test "current work-item read serializes incomplete evidence and absent timestamps" do
+    route = route(:in_progress, "implementation")
+    context = semantic_context(work_item(:in_progress), contract())
+
+    for {completeness, expected} <- [
+          {{:incomplete, :stale}, %{"status" => "incomplete", "reason" => "stale"}},
+          {:unexpected, "unavailable"}
+        ] do
+      item = %{context.work_item | dependency_completeness: completeness}
+      response = AgentTool.execute("plane_get_current_work_item", %{}, host_opts(route, %{context | work_item: item}))
+
+      assert response["success"]
+      assert Jason.decode!(response["output"])["dependencyCompleteness"] == expected
+    end
+
+    observation =
+      context.work_item.provider_observation
+      |> Map.put(:observed_at, :not_a_datetime)
+      |> Map.put(:provider_updated_at, :also_not_a_datetime)
+
+    assessment = %{context.work_item.lifecycle_assessment | provider_observation: observation}
+
+    item = %{
+      context.work_item
+      | provider_observation: observation,
+        lifecycle_assessment: assessment
+    }
+
+    response =
+      AgentTool.execute(
+        "plane_get_current_work_item",
+        %{},
+        host_opts(route, %{context | work_item: item})
+      )
+
+    assert response["success"]
+
+    assert Jason.decode!(response["output"])["providerObservation"] == %{
+             "stateName" => "In Progress",
+             "observedAt" => nil,
+             "providerUpdatedAt" => nil
+           }
   end
 
   test "assessment and disposition reads expose only allowlisted fields" do
