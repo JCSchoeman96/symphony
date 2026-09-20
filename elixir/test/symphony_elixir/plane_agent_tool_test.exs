@@ -849,8 +849,15 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
   end
 
   test "dependency read requires a complete epoch and returns bounded blocker classifications" do
-    work_item = work_item(:in_progress)
     blocker = blocker_work_item(:done)
+
+    work_item = %{
+      work_item(:in_progress)
+      | blocked_by: [
+          %{id: blocker.id, identifier: blocker.identifier, state: "Done"}
+        ]
+    }
+
     contract = contract()
 
     decision = %{
@@ -865,7 +872,7 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
     complete_context =
       semantic_context(work_item, contract, %{
         dependency_decision: decision,
-        work_control: %{"blocker-1" => blocker}
+        dependency_blocker_classifications: %{blocker.id => :satisfied}
       })
 
     complete =
@@ -930,9 +937,16 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
              "dependency_blocker_limit_exceeded"
   end
 
-  test "dependency read classifies a normalized Done blocker from orchestrator work control" do
-    work_item = work_item(:in_progress)
+  test "dependency read classifies a normalized Done blocker from bounded semantic context" do
     blocker = blocker_work_item(:done)
+
+    work_item = %{
+      work_item(:in_progress)
+      | blocked_by: [
+          %{id: blocker.id, identifier: blocker.identifier, state: "Done"}
+        ]
+    }
+
     contract = contract()
 
     decision = %{
@@ -972,6 +986,9 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
 
     assert {:reply, {:ok, semantic_context}, _state} =
              Orchestrator.handle_call({:semantic_tool_context, work_item.id}, from, state)
+
+    refute Map.has_key?(semantic_context, :work_control)
+    assert semantic_context.dependency_blocker_classifications == %{blocker.id => :satisfied}
 
     response =
       AgentTool.execute(
@@ -1060,7 +1077,7 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
           semantic_context(work_item(:in_progress), contract(), %{
             dependency_epoch_evidence: %{epoch: 42, completeness: "complete", complete?: true},
             dependency_decision: decision,
-            work_control: %{}
+            dependency_blocker_classifications: %{}
           })
         )
       )
@@ -1127,7 +1144,7 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
       assert Jason.decode!(response["output"])["error"]["code"] == "dependency_decision_unavailable"
     end
 
-    invalid_work_control =
+    invalid_blocker_classifications =
       AgentTool.execute(
         "plane_get_dependencies",
         %{},
@@ -1135,13 +1152,41 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
           route,
           semantic_context(work_item, contract(), %{
             dependency_decision: %{allowed?: true, blockers: []},
-            work_control: :not_a_map
+            dependency_blocker_classifications: :not_a_map
           })
         )
       )
 
-    refute invalid_work_control["success"]
-    assert Jason.decode!(invalid_work_control["output"])["error"]["code"] == "dependency_decision_unavailable"
+    refute invalid_blocker_classifications["success"]
+
+    assert Jason.decode!(invalid_blocker_classifications["output"])["error"]["code"] ==
+             "dependency_decision_unavailable"
+  end
+
+  test "dependency fallback bounds malformed diagnostic blocker lists" do
+    response =
+      AgentTool.execute(
+        "plane_get_dependencies",
+        %{},
+        host_opts(
+          route(:in_progress, "implementation"),
+          semantic_context(work_item(:in_progress), contract(), %{
+            dependency_decision: %{
+              allowed?: false,
+              dependency_status: :unresolved,
+              blockers: [%{"id" => "unknown"}],
+              unresolved_blockers: [%{"id" => "unknown"} | :improper_tail],
+              invalidated_blockers: [%{"id" => "other"} | :improper_tail]
+            }
+          })
+        )
+      )
+
+    assert response["success"]
+
+    assert Jason.decode!(response["output"])["blockers"] == [
+             %{"id" => "unknown", "identifier" => nil, "classification" => "unavailable"}
+           ]
   end
 
   test "dependency read serializes raw blockers, scalar epochs, and scalar reasons" do
@@ -1163,7 +1208,7 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
           reason: :known_work_item,
           blockers: [known_blocker]
         },
-        work_control: %{blocker.id => blocker}
+        dependency_blocker_classifications: %{blocker.id => :satisfied}
       })
 
     known_blocker_response =

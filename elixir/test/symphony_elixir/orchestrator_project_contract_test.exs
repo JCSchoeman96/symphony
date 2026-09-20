@@ -258,6 +258,8 @@ defmodule SymphonyElixir.OrchestratorProjectContractTest do
              Orchestrator.handle_call({:semantic_tool_context, "work-1"}, from, state)
 
     assert context.work_item == work_item
+    refute Map.has_key?(context, :work_control)
+    assert context.dependency_blocker_classifications == %{}
     assert context.dependency_decision == %{allowed?: true}
 
     assert context.dependency_epoch_evidence == %{
@@ -303,6 +305,8 @@ defmodule SymphonyElixir.OrchestratorProjectContractTest do
 
     assert context.work_item == suspended
     assert WorkItem.suspended?(context.work_item)
+    refute Map.has_key?(context, :work_control)
+    assert context.dependency_blocker_classifications == %{}
     assert context.dependency_decision == nil
 
     assert context.dependency_epoch_evidence == %{

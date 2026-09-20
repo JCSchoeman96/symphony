@@ -10,7 +10,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
   alias SymphonyElixir.AgentRuntime.{AttemptLedger, AttemptPolicy, Route, Router}
-  alias SymphonyElixir.Dependency.{Graph, Guard}
+  alias SymphonyElixir.Dependency.{Graph, Guard, Policy}
   alias SymphonyElixir.Plane.ProjectContract
   alias SymphonyElixir.Tracker.Issue
 
@@ -44,6 +44,7 @@ defmodule SymphonyElixir.Orchestrator do
     "windowdurationmins"
   ]
   @observability_rate_credit_keys ["has_credits", "unlimited", "balance"]
+  @semantic_tool_dependency_blocker_limit 128
   @blocked_termination_rules [
     {"review cycle limit", :review_cycle_exhausted},
     {"retry limit", :retry_exhausted},
@@ -3815,14 +3816,110 @@ defmodule SymphonyElixir.Orchestrator do
 
     %{
       work_item: work_item,
-      work_control: state.work_control,
       dependency_decision: Map.get(state.dependency_diagnostics || %{}, work_item_id),
+      dependency_blocker_classifications: semantic_tool_dependency_blocker_classifications(state, work_item_id),
       dependency_epoch_evidence: semantic_tool_dependency_epoch_evidence(state),
       provider_project_contract: contract,
       provider_contract_fingerprint: provider_contract_fingerprint(contract),
       project_contract_evidence: semantic_tool_project_contract_evidence(state.project_contract_evidence)
     }
   end
+
+  defp semantic_tool_dependency_blocker_classifications(%State{} = state, work_item_id) do
+    decision =
+      if is_map(state.dependency_diagnostics) do
+        Map.get(state.dependency_diagnostics, work_item_id)
+      end
+
+    blockers =
+      if is_map(decision) do
+        Map.get(decision, :blockers) || Map.get(decision, "blockers")
+      end
+
+    with {:ok, blockers} <- semantic_tool_dependency_blocker_prefix(blockers),
+         true <- is_map(state.work_control) do
+      Enum.reduce(blockers, %{}, fn blocker, classifications ->
+        semantic_tool_dependency_blocker_classification(
+          blocker,
+          state.work_control,
+          classifications
+        )
+      end)
+    else
+      _reason -> %{}
+    end
+  end
+
+  defp semantic_tool_dependency_blocker_prefix(nil), do: {:ok, []}
+
+  defp semantic_tool_dependency_blocker_prefix(blockers) when is_list(blockers) do
+    semantic_tool_dependency_blocker_prefix(
+      blockers,
+      @semantic_tool_dependency_blocker_limit,
+      []
+    )
+  end
+
+  defp semantic_tool_dependency_blocker_prefix(_blockers), do: {:error, :invalid_blockers}
+
+  defp semantic_tool_dependency_blocker_prefix([], _remaining, acc),
+    do: {:ok, Enum.reverse(acc)}
+
+  defp semantic_tool_dependency_blocker_prefix([_head | _tail], 0, acc),
+    do: {:ok, Enum.reverse(acc)}
+
+  defp semantic_tool_dependency_blocker_prefix([head | tail], remaining, acc)
+       when remaining > 0 do
+    semantic_tool_dependency_blocker_prefix(tail, remaining - 1, [head | acc])
+  end
+
+  defp semantic_tool_dependency_blocker_prefix(_improper_tail, _remaining, _acc),
+    do: {:error, :invalid_blockers}
+
+  defp semantic_tool_dependency_blocker_classification(
+         %WorkItem{} = blocker,
+         _work_control,
+         classifications
+       ) do
+    case Policy.classify_blocker(blocker) do
+      {:ok, %{status: status}} ->
+        Map.put(classifications, blocker.id, semantic_tool_dependency_classification(status))
+
+      {:error, _reason} ->
+        classifications
+    end
+  end
+
+  defp semantic_tool_dependency_blocker_classification(
+         %{} = blocker,
+         work_control,
+         classifications
+       ) do
+    with id when is_binary(id) <- semantic_tool_dependency_blocker_id(blocker),
+         %WorkItem{} = work_item <- Map.get(work_control, id),
+         {:ok, %{status: status}} <-
+           Policy.classify_blocker(blocker, work_control: %{id => work_item}) do
+      Map.put(classifications, id, semantic_tool_dependency_classification(status))
+    else
+      _reason ->
+        classifications
+    end
+  end
+
+  defp semantic_tool_dependency_blocker_classification(
+         _blocker,
+         _work_control,
+         classifications
+       ),
+       do: classifications
+
+  defp semantic_tool_dependency_blocker_id(blocker) when is_map(blocker) do
+    Map.get(blocker, :id) || Map.get(blocker, "id")
+  end
+
+  defp semantic_tool_dependency_classification(:satisfied), do: :satisfied
+  defp semantic_tool_dependency_classification(:invalidated), do: :invalidated
+  defp semantic_tool_dependency_classification(:unresolved), do: :unavailable
 
   defp semantic_tool_dependency_epoch_evidence(%State{dependency_graph: %Graph{} = graph}) do
     %{

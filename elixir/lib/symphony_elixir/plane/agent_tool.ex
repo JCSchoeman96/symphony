@@ -783,11 +783,11 @@ defmodule SymphonyElixir.Plane.AgentTool do
   end
 
   defp serialize_blockers(decision, context) do
-    work_control = map_value(context, :work_control) || %{}
+    blocker_classifications = map_value(context, :dependency_blocker_classifications) || %{}
 
     with {:ok, blockers} <- normalize_blockers(decision),
-         true <- is_map(work_control) do
-      serialize_blocker_list(blockers, decision, work_control)
+         true <- is_map(blocker_classifications) do
+      serialize_blocker_list(blockers, decision, blocker_classifications)
     else
       {:error, _reason} = error -> error
       false -> {:error, :dependency_decision_unavailable}
@@ -823,9 +823,9 @@ defmodule SymphonyElixir.Plane.AgentTool do
   defp bound_blockers(_improper_tail, _remaining, _acc),
     do: {:error, :dependency_decision_unavailable}
 
-  defp serialize_blocker_list(blockers, decision, work_control) do
+  defp serialize_blocker_list(blockers, decision, blocker_classifications) do
     Enum.reduce_while(blockers, {:ok, []}, fn blocker, {:ok, acc} ->
-      case serialize_blocker(blocker, decision, work_control) do
+      case serialize_blocker(blocker, decision, blocker_classifications) do
         {:ok, serialized} -> {:cont, {:ok, [serialized | acc]}}
         {:error, _reason} = error -> {:halt, error}
       end
@@ -836,7 +836,7 @@ defmodule SymphonyElixir.Plane.AgentTool do
     end
   end
 
-  defp serialize_blocker(%WorkItem{} = work_item, _decision, _work_control) do
+  defp serialize_blocker(%WorkItem{} = work_item, _decision, _blocker_classifications) do
     classification = classify_work_item(work_item)
 
     {:ok,
@@ -847,15 +847,15 @@ defmodule SymphonyElixir.Plane.AgentTool do
      }}
   end
 
-  defp serialize_blocker(%{} = blocker, decision, work_control) do
+  defp serialize_blocker(%{} = blocker, decision, blocker_classifications) do
     id = Map.get(blocker, :id) || Map.get(blocker, "id")
     identifier = Map.get(blocker, :identifier) || Map.get(blocker, "identifier")
 
     if present_text?(id) do
       classification =
-        case work_item_for(work_control, id) do
-          %WorkItem{} = work_item -> classify_work_item(work_item)
-          _missing -> classify_raw_blocker(blocker, decision)
+        case dependency_blocker_classification(blocker_classifications, id) do
+          nil -> classify_raw_blocker(blocker, decision)
+          classification -> classification
         end
 
       {:ok,
@@ -869,8 +869,21 @@ defmodule SymphonyElixir.Plane.AgentTool do
     end
   end
 
-  defp serialize_blocker(_blocker, _decision, _work_control),
+  defp serialize_blocker(_blocker, _decision, _blocker_classifications),
     do: {:error, :malformed_dependency_blocker}
+
+  defp dependency_blocker_classification(blocker_classifications, id)
+       when is_map(blocker_classifications) do
+    case Map.get(blocker_classifications, id) do
+      classification when classification in [:satisfied, :invalidated, :unavailable] ->
+        classification
+
+      _missing ->
+        nil
+    end
+  end
+
+  defp dependency_blocker_classification(_blocker_classifications, _id), do: nil
 
   defp classify_work_item(%WorkItem{} = work_item) do
     cond do
@@ -900,18 +913,30 @@ defmodule SymphonyElixir.Plane.AgentTool do
   end
 
   defp blocker_in?(blockers, id) when is_list(blockers) do
-    Enum.any?(blockers, fn
-      %WorkItem{id: blocker_id} -> blocker_id == id
-      blocker when is_map(blocker) -> (Map.get(blocker, :id) || Map.get(blocker, "id")) == id
-      _other -> false
-    end)
+    blocker_in?(blockers, id, @max_dependency_blockers)
   end
 
   defp blocker_in?(_blockers, _id), do: false
 
-  defp work_item_for(work_control, id) do
-    Map.get(work_control, id) || Map.get(work_control, to_string(id))
+  defp blocker_in?([], _id, _remaining), do: false
+  defp blocker_in?(_blockers, _id, 0), do: false
+
+  defp blocker_in?([blocker | tail], id, remaining) when remaining > 0 do
+    if blocker_id(blocker) == id do
+      true
+    else
+      blocker_in?(tail, id, remaining - 1)
+    end
   end
+
+  defp blocker_in?(_improper_tail, _id, _remaining), do: false
+
+  defp blocker_id(%WorkItem{id: blocker_id}), do: blocker_id
+
+  defp blocker_id(blocker) when is_map(blocker),
+    do: Map.get(blocker, :id) || Map.get(blocker, "id")
+
+  defp blocker_id(_blocker), do: nil
 
   defp dependency_status(decision, blockers) do
     status = map_value(decision, :dependency_status)
