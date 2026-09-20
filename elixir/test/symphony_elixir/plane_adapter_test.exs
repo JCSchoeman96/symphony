@@ -1,8 +1,10 @@
 defmodule SymphonyElixir.PlaneAdapterTest do
   use ExUnit.Case, async: true
 
+  alias SymphonyElixir.AgentRuntime.{Profile, Route}
   alias SymphonyElixir.Plane.Adapter
   alias SymphonyElixir.Plane.AgentTool
+  alias SymphonyElixir.Tracker.Capabilities
   alias SymphonyElixir.Tracker.Issue
   alias SymphonyElixir.WorkControl.{ProviderProjectContract, WorkflowLifecycle}
 
@@ -14,22 +16,35 @@ defmodule SymphonyElixir.PlaneAdapterTest do
     secret_environment_names: ["PLANE_API_KEY"]
   }
 
-  test "declares only the graduated host capabilities" do
+  test "declares the graduated host capabilities" do
     assert Adapter.capabilities() == [
              :current_issue_refresh,
              :dependency_graph,
              :dependency_completeness,
              :controlled_transition,
-             :transition_verification
+             :transition_verification,
+             :agent_read_tools,
+             :agent_transition_tools
            ]
 
+    assert {:ok, Adapter.capabilities()} == Capabilities.validate_adapter(Adapter)
     assert Adapter.secret_environment_names(@settings) == ["PLANE_API_KEY"]
   end
 
-  test "forwards semantic Plane tool callbacks without changing capabilities" do
+  test "forwards semantic Plane tool callbacks without exposing provider scope" do
     assert Adapter.agent_tool_specs() == AgentTool.agent_tool_specs()
 
     assert Adapter.agent_tool_specs(%{}) == []
+
+    specs = Adapter.agent_tool_specs(%{route: merge_route()})
+    assert Enum.count(specs) == 4
+    refute Enum.any?(specs, &(&1["name"] == "plane_request_lifecycle_transition"))
+
+    encoded_specs = Jason.encode!(specs)
+    refute encoded_specs =~ "workspace-stable-1"
+    refute encoded_specs =~ "project-1"
+    refute encoded_specs =~ "PLANE_API_KEY"
+    refute encoded_specs =~ "secret"
 
     assert Adapter.execute_agent_tool("plane_request_lifecycle_transition", %{}, [])[
              "success"
@@ -183,6 +198,20 @@ defmodule SymphonyElixir.PlaneAdapterTest do
     assert snapshot.capability_statuses.dependency_completeness == :supported
     assert snapshot.capability_statuses.controlled_transition == :supported
     assert snapshot.capability_statuses.transition_verification == :supported
+    assert snapshot.capability_statuses.agent_read_tools == :supported
+    assert snapshot.capability_statuses.agent_transition_tools == :supported
+    assert snapshot.capability_statuses.conditional_transition == :unsupported
+
+    assert snapshot.capability_statuses == %{
+             current_issue_refresh: :supported,
+             dependency_graph: :supported,
+             dependency_completeness: :supported,
+             controlled_transition: :supported,
+             transition_verification: :supported,
+             agent_read_tools: :supported,
+             agent_transition_tools: :supported,
+             conditional_transition: :unsupported
+           }
   end
 
   test "performs a host-only stable-UUID transition through the scoped PATCH" do
@@ -337,6 +366,11 @@ defmodule SymphonyElixir.PlaneAdapterTest do
       })
 
     contract
+  end
+
+  defp merge_route do
+    profile = Profile.default_profiles("codex app-server", 20)["merge_gatekeeper"]
+    Route.new(%Issue{id: "merge-work", state: "Ready to Merge", dispatchable: true}, profile)
   end
 
   test "rejects a project response with a contradictory stable workspace or project ID" do

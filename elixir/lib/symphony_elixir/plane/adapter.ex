@@ -18,7 +18,9 @@ defmodule SymphonyElixir.Plane.Adapter do
       :dependency_graph,
       :dependency_completeness,
       :controlled_transition,
-      :transition_verification
+      :transition_verification,
+      :agent_read_tools,
+      :agent_transition_tools
     ]
   end
 
@@ -412,7 +414,9 @@ defmodule SymphonyElixir.Plane.Adapter do
            :dependency_graph,
            :dependency_completeness,
            :controlled_transition,
-           :transition_verification
+           :transition_verification,
+           :agent_read_tools,
+           :agent_transition_tools
          ],
          do: :supported,
          else: :unsupported

@@ -52,6 +52,7 @@ defmodule SymphonyElixir.TrackerCapabilitiesTest do
 
   alias SymphonyElixir.Config
   alias SymphonyElixir.Config.Schema
+  alias SymphonyElixir.Plane.Adapter
   alias SymphonyElixir.Tracker
   alias SymphonyElixir.Tracker.Capabilities
   alias SymphonyElixir.TransitionCoordinator
@@ -96,6 +97,13 @@ defmodule SymphonyElixir.TrackerCapabilitiesTest do
     assert {:ok, declared} = Tracker.capabilities_for_kind("linear")
     refute :transition_verification in declared
     refute :agent_read_tools in declared
+  end
+
+  test "Plane satisfies the complete routed capability contract without conditional transitions" do
+    assert {:ok, declared} = Tracker.capabilities_for_kind("plane")
+    assert declared == Capabilities.required_routed()
+    assert {:ok, ^declared} = Capabilities.validate_adapter(Adapter)
+    refute :conditional_transition in declared
   end
 
   test "missing routed capabilities reject configuration before dispatch" do

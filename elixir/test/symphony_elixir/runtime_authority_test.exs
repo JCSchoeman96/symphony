@@ -324,8 +324,8 @@ defmodule SymphonyElixir.RuntimeAuthorityTest do
     capabilities = Adapter.capabilities()
 
     assert :controlled_transition in capabilities
-    refute :agent_read_tools in capabilities
-    refute :agent_transition_tools in capabilities
+    assert :agent_read_tools in capabilities
+    assert :agent_transition_tools in capabilities
     refute :conditional_transition in capabilities
 
     profiles = Profile.default_profiles("codex app-server", 20)
