@@ -85,10 +85,11 @@ defmodule SymphonyElixir.Codex.AppServer do
         opts \\ []
       ) do
     on_message = Keyword.get(opts, :on_message, &default_on_message/1)
+    turn_tool_binding = overlay_agent_tool_context(dynamic_tool_binding, opts)
 
     tool_executor =
       Keyword.get(opts, :tool_executor, fn tool, arguments ->
-        DynamicTool.execute(tool, arguments, dynamic_tool_binding, issue: issue)
+        DynamicTool.execute(tool, arguments, turn_tool_binding, issue: issue)
       end)
 
     case start_turn(
@@ -1040,6 +1041,13 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp default_on_message(_message), do: :ok
+
+  defp overlay_agent_tool_context(binding, opts) do
+    case Keyword.get(opts, :agent_tool_context) do
+      context when is_map(context) -> Map.put(binding, :agent_tool_context, context)
+      _missing -> binding
+    end
+  end
 
   defp tool_call_name(params) when is_map(params) do
     case Map.get(params, "tool") || Map.get(params, :tool) || Map.get(params, "name") || Map.get(params, :name) do

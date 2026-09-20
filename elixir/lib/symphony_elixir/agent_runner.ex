@@ -136,6 +136,7 @@ defmodule SymphonyElixir.AgentRunner do
       |> Keyword.put(:worker_host, worker_host)
       |> profile_runtime_options(route)
       |> Keyword.put(:agent_tool_context, agent_tool_context(issue, route, opts))
+      |> Keyword.delete(:route)
 
     role_prompt = PromptBuilder.role_prompt(route)
 
@@ -150,7 +151,8 @@ defmodule SymphonyElixir.AgentRunner do
         issue_state_fetcher: issue_state_fetcher,
         route: route,
         role_prompt: role_prompt,
-        work_item: Keyword.get(opts, :work_item)
+        work_item: Keyword.get(opts, :work_item),
+        session_restarted?: false
       }
 
       run_runtime_session(runtime, session, fn ->
@@ -160,7 +162,12 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp do_run_codex_turns(context, turn_number, max_turns) do
-    prompt_opts = Keyword.put(context.opts, :role_prompt, context.role_prompt)
+    prompt_opts =
+      context.opts
+      |> Keyword.put(:role_prompt, context.role_prompt)
+      |> Keyword.put(:route, context.route)
+      |> Keyword.put(:session_restarted?, context.session_restarted?)
+
     prompt = build_turn_prompt(context.issue, prompt_opts, turn_number, max_turns)
 
     with {:ok, _turn_result} <-
@@ -232,6 +239,16 @@ defmodule SymphonyElixir.AgentRunner do
         kind, reason -> {:raised, kind, reason, __STACKTRACE__}
       end
 
+    case execution_result do
+      {:returned, {:restart_runtime_session, next_context, turn_number, max_turns}} ->
+        restart_runtime_session(runtime, session, next_context, turn_number, max_turns)
+
+      _other ->
+        finish_runtime_session(runtime, session, execution_result)
+    end
+  end
+
+  defp finish_runtime_session(runtime, session, execution_result) do
     case stop_runtime_session(runtime, session) do
       :ok ->
         restore_execution_result(execution_result)
@@ -317,10 +334,42 @@ defmodule SymphonyElixir.AgentRunner do
           | issue: refreshed_issue,
             route: refreshed_route,
             opts: next_opts,
-            work_item: refreshed_work_item
+            work_item: refreshed_work_item,
+            session_restarted?: false
         }
 
-        do_run_codex_turns(next_context, turn_number + 1, max_turns)
+        if route_catalogue_changed?(context.route, refreshed_route) do
+          {:restart_runtime_session, next_context, turn_number + 1, max_turns}
+        else
+          do_run_codex_turns(next_context, turn_number + 1, max_turns)
+        end
+    end
+  end
+
+  defp restart_runtime_session(runtime, session, next_context, turn_number, max_turns) do
+    case stop_runtime_session(runtime, session) do
+      :ok ->
+        start_restarted_runtime_session(runtime, next_context, turn_number, max_turns)
+
+      {:error, {:session_not_active, :stopped}} ->
+        start_restarted_runtime_session(runtime, next_context, turn_number, max_turns)
+
+      {:error, reason} ->
+        {:error, {:runtime_stop_failed, reason}}
+    end
+  end
+
+  defp start_restarted_runtime_session(runtime, next_context, turn_number, max_turns) do
+    case runtime.start_session(next_context.workspace, next_context.opts) do
+      {:ok, session} ->
+        restarted_context = %{next_context | session: session, session_restarted?: true}
+
+        run_runtime_session(runtime, session, fn ->
+          do_run_codex_turns(restarted_context, turn_number, max_turns)
+        end)
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -477,6 +526,14 @@ defmodule SymphonyElixir.AgentRunner do
   defp route_changed?(%Route{} = left, %Route{} = right), do: not Route.same?(left, right)
   defp route_changed?(_left, _right), do: true
 
+  # Route.same?/2 intentionally preserves same-profile continuation identity.
+  # Plane's lifecycle schema is source-state-specific, so a source change needs
+  # a new runtime thread even when the route remains the same.
+  defp route_catalogue_changed?(%Route{} = left, %Route{} = right),
+    do: left.starting_state != right.starting_state
+
+  defp route_catalogue_changed?(_left, _right), do: false
+
   defp notify_route_change(
          recipient,
          %Issue{id: issue_id},
@@ -529,6 +586,7 @@ defmodule SymphonyElixir.AgentRunner do
     context = %{
       issue_id: issue.id,
       current_issue_state: issue.state,
+      route: route,
       responsibility: route.responsibility,
       dependency_decision: dependency_decision_from_options(issue, route, opts),
       work_control: Keyword.get(opts, :work_control, %{}),
@@ -649,23 +707,39 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp build_turn_prompt(issue, opts, 1, _max_turns), do: PromptBuilder.build_prompt(issue, opts)
 
-  defp build_turn_prompt(_issue, opts, turn_number, max_turns) do
-    continuation = """
-    Continuation guidance:
+  defp build_turn_prompt(issue, opts, turn_number, max_turns) do
+    continuation =
+      if Keyword.get(opts, :session_restarted?, false) do
+        """
+        Continuation guidance:
 
-    - The previous Codex turn completed normally, but the tracker work item is still in an active state.
-    - This is continuation turn ##{turn_number} of #{max_turns} for the current agent run.
-    - Resume from the current workspace and workpad state instead of restarting from scratch.
-    - The original task instructions and prior turn context are already present in this thread, so do not restate them before acting.
-    - Focus on the remaining ticket work and do not end the turn while the issue stays active unless you are truly blocked.
-    """
+        - The previous Codex turn completed normally, but the tracker work item is still in an active state.
+        - This is continuation turn ##{turn_number} of #{max_turns} for the current agent run.
+        - A new runtime thread was started after the trusted route changed. Use the current workspace and the task prompt above; prior thread messages are not available.
+        - Focus on the remaining ticket work and do not end the turn while the issue stays active unless you are truly blocked.
+        """
+      else
+        """
+        Continuation guidance:
 
-    case Keyword.fetch(opts, :role_prompt) do
-      {:ok, role_prompt} ->
-        PromptBuilder.with_role_prompt(continuation, Keyword.get(opts, :route), role_prompt)
+        - The previous Codex turn completed normally, but the tracker work item is still in an active state.
+        - This is continuation turn ##{turn_number} of #{max_turns} for the current agent run.
+        - Resume from the current workspace and workpad state instead of restarting from scratch.
+        - The original task instructions and prior turn context are already present in this thread, so do not restate them before acting.
+        - Focus on the remaining ticket work and do not end the turn while the issue stays active unless you are truly blocked.
+        """
+      end
 
-      :error ->
-        PromptBuilder.with_role_prompt(continuation, Keyword.get(opts, :route))
+    if Keyword.get(opts, :session_restarted?, false) do
+      PromptBuilder.build_prompt(issue, opts) <> "\n\n" <> continuation
+    else
+      case Keyword.fetch(opts, :role_prompt) do
+        {:ok, role_prompt} ->
+          PromptBuilder.with_role_prompt(continuation, Keyword.get(opts, :route), role_prompt)
+
+        :error ->
+          PromptBuilder.with_role_prompt(continuation, Keyword.get(opts, :route))
+      end
     end
   end
 

@@ -92,9 +92,10 @@ defmodule SymphonyElixir.PlaneConfigTest do
     assert {:error, :literal_plane_api_key_forbidden} = Config.validate_settings(top_level)
   end
 
-  test "routed Plane remains fail-closed while later capabilities are absent" do
+  test "routed Plane passes capability and configuration validation" do
     assert {:ok, settings} =
              Schema.parse(%{
+               "symphony" => %{"project_id" => "symphony-plane"},
                "tracker" => %{
                  "kind" => "plane",
                  "provider" => %{
@@ -107,10 +108,10 @@ defmodule SymphonyElixir.PlaneConfigTest do
                "agent" => %{"routing" => "routed"}
              })
 
-    assert {:error, {:routed_provider_capabilities_missing, "plane", missing}} =
-             Config.validate_settings(settings)
-
-    assert missing == [:agent_read_tools, :agent_transition_tools]
+    assert :ok = Config.validate_settings(settings)
+    assert {:ok, declared} = Tracker.capabilities_for_kind("plane")
+    assert :agent_read_tools in declared
+    assert :agent_transition_tools in declared
   end
 
   test "missing Plane credentials and repository endpoints fail before transport" do

@@ -249,8 +249,8 @@ defmodule SymphonyElixir.RuntimeTransitionAuthorityBindingTest do
     capabilities = Adapter.capabilities()
 
     assert :controlled_transition in capabilities
-    refute :agent_read_tools in capabilities
-    refute :agent_transition_tools in capabilities
+    assert :agent_read_tools in capabilities
+    assert :agent_transition_tools in capabilities
     refute :conditional_transition in capabilities
   end
 

@@ -10,7 +10,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
   alias SymphonyElixir.AgentRuntime.{AttemptLedger, AttemptPolicy, Route, Router}
-  alias SymphonyElixir.Dependency.{Graph, Guard}
+  alias SymphonyElixir.Dependency.{Graph, Guard, Policy}
   alias SymphonyElixir.Plane.ProjectContract
   alias SymphonyElixir.Tracker.Issue
 
@@ -44,6 +44,7 @@ defmodule SymphonyElixir.Orchestrator do
     "windowdurationmins"
   ]
   @observability_rate_credit_keys ["has_credits", "unlimited", "balance"]
+  @semantic_tool_dependency_blocker_limit 128
   @blocked_termination_rules [
     {"review cycle limit", :review_cycle_exhausted},
     {"retry limit", :retry_exhausted},
@@ -3800,6 +3801,147 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp semantic_tool_context_for_state(%State{} = state, work_item_id) do
+    case Map.get(state.work_control, work_item_id) do
+      %WorkItem{} = work_item ->
+        {:ok, build_semantic_tool_context(state, work_item_id, work_item)}
+
+      _missing ->
+        {:error, :work_item_not_found}
+    end
+  end
+
+  defp build_semantic_tool_context(%State{} = state, work_item_id, %WorkItem{} = work_item) do
+    contract = semantic_tool_project_contract(state.project_contract_evidence)
+
+    %{
+      work_item: work_item,
+      dependency_decision: Map.get(state.dependency_diagnostics || %{}, work_item_id),
+      dependency_blocker_classifications: semantic_tool_dependency_blocker_classifications(state, work_item_id),
+      dependency_epoch_evidence: semantic_tool_dependency_epoch_evidence(state),
+      provider_project_contract: contract,
+      provider_contract_fingerprint: provider_contract_fingerprint(contract),
+      project_contract_evidence: semantic_tool_project_contract_evidence(state.project_contract_evidence)
+    }
+  end
+
+  defp semantic_tool_dependency_blocker_classifications(%State{} = state, work_item_id) do
+    decision =
+      if is_map(state.dependency_diagnostics) do
+        Map.get(state.dependency_diagnostics, work_item_id)
+      end
+
+    blockers =
+      if is_map(decision) do
+        Map.get(decision, :blockers) || Map.get(decision, "blockers")
+      end
+
+    with {:ok, blockers} <- semantic_tool_dependency_blocker_prefix(blockers),
+         true <- is_map(state.work_control) do
+      Enum.reduce(blockers, %{}, fn blocker, classifications ->
+        semantic_tool_dependency_blocker_classification(
+          blocker,
+          state.work_control,
+          classifications
+        )
+      end)
+    else
+      _reason -> %{}
+    end
+  end
+
+  defp semantic_tool_dependency_blocker_prefix(nil), do: {:ok, []}
+
+  defp semantic_tool_dependency_blocker_prefix(blockers) when is_list(blockers) do
+    semantic_tool_dependency_blocker_prefix(
+      blockers,
+      @semantic_tool_dependency_blocker_limit,
+      []
+    )
+  end
+
+  defp semantic_tool_dependency_blocker_prefix(_blockers), do: {:error, :invalid_blockers}
+
+  defp semantic_tool_dependency_blocker_prefix([], _remaining, acc),
+    do: {:ok, Enum.reverse(acc)}
+
+  defp semantic_tool_dependency_blocker_prefix([_head | _tail], 0, acc),
+    do: {:ok, Enum.reverse(acc)}
+
+  defp semantic_tool_dependency_blocker_prefix([head | tail], remaining, acc)
+       when remaining > 0 do
+    semantic_tool_dependency_blocker_prefix(tail, remaining - 1, [head | acc])
+  end
+
+  defp semantic_tool_dependency_blocker_prefix(_improper_tail, _remaining, _acc),
+    do: {:error, :invalid_blockers}
+
+  defp semantic_tool_dependency_blocker_classification(
+         %WorkItem{} = blocker,
+         _work_control,
+         classifications
+       ) do
+    case Policy.classify_blocker(blocker) do
+      {:ok, %{status: status}} ->
+        Map.put(classifications, blocker.id, semantic_tool_dependency_classification(status))
+
+      {:error, _reason} ->
+        classifications
+    end
+  end
+
+  defp semantic_tool_dependency_blocker_classification(
+         %{} = blocker,
+         work_control,
+         classifications
+       ) do
+    with id when is_binary(id) <- semantic_tool_dependency_blocker_id(blocker),
+         %WorkItem{} = work_item <- Map.get(work_control, id),
+         {:ok, %{status: status}} <-
+           Policy.classify_blocker(blocker, work_control: %{id => work_item}) do
+      Map.put(classifications, id, semantic_tool_dependency_classification(status))
+    else
+      _reason ->
+        classifications
+    end
+  end
+
+  defp semantic_tool_dependency_blocker_classification(
+         _blocker,
+         _work_control,
+         classifications
+       ),
+       do: classifications
+
+  defp semantic_tool_dependency_blocker_id(blocker) when is_map(blocker) do
+    Map.get(blocker, :id) || Map.get(blocker, "id")
+  end
+
+  defp semantic_tool_dependency_classification(:satisfied), do: :satisfied
+  defp semantic_tool_dependency_classification(:invalidated), do: :invalidated
+  defp semantic_tool_dependency_classification(:unresolved), do: :unavailable
+
+  defp semantic_tool_dependency_epoch_evidence(%State{dependency_graph: %Graph{} = graph}) do
+    %{
+      epoch: graph.epoch,
+      completeness: graph.completeness,
+      complete?: Graph.complete?(graph)
+    }
+  end
+
+  defp semantic_tool_dependency_epoch_evidence(%State{}) do
+    %{epoch: nil, completeness: {:unavailable, :unknown}, complete?: false}
+  end
+
+  defp semantic_tool_project_contract(%ProjectContractEvidence{contract: contract}), do: contract
+  defp semantic_tool_project_contract(_evidence), do: nil
+
+  defp semantic_tool_project_contract_evidence(%ProjectContractEvidence{} = evidence),
+    do: ProjectContractEvidence.observability(evidence)
+
+  defp semantic_tool_project_contract_evidence(_evidence),
+    do: ProjectContractEvidence.observability(nil)
+
   defp transition_context_available?(%State{} = state, work_item_id, %WorkItem{} = work_item) do
     with :ok <- validate_transition_work_item(work_item),
          :ok <- validate_transition_dependency_context(state, work_item_id),
@@ -3980,6 +4122,23 @@ defmodule SymphonyElixir.Orchestrator do
       when is_binary(work_item_id) and is_list(opts) do
     if server_available?(server) do
       GenServer.call(server, {:transition_context, work_item_id, opts})
+    else
+      :unavailable
+    end
+  end
+
+  @doc """
+  Returns current host-owned canonical context for one work item.
+
+  This read path preserves local lifecycle, dependency, and project-contract
+  evidence even when the item is suspended or the evidence is incomplete. It
+  does not refresh provider state or validate transition authority.
+  """
+  @spec semantic_tool_context(GenServer.server(), String.t()) ::
+          {:ok, map()} | {:error, :work_item_not_found} | :unavailable
+  def semantic_tool_context(server \\ __MODULE__, work_item_id) when is_binary(work_item_id) do
+    if server_available?(server) do
+      GenServer.call(server, {:semantic_tool_context, work_item_id})
     else
       :unavailable
     end
@@ -4230,6 +4389,14 @@ defmodule SymphonyElixir.Orchestrator do
   def handle_call({:transition_context, work_item_id, opts}, _from, %State{} = state)
       when is_binary(work_item_id) and is_list(opts) do
     case transition_context_for_state(state, work_item_id, opts) do
+      {:ok, context} -> {:reply, {:ok, context}, state}
+      {:error, _reason} = error -> {:reply, error, state}
+    end
+  end
+
+  def handle_call({:semantic_tool_context, work_item_id}, _from, %State{} = state)
+      when is_binary(work_item_id) do
+    case semantic_tool_context_for_state(state, work_item_id) do
       {:ok, context} -> {:reply, {:ok, context}, state}
       {:error, _reason} = error -> {:reply, error, state}
     end
