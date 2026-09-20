@@ -3815,6 +3815,7 @@ defmodule SymphonyElixir.Orchestrator do
 
     %{
       work_item: work_item,
+      work_control: state.work_control,
       dependency_decision: Map.get(state.dependency_diagnostics || %{}, work_item_id),
       dependency_epoch_evidence: semantic_tool_dependency_epoch_evidence(state),
       provider_project_contract: contract,

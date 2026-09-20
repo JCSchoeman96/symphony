@@ -26,6 +26,8 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
   use ExUnit.Case, async: true
 
   alias SymphonyElixir.AgentRuntime.{Profile, Route}
+  alias SymphonyElixir.Dependency.Graph
+  alias SymphonyElixir.Orchestrator
   alias SymphonyElixir.Plane.AgentTool
   alias SymphonyElixir.PlaneAgentToolTest.CoordinatorStub
   alias SymphonyElixir.PlaneAgentToolTest.ThrowingContextStub
@@ -35,6 +37,7 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
   alias SymphonyElixir.WorkControl.{
     AuthorityDisposition,
     GuardClass,
+    ProjectContractEvidence,
     ProviderProjectContract,
     WorkflowLifecycle,
     WorkItem
@@ -898,6 +901,73 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
       )
 
     refute incomplete["success"]
+  end
+
+  test "dependency read classifies a normalized Done blocker from orchestrator work control" do
+    work_item = work_item(:in_progress)
+    blocker = blocker_work_item(:done)
+    contract = contract()
+
+    decision = %{
+      allowed?: true,
+      dependency_status: :satisfied,
+      reason: :dependencies_satisfied,
+      blockers: [
+        %{
+          id: blocker.id,
+          identifier: blocker.identifier,
+          state: blocker.provider_observation.provider_state_name
+        }
+      ],
+      unresolved_blockers: [],
+      invalidated_blockers: []
+    }
+
+    state = %Orchestrator.State{
+      work_control: %{work_item.id => work_item, blocker.id => blocker},
+      dependency_diagnostics: %{work_item.id => decision},
+      dependency_graph:
+        Graph.build(
+          [
+            %Issue{
+              id: work_item.id,
+              identifier: work_item.identifier,
+              title: work_item.title,
+              state: "In Progress"
+            }
+          ],
+          epoch: "epoch-1"
+        ),
+      project_contract_evidence: ProjectContractEvidence.new(contract)
+    }
+
+    from = {self(), make_ref()}
+
+    assert {:reply, {:ok, semantic_context}, _state} =
+             Orchestrator.handle_call({:semantic_tool_context, work_item.id}, from, state)
+
+    response =
+      AgentTool.execute(
+        "plane_get_dependencies",
+        %{},
+        host_opts(route(:in_progress, "implementation"), semantic_context)
+      )
+
+    assert response["success"]
+
+    assert Jason.decode!(response["output"]) == %{
+             "epoch" => "epoch-1",
+             "completeness" => "complete",
+             "status" => "satisfied",
+             "reason" => "dependencies_satisfied",
+             "blockers" => [
+               %{
+                 "id" => "blocker-1",
+                 "identifier" => "SYM-BLOCKER",
+                 "classification" => "satisfied"
+               }
+             ]
+           }
   end
 
   test "dependency read classifies cancellation as invalidated and raw Done as unavailable" do
