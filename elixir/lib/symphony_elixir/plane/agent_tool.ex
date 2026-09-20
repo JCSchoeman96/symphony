@@ -5,6 +5,9 @@ defmodule SymphonyElixir.Plane.AgentTool do
   The tools read canonical state held by the orchestrator. Lifecycle requests
   delegate to the host-owned transition coordinator and never accept provider
   transport details from the runtime.
+
+  Dependency reads reject blocker lists longer than 128 entries and inspect at
+  most one item beyond that bound before returning an error.
   """
 
   alias SymphonyElixir.AgentRuntime.{Authority, Route}
@@ -27,6 +30,8 @@ defmodule SymphonyElixir.Plane.AgentTool do
   @lifecycle_assessment_tool "plane_get_lifecycle_assessment"
   @authority_disposition_tool "plane_get_authority_disposition"
   @transition_request_tool "plane_request_lifecycle_transition"
+
+  @max_dependency_blockers 128
 
   @read_tool_names [
     @current_work_item_tool,
@@ -795,12 +800,26 @@ defmodule SymphonyElixir.Plane.AgentTool do
           else: {:ok, []}
 
       blockers when is_list(blockers) ->
-        {:ok, blockers}
+        bound_blockers(blockers)
 
       _invalid ->
         {:error, :dependency_decision_unavailable}
     end
   end
+
+  defp bound_blockers(blockers), do: bound_blockers(blockers, @max_dependency_blockers, [])
+
+  defp bound_blockers([], _remaining, acc), do: {:ok, Enum.reverse(acc)}
+
+  defp bound_blockers([_head | _tail], 0, _acc),
+    do: {:error, :dependency_blocker_limit_exceeded}
+
+  defp bound_blockers([head | tail], remaining, acc) when remaining > 0 do
+    bound_blockers(tail, remaining - 1, [head | acc])
+  end
+
+  defp bound_blockers(_improper_tail, _remaining, _acc),
+    do: {:error, :dependency_decision_unavailable}
 
   defp serialize_blocker_list(blockers, decision, work_control) do
     Enum.reduce_while(blockers, {:ok, []}, fn blocker, {:ok, acc} ->

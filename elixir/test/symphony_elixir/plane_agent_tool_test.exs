@@ -904,6 +904,32 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
     refute incomplete["success"]
   end
 
+  test "dependency read rejects over-limit blocker lists after a bounded prefix scan" do
+    max_blockers = 128
+
+    over_limit_blockers =
+      Enum.reduce(0..max_blockers, :unexamined_tail, fn index, tail ->
+        [%{"id" => "blocker-#{index}"} | tail]
+      end)
+
+    response =
+      AgentTool.execute(
+        "plane_get_dependencies",
+        %{},
+        host_opts(
+          route(:in_progress, "implementation"),
+          semantic_context(work_item(:in_progress), contract(), %{
+            dependency_decision: %{allowed?: false, blockers: over_limit_blockers}
+          })
+        )
+      )
+
+    refute response["success"]
+
+    assert Jason.decode!(response["output"])["error"]["code"] ==
+             "dependency_blocker_limit_exceeded"
+  end
+
   test "dependency read classifies a normalized Done blocker from orchestrator work control" do
     work_item = work_item(:in_progress)
     blocker = blocker_work_item(:done)
