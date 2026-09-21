@@ -93,6 +93,42 @@ defmodule SymphonyElixir.SourceControl.MergeVerificationTest do
     assert verification.status == :not_merged
   end
 
+  test "host verify_merge_from_evidence with synthetic_merge checks after ordinary merge" do
+    config = synthetic_merge_config()
+    evidence = review_acceptance_evidence(config)
+
+    assert {:ok, verification} =
+             SourceControl.verify_merge_from_evidence(evidence,
+               source_control_config: config,
+               settings: %{symphony: %{project_id: "project-1"}},
+               token: "token",
+               request_fun: fn _token, path, _params, _opts ->
+                 {:ok, merged_payload_with_checks(path, "success", :ordinary)}
+               end
+             )
+
+    assert MergeVerification.verified?(verification)
+    assert verification.merge_strategy == :ordinary
+  end
+
+  test "host verify_merge_from_evidence with synthetic_merge checks after squash merge" do
+    config = synthetic_merge_config()
+    evidence = review_acceptance_evidence(config)
+
+    assert {:ok, verification} =
+             SourceControl.verify_merge_from_evidence(evidence,
+               source_control_config: config,
+               settings: %{symphony: %{project_id: "project-1"}},
+               token: "token",
+               request_fun: fn _token, path, _params, _opts ->
+                 {:ok, merged_payload_with_checks(path, "success", :squash)}
+               end
+             )
+
+    assert MergeVerification.verified?(verification)
+    assert verification.merge_strategy == :squash
+  end
+
   test "host verify_merge_from_evidence requires required checks after exact merge" do
     evidence = [
       %{
@@ -192,7 +228,32 @@ defmodule SymphonyElixir.SourceControl.MergeVerificationTest do
       else: nil
   end
 
-  defp merged_payload_with_checks(path, conclusion) do
+  defp synthetic_merge_config do
+    Map.put(@config, :required_checks, [
+      %{context: "make-all", app_id: 15_368, subject: "synthetic_merge"}
+    ])
+  end
+
+  defp review_acceptance_evidence(config) do
+    [
+      %{
+        class: :mechanical_guard,
+        name: :review_acceptance_verified,
+        outcome: :verified,
+        candidate_ref: Map.from_struct(candidate_ref()),
+        candidate_tree_sha: @tree,
+        policy_fingerprint: SourceControl.policy_fingerprint_for(config, %{symphony: %{project_id: "project-1"}})
+      }
+    ]
+  end
+
+  defp merged_payload_with_checks(path, conclusion, merge_strategy \\ :ordinary) do
+    merge_parents =
+      case merge_strategy do
+        :squash -> [%{"sha" => @sha_a}]
+        _ -> [%{"sha" => @sha_a}, %{"sha" => @sha_b}]
+      end
+
     cond do
       repository_payload(path) ->
         repository_payload(path)
@@ -209,7 +270,7 @@ defmodule SymphonyElixir.SourceControl.MergeVerificationTest do
         %{
           "sha" => @sha_m,
           "tree" => %{"sha" => @tree},
-          "parents" => [%{"sha" => @sha_a}, %{"sha" => @sha_b}]
+          "parents" => merge_parents
         }
 
       String.contains?(path, "/git/ref/heads/main") ->

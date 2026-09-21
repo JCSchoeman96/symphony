@@ -204,12 +204,22 @@ defmodule SymphonyElixir.GitHub.SourceControl do
   end
 
   defp validate_synthetic_merge_subjects(config, candidate_ref, candidate_tree_sha, checks, opts) do
-    if Enum.any?(checks, &synthetic_merge_check?/1) do
-      do_validate_synthetic_merge_subject(config, candidate_ref, candidate_tree_sha, opts)
-    else
-      :ok
+    cond do
+      skip_synthetic_merge_validation?(opts) ->
+        :ok
+
+      Enum.any?(checks, &synthetic_merge_check?/1) ->
+        do_validate_synthetic_merge_subject(config, candidate_ref, candidate_tree_sha, opts)
+
+      true ->
+        :ok
     end
   end
+
+  defp skip_synthetic_merge_validation?(opts) when is_list(opts),
+    do: Keyword.get(opts, :merge_verified?, false)
+
+  defp skip_synthetic_merge_validation?(_opts), do: false
 
   defp do_validate_synthetic_merge_subject(config, candidate_ref, candidate_tree_sha, opts) do
     with {:ok, merge_commit} <- fetch_merge_ref_commit(config, candidate_ref.pr_identity, opts) do

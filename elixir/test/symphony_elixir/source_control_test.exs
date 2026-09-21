@@ -271,6 +271,47 @@ defmodule SymphonyElixir.SourceControlTest do
     assert entry.outcome == :verified
   end
 
+  test "reconcile preserves merged review acceptance for synthetic_merge required checks" do
+    {:ok, ref} =
+      CandidateRef.new(%{
+        repository_identity: "github:repository:1368436395",
+        base_sha: @sha_a,
+        candidate_sha: @sha_b,
+        pr_identity: "15",
+        observed_pr_head_sha: @sha_b
+      })
+
+    sha_m = String.duplicate("d", 40)
+    tree = String.duplicate("c", 40)
+    synthetic_config = synthetic_merge_config()
+
+    evidence = [
+      %{
+        class: :mechanical_guard,
+        name: :review_acceptance_verified,
+        outcome: :verified,
+        candidate_ref: Map.from_struct(ref),
+        candidate_tree_sha: tree,
+        policy_fingerprint: synthetic_policy_fingerprint()
+      }
+    ]
+
+    assert {:ok, reconciled} =
+             SourceControl.reconcile_stored_evidence(
+               :ready_to_merge,
+               evidence,
+               source_control_config: synthetic_config,
+               settings: %{symphony: %{project_id: "project-1"}},
+               token: "token",
+               request_fun: fn _token, path, _params, _opts ->
+                 {:ok, merged_github_payload(path, sha_m, tree, merge_strategy: :squash)}
+               end
+             )
+
+    entry = Enum.find(reconciled, &(&1.name == :review_acceptance_verified))
+    assert entry.outcome == :verified
+  end
+
   test "reconcile invalidates merged review acceptance when required checks are no longer green" do
     {:ok, ref} =
       CandidateRef.new(%{
@@ -487,6 +528,16 @@ defmodule SymphonyElixir.SourceControlTest do
     SourceControl.policy_fingerprint_for(@config, %{symphony: %{project_id: "project-1"}})
   end
 
+  defp synthetic_merge_config do
+    Map.put(@config, :required_checks, [
+      %{context: "make-all", app_id: 15_368, subject: "synthetic_merge"}
+    ])
+  end
+
+  defp synthetic_policy_fingerprint do
+    SourceControl.policy_fingerprint_for(synthetic_merge_config(), %{symphony: %{project_id: "project-1"}})
+  end
+
   defp eligible_pull do
     %{
       "number" => 15,
@@ -501,6 +552,13 @@ defmodule SymphonyElixir.SourceControlTest do
 
   defp merged_github_payload(path, sha_m, tree, opts \\ []) do
     check_conclusion = Keyword.get(opts, :check_conclusion, "success")
+    merge_strategy = Keyword.get(opts, :merge_strategy, :ordinary)
+
+    merge_parents =
+      case merge_strategy do
+        :squash -> [%{"sha" => @sha_a}]
+        _ -> [%{"sha" => @sha_a}, %{"sha" => @sha_b}]
+      end
 
     cond do
       String.ends_with?(path, "/repos/JCSchoeman96/symphony") ->
@@ -518,7 +576,7 @@ defmodule SymphonyElixir.SourceControlTest do
         %{
           "sha" => sha_m,
           "tree" => %{"sha" => tree},
-          "parents" => [%{"sha" => @sha_a}, %{"sha" => @sha_b}]
+          "parents" => merge_parents
         }
 
       String.contains?(path, "/git/ref/heads/main") ->
