@@ -45,6 +45,27 @@ defmodule SymphonyElixir.GitHub.SourceControlTest do
              )
   end
 
+  test "capture fails closed when too many associated pull requests are returned" do
+    pulls =
+      for number <- 1..101 do
+        %{
+          "number" => number,
+          "state" => "open",
+          "head" => %{"sha" => @sha_b, "repo" => %{"id" => 1_368_436_395}},
+          "base" => %{"sha" => @sha_a, "ref" => "main"}
+        }
+      end
+
+    assert {:error, :too_many_associated_pull_requests} =
+             SourceControl.capture_candidate_ref(
+               @config,
+               @sha_b,
+               request_opts(fn path ->
+                 if String.contains?(path, "/commits/" <> @sha_b <> "/pulls"), do: pulls, else: base_github_payload().(path)
+               end)
+             )
+  end
+
   test "capture fails closed for ambiguous pull requests" do
     assert {:error, :ambiguous_pull_request} =
              SourceControl.capture_candidate_ref(

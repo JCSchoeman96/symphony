@@ -125,6 +125,7 @@ defmodule SymphonyElixir.SourceControlCoverageTest do
 
     assert :ok = Config.validate!()
     assert SourceControl.configured?()
+    assert is_binary(SourceControl.policy_fingerprint())
     assert SourceControl.secret_environment_names() == ["GITHUB_TOKEN"]
   end
 
