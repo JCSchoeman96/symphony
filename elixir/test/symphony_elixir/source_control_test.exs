@@ -65,6 +65,13 @@ defmodule SymphonyElixir.SourceControlTest do
     assert entry.candidate_ref.candidate_sha == @sha_b
   end
 
+  test "verify merge from evidence returns mismatch when review acceptance is absent" do
+    assert {:ok, verification} =
+             SourceControl.verify_merge_from_evidence([], source_control_config: @config)
+
+    refute verification.status == :verified
+  end
+
   test "extracts candidate ref from trusted evidence" do
     {:ok, ref} =
       CandidateRef.new(%{
