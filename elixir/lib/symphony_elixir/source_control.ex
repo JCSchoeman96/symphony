@@ -186,8 +186,8 @@ defmodule SymphonyElixir.SourceControl do
 
   defp enrich_candidate_capture(_intent, context, evidence) do
     case settings_config(github_opts(context)) do
-      {:error, :unconfigured} ->
-        {:error, {:source_control, :unconfigured}}
+      {:error, reason} ->
+        {:error, {:source_control, reason}}
 
       {:ok, config} ->
         with {:ok, repository_context} <- repository_context(context),
@@ -216,12 +216,15 @@ defmodule SymphonyElixir.SourceControl do
 
   defp enrich_review_acceptance(intent, context, evidence) do
     case settings_config(github_opts(context)) do
-      {:error, :unconfigured} ->
-        {:error, {:source_control, :unconfigured}}
+      {:error, reason} ->
+        {:error, {:source_control, reason}}
 
       {:ok, config} ->
         with {:ok, candidate_evidence} <- find_candidate_state_evidence(context_evidence(context, intent)),
              {:ok, candidate_ref} <- decode_candidate_ref(candidate_evidence),
+             :ok <- GitHubSourceControl.validate_candidate_ref_binding(config, candidate_ref),
+             {:ok, settings} <- Config.settings(),
+             :ok <- validate_policy_fingerprint(candidate_evidence, config, settings),
              {:ok, candidate_tree_sha} <-
                GitHubSourceControl.verify_candidate_unchanged(config, candidate_ref, github_opts(context)),
              :ok <-
@@ -230,8 +233,7 @@ defmodule SymphonyElixir.SourceControl do
                  candidate_ref,
                  candidate_tree_sha,
                  github_opts(context)
-               ),
-             {:ok, settings} <- Config.settings() do
+               ) do
           fingerprint = policy_fingerprint_for(config, settings)
 
           {:ok,
@@ -302,7 +304,7 @@ defmodule SymphonyElixir.SourceControl do
   defp reconcile_verified_review_acceptance(evidence, entry, config, opts) do
     case verify_review_acceptance_freshness(entry, config, opts) do
       :ok -> evidence
-      :stale -> invalidate_review_acceptance(evidence, :candidate_moved)
+      {:stale, reason} -> invalidate_review_acceptance(evidence, reason)
     end
   end
 
@@ -316,13 +318,17 @@ defmodule SymphonyElixir.SourceControl do
 
   defp verify_review_acceptance_freshness(entry, config, opts) do
     with {:ok, candidate_ref} <- decode_candidate_ref(entry),
+         :ok <- GitHubSourceControl.validate_candidate_ref_binding(config, candidate_ref),
+         :ok <- validate_policy_fingerprint(entry, config, settings_from_opts(opts)),
          candidate_tree_sha when is_binary(candidate_tree_sha) <- Map.get(entry, :candidate_tree_sha),
          {:ok, _} <- GitHubSourceControl.verify_candidate_unchanged(config, candidate_ref, opts),
          :ok <-
            GitHubSourceControl.verify_required_checks(config, candidate_ref, candidate_tree_sha, opts) do
       :ok
     else
-      _ -> :stale
+      {:error, :policy_fingerprint_mismatch} -> {:stale, :policy_fingerprint_mismatch}
+      {:error, :repository_identity_mismatch} -> {:stale, :repository_identity_mismatch}
+      _ -> {:stale, :candidate_moved}
     end
   end
 
@@ -388,8 +394,15 @@ defmodule SymphonyElixir.SourceControl do
 
   defp encode_candidate_ref(%CandidateRef{} = ref), do: Map.from_struct(ref)
 
-  defp validate_policy_fingerprint(evidence, config, opts) do
-    expected = policy_fingerprint_for(config, settings_from_opts(opts))
+  defp validate_policy_fingerprint(evidence, config, settings_or_opts) do
+    settings =
+      cond do
+        is_list(settings_or_opts) -> settings_from_opts(settings_or_opts)
+        is_map(settings_or_opts) -> settings_or_opts
+        true -> Config.settings!()
+      end
+
+    expected = policy_fingerprint_for(config, settings)
 
     if Map.get(evidence, :policy_fingerprint) == expected do
       :ok
@@ -472,15 +485,22 @@ defmodule SymphonyElixir.SourceControl do
   defp settings_config(opts \\ []) do
     case Keyword.get(opts, :source_control_config) do
       config when is_map(config) ->
-        {:ok, normalize_config(config)}
+        validate_source_control_config(normalize_config(config))
 
       _ ->
         with {:ok, settings} <- Config.settings(),
              %{source_control: %{kind: kind} = source_control} when not is_nil(kind) <- settings do
-          {:ok, normalize_config(source_control)}
+          validate_source_control_config(normalize_config(source_control))
         else
           _ -> {:error, :unconfigured}
         end
+    end
+  end
+
+  defp validate_source_control_config(config) when is_map(config) do
+    case Map.get(config, :required_checks, []) do
+      checks when is_list(checks) and checks != [] -> {:ok, config}
+      _ -> {:error, :required_checks_missing}
     end
   end
 

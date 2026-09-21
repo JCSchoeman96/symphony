@@ -13,7 +13,9 @@ defmodule SymphonyElixir.SourceControlGitHubApiTest do
     repository_id: 1_368_436_395,
     base_branch: "main",
     token_env: "GITHUB_TOKEN",
-    required_checks: []
+    required_checks: [
+      %{context: "make-all", app_id: 15_368, subject: "head"}
+    ]
   }
 
   test "read helpers surface github facts used by verification" do
@@ -70,8 +72,7 @@ defmodule SymphonyElixir.SourceControlGitHubApiTest do
       {&compare_payload?/1, &compare_payload/0},
       {&check_runs_payload?/1, &check_runs_payload/0},
       {&commit_payload?/1, &commit_payload/0},
-      {&git_commit_payload?/1, &git_commit_payload/0},
-      {&merge_ref_payload?/1, &merge_ref_payload/0}
+      {&git_commit_payload?/1, &git_commit_payload/0}
     ]
   end
 
@@ -113,13 +114,14 @@ defmodule SymphonyElixir.SourceControlGitHubApiTest do
   defp git_commit_payload?(path), do: String.contains?(path, "/git/commits/" <> @sha_a)
   defp git_commit_payload, do: %{"sha" => @sha_a, "tree" => %{"sha" => @tree}}
 
-  defp merge_ref_payload?(path), do: String.contains?(path, "/pulls/15/merge")
-  defp merge_ref_payload, do: %{"sha" => String.duplicate("9", 40)}
-
   defp open_pull do
     %{
       "number" => 15,
       "state" => "open",
+      "merged" => false,
+      "draft" => false,
+      "mergeable" => true,
+      "merge_commit_sha" => @sha_a,
       "head" => %{"sha" => @sha_b, "repo" => %{"id" => 1_368_436_395}},
       "base" => %{"sha" => @sha_a, "ref" => "main"}
     }

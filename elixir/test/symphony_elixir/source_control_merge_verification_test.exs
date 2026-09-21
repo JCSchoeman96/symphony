@@ -17,7 +17,9 @@ defmodule SymphonyElixir.SourceControl.MergeVerificationTest do
     repository_id: 1_368_436_395,
     base_branch: "main",
     token_env: "GITHUB_TOKEN",
-    required_checks: []
+    required_checks: [
+      %{context: "make-all", app_id: 15_368, subject: "head"}
+    ]
   }
 
   test "verifies accepted ordinary two-parent merge form" do

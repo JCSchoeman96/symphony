@@ -391,9 +391,10 @@ defmodule SymphonyElixir.Config.Schema do
     def changeset(schema, attrs) do
       schema
       |> cast(attrs, [:kind, :repository, :repository_id, :base_branch, :token_env], empty_values: [])
-      |> cast_embed(:required_checks, with: &SourceControlRequiredCheck.changeset/2)
+      |> cast_embed(:required_checks, with: &SourceControlRequiredCheck.changeset/2, required: true)
       |> validate_inclusion(:kind, ["github"])
       |> validate_required([:kind, :repository, :repository_id, :base_branch, :token_env])
+      |> validate_length(:required_checks, min: 1)
       |> update_change(:repository, &String.trim/1)
       |> update_change(:base_branch, &String.trim/1)
       |> update_change(:token_env, &String.trim/1)

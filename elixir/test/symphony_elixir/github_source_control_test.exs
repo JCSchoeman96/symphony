@@ -145,6 +145,37 @@ defmodule SymphonyElixir.GitHub.SourceControlTest do
              )
   end
 
+  test "verify candidate unchanged rejects closed pull requests" do
+    candidate_ref = candidate_ref()
+
+    assert {:error, :pull_request_not_open} =
+             SourceControl.verify_candidate_unchanged(
+               @config,
+               candidate_ref,
+               request_opts(fn path ->
+                 if String.contains?(path, "/pulls/15") do
+                   open_pull(15, %{"state" => "closed"})
+                 else
+                   base_github_payload().(path)
+                 end
+               end)
+             )
+  end
+
+  test "verify candidate unchanged rejects repository identity drift" do
+    {:ok, drifted_ref} =
+      CandidateRef.new(%{
+        repository_identity: "github:repository:999",
+        base_sha: @sha_a,
+        candidate_sha: @sha_b,
+        pr_identity: "15",
+        observed_pr_head_sha: @sha_b
+      })
+
+    assert {:error, :repository_identity_mismatch} =
+             SourceControl.verify_candidate_unchanged(@config, drifted_ref, request_opts(base_github_payload()))
+  end
+
   test "verify candidate unchanged detects head movement" do
     candidate_ref = candidate_ref()
 
@@ -154,13 +185,7 @@ defmodule SymphonyElixir.GitHub.SourceControlTest do
                candidate_ref,
                request_opts(fn path ->
                  if String.contains?(path, "/pulls/15") do
-                   %{
-                     "number" => 15,
-                     "state" => "open",
-                     "merged" => false,
-                     "head" => %{"sha" => String.duplicate("f", 40), "repo" => %{"id" => 1_368_436_395}},
-                     "base" => %{"sha" => @sha_a, "ref" => "main"}
-                   }
+                   open_pull(15, %{"head" => %{"sha" => String.duplicate("f", 40), "repo" => %{"id" => 1_368_436_395}}})
                  else
                    base_github_payload().(path)
                  end
@@ -184,6 +209,20 @@ defmodule SymphonyElixir.GitHub.SourceControlTest do
                  end
                end)
              )
+  end
+
+  test "verify merge rejects candidate ref repository identity drift" do
+    {:ok, drifted_ref} =
+      CandidateRef.new(%{
+        repository_identity: "github:repository:999",
+        base_sha: @sha_a,
+        candidate_sha: @sha_b,
+        pr_identity: "15",
+        observed_pr_head_sha: @sha_b
+      })
+
+    assert {:error, :repository_identity_mismatch} =
+             SourceControl.verify_merge(@config, drifted_ref, @tree, request_opts(base_github_payload()))
   end
 
   test "verify merge rejects repository identity substitution" do
@@ -241,13 +280,7 @@ defmodule SymphonyElixir.GitHub.SourceControlTest do
                candidate_ref,
                request_opts(fn path ->
                  if String.contains?(path, "/pulls/15") do
-                   %{
-                     "number" => 15,
-                     "state" => "open",
-                     "merged" => false,
-                     "head" => %{"sha" => @sha_b, "repo" => %{"id" => 1_368_436_395}},
-                     "base" => %{"sha" => @sha_a, "ref" => "develop"}
-                   }
+                   open_pull(15, %{"base" => %{"sha" => @sha_a, "ref" => "develop"}})
                  else
                    base_github_payload().(path)
                  end
@@ -319,6 +352,21 @@ defmodule SymphonyElixir.GitHub.SourceControlTest do
              )
   end
 
+  test "synthetic merge fetch fails when merge commit sha is unavailable" do
+    assert {:error, :synthetic_merge_unavailable} =
+             SourceControl.fetch_merge_ref_commit(
+               @config,
+               15,
+               request_opts(fn path ->
+                 if String.contains?(path, "/pulls/15") do
+                   open_pull(15, %{"merge_commit_sha" => nil})
+                 else
+                   base_github_payload().(path)
+                 end
+               end)
+             )
+  end
+
   test "synthetic merge checks validate merge ref parents and tree" do
     config =
       Map.put(@config, :required_checks, [
@@ -335,8 +383,8 @@ defmodule SymphonyElixir.GitHub.SourceControlTest do
                @tree,
                request_opts(fn path ->
                  cond do
-                   String.contains?(path, "/pulls/15/merge") ->
-                     %{"sha" => sha_merge}
+                   String.contains?(path, "/pulls/15") ->
+                     open_pull(15, %{"merge_commit_sha" => sha_merge})
 
                    String.contains?(path, "/git/commits/" <> sha_merge) ->
                      %{
@@ -380,13 +428,7 @@ defmodule SymphonyElixir.GitHub.SourceControlTest do
                @sha_b,
                request_opts(fn path ->
                  if String.contains?(path, "/pulls/15") do
-                   %{
-                     "number" => 15,
-                     "state" => "open",
-                     "merged" => false,
-                     "head" => %{"sha" => String.duplicate("f", 40), "repo" => %{"id" => 1_368_436_395}},
-                     "base" => %{"sha" => @sha_a, "ref" => "main"}
-                   }
+                   open_pull(15, %{"head" => %{"sha" => String.duplicate("f", 40), "repo" => %{"id" => 1_368_436_395}}})
                  else
                    base_github_payload().(path)
                  end
@@ -414,8 +456,8 @@ defmodule SymphonyElixir.GitHub.SourceControlTest do
                @tree,
                request_opts(fn path ->
                  cond do
-                   String.contains?(path, "/pulls/15/merge") ->
-                     %{"sha" => String.duplicate("9", 40)}
+                   String.contains?(path, "/pulls/15") ->
+                     open_pull(15)
 
                    String.contains?(path, "/git/commits/") ->
                      %{
@@ -491,13 +533,20 @@ defmodule SymphonyElixir.GitHub.SourceControlTest do
              )
   end
 
-  defp open_pull(number) do
-    %{
-      "number" => number,
-      "state" => "open",
-      "head" => %{"sha" => @sha_b, "repo" => %{"id" => 1_368_436_395}},
-      "base" => %{"sha" => @sha_a, "ref" => "main"}
-    }
+  defp open_pull(number, attrs \\ %{}) do
+    Map.merge(
+      %{
+        "number" => number,
+        "state" => "open",
+        "merged" => false,
+        "draft" => false,
+        "mergeable" => true,
+        "merge_commit_sha" => String.duplicate("9", 40),
+        "head" => %{"sha" => @sha_b, "repo" => %{"id" => 1_368_436_395}},
+        "base" => %{"sha" => @sha_a, "ref" => "main"}
+      },
+      attrs
+    )
   end
 
   defp candidate_ref do
@@ -576,23 +625,10 @@ defmodule SymphonyElixir.GitHub.SourceControlTest do
           %{"object" => %{"sha" => @sha_a}}
 
         String.contains?(path, "/commits/" <> @sha_b <> "/pulls") ->
-          [
-            %{
-              "number" => 15,
-              "state" => "open",
-              "head" => %{"sha" => @sha_b, "repo" => %{"id" => 1_368_436_395}},
-              "base" => %{"sha" => @sha_a, "ref" => "main"}
-            }
-          ]
+          [open_pull(15)]
 
         String.contains?(path, "/pulls/15") ->
-          %{
-            "number" => 15,
-            "state" => "open",
-            "merged" => false,
-            "head" => %{"sha" => @sha_b, "repo" => %{"id" => 1_368_436_395}},
-            "base" => %{"sha" => @sha_a, "ref" => "main"}
-          }
+          open_pull(15)
 
         String.contains?(path, "/compare/" <> @sha_a <> "..." <> @sha_b) ->
           %{"status" => "ahead"}

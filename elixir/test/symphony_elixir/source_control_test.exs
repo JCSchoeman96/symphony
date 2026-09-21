@@ -192,7 +192,7 @@ defmodule SymphonyElixir.SourceControlTest do
         outcome: :verified,
         candidate_ref: Map.from_struct(ref),
         candidate_tree_sha: String.duplicate("c", 40),
-        policy_fingerprint: "sha256:test"
+        policy_fingerprint: policy_fingerprint()
       }
     ]
 
@@ -201,6 +201,7 @@ defmodule SymphonyElixir.SourceControlTest do
                :ready_to_merge,
                evidence,
                source_control_config: @config,
+               settings: %{symphony: %{project_id: "project-1"}},
                token: "token",
                request_fun: fn _token, path, _params, _opts -> {:ok, github_payload(path)} end
              )
@@ -247,7 +248,7 @@ defmodule SymphonyElixir.SourceControlTest do
         outcome: :verified,
         candidate_ref: Map.from_struct(ref),
         candidate_tree_sha: String.duplicate("c", 40),
-        policy_fingerprint: "sha256:test"
+        policy_fingerprint: policy_fingerprint()
       }
     ]
 
@@ -256,17 +257,15 @@ defmodule SymphonyElixir.SourceControlTest do
                :ready_to_merge,
                evidence,
                source_control_config: @config,
+               settings: %{symphony: %{project_id: "project-1"}},
                token: "token",
                request_fun: fn _token, path, _params, _opts ->
                  {:ok,
                   if String.contains?(path, "/pulls/15") do
-                    %{
-                      "number" => 15,
-                      "state" => "open",
-                      "merged" => false,
-                      "head" => %{"sha" => String.duplicate("f", 40), "repo" => %{"id" => 1_368_436_395}},
-                      "base" => %{"sha" => @sha_a, "ref" => "main"}
-                    }
+                    Map.put(eligible_pull(), "head", %{
+                      "sha" => String.duplicate("f", 40),
+                      "repo" => %{"id" => 1_368_436_395}
+                    })
                   else
                     github_payload(path)
                   end}
@@ -310,6 +309,71 @@ defmodule SymphonyElixir.SourceControlTest do
     intent
   end
 
+  test "enrich review acceptance rejects policy fingerprint drift from candidate capture" do
+    {:ok, ref} =
+      CandidateRef.new(%{
+        repository_identity: "github:repository:1368436395",
+        base_sha: @sha_a,
+        candidate_sha: @sha_b,
+        pr_identity: "15",
+        observed_pr_head_sha: @sha_b
+      })
+
+    intent = intent(:in_review, :ready_to_merge)
+
+    context = %{
+      github_opts: [
+        source_control_config: @config,
+        token: "token",
+        request_fun: fn _token, path, _params, _opts -> {:ok, github_payload(path)} end
+      ],
+      guard_evidence: [
+        %{
+          class: :mechanical_guard,
+          name: :candidate_state_verified,
+          outcome: :verified,
+          candidate_ref: Map.from_struct(ref),
+          candidate_tree_sha: String.duplicate("c", 40),
+          policy_fingerprint: "sha256:deadbeef"
+        }
+      ]
+    }
+
+    assert {:error, {:source_control, :policy_fingerprint_mismatch}} =
+             SourceControl.enrich_guard_evidence(
+               intent,
+               context,
+               [%{class: :semantic_attestation, name: :review_accepted}]
+             )
+  end
+
+  test "settings reject source control config without required checks" do
+    intent = intent(:in_progress, :in_review)
+
+    assert {:error, {:source_control, :required_checks_missing}} =
+             SourceControl.enrich_guard_evidence(
+               intent,
+               %{repository_context: %{workspace_path: "/tmp/ws"}, github_opts: [source_control_config: Map.put(@config, :required_checks, [])]},
+               []
+             )
+  end
+
+  defp policy_fingerprint do
+    SourceControl.policy_fingerprint_for(@config, %{symphony: %{project_id: "project-1"}})
+  end
+
+  defp eligible_pull do
+    %{
+      "number" => 15,
+      "state" => "open",
+      "merged" => false,
+      "draft" => false,
+      "mergeable" => true,
+      "head" => %{"sha" => @sha_b, "repo" => %{"id" => 1_368_436_395}},
+      "base" => %{"sha" => @sha_a, "ref" => "main"}
+    }
+  end
+
   defp github_payload(path) do
     cond do
       String.ends_with?(path, "/repos/JCSchoeman96/symphony") ->
@@ -319,23 +383,10 @@ defmodule SymphonyElixir.SourceControlTest do
         %{"object" => %{"sha" => @sha_a}}
 
       String.contains?(path, "/commits/" <> @sha_b <> "/pulls") ->
-        [
-          %{
-            "number" => 15,
-            "state" => "open",
-            "head" => %{"sha" => @sha_b, "repo" => %{"id" => 1_368_436_395}},
-            "base" => %{"sha" => @sha_a, "ref" => "main"}
-          }
-        ]
+        [eligible_pull()]
 
       String.contains?(path, "/pulls/15") ->
-        %{
-          "number" => 15,
-          "state" => "open",
-          "merged" => false,
-          "head" => %{"sha" => @sha_b, "repo" => %{"id" => 1_368_436_395}},
-          "base" => %{"sha" => @sha_a, "ref" => "main"}
-        }
+        eligible_pull()
 
       String.contains?(path, "/compare/" <> @sha_a <> "..." <> @sha_b) ->
         %{"status" => "ahead"}

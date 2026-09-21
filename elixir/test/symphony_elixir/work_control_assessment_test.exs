@@ -1,6 +1,7 @@
 defmodule SymphonyElixir.WorkControlAssessmentTest do
   use ExUnit.Case, async: true
 
+  alias SymphonyElixir.SourceControl
   alias SymphonyElixir.SourceControl.CandidateRef
 
   alias SymphonyElixir.WorkControl.{
@@ -329,7 +330,7 @@ defmodule SymphonyElixir.WorkControlAssessmentTest do
         outcome: :verified,
         candidate_ref: Map.from_struct(candidate_ref),
         candidate_tree_sha: @tree,
-        policy_fingerprint: "sha256:test"
+        policy_fingerprint: review_policy_fingerprint()
       }
     ]
 
@@ -337,6 +338,7 @@ defmodule SymphonyElixir.WorkControlAssessmentTest do
       source_control_opts: [
         source_control_config: @source_control_config,
         token: "token",
+        settings: %{symphony: %{project_id: "project-1"}},
         request_fun: fn _token, path, _params, _opts ->
           {:ok,
            if String.contains?(path, "/pulls/15") do
@@ -344,6 +346,8 @@ defmodule SymphonyElixir.WorkControlAssessmentTest do
                "number" => 15,
                "state" => "open",
                "merged" => false,
+               "draft" => false,
+               "mergeable" => true,
                "head" => %{"sha" => String.duplicate("f", 40), "repo" => %{"id" => 1_368_436_395}},
                "base" => %{"sha" => @sha_a, "ref" => "main"}
              }
@@ -740,6 +744,10 @@ defmodule SymphonyElixir.WorkControlAssessmentTest do
     assert {:error, :context_not_resolving} = SuspensionContext.escalate(escalated, :again)
   end
 
+  defp review_policy_fingerprint do
+    SourceControl.policy_fingerprint_for(@source_control_config, %{symphony: %{project_id: "project-1"}})
+  end
+
   defp source_control_github_payload(path) do
     cond do
       String.ends_with?(path, "/repos/JCSchoeman96/symphony") ->
@@ -753,6 +761,8 @@ defmodule SymphonyElixir.WorkControlAssessmentTest do
           "number" => 15,
           "state" => "open",
           "merged" => false,
+          "draft" => false,
+          "mergeable" => true,
           "head" => %{"sha" => @sha_b, "repo" => %{"id" => 1_368_436_395}},
           "base" => %{"sha" => @sha_a, "ref" => "main"}
         }

@@ -82,11 +82,25 @@ defmodule SymphonyElixir.GitHub.SourceControl do
   @spec fetch_merge_ref_commit(config(), String.t() | integer(), keyword()) ::
           {:ok, map()} | {:error, term()}
   def fetch_merge_ref_commit(config, pr_number, opts \\ []) do
-    {owner, repo} = split_repository(config.repository)
+    with {:ok, pull} <- fetch_pull_request(config, pr_number, opts),
+         :ok <- validate_pull_merge_eligibility(pull),
+         merge_sha when is_binary(merge_sha) <- normalize_sha(pull["merge_commit_sha"]),
+         {:ok, commit} <- fetch_git_commit(config, merge_sha, opts) do
+      {:ok, commit}
+    else
+      nil -> {:error, :synthetic_merge_unavailable}
+      {:error, reason} -> {:error, reason}
+    end
+  end
 
-    with {:ok, %{"sha" => merge_sha}} <-
-           get(config, "/repos/#{owner}/#{repo}/pulls/#{pr_number}/merge", %{}, opts) do
-      fetch_git_commit(config, merge_sha, opts)
+  @spec validate_candidate_ref_binding(config(), CandidateRef.t()) :: :ok | {:error, term()}
+  def validate_candidate_ref_binding(config, %CandidateRef{} = candidate_ref) do
+    expected = CandidateRef.github_repository_identity(config.repository_id)
+
+    if candidate_ref.repository_identity == expected do
+      :ok
+    else
+      {:error, :repository_identity_mismatch}
     end
   end
 
@@ -126,7 +140,8 @@ defmodule SymphonyElixir.GitHub.SourceControl do
   @spec verify_candidate_unchanged(config(), CandidateRef.t(), keyword()) ::
           {:ok, String.t()} | {:error, term()}
   def verify_candidate_unchanged(config, %CandidateRef{} = candidate_ref, opts \\ []) do
-    with {:ok, repository} <- fetch_repository(config, opts),
+    with :ok <- validate_candidate_ref_binding(config, candidate_ref),
+         {:ok, repository} <- fetch_repository(config, opts),
          :ok <- validate_repository_id(repository, config.repository_id),
          {:ok, base_sha} <- fetch_base_sha(config, opts),
          true <- base_sha == candidate_ref.base_sha,
@@ -148,6 +163,14 @@ defmodule SymphonyElixir.GitHub.SourceControl do
       when is_binary(candidate_tree_sha) do
     checks = Map.get(config, :required_checks, [])
 
+    if checks == [] do
+      {:error, :required_checks_missing}
+    else
+      verify_required_checks_list(config, candidate_ref, candidate_tree_sha, checks, opts)
+    end
+  end
+
+  defp verify_required_checks_list(config, candidate_ref, candidate_tree_sha, checks, opts) do
     Enum.reduce_while(checks, :ok, fn check, _acc ->
       case verify_required_check(config, candidate_ref, candidate_tree_sha, check, opts) do
         :ok -> {:cont, :ok}
@@ -160,7 +183,8 @@ defmodule SymphonyElixir.GitHub.SourceControl do
           {:ok, map()} | {:error, term()}
   def verify_merge(config, %CandidateRef{} = candidate_ref, candidate_tree_sha, opts \\ [])
       when is_binary(candidate_tree_sha) do
-    with {:ok, repository} <- fetch_repository(config, opts),
+    with :ok <- validate_candidate_ref_binding(config, candidate_ref),
+         {:ok, repository} <- fetch_repository(config, opts),
          :ok <- validate_repository_id(repository, config.repository_id),
          {:ok, pull} <- fetch_pull_request(config, candidate_ref.pr_identity, opts),
          true <- pull["merged"] == true,
@@ -329,37 +353,63 @@ defmodule SymphonyElixir.GitHub.SourceControl do
   end
 
   defp validate_pull_request(pull, config, workspace_head_sha, base_sha) do
-    cond do
-      normalize_sha(get_in(pull, ["head", "sha"])) != workspace_head_sha ->
-        {:error, :workspace_head_mismatch}
+    with :ok <- validate_pull_merge_eligibility(pull) do
+      cond do
+        normalize_sha(get_in(pull, ["head", "sha"])) != workspace_head_sha ->
+          {:error, :workspace_head_mismatch}
 
-      normalize_sha(get_in(pull, ["base", "sha"])) != base_sha ->
-        {:error, :base_sha_mismatch}
+        normalize_sha(get_in(pull, ["base", "sha"])) != base_sha ->
+          {:error, :base_sha_mismatch}
 
-      normalize_sha(get_in(pull, ["base", "ref"])) != config.base_branch ->
-        {:error, :base_branch_retargeted}
+        normalize_sha(get_in(pull, ["base", "ref"])) != config.base_branch ->
+          {:error, :base_branch_retargeted}
 
-      not same_repository?(pull, config) ->
-        {:error, :fork_pull_request}
+        not same_repository?(pull, config) ->
+          {:error, :fork_pull_request}
 
-      true ->
-        :ok
+        true ->
+          :ok
+      end
     end
   end
 
   defp validate_pull_identity(pull, candidate_ref, config) do
+    with :ok <- validate_pull_merge_eligibility(pull) do
+      cond do
+        Integer.to_string(pull["number"]) != candidate_ref.pr_identity ->
+          {:error, :pull_request_identity_mismatch}
+
+        not same_repository?(pull, config) ->
+          {:error, :repository_mismatch}
+
+        normalize_sha(get_in(pull, ["base", "sha"])) != candidate_ref.base_sha ->
+          {:error, :base_sha_mismatch}
+
+        normalize_sha(get_in(pull, ["base", "ref"])) != config.base_branch ->
+          {:error, :base_branch_retargeted}
+
+        true ->
+          :ok
+      end
+    end
+  end
+
+  defp validate_pull_merge_eligibility(pull) do
     cond do
-      Integer.to_string(pull["number"]) != candidate_ref.pr_identity ->
-        {:error, :pull_request_identity_mismatch}
+      pull["merged"] == true ->
+        {:error, :pull_request_already_merged}
 
-      not same_repository?(pull, config) ->
-        {:error, :repository_mismatch}
+      pull["state"] != "open" ->
+        {:error, :pull_request_not_open}
 
-      normalize_sha(get_in(pull, ["base", "sha"])) != candidate_ref.base_sha ->
-        {:error, :base_sha_mismatch}
+      pull["draft"] == true ->
+        {:error, :pull_request_draft}
 
-      normalize_sha(get_in(pull, ["base", "ref"])) != config.base_branch ->
-        {:error, :base_branch_retargeted}
+      pull["mergeable"] == false ->
+        {:error, :pull_request_not_mergeable}
+
+      pull["mergeable"] == nil ->
+        {:error, :pull_request_mergeability_pending}
 
       true ->
         :ok

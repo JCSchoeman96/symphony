@@ -95,6 +95,21 @@ defmodule SymphonyElixir.SourceControlCoverageTest do
     assert "GITHUB_TOKEN" in binding.secret_environment_names
   end
 
+  test "workflow config rejects source_control without required checks" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      symphony_project_id: "project-1",
+      source_control_kind: "github",
+      source_control_repository: "JCSchoeman96/symphony",
+      source_control_repository_id: 1_368_436_395,
+      source_control_base_branch: "main",
+      source_control_token_env: "GITHUB_TOKEN",
+      source_control_required_checks: []
+    )
+
+    assert {:error, _reason} = Config.validate!()
+  end
+
   test "workflow config rejects invalid source_control sections" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "memory",
@@ -183,6 +198,9 @@ defmodule SymphonyElixir.SourceControlCoverageTest do
   end
 
   test "enrich review acceptance produces verified mechanical evidence" do
+    settings = Config.settings!()
+    fingerprint = SourceControl.policy_fingerprint_for(@config, settings)
+
     {:ok, candidate_ref} =
       CandidateRef.new(%{
         repository_identity: "github:repository:1368436395",
@@ -206,7 +224,8 @@ defmodule SymphonyElixir.SourceControlCoverageTest do
           name: :candidate_state_verified,
           outcome: :verified,
           candidate_ref: Map.from_struct(candidate_ref),
-          candidate_tree_sha: @tree
+          candidate_tree_sha: @tree,
+          policy_fingerprint: fingerprint
         }
       ]
     }
@@ -317,6 +336,8 @@ defmodule SymphonyElixir.SourceControlCoverageTest do
                "number" => 15,
                "state" => "open",
                "merged" => false,
+               "draft" => false,
+               "mergeable" => true,
                "head" => %{"sha" => String.duplicate("f", 40), "repo" => %{"id" => 1_368_436_395}},
                "base" => %{"sha" => @sha_a, "ref" => "main"}
              }
@@ -410,6 +431,8 @@ defmodule SymphonyElixir.SourceControlCoverageTest do
           "number" => 15,
           "state" => "open",
           "merged" => false,
+          "draft" => false,
+          "mergeable" => true,
           "head" => %{"sha" => @sha_b, "repo" => %{"id" => 1_368_436_395}},
           "base" => %{"sha" => @sha_a, "ref" => "main"}
         }
