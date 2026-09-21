@@ -389,7 +389,15 @@ defmodule SymphonyElixir.RuntimeTransitionAuthorityBindingTest do
     evidence
   end
 
-  defp evidence(class, name, _work_item_id, _responsibility), do: %{class: class, name: name}
+  defp evidence(class, name, _work_item_id, _responsibility) do
+    entry = %{class: class, name: name}
+
+    if name in [:candidate_state_verified, :review_acceptance_verified] do
+      Map.put(entry, :outcome, :verified)
+    else
+      entry
+    end
+  end
 
   defp verified(attempt, _context) do
     {:verified,

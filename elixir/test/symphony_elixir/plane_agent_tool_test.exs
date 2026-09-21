@@ -1548,7 +1548,7 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
     [
       attestation,
       %{class: :mechanical_guard, name: :implementation_checks_verified},
-      %{class: :mechanical_guard, name: :candidate_state_verified, outcome: :not_applicable}
+      %{class: :mechanical_guard, name: :candidate_state_verified, outcome: :verified}
     ]
   end
 

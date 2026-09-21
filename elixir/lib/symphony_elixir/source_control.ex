@@ -13,7 +13,7 @@ defmodule SymphonyElixir.SourceControl do
     RepositoryProbe
   }
 
-  alias SymphonyElixir.WorkControl.SemanticTransitionIntent
+  alias SymphonyElixir.WorkControl.{SemanticTransitionIntent, WorkflowLifecycle}
 
   @capabilities [
     :repository_identity_read,
@@ -81,6 +81,20 @@ defmodule SymphonyElixir.SourceControl do
     case settings_config() do
       {:ok, config} -> GitHubSourceControl.secret_environment_names(config)
       _ -> []
+    end
+  end
+
+  @spec reconcile_stored_evidence(WorkflowLifecycle.state() | atom(), term(), keyword()) ::
+          {:ok, [map()]} | {:error, term()}
+  def reconcile_stored_evidence(state, evidence, opts \\ []) do
+    evidence = normalize_evidence(evidence)
+
+    case state do
+      :ready_to_merge ->
+        reconcile_ready_to_merge_evidence(evidence, opts)
+
+      _ ->
+        {:ok, evidence}
     end
   end
 
@@ -173,7 +187,7 @@ defmodule SymphonyElixir.SourceControl do
   defp enrich_candidate_capture(_intent, context, evidence) do
     case settings_config(github_opts(context)) do
       {:error, :unconfigured} ->
-        {:ok, evidence ++ [candidate_state_evidence(:not_applicable, nil, nil, nil)]}
+        {:error, {:source_control, :unconfigured}}
 
       {:ok, config} ->
         with {:ok, repository_context} <- repository_context(context),
@@ -203,7 +217,7 @@ defmodule SymphonyElixir.SourceControl do
   defp enrich_review_acceptance(intent, context, evidence) do
     case settings_config(github_opts(context)) do
       {:error, :unconfigured} ->
-        {:ok, evidence ++ [review_acceptance_evidence(:not_applicable, nil, nil, nil, nil)]}
+        {:error, {:source_control, :unconfigured}}
 
       {:ok, config} ->
         with {:ok, candidate_evidence} <- find_candidate_state_evidence(context_evidence(context, intent)),
@@ -265,6 +279,75 @@ defmodule SymphonyElixir.SourceControl do
     }
   end
 
+  defp reconcile_ready_to_merge_evidence(evidence, opts) do
+    case settings_config(opts) do
+      {:error, :unconfigured} ->
+        {:ok, invalidate_source_control_evidence(evidence, :unconfigured)}
+
+      {:ok, config} ->
+        {:ok, reconcile_configured_ready_to_merge(evidence, config, opts)}
+    end
+  end
+
+  defp reconcile_configured_ready_to_merge(evidence, config, opts) do
+    case extract_review_acceptance_evidence(evidence) do
+      {:ok, entry} ->
+        reconcile_verified_review_acceptance(evidence, entry, config, opts)
+
+      {:error, _} ->
+        reconcile_missing_review_acceptance(evidence)
+    end
+  end
+
+  defp reconcile_verified_review_acceptance(evidence, entry, config, opts) do
+    case verify_review_acceptance_freshness(entry, config, opts) do
+      :ok -> evidence
+      :stale -> invalidate_review_acceptance(evidence, :candidate_moved)
+    end
+  end
+
+  defp reconcile_missing_review_acceptance(evidence) do
+    if Enum.any?(evidence, &match?(%{name: :review_acceptance_verified}, &1)) do
+      invalidate_review_acceptance(evidence, :review_acceptance_missing)
+    else
+      evidence
+    end
+  end
+
+  defp verify_review_acceptance_freshness(entry, config, opts) do
+    with {:ok, candidate_ref} <- decode_candidate_ref(entry),
+         candidate_tree_sha when is_binary(candidate_tree_sha) <- Map.get(entry, :candidate_tree_sha),
+         {:ok, _} <- GitHubSourceControl.verify_candidate_unchanged(config, candidate_ref, opts),
+         :ok <-
+           GitHubSourceControl.verify_required_checks(config, candidate_ref, candidate_tree_sha, opts) do
+      :ok
+    else
+      _ -> :stale
+    end
+  end
+
+  defp invalidate_source_control_evidence(evidence, reason) do
+    Enum.map(evidence, fn
+      %{name: name} = entry when name in [:candidate_state_verified, :review_acceptance_verified] ->
+        Map.put(entry, :outcome, :stale)
+        |> Map.put(:stale_reason, reason)
+
+      entry ->
+        entry
+    end)
+  end
+
+  defp invalidate_review_acceptance(evidence, reason) do
+    Enum.map(evidence, fn
+      %{name: :review_acceptance_verified} = entry ->
+        Map.put(entry, :outcome, :stale)
+        |> Map.put(:stale_reason, reason)
+
+      entry ->
+        entry
+    end)
+  end
+
   defp find_candidate_state_evidence(evidence) do
     case find_evidence(evidence, :candidate_state_verified) do
       {:ok, %{outcome: :verified} = entry} -> {:ok, entry}
@@ -304,7 +387,6 @@ defmodule SymphonyElixir.SourceControl do
   defp decode_candidate_ref(_), do: {:error, :malformed_candidate_ref}
 
   defp encode_candidate_ref(%CandidateRef{} = ref), do: Map.from_struct(ref)
-  defp encode_candidate_ref(_), do: nil
 
   defp validate_policy_fingerprint(evidence, config, opts) do
     expected = policy_fingerprint_for(config, settings_from_opts(opts))
@@ -349,6 +431,7 @@ defmodule SymphonyElixir.SourceControl do
   defp error_status(:not_merged), do: :not_merged
   defp error_status(:unsupported_merge_strategy), do: :unsupported_strategy
   defp error_status(:ambiguous_pull_request), do: :ambiguous
+  defp error_status(:main_advanced_after_merge), do: :main_moved
   defp error_status(_reason), do: :mismatch
 
   defp stale_candidate_status(evidence, state) do

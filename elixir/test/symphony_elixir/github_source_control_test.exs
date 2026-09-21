@@ -45,6 +45,48 @@ defmodule SymphonyElixir.GitHub.SourceControlTest do
              )
   end
 
+  test "fetch associated pull requests paginates provider pages" do
+    page_one =
+      for number <- 1..100 do
+        %{
+          "number" => number,
+          "state" => "open",
+          "head" => %{"sha" => @sha_b, "repo" => %{"id" => 1_368_436_395}},
+          "base" => %{"sha" => @sha_a, "ref" => "main"}
+        }
+      end
+
+    page_two = [
+      %{
+        "number" => 101,
+        "state" => "open",
+        "head" => %{"sha" => @sha_b, "repo" => %{"id" => 1_368_436_395}},
+        "base" => %{"sha" => @sha_a, "ref" => "main"}
+      }
+    ]
+
+    assert {:error, :too_many_associated_pull_requests} =
+             SourceControl.fetch_associated_pull_requests(
+               @config,
+               @sha_b,
+               token: "token",
+               request_fun: fn _token, _path, params, _opts ->
+                 page = Map.get(params, "page", Map.get(params, :page, 1))
+
+                 pulls =
+                   case page do
+                     1 -> page_one
+                     2 -> page_two
+                     "1" -> page_one
+                     "2" -> page_two
+                     _ -> []
+                   end
+
+                 {:ok, pulls}
+               end
+             )
+  end
+
   test "capture fails closed when too many associated pull requests are returned" do
     pulls =
       for number <- 1..101 do
@@ -144,12 +186,30 @@ defmodule SymphonyElixir.GitHub.SourceControlTest do
              )
   end
 
-  test "verify merge accepts main advanced after a valid merge" do
+  test "verify merge rejects repository identity substitution" do
+    candidate_ref = candidate_ref()
+
+    assert {:error, :repository_id_mismatch} =
+             SourceControl.verify_merge(
+               @config,
+               candidate_ref,
+               @tree,
+               request_opts(fn path ->
+                 if String.ends_with?(path, "/repos/JCSchoeman96/symphony") do
+                   %{"id" => 999}
+                 else
+                   base_github_payload().(path)
+                 end
+               end)
+             )
+  end
+
+  test "verify merge rejects main advanced after merge commit" do
     candidate_ref = candidate_ref()
     sha_m = String.duplicate("d", 40)
     sha_main = String.duplicate("e", 40)
 
-    assert {:ok, %{merge_strategy: :ordinary}} =
+    assert {:error, :main_advanced_after_merge} =
              SourceControl.verify_merge(
                @config,
                candidate_ref,
@@ -165,11 +225,31 @@ defmodule SymphonyElixir.GitHub.SourceControlTest do
                    String.contains?(path, "/git/ref/heads/main") ->
                      %{"object" => %{"sha" => sha_main}}
 
-                   String.contains?(path, "/compare/" <> sha_m <> "..." <> sha_main) ->
-                     %{"status" => "behind"}
-
                    true ->
-                     %{}
+                     base_github_payload().(path)
+                 end
+               end)
+             )
+  end
+
+  test "verify candidate unchanged detects base branch retargeting" do
+    candidate_ref = candidate_ref()
+
+    assert {:error, :base_branch_retargeted} =
+             SourceControl.verify_candidate_unchanged(
+               @config,
+               candidate_ref,
+               request_opts(fn path ->
+                 if String.contains?(path, "/pulls/15") do
+                   %{
+                     "number" => 15,
+                     "state" => "open",
+                     "merged" => false,
+                     "head" => %{"sha" => @sha_b, "repo" => %{"id" => 1_368_436_395}},
+                     "base" => %{"sha" => @sha_a, "ref" => "develop"}
+                   }
+                 else
+                   base_github_payload().(path)
                  end
                end)
              )
@@ -377,7 +457,7 @@ defmodule SymphonyElixir.GitHub.SourceControlTest do
                      }
 
                    true ->
-                     %{}
+                     base_github_payload().(path)
                  end
                end)
              )
@@ -388,7 +468,7 @@ defmodule SymphonyElixir.GitHub.SourceControlTest do
     sha_m = String.duplicate("d", 40)
     sha_main = String.duplicate("e", 40)
 
-    assert {:error, :merge_not_on_main} =
+    assert {:error, :main_advanced_after_merge} =
              SourceControl.verify_merge(
                @config,
                candidate_ref,
@@ -404,11 +484,8 @@ defmodule SymphonyElixir.GitHub.SourceControlTest do
                    String.contains?(path, "/git/ref/heads/main") ->
                      %{"object" => %{"sha" => sha_main}}
 
-                   String.contains?(path, "/compare/" <> sha_m <> "..." <> sha_main) ->
-                     %{"status" => "ahead"}
-
                    true ->
-                     %{}
+                     base_github_payload().(path)
                  end
                end)
              )

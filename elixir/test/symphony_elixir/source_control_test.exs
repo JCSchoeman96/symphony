@@ -30,15 +30,13 @@ defmodule SymphonyElixir.SourceControlTest do
     assert evidence == [%{class: :mechanical_guard, name: :merge_verified}]
   end
 
-  test "enrich adds not-applicable candidate evidence when source control is unconfigured" do
+  test "enrich fails closed when source control is unconfigured for candidate capture" do
     intent = intent(:in_progress, :in_review)
 
-    assert {:ok, evidence} =
+    assert {:error, {:source_control, :unconfigured}} =
              SourceControl.enrich_guard_evidence(intent, %{}, [
                %{class: :mechanical_guard, name: :implementation_checks_verified}
              ])
-
-    assert Enum.any?(evidence, &match?(%{name: :candidate_state_verified, outcome: :not_applicable}, &1))
   end
 
   test "enrich captures candidate evidence from trusted host facts" do
@@ -144,15 +142,139 @@ defmodule SymphonyElixir.SourceControlTest do
     assert Enum.any?(evidence, &match?(%{name: :candidate_state_verified, outcome: :verified}, &1))
   end
 
-  test "enrich adds not-applicable review acceptance when source control is unconfigured" do
+  test "enrich fails closed when source control is unconfigured for review acceptance" do
     intent = intent(:in_review, :ready_to_merge)
 
-    assert {:ok, evidence} =
+    assert {:error, {:source_control, :unconfigured}} =
              SourceControl.enrich_guard_evidence(intent, %{}, [
                %{class: :semantic_attestation, name: :review_accepted}
              ])
+  end
 
-    assert Enum.any?(evidence, &match?(%{name: :review_acceptance_verified, outcome: :not_applicable}, &1))
+  test "reconcile invalidates source-control evidence when unconfigured" do
+    evidence = [
+      %{
+        class: :mechanical_guard,
+        name: :review_acceptance_verified,
+        outcome: :verified
+      }
+    ]
+
+    assert {:ok, reconciled} = SourceControl.reconcile_stored_evidence(:ready_to_merge, evidence, [])
+    entry = Enum.find(reconciled, &(&1.name == :review_acceptance_verified))
+    assert entry.outcome == :stale
+    assert entry.stale_reason == :unconfigured
+  end
+
+  test "reconcile leaves non-ready states unchanged" do
+    evidence = [%{class: :mechanical_guard, name: :candidate_state_verified, outcome: :verified}]
+
+    assert {:ok, reconciled} =
+             SourceControl.reconcile_stored_evidence(:in_review, evidence, source_control_config: @config)
+
+    assert reconciled == evidence
+  end
+
+  test "reconcile preserves verified review acceptance when candidate is unchanged" do
+    {:ok, ref} =
+      CandidateRef.new(%{
+        repository_identity: "github:repository:1368436395",
+        base_sha: @sha_a,
+        candidate_sha: @sha_b,
+        pr_identity: "15",
+        observed_pr_head_sha: @sha_b
+      })
+
+    evidence = [
+      %{
+        class: :mechanical_guard,
+        name: :review_acceptance_verified,
+        outcome: :verified,
+        candidate_ref: Map.from_struct(ref),
+        candidate_tree_sha: String.duplicate("c", 40),
+        policy_fingerprint: "sha256:test"
+      }
+    ]
+
+    assert {:ok, reconciled} =
+             SourceControl.reconcile_stored_evidence(
+               :ready_to_merge,
+               evidence,
+               source_control_config: @config,
+               token: "token",
+               request_fun: fn _token, path, _params, _opts -> {:ok, github_payload(path)} end
+             )
+
+    entry = Enum.find(reconciled, &(&1.name == :review_acceptance_verified))
+    assert entry.outcome == :verified
+  end
+
+  test "reconcile marks non-verified review acceptance as missing" do
+    evidence = [
+      %{
+        class: :mechanical_guard,
+        name: :review_acceptance_verified,
+        outcome: :stale
+      }
+    ]
+
+    assert {:ok, reconciled} =
+             SourceControl.reconcile_stored_evidence(
+               :ready_to_merge,
+               evidence,
+               source_control_config: @config
+             )
+
+    entry = Enum.find(reconciled, &(&1.name == :review_acceptance_verified))
+    assert entry.outcome == :stale
+    assert entry.stale_reason == :review_acceptance_missing
+  end
+
+  test "reconcile invalidates stale review acceptance for ready to merge" do
+    {:ok, ref} =
+      CandidateRef.new(%{
+        repository_identity: "github:repository:1368436395",
+        base_sha: @sha_a,
+        candidate_sha: @sha_b,
+        pr_identity: "15",
+        observed_pr_head_sha: @sha_b
+      })
+
+    evidence = [
+      %{
+        class: :mechanical_guard,
+        name: :review_acceptance_verified,
+        outcome: :verified,
+        candidate_ref: Map.from_struct(ref),
+        candidate_tree_sha: String.duplicate("c", 40),
+        policy_fingerprint: "sha256:test"
+      }
+    ]
+
+    assert {:ok, reconciled} =
+             SourceControl.reconcile_stored_evidence(
+               :ready_to_merge,
+               evidence,
+               source_control_config: @config,
+               token: "token",
+               request_fun: fn _token, path, _params, _opts ->
+                 {:ok,
+                  if String.contains?(path, "/pulls/15") do
+                    %{
+                      "number" => 15,
+                      "state" => "open",
+                      "merged" => false,
+                      "head" => %{"sha" => String.duplicate("f", 40), "repo" => %{"id" => 1_368_436_395}},
+                      "base" => %{"sha" => @sha_a, "ref" => "main"}
+                    }
+                  else
+                    github_payload(path)
+                  end}
+               end
+             )
+
+    entry = Enum.find(reconciled, &(&1.name == :review_acceptance_verified))
+    assert entry.outcome == :stale
   end
 
   test "policy fingerprint changes when required checks change" do

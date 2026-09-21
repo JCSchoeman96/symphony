@@ -7,6 +7,7 @@ defmodule SymphonyElixir.WorkControl.LifecycleAssessment do
   observation is trusted for local authority.
   """
 
+  alias SymphonyElixir.SourceControl
   alias SymphonyElixir.WorkControl.{GuardClass, ProviderObservation, ProviderProjectContract, WorkflowLifecycle}
 
   defstruct [
@@ -194,7 +195,7 @@ defmodule SymphonyElixir.WorkControl.LifecycleAssessment do
         assess_completion(assessment, prior_state, evidence, context)
 
       mapped_state == prior_state ->
-        finalize(assessment, :validated, mapped_state, mapped_state, [], evidence, :corroborated_state)
+        corroborate_same_state(assessment, mapped_state, prior_state, evidence, context)
 
       true ->
         assess_transition(assessment, prior_state, mapped_state, evidence, context)
@@ -211,6 +212,30 @@ defmodule SymphonyElixir.WorkControl.LifecycleAssessment do
 
       true ->
         assess_transition(assessment, prior_state, :done, evidence, context)
+    end
+  end
+
+  defp corroborate_same_state(assessment, mapped_state, _prior_state, evidence, context) do
+    source_control_opts = Map.get(context, :source_control_opts, [])
+
+    {:ok, reconciled} =
+      SourceControl.reconcile_stored_evidence(mapped_state, evidence, source_control_opts)
+
+    review_guard = GuardClass.requirement(:mechanical_guard, :review_acceptance_verified)
+
+    if mapped_state == :ready_to_merge and not GuardClass.satisfied?(review_guard, reconciled, context) do
+      finalize(
+        assessment,
+        :validation_required,
+        mapped_state,
+        :in_review,
+        [review_guard],
+        reconciled,
+        :candidate_moved,
+        context
+      )
+    else
+      finalize(assessment, :validated, mapped_state, mapped_state, [], reconciled, :corroborated_state)
     end
   end
 

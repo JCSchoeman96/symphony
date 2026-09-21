@@ -447,6 +447,9 @@ defmodule SymphonyElixir.SourceControlCoverageTest do
     sha_m = String.duplicate("d", 40)
 
     cond do
+      String.ends_with?(path, "/repos/JCSchoeman96/symphony") ->
+        %{"id" => 1_368_436_395}
+
       String.contains?(path, "/pulls/15") ->
         %{"number" => 15, "merged" => true, "head" => %{"sha" => @sha_b}, "merge_commit_sha" => sha_m}
 

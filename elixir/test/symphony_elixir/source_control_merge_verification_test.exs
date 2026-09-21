@@ -75,10 +75,15 @@ defmodule SymphonyElixir.SourceControl.MergeVerificationTest do
                token: "token",
                request_fun: fn _token, path, _params, _opts ->
                  {:ok,
-                  if String.contains?(path, "/pulls/15") do
-                    %{"number" => 15, "merged" => false, "head" => %{"sha" => @sha_b}}
-                  else
-                    %{}
+                  cond do
+                    repository_payload(path) ->
+                      repository_payload(path)
+
+                    String.contains?(path, "/pulls/15") ->
+                      %{"number" => 15, "merged" => false, "head" => %{"sha" => @sha_b}}
+
+                    true ->
+                      %{}
                   end}
                end
              )
@@ -129,9 +134,18 @@ defmodule SymphonyElixir.SourceControl.MergeVerificationTest do
     ]
   end
 
+  defp repository_payload(path) do
+    if String.ends_with?(path, "/repos/JCSchoeman96/symphony"),
+      do: %{"id" => 1_368_436_395},
+      else: nil
+  end
+
   defp ordinary_merge_payload do
     fn path ->
       cond do
+        repository_payload(path) ->
+          repository_payload(path)
+
         String.contains?(path, "/pulls/15") ->
           %{
             "number" => 15,
@@ -159,6 +173,9 @@ defmodule SymphonyElixir.SourceControl.MergeVerificationTest do
   defp squash_merge_payload do
     fn path ->
       cond do
+        repository_payload(path) ->
+          repository_payload(path)
+
         String.contains?(path, "/pulls/15") ->
           %{
             "number" => 15,
@@ -186,6 +203,9 @@ defmodule SymphonyElixir.SourceControl.MergeVerificationTest do
   defp rebase_merge_payload do
     fn path ->
       cond do
+        repository_payload(path) ->
+          repository_payload(path)
+
         String.contains?(path, "/pulls/15") ->
           %{
             "number" => 15,

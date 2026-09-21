@@ -55,16 +55,7 @@ defmodule SymphonyElixir.GitHub.SourceControl do
           {:ok, [map()]} | {:error, term()}
   def fetch_associated_pull_requests(config, sha, opts \\ []) when is_binary(sha) do
     {owner, repo} = split_repository(config.repository)
-
-    with {:ok, pulls} <- get(config, "/repos/#{owner}/#{repo}/commits/#{sha}/pulls", %{}, opts) do
-      pulls = if is_list(pulls), do: pulls, else: []
-
-      if length(pulls) > @max_associated_prs do
-        {:error, :too_many_associated_pull_requests}
-      else
-        {:ok, pulls}
-      end
-    end
+    fetch_associated_pulls_page(config, owner, repo, sha, 1, [], opts)
   end
 
   @spec fetch_pull_request(config(), String.t() | integer(), keyword()) ::
@@ -169,7 +160,9 @@ defmodule SymphonyElixir.GitHub.SourceControl do
           {:ok, map()} | {:error, term()}
   def verify_merge(config, %CandidateRef{} = candidate_ref, candidate_tree_sha, opts \\ [])
       when is_binary(candidate_tree_sha) do
-    with {:ok, pull} <- fetch_pull_request(config, candidate_ref.pr_identity, opts),
+    with {:ok, repository} <- fetch_repository(config, opts),
+         :ok <- validate_repository_id(repository, config.repository_id),
+         {:ok, pull} <- fetch_pull_request(config, candidate_ref.pr_identity, opts),
          true <- pull["merged"] == true,
          true <- normalize_sha(get_in(pull, ["head", "sha"])) == candidate_ref.candidate_sha,
          merge_sha when is_binary(merge_sha) <- normalize_sha(pull["merge_commit_sha"]),
@@ -302,15 +295,11 @@ defmodule SymphonyElixir.GitHub.SourceControl do
     end
   end
 
-  defp verify_main_contains_merge(config, merge_sha, current_main_sha, opts) do
+  defp verify_main_contains_merge(_config, merge_sha, current_main_sha, _opts) do
     if merge_sha == current_main_sha do
       :ok
     else
-      case compare_commits(config, merge_sha, current_main_sha, opts) do
-        {:ok, %{"status" => status}} when status in ["behind", "identical"] -> :ok
-        {:ok, %{"status" => "ahead"}} -> {:error, :merge_not_on_main}
-        _ -> {:error, :main_ancestry_unavailable}
-      end
+      {:error, :main_advanced_after_merge}
     end
   end
 
@@ -347,6 +336,9 @@ defmodule SymphonyElixir.GitHub.SourceControl do
       normalize_sha(get_in(pull, ["base", "sha"])) != base_sha ->
         {:error, :base_sha_mismatch}
 
+      normalize_sha(get_in(pull, ["base", "ref"])) != config.base_branch ->
+        {:error, :base_branch_retargeted}
+
       not same_repository?(pull, config) ->
         {:error, :fork_pull_request}
 
@@ -366,8 +358,38 @@ defmodule SymphonyElixir.GitHub.SourceControl do
       normalize_sha(get_in(pull, ["base", "sha"])) != candidate_ref.base_sha ->
         {:error, :base_sha_mismatch}
 
+      normalize_sha(get_in(pull, ["base", "ref"])) != config.base_branch ->
+        {:error, :base_branch_retargeted}
+
       true ->
         :ok
+    end
+  end
+
+  defp fetch_associated_pulls_page(config, owner, repo, sha, page, acc, opts) do
+    with {:ok, pulls} <-
+           get(
+             config,
+             "/repos/#{owner}/#{repo}/commits/#{sha}/pulls",
+             %{"per_page" => 100, "page" => page},
+             opts
+           ) do
+      pulls = if is_list(pulls), do: pulls, else: []
+      acc = acc ++ pulls
+
+      cond do
+        length(acc) > @max_associated_prs ->
+          {:error, :too_many_associated_pull_requests}
+
+        pulls == [] ->
+          {:ok, acc}
+
+        length(pulls) < 100 ->
+          {:ok, acc}
+
+        true ->
+          fetch_associated_pulls_page(config, owner, repo, sha, page + 1, acc, opts)
+      end
     end
   end
 
