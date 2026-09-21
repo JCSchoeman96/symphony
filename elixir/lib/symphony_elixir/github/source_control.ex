@@ -171,12 +171,79 @@ defmodule SymphonyElixir.GitHub.SourceControl do
   end
 
   defp verify_required_checks_list(config, candidate_ref, candidate_tree_sha, checks, opts) do
+    with :ok <- validate_synthetic_merge_subjects(config, candidate_ref, candidate_tree_sha, checks, opts),
+         {:ok, runs_by_lookup_sha} <- fetch_grouped_check_runs(config, candidate_ref, checks, opts) do
+      evaluate_configured_checks(checks, runs_by_lookup_sha, candidate_ref)
+    end
+  end
+
+  defp evaluate_configured_checks(checks, runs_by_lookup_sha, candidate_ref) do
     Enum.reduce_while(checks, :ok, fn check, _acc ->
-      case verify_required_check(config, candidate_ref, candidate_tree_sha, check, opts) do
+      case evaluate_required_check(check, runs_by_lookup_sha, candidate_ref) do
         :ok -> {:cont, :ok}
         {:error, reason} -> {:halt, {:error, reason}}
       end
     end)
+  end
+
+  defp validate_synthetic_merge_subjects(config, candidate_ref, candidate_tree_sha, checks, opts) do
+    if Enum.any?(checks, &synthetic_merge_check?/1) do
+      do_validate_synthetic_merge_subject(config, candidate_ref, candidate_tree_sha, opts)
+    else
+      :ok
+    end
+  end
+
+  defp do_validate_synthetic_merge_subject(config, candidate_ref, candidate_tree_sha, opts) do
+    with {:ok, merge_commit} <- fetch_merge_ref_commit(config, candidate_ref.pr_identity, opts) do
+      validate_synthetic_merge(merge_commit, candidate_ref, candidate_tree_sha)
+    end
+  end
+
+  defp fetch_grouped_check_runs(config, candidate_ref, checks, opts) do
+    lookup_shas =
+      checks
+      |> Enum.map(&check_run_lookup_sha(&1, candidate_ref))
+      |> Enum.reject(&is_nil/1)
+      |> Enum.uniq()
+
+    Enum.reduce_while(lookup_shas, %{}, fn lookup_sha, acc ->
+      case fetch_check_runs(config, lookup_sha, opts) do
+        {:ok, runs} -> {:cont, Map.put(acc, lookup_sha, runs)}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+    |> case do
+      {:error, reason} -> {:error, reason}
+      runs_by_lookup_sha -> {:ok, runs_by_lookup_sha}
+    end
+  end
+
+  defp evaluate_required_check(check, runs_by_lookup_sha, candidate_ref) do
+    subject = normalize_subject(Map.get(check, :subject) || Map.get(check, "subject"))
+    context = Map.get(check, :context) || Map.get(check, "context")
+    app_id = Map.get(check, :app_id) || Map.get(check, "app_id")
+
+    case check_run_lookup_sha(check, candidate_ref) do
+      nil ->
+        {:error, :unsupported_check_subject}
+
+      lookup_sha ->
+        runs = Map.get(runs_by_lookup_sha, lookup_sha, [])
+        evaluate_check_runs(runs, context, app_id, lookup_sha, subject)
+    end
+  end
+
+  defp synthetic_merge_check?(check) do
+    normalize_subject(Map.get(check, :subject) || Map.get(check, "subject")) == :synthetic_merge
+  end
+
+  defp check_run_lookup_sha(check, candidate_ref) do
+    case normalize_subject(Map.get(check, :subject) || Map.get(check, "subject")) do
+      :head -> candidate_ref.candidate_sha
+      :synthetic_merge -> candidate_ref.candidate_sha
+      _ -> nil
+    end
   end
 
   @spec verify_merge(config(), CandidateRef.t(), String.t(), keyword()) ::
@@ -208,31 +275,6 @@ defmodule SymphonyElixir.GitHub.SourceControl do
     end
   end
 
-  defp verify_required_check(config, candidate_ref, candidate_tree_sha, check, opts) do
-    subject = normalize_subject(Map.get(check, :subject) || Map.get(check, "subject"))
-    context = Map.get(check, :context) || Map.get(check, "context")
-    app_id = Map.get(check, :app_id) || Map.get(check, "app_id")
-
-    with {:ok, head_sha} <- subject_head_sha(config, candidate_ref, candidate_tree_sha, subject, opts),
-         {:ok, runs} <- fetch_check_runs(config, head_sha, opts) do
-      evaluate_check_runs(runs, context, app_id, head_sha)
-    end
-  end
-
-  defp subject_head_sha(_config, candidate_ref, _candidate_tree_sha, :head, _opts) do
-    {:ok, candidate_ref.candidate_sha}
-  end
-
-  defp subject_head_sha(config, candidate_ref, candidate_tree_sha, :synthetic_merge, opts) do
-    with {:ok, merge_commit} <- fetch_merge_ref_commit(config, candidate_ref.pr_identity, opts),
-         :ok <- validate_synthetic_merge(merge_commit, candidate_ref, candidate_tree_sha) do
-      {:ok, normalize_sha(Map.get(merge_commit, "sha"))}
-    end
-  end
-
-  defp subject_head_sha(_config, _candidate_ref, _candidate_tree_sha, _subject, _opts),
-    do: {:error, :unsupported_check_subject}
-
   defp validate_synthetic_merge(merge_commit, candidate_ref, candidate_tree_sha) do
     parents = Map.get(merge_commit, "parents", [])
     parent_shas = Enum.map(parents, fn parent -> normalize_sha(Map.get(parent, "sha")) end)
@@ -250,11 +292,11 @@ defmodule SymphonyElixir.GitHub.SourceControl do
     end
   end
 
-  defp evaluate_check_runs(runs, context, app_id, head_sha) do
+  defp evaluate_check_runs(runs, context, app_id, lookup_sha, subject) do
     matching =
       Enum.filter(runs, fn run ->
         is_map(run) and
-          check_run_field(run, "head_sha") |> normalize_sha() == head_sha and
+          check_run_matches_subject?(run, lookup_sha, subject) and
           check_run_field(run, "name") == context and
           app_id_for(run) == normalize_app_id(app_id)
       end)
@@ -264,13 +306,17 @@ defmodule SymphonyElixir.GitHub.SourceControl do
         {check_run_field(run, "name"), app_id_for(run), check_run_field(run, "head_sha") |> normalize_sha()}
       end)
 
-    case Map.get(grouped, {context, normalize_app_id(app_id), head_sha}, []) do
+    case Map.get(grouped, {context, normalize_app_id(app_id), lookup_sha}, []) do
       [] ->
         {:error, :missing_required_check}
 
       observations ->
         evaluate_terminal_observations(observations)
     end
+  end
+
+  defp check_run_matches_subject?(run, lookup_sha, _subject) do
+    check_run_field(run, "head_sha") |> normalize_sha() == lookup_sha
   end
 
   defp evaluate_terminal_observations(observations) do

@@ -455,6 +455,14 @@ defmodule SymphonyElixir.Config.Schema do
   end
 
   @spec validate_source_control(%__MODULE__{}) :: :ok | {:error, term()}
+  def validate_source_control(%__MODULE__{agent: %{routing: "legacy"}}), do: :ok
+
+  def validate_source_control(%__MODULE__{agent: %{routing: "routed"}, source_control: nil}),
+    do: {:error, :missing_source_control_config}
+
+  def validate_source_control(%__MODULE__{agent: %{routing: "routed"}, source_control: %{kind: nil}}),
+    do: {:error, :missing_source_control_config}
+
   def validate_source_control(%__MODULE__{source_control: nil}), do: :ok
 
   def validate_source_control(%__MODULE__{source_control: %{kind: nil}}), do: :ok

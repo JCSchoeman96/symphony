@@ -124,10 +124,22 @@ defmodule SymphonyElixir.SourceControlCoverageTest do
     assert {:error, _reason} = Config.validate!()
   end
 
+  test "workflow config requires source_control for routed startup" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      symphony_project_id: "project-1",
+      agent_routing: "routed",
+      source_control_kind: nil
+    )
+
+    assert {:error, :missing_source_control_config} = Config.validate!()
+  end
+
   test "workflow config validates optional source_control section" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "memory",
       symphony_project_id: "project-1",
+      agent_routing: "routed",
       source_control_kind: "github",
       source_control_repository: "JCSchoeman96/symphony",
       source_control_repository_id: 1_368_436_395,

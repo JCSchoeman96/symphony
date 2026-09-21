@@ -367,6 +367,41 @@ defmodule SymphonyElixir.GitHub.SourceControlTest do
              )
   end
 
+  test "required checks fetch check-runs once per lookup sha" do
+    candidate_ref = candidate_ref()
+    calls = :counters.new(1, [])
+
+    config =
+      Map.put(@config, :required_checks, [
+        %{context: "make-all", app_id: 15_368, subject: "head"},
+        %{context: "validate-pr-description", app_id: 15_368, subject: "head"}
+      ])
+
+    assert :ok =
+             SourceControl.verify_required_checks(
+               config,
+               candidate_ref,
+               @tree,
+               request_opts(fn path ->
+                 if String.contains?(path, "/check-runs") do
+                   :counters.add(calls, 1, 1)
+
+                   %{
+                     "total_count" => 2,
+                     "check_runs" => [
+                       check_run("make-all", "success"),
+                       check_run("validate-pr-description", "success")
+                     ]
+                   }
+                 else
+                   base_github_payload().(path)
+                 end
+               end)
+             )
+
+    assert :counters.get(calls, 1) == 1
+  end
+
   test "synthetic merge checks validate merge ref parents and tree" do
     config =
       Map.put(@config, :required_checks, [
@@ -396,9 +431,7 @@ defmodule SymphonyElixir.GitHub.SourceControlTest do
                    String.contains?(path, "/check-runs") ->
                      %{
                        "total_count" => 1,
-                       "check_runs" => [
-                         Map.merge(check_run("make-all", "success"), %{"head_sha" => sha_merge})
-                       ]
+                       "check_runs" => [check_run("make-all", "success")]
                      }
 
                    true ->

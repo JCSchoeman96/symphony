@@ -277,7 +277,7 @@ defmodule SymphonyElixir.AppServerEdgeTest do
         ],
         [json_line(%{"method" => "turn/completed"})]
       ],
-      [tracker_kind: "memory"],
+      [tracker_kind: "memory", agent_routing: "legacy"],
       fn workspace, binary, issue ->
         Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
 
@@ -441,6 +441,16 @@ defmodule SymphonyElixir.AppServerEdgeTest do
       root: "#{workspace_root}"
     agent:
       routing: "routed"
+    source_control:
+      kind: "github"
+      repository: "octo/symphony"
+      repository_id: 1368436395
+      base_branch: "main"
+      token_env: "GITHUB_TOKEN"
+      required_checks:
+        - context: "make-all"
+          app_id: 15368
+          subject: "head"
     codex:
       command: "codex app-server"
     ---

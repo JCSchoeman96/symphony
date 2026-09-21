@@ -133,6 +133,7 @@ defmodule SymphonyElixir.TestSupport do
       ]
       |> Keyword.merge(overrides)
       |> maybe_default_agent_routing(overrides)
+      |> maybe_default_routed_source_control(overrides)
 
     tracker_kind = Keyword.get(config, :tracker_kind)
     tracker_endpoint = Keyword.get(config, :tracker_endpoint)
@@ -269,6 +270,28 @@ defmodule SymphonyElixir.TestSupport do
       routing = if Keyword.get(config, :tracker_kind) == "memory", do: "routed", else: "legacy"
       Keyword.put(config, :agent_routing, routing)
     end
+  end
+
+  defp maybe_default_routed_source_control(config, overrides) do
+    if should_inject_routed_source_control?(config, overrides) do
+      config
+      |> Keyword.put(:source_control_kind, "github")
+      |> Keyword.put(:source_control_repository, "octo/symphony")
+      |> Keyword.put(:source_control_repository_id, 1_368_436_395)
+      |> Keyword.put(:source_control_base_branch, "main")
+      |> Keyword.put(:source_control_token_env, "GITHUB_TOKEN")
+      |> Keyword.put(:source_control_required_checks, [
+        %{"context" => "make-all", "app_id" => 15_368, "subject" => "head"}
+      ])
+    else
+      config
+    end
+  end
+
+  defp should_inject_routed_source_control?(config, overrides) do
+    Keyword.get(config, :agent_routing) == "routed" and
+      not Keyword.has_key?(overrides, :source_control_kind) and
+      is_nil(Keyword.get(config, :source_control_kind))
   end
 
   defp agent_profiles_yaml(nil), do: nil
