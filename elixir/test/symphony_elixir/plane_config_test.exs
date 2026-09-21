@@ -105,7 +105,17 @@ defmodule SymphonyElixir.PlaneConfigTest do
                    "api_key" => "$PLANE_API_KEY"
                  }
                },
-               "agent" => %{"routing" => "routed"}
+               "agent" => %{"routing" => "routed"},
+               "source_control" => %{
+                 "kind" => "github",
+                 "repository" => "octo/symphony",
+                 "repository_id" => 1_368_436_395,
+                 "base_branch" => "main",
+                 "token_env" => "GITHUB_TOKEN",
+                 "required_checks" => [
+                   %{"context" => "make-all", "app_id" => 15_368, "subject" => "head"}
+                 ]
+               }
              })
 
     assert :ok = Config.validate_settings(settings)

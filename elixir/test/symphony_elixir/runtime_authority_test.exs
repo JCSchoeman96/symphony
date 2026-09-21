@@ -87,6 +87,20 @@ defmodule SymphonyElixir.RuntimeAuthorityTest do
     assert :ok == authorize("fixer", :changes_requested, :in_review)
   end
 
+  test "reviewer authorizes source-control read and merge gatekeeper does not" do
+    reviewer_route = default_profile("reviewer") |> route_for()
+
+    assert :ok == Authority.authorize_source_control_operation(reviewer_route, :read_current_candidate_status)
+
+    merge_route = default_profile("merge_gatekeeper") |> route_for()
+
+    assert_denied(
+      Authority.authorize_source_control_operation(merge_route, :read_current_candidate_status),
+      :not_permitted,
+      :source_control_operation_not_permitted
+    )
+  end
+
   test "planner denies a builder command" do
     assert_denied(authorize("planner", :ready, :in_progress), :not_permitted, :command_not_permitted)
   end

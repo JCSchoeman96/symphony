@@ -675,6 +675,16 @@ defmodule SymphonyElixir.AgentRuntimeTest do
     agent:
       routing: "routed"
       max_turns: 2
+    source_control:
+      kind: "github"
+      repository: "octo/symphony"
+      repository_id: 1368436395
+      base_branch: "main"
+      token_env: "GITHUB_TOKEN"
+      required_checks:
+        - context: "make-all"
+          app_id: 15368
+          subject: "head"
     codex:
       command: "codex app-server"
     ---

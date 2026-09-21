@@ -1,6 +1,9 @@
 defmodule SymphonyElixir.WorkControlAssessmentTest do
   use ExUnit.Case, async: true
 
+  alias SymphonyElixir.SourceControl
+  alias SymphonyElixir.SourceControl.CandidateRef
+
   alias SymphonyElixir.WorkControl.{
     AuthorityDisposition,
     GuardClass,
@@ -8,6 +11,21 @@ defmodule SymphonyElixir.WorkControlAssessmentTest do
     ProviderObservation,
     SuspensionContext,
     WorkflowLifecycle
+  }
+
+  @sha_a String.duplicate("a", 40)
+  @sha_b String.duplicate("b", 40)
+  @tree String.duplicate("c", 40)
+
+  @source_control_config %{
+    kind: :github,
+    repository: "JCSchoeman96/symphony",
+    repository_id: 1_368_436_395,
+    base_branch: "main",
+    token_env: "GITHUB_TOKEN",
+    required_checks: [
+      %{context: "make-all", app_id: 15_368, subject: "head"}
+    ]
   }
 
   @now ~U[2026-09-16 00:00:00Z]
@@ -293,6 +311,64 @@ defmodule SymphonyElixir.WorkControlAssessmentTest do
     assert assessment.reason == :initial_inactive_state
 
     assert AuthorityDisposition.derive(assessment).status == :none
+  end
+
+  test "corroborated ready to merge regresses when review acceptance goes stale" do
+    {:ok, candidate_ref} =
+      CandidateRef.new(%{
+        repository_identity: "github:repository:1368436395",
+        base_sha: @sha_a,
+        candidate_sha: @sha_b,
+        pr_identity: "15",
+        observed_pr_head_sha: @sha_b
+      })
+
+    evidence = [
+      %{
+        class: :mechanical_guard,
+        name: :review_acceptance_verified,
+        outcome: :verified,
+        candidate_ref: Map.from_struct(candidate_ref),
+        candidate_tree_sha: @tree,
+        policy_fingerprint: review_policy_fingerprint()
+      }
+    ]
+
+    context = %{
+      source_control_opts: [
+        source_control_config: @source_control_config,
+        token: "token",
+        settings: %{symphony: %{project_id: "project-1"}},
+        request_fun: fn _token, path, _params, _opts ->
+          {:ok,
+           if String.contains?(path, "/pulls/15") do
+             %{
+               "number" => 15,
+               "state" => "open",
+               "merged" => false,
+               "draft" => false,
+               "mergeable" => true,
+               "head" => %{"sha" => String.duplicate("f", 40), "repo" => %{"id" => 1_368_436_395}},
+               "base" => %{"sha" => @sha_a, "ref" => "main"}
+             }
+           else
+             source_control_github_payload(path)
+           end}
+        end
+      ]
+    }
+
+    assessment =
+      LifecycleAssessment.assess(
+        observation("Ready to Merge"),
+        :ready_to_merge,
+        evidence,
+        context
+      )
+
+    assert assessment.status == :validation_required
+    assert assessment.validated_state == :in_review
+    assert assessment.reason == :candidate_moved
   end
 
   test "a corroborating observation validates while an untrusted forward observation does not" do
@@ -666,5 +742,50 @@ defmodule SymphonyElixir.WorkControlAssessmentTest do
     refute SuspensionContext.resolving?(escalated)
     assert {:error, :terminal_suspension_context} = SuspensionContext.begin_resolution(escalated)
     assert {:error, :context_not_resolving} = SuspensionContext.escalate(escalated, :again)
+  end
+
+  defp review_policy_fingerprint do
+    SourceControl.policy_fingerprint_for(@source_control_config, %{symphony: %{project_id: "project-1"}})
+  end
+
+  defp source_control_github_payload(path) do
+    cond do
+      String.ends_with?(path, "/repos/JCSchoeman96/symphony") ->
+        %{"id" => 1_368_436_395}
+
+      String.contains?(path, "/git/ref/heads/main") ->
+        %{"object" => %{"sha" => @sha_a}}
+
+      String.contains?(path, "/pulls/15") ->
+        %{
+          "number" => 15,
+          "state" => "open",
+          "merged" => false,
+          "draft" => false,
+          "mergeable" => true,
+          "head" => %{"sha" => @sha_b, "repo" => %{"id" => 1_368_436_395}},
+          "base" => %{"sha" => @sha_a, "ref" => "main"}
+        }
+
+      String.contains?(path, "/compare/" <> @sha_a <> "..." <> @sha_b) ->
+        %{"status" => "ahead"}
+
+      String.contains?(path, "/check-runs") ->
+        %{
+          "total_count" => 1,
+          "check_runs" => [
+            %{
+              "name" => "make-all",
+              "head_sha" => @sha_b,
+              "status" => "completed",
+              "conclusion" => "success",
+              "app" => %{"id" => 15_368}
+            }
+          ]
+        }
+
+      true ->
+        %{}
+    end
   end
 end

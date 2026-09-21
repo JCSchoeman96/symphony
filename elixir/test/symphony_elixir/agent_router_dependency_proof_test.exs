@@ -236,7 +236,9 @@ defmodule SymphonyElixir.AgentRouterDependencyProofTest do
         prior_validated_lifecycle_state: merge_issue.state
       })
 
-    assert {:error, :authority_unavailable} = Router.resolve(merge_work_item, Config.settings!().agent.profiles)
+    assert {:error, :lifecycle_validation_required} =
+             Router.resolve(merge_work_item, Config.settings!().agent.profiles)
+
     refute Config.settings!().agent.profiles["merge_gatekeeper"].command
     refute Map.has_key?(Map.from_struct(Config.settings!().agent), :auto_merge)
   end
@@ -478,10 +480,20 @@ defmodule SymphonyElixir.AgentRouterDependencyProofTest do
           evidence
 
         requirement ->
-          requirement
+          mechanical_guard_evidence(requirement)
       end)
     end)
   end
+
+  defp mechanical_guard_evidence(%{class: :mechanical_guard, name: name} = requirement) do
+    if name in [:candidate_state_verified, :review_acceptance_verified] do
+      Map.put(requirement, :outcome, :verified)
+    else
+      requirement
+    end
+  end
+
+  defp mechanical_guard_evidence(requirement), do: requirement
 
   defp trusted_work_control(issues) when is_list(issues) do
     Map.new(issues, fn issue -> {issue.id, trusted_work_item(issue)} end)

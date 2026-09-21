@@ -10,7 +10,8 @@ defmodule SymphonyElixir.ConfigIdentityTest do
              Schema.parse(%{
                "symphony" => %{"project_id" => "  symphony-main  "},
                "tracker" => %{"kind" => "memory"},
-               "agent" => %{"routing" => "routed"}
+               "agent" => %{"routing" => "routed"},
+               "source_control" => routed_source_control_config()
              })
 
     assert settings.symphony.project_id == "symphony-main"
@@ -21,7 +22,8 @@ defmodule SymphonyElixir.ConfigIdentityTest do
     assert {:ok, settings} =
              Schema.parse(%{
                "tracker" => %{"kind" => "memory"},
-               "agent" => %{"routing" => "routed"}
+               "agent" => %{"routing" => "routed"},
+               "source_control" => routed_source_control_config()
              })
 
     assert {:error, :missing_symphony_project_id} = Config.validate_settings(settings)
@@ -38,6 +40,45 @@ defmodule SymphonyElixir.ConfigIdentityTest do
 
       assert message =~ "symphony.project_id"
     end
+  end
+
+  test "routed settings require source control configuration" do
+    assert {:ok, settings} =
+             Schema.parse(%{
+               "symphony" => %{"project_id" => "symphony-main"},
+               "tracker" => %{"kind" => "memory"},
+               "agent" => %{"routing" => "routed"}
+             })
+
+    assert {:error, :missing_source_control_config} = Config.validate_settings(settings)
+  end
+
+  defp routed_source_control_config do
+    %{
+      "kind" => "github",
+      "repository" => "octo/symphony",
+      "repository_id" => 1_368_436_395,
+      "base_branch" => "main",
+      "token_env" => "GITHUB_TOKEN",
+      "required_checks" => [
+        %{"context" => "make-all", "app_id" => 15_368, "subject" => "head"}
+      ]
+    }
+  end
+
+  test "legacy settings remain valid without source control configuration" do
+    assert {:ok, settings} =
+             Schema.parse(%{
+               "tracker" => %{
+                 "kind" => "github",
+                 "provider" => %{"repo" => "octo/repo", "token" => "secret"},
+                 "active_states" => ["open"],
+                 "terminal_states" => ["closed"]
+               },
+               "agent" => %{"routing" => "legacy"}
+             })
+
+    assert :ok = Config.validate_settings(settings)
   end
 
   test "legacy settings remain valid without a project identity" do

@@ -12,7 +12,7 @@ defmodule SymphonyElixir.TransitionCoordinator do
   use GenServer
 
   alias SymphonyElixir.AgentRuntime.{Authority, Route}
-  alias SymphonyElixir.{Config, Orchestrator}
+  alias SymphonyElixir.{Config, Orchestrator, SourceControl}
   alias SymphonyElixir.Plane.ProjectContract, as: PlaneProjectContract
   alias SymphonyElixir.Tracker
   alias SymphonyElixir.Tracker.Issue
@@ -1068,14 +1068,20 @@ defmodule SymphonyElixir.TransitionCoordinator do
              intent.guard_evidence,
              Map.put(context, :responsibility, canonical_transition_responsibility(intent))
            ),
-         true <- LifecycleAssessment.validated?(assessment) do
+         true <- LifecycleAssessment.validated?(assessment),
+         {:ok, guard_evidence} <-
+           SourceControl.enrich_guard_evidence(
+             intent,
+             context,
+             transition_guard_evidence(context, intent, assessment)
+           ) do
       {:ok,
        context
        |> Map.put(:provider_observation, observation)
        |> Map.put(:pre_observation_evidence, observation)
        |> Map.put(:current_state, canonical_state)
        |> Map.put(:pre_assessment_evidence, assessment)
-       |> Map.put(:guard_evidence, transition_guard_evidence(context, intent))
+       |> Map.put(:guard_evidence, guard_evidence)
        |> Map.put(:fresh_read_at, observation.observed_at)}
     else
       {:ok, []} -> {:error, :work_item_not_found}
@@ -1088,12 +1094,25 @@ defmodule SymphonyElixir.TransitionCoordinator do
     %{provider: :plane, observed_at: DateTime.utc_now()}
   end
 
-  defp transition_guard_evidence(context, %SemanticTransitionIntent{} = intent) do
-    case Map.get(context, :guard_evidence) do
-      evidence when is_list(evidence) and evidence != [] -> evidence
-      _ -> intent.guard_evidence
-    end
+  defp transition_guard_evidence(context, %SemanticTransitionIntent{} = intent, assessment) do
+    base_evidence =
+      case assessment do
+        %LifecycleAssessment{satisfied_guards: guards} when is_list(guards) and guards != [] ->
+          guards
+
+        _ ->
+          case Map.get(context, :guard_evidence) do
+            evidence when is_list(evidence) and evidence != [] -> evidence
+            _ -> intent.guard_evidence
+          end
+      end
+
+    normalize_guard_evidence(base_evidence)
   end
+
+  defp normalize_guard_evidence(evidence) when is_list(evidence), do: evidence
+  defp normalize_guard_evidence(evidence) when is_map(evidence), do: [evidence]
+  defp normalize_guard_evidence(_evidence), do: []
 
   defp fresh_canonical_state(%ProviderObservation{} = observation, context) do
     case Map.get(context, :provider_project_contract) do

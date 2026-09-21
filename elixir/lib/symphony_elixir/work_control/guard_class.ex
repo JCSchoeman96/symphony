@@ -8,6 +8,8 @@ defmodule SymphonyElixir.WorkControl.GuardClass do
 
   @classes [:mechanical_guard, :semantic_attestation, :human_decision]
 
+  @verified_outcome_guards [:candidate_state_verified, :review_acceptance_verified]
+
   @type class :: :mechanical_guard | :semantic_attestation | :human_decision
   @type requirement :: %{class: class(), name: atom()}
   @type semantic_attestation :: %{
@@ -117,8 +119,15 @@ defmodule SymphonyElixir.WorkControl.GuardClass do
   end
 
   defp evidence_satisfies?(class, name, evidence, _context) do
-    match?(%{class: ^class, name: ^name}, evidence) and valid_evidence?(evidence)
+    match?(%{class: ^class, name: ^name}, evidence) and valid_evidence?(evidence) and
+      verified_outcome_satisfied?(name, evidence)
   end
+
+  defp verified_outcome_satisfied?(_name, %{outcome: :verified}), do: true
+
+  defp verified_outcome_satisfied?(name, _evidence) when name in @verified_outcome_guards, do: false
+
+  defp verified_outcome_satisfied?(_name, _evidence), do: true
 
   defp validate_semantic_attestation(%{class: :semantic_attestation, name: name} = evidence)
        when is_atom(name) do

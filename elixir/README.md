@@ -238,6 +238,19 @@ codex:
 - `server.port` or CLI `--port` enables the optional Phoenix LiveView dashboard and JSON API at
   `/`, `/api/v1/state`, `/api/v1/<issue_identifier>`, and `/api/v1/refresh`.
 
+### Source-control authority (H-050C)
+
+- Optional `source_control` configuration is independent of `tracker`. It binds host-owned GitHub
+  repository identity, protected base branch, required CI checks, and a token environment-variable
+  name (never a literal token value).
+- Candidate identity is captured from the assigned workspace HEAD plus fresh GitHub corroboration.
+  Runtimes cannot supply repository, PR, SHA, branch, or check selectors for source-control
+  authority.
+- Reviewer sessions may receive one read-only semantic tool,
+  `source_control_read_current_candidate_status`, with an empty input schema.
+- Merge execution remains human/external. Symphony verifies ordinary and squash merges against the
+  approved `CandidateRef`; rebase merges fail closed in V1.
+
 ### Linear adapter profile
 
 - Config: use `tracker.kind: linear` with `tracker.provider.endpoint` (default

@@ -1,0 +1,754 @@
+defmodule SymphonyElixir.GitHub.SourceControlTest do
+  use ExUnit.Case, async: true
+
+  alias SymphonyElixir.GitHub.SourceControl
+  alias SymphonyElixir.SourceControl.CandidateRef
+
+  @sha_a String.duplicate("a", 40)
+  @sha_b String.duplicate("b", 40)
+  @sha_m String.duplicate("d", 40)
+  @tree String.duplicate("c", 40)
+
+  @config %{
+    kind: :github,
+    repository: "JCSchoeman96/symphony",
+    repository_id: 1_368_436_395,
+    base_branch: "main",
+    token_env: "GITHUB_TOKEN",
+    required_checks: [
+      %{context: "make-all", app_id: 15_368, subject: "head"},
+      %{context: "validate-pr-description", app_id: 15_368, subject: "head"}
+    ]
+  }
+
+  test "duplicate successful checks with same identity are accepted" do
+    candidate_ref = candidate_ref()
+
+    assert :ok =
+             SourceControl.verify_required_checks(
+               @config,
+               candidate_ref,
+               @tree,
+               request_opts(duplicate_success_checks())
+             )
+  end
+
+  test "conflicting duplicate checks fail closed" do
+    candidate_ref = candidate_ref()
+
+    assert {:error, :ambiguous_check} =
+             SourceControl.verify_required_checks(
+               @config,
+               candidate_ref,
+               @tree,
+               request_opts(conflicting_duplicate_checks())
+             )
+  end
+
+  test "fetch associated pull requests paginates provider pages" do
+    page_one =
+      for number <- 1..100 do
+        %{
+          "number" => number,
+          "state" => "open",
+          "head" => %{"sha" => @sha_b, "repo" => %{"id" => 1_368_436_395}},
+          "base" => %{"sha" => @sha_a, "ref" => "main"}
+        }
+      end
+
+    page_two = [
+      %{
+        "number" => 101,
+        "state" => "open",
+        "head" => %{"sha" => @sha_b, "repo" => %{"id" => 1_368_436_395}},
+        "base" => %{"sha" => @sha_a, "ref" => "main"}
+      }
+    ]
+
+    assert {:error, :too_many_associated_pull_requests} =
+             SourceControl.fetch_associated_pull_requests(
+               @config,
+               @sha_b,
+               token: "token",
+               request_fun: fn _token, _path, params, _opts ->
+                 page = Map.get(params, "page", Map.get(params, :page, 1))
+
+                 pulls =
+                   case page do
+                     1 -> page_one
+                     2 -> page_two
+                     "1" -> page_one
+                     "2" -> page_two
+                     _ -> []
+                   end
+
+                 {:ok, pulls}
+               end
+             )
+  end
+
+  test "capture fails closed when too many associated pull requests are returned" do
+    pulls =
+      for number <- 1..101 do
+        %{
+          "number" => number,
+          "state" => "open",
+          "head" => %{"sha" => @sha_b, "repo" => %{"id" => 1_368_436_395}},
+          "base" => %{"sha" => @sha_a, "ref" => "main"}
+        }
+      end
+
+    assert {:error, :too_many_associated_pull_requests} =
+             SourceControl.capture_candidate_ref(
+               @config,
+               @sha_b,
+               request_opts(fn path ->
+                 if String.contains?(path, "/commits/" <> @sha_b <> "/pulls"), do: pulls, else: base_github_payload().(path)
+               end)
+             )
+  end
+
+  test "capture fails closed for ambiguous pull requests" do
+    assert {:error, :ambiguous_pull_request} =
+             SourceControl.capture_candidate_ref(
+               @config,
+               @sha_b,
+               request_opts(fn path ->
+                 if String.contains?(path, "/commits/" <> @sha_b <> "/pulls") do
+                   [open_pull(15), open_pull(16)]
+                 else
+                   base_github_payload().(path)
+                 end
+               end)
+             )
+  end
+
+  test "capture fails closed for fork pull requests" do
+    assert {:error, :fork_pull_request} =
+             SourceControl.capture_candidate_ref(
+               @config,
+               @sha_b,
+               request_opts(fn path ->
+                 if String.contains?(path, "/commits/" <> @sha_b <> "/pulls") do
+                   [
+                     %{
+                       "number" => 15,
+                       "state" => "open",
+                       "head" => %{"sha" => @sha_b, "repo" => %{"id" => 999}},
+                       "base" => %{"sha" => @sha_a, "ref" => "main"}
+                     }
+                   ]
+                 else
+                   base_github_payload().(path)
+                 end
+               end)
+             )
+  end
+
+  test "verify candidate unchanged rejects closed pull requests" do
+    candidate_ref = candidate_ref()
+
+    assert {:error, :pull_request_not_open} =
+             SourceControl.verify_candidate_unchanged(
+               @config,
+               candidate_ref,
+               request_opts(fn path ->
+                 if String.contains?(path, "/pulls/15") do
+                   open_pull(15, %{"state" => "closed"})
+                 else
+                   base_github_payload().(path)
+                 end
+               end)
+             )
+  end
+
+  test "verify candidate unchanged rejects repository identity drift" do
+    {:ok, drifted_ref} =
+      CandidateRef.new(%{
+        repository_identity: "github:repository:999",
+        base_sha: @sha_a,
+        candidate_sha: @sha_b,
+        pr_identity: "15",
+        observed_pr_head_sha: @sha_b
+      })
+
+    assert {:error, :repository_identity_mismatch} =
+             SourceControl.verify_candidate_unchanged(@config, drifted_ref, request_opts(base_github_payload()))
+  end
+
+  test "verify candidate unchanged detects head movement" do
+    candidate_ref = candidate_ref()
+
+    assert {:error, :candidate_moved} =
+             SourceControl.verify_candidate_unchanged(
+               @config,
+               candidate_ref,
+               request_opts(fn path ->
+                 if String.contains?(path, "/pulls/15") do
+                   open_pull(15, %{"head" => %{"sha" => String.duplicate("f", 40), "repo" => %{"id" => 1_368_436_395}}})
+                 else
+                   base_github_payload().(path)
+                 end
+               end)
+             )
+  end
+
+  test "missing required check fails closed" do
+    candidate_ref = candidate_ref()
+
+    assert {:error, :missing_required_check} =
+             SourceControl.verify_required_checks(
+               @config,
+               candidate_ref,
+               @tree,
+               request_opts(fn path ->
+                 if String.contains?(path, "/check-runs") do
+                   %{"total_count" => 0, "check_runs" => []}
+                 else
+                   base_github_payload().(path)
+                 end
+               end)
+             )
+  end
+
+  test "verify merge rejects candidate ref repository identity drift" do
+    {:ok, drifted_ref} =
+      CandidateRef.new(%{
+        repository_identity: "github:repository:999",
+        base_sha: @sha_a,
+        candidate_sha: @sha_b,
+        pr_identity: "15",
+        observed_pr_head_sha: @sha_b
+      })
+
+    assert {:error, :repository_identity_mismatch} =
+             SourceControl.verify_merge(@config, drifted_ref, @tree, request_opts(base_github_payload()))
+  end
+
+  test "verify merge rejects repository identity substitution" do
+    candidate_ref = candidate_ref()
+
+    assert {:error, :repository_id_mismatch} =
+             SourceControl.verify_merge(
+               @config,
+               candidate_ref,
+               @tree,
+               request_opts(fn path ->
+                 if String.ends_with?(path, "/repos/JCSchoeman96/symphony") do
+                   %{"id" => 999}
+                 else
+                   base_github_payload().(path)
+                 end
+               end)
+             )
+  end
+
+  test "verify merge rejects main advanced after merge commit" do
+    candidate_ref = candidate_ref()
+    sha_m = String.duplicate("d", 40)
+    sha_main = String.duplicate("e", 40)
+
+    assert {:error, :main_advanced_after_merge} =
+             SourceControl.verify_merge(
+               @config,
+               candidate_ref,
+               @tree,
+               request_opts(fn path ->
+                 cond do
+                   String.contains?(path, "/pulls/15") ->
+                     %{"number" => 15, "merged" => true, "head" => %{"sha" => @sha_b}, "merge_commit_sha" => sha_m}
+
+                   String.contains?(path, "/git/commits/" <> sha_m) ->
+                     %{"sha" => sha_m, "tree" => %{"sha" => @tree}, "parents" => [%{"sha" => @sha_a}, %{"sha" => @sha_b}]}
+
+                   String.contains?(path, "/git/ref/heads/main") ->
+                     %{"object" => %{"sha" => sha_main}}
+
+                   true ->
+                     base_github_payload().(path)
+                 end
+               end)
+             )
+  end
+
+  test "verify candidate unchanged detects base branch retargeting" do
+    candidate_ref = candidate_ref()
+
+    assert {:error, :base_branch_retargeted} =
+             SourceControl.verify_candidate_unchanged(
+               @config,
+               candidate_ref,
+               request_opts(fn path ->
+                 if String.contains?(path, "/pulls/15") do
+                   open_pull(15, %{"base" => %{"sha" => @sha_a, "ref" => "develop"}})
+                 else
+                   base_github_payload().(path)
+                 end
+               end)
+             )
+  end
+
+  test "verify merge fails when pull request is not merged" do
+    candidate_ref = candidate_ref()
+
+    assert {:error, :not_merged} =
+             SourceControl.verify_merge(
+               @config,
+               candidate_ref,
+               @tree,
+               request_opts(fn path ->
+                 if String.contains?(path, "/pulls/15") do
+                   %{"number" => 15, "merged" => false, "head" => %{"sha" => @sha_b}}
+                 else
+                   base_github_payload().(path)
+                 end
+               end)
+             )
+  end
+
+  test "captures candidate ref from workspace head and github corroboration" do
+    assert {:ok, ref, tree} =
+             SourceControl.capture_candidate_ref(@config, @sha_b, request_opts(base_github_payload()))
+
+    assert %CandidateRef{pr_identity: "15", candidate_sha: @sha_b} = ref
+    assert tree == @tree
+  end
+
+  test "capture fails closed when commit response omits tree sha" do
+    assert {:error, :malformed_candidate_tree} =
+             SourceControl.capture_candidate_ref(
+               @config,
+               @sha_b,
+               request_opts(fn path ->
+                 if String.ends_with?(path, "/commits/" <> @sha_b) do
+                   %{"commit" => %{}}
+                 else
+                   base_github_payload().(path)
+                 end
+               end)
+             )
+  end
+
+  test "verify candidate unchanged fails closed on malformed tree sha" do
+    candidate_ref = candidate_ref()
+
+    assert {:error, :malformed_candidate_tree} =
+             SourceControl.verify_candidate_unchanged(
+               @config,
+               candidate_ref,
+               request_opts(fn path ->
+                 if String.contains?(path, "/commits/" <> @sha_b) do
+                   %{"commit" => %{"tree" => %{"sha" => "not-a-sha"}}}
+                 else
+                   base_github_payload().(path)
+                 end
+               end)
+             )
+  end
+
+  test "verify required checks rejects malformed tree evidence" do
+    candidate_ref = candidate_ref()
+
+    assert {:error, :malformed_candidate_tree} =
+             SourceControl.verify_required_checks(@config, candidate_ref, nil, request_opts(base_github_payload()))
+  end
+
+  test "verify merge rejects malformed merge tree" do
+    candidate_ref = candidate_ref()
+
+    assert {:error, :malformed_candidate_tree} =
+             SourceControl.verify_merge(
+               @config,
+               candidate_ref,
+               @tree,
+               request_opts(fn path ->
+                 cond do
+                   String.contains?(path, "/pulls/15") ->
+                     %{
+                       "number" => 15,
+                       "merged" => true,
+                       "head" => %{"sha" => @sha_b},
+                       "merge_commit_sha" => @sha_m
+                     }
+
+                   String.contains?(path, "/git/commits/" <> @sha_m) ->
+                     %{
+                       "sha" => @sha_m,
+                       "tree" => %{"sha" => "bad-tree"},
+                       "parents" => [%{"sha" => @sha_a}, %{"sha" => @sha_b}]
+                     }
+
+                   true ->
+                     base_github_payload().(path)
+                 end
+               end)
+             )
+  end
+
+  test "pending and failed checks fail closed" do
+    candidate_ref = candidate_ref()
+
+    assert {:error, :check_pending} =
+             SourceControl.verify_required_checks(
+               @config,
+               candidate_ref,
+               @tree,
+               request_opts(fn path ->
+                 if String.contains?(path, "/check-runs") do
+                   %{
+                     "total_count" => 1,
+                     "check_runs" => [Map.put(check_run("make-all", "success"), "status", "in_progress")]
+                   }
+                 else
+                   base_github_payload().(path)
+                 end
+               end)
+             )
+
+    assert {:error, :check_not_successful} =
+             SourceControl.verify_required_checks(
+               @config,
+               candidate_ref,
+               @tree,
+               request_opts(fn path ->
+                 if String.contains?(path, "/check-runs") do
+                   %{
+                     "total_count" => 1,
+                     "check_runs" => [check_run("make-all", "failure")]
+                   }
+                 else
+                   base_github_payload().(path)
+                 end
+               end)
+             )
+  end
+
+  test "synthetic merge fetch fails when merge commit sha is unavailable" do
+    assert {:error, :synthetic_merge_unavailable} =
+             SourceControl.fetch_merge_ref_commit(
+               @config,
+               15,
+               request_opts(fn path ->
+                 if String.contains?(path, "/pulls/15") do
+                   open_pull(15, %{"merge_commit_sha" => nil})
+                 else
+                   base_github_payload().(path)
+                 end
+               end)
+             )
+  end
+
+  test "required checks fetch check-runs once per lookup sha" do
+    candidate_ref = candidate_ref()
+    calls = :counters.new(1, [])
+
+    config =
+      Map.put(@config, :required_checks, [
+        %{context: "make-all", app_id: 15_368, subject: "head"},
+        %{context: "validate-pr-description", app_id: 15_368, subject: "head"}
+      ])
+
+    assert :ok =
+             SourceControl.verify_required_checks(
+               config,
+               candidate_ref,
+               @tree,
+               request_opts(fn path ->
+                 if String.contains?(path, "/check-runs") do
+                   :counters.add(calls, 1, 1)
+
+                   %{
+                     "total_count" => 2,
+                     "check_runs" => [
+                       check_run("make-all", "success"),
+                       check_run("validate-pr-description", "success")
+                     ]
+                   }
+                 else
+                   base_github_payload().(path)
+                 end
+               end)
+             )
+
+    assert :counters.get(calls, 1) == 1
+  end
+
+  test "synthetic merge checks validate merge ref parents and tree" do
+    config =
+      Map.put(@config, :required_checks, [
+        %{context: "make-all", app_id: 15_368, subject: "synthetic_merge"}
+      ])
+
+    candidate_ref = candidate_ref()
+    sha_merge = String.duplicate("9", 40)
+
+    assert :ok =
+             SourceControl.verify_required_checks(
+               config,
+               candidate_ref,
+               @tree,
+               request_opts(fn path ->
+                 cond do
+                   String.contains?(path, "/pulls/15") ->
+                     open_pull(15, %{"merge_commit_sha" => sha_merge})
+
+                   String.contains?(path, "/git/commits/" <> sha_merge) ->
+                     %{
+                       "sha" => sha_merge,
+                       "tree" => %{"sha" => @tree},
+                       "parents" => [%{"sha" => @sha_a}, %{"sha" => @sha_b}]
+                     }
+
+                   String.contains?(path, "/check-runs") ->
+                     %{
+                       "total_count" => 1,
+                       "check_runs" => [check_run("make-all", "success")]
+                     }
+
+                   true ->
+                     base_github_payload().(path)
+                 end
+               end)
+             )
+  end
+
+  test "capture fails for diverged ancestry and workspace head mismatch" do
+    assert {:error, :candidate_not_based_on_base} =
+             SourceControl.capture_candidate_ref(
+               @config,
+               @sha_b,
+               request_opts(fn path ->
+                 if String.contains?(path, "/compare/") do
+                   %{"status" => "diverged"}
+                 else
+                   base_github_payload().(path)
+                 end
+               end)
+             )
+
+    assert {:error, :workspace_head_mismatch} =
+             SourceControl.capture_candidate_ref(
+               @config,
+               @sha_b,
+               request_opts(fn path ->
+                 if String.contains?(path, "/pulls/15") do
+                   open_pull(15, %{"head" => %{"sha" => String.duplicate("f", 40), "repo" => %{"id" => 1_368_436_395}}})
+                 else
+                   base_github_payload().(path)
+                 end
+               end)
+             )
+  end
+
+  test "rejects unsupported check subjects and invalid synthetic merge refs" do
+    candidate_ref = candidate_ref()
+
+    assert {:error, :unsupported_check_subject} =
+             SourceControl.verify_required_checks(
+               Map.put(@config, :required_checks, [%{context: "make-all", app_id: 15_368, subject: "unknown"}]),
+               candidate_ref,
+               @tree,
+               request_opts(base_github_payload())
+             )
+
+    assert {:error, :invalid_synthetic_merge_parents} =
+             SourceControl.verify_required_checks(
+               Map.put(@config, :required_checks, [
+                 %{context: "make-all", app_id: 15_368, subject: "synthetic_merge"}
+               ]),
+               candidate_ref,
+               @tree,
+               request_opts(fn path ->
+                 cond do
+                   String.contains?(path, "/pulls/15") ->
+                     open_pull(15)
+
+                   String.contains?(path, "/git/commits/") ->
+                     %{
+                       "sha" => String.duplicate("9", 40),
+                       "tree" => %{"sha" => @tree},
+                       "parents" => [%{"sha" => @sha_a}]
+                     }
+
+                   true ->
+                     base_github_payload().(path)
+                 end
+               end)
+             )
+  end
+
+  test "verify merge fails when squash parent does not match base" do
+    candidate_ref = candidate_ref()
+
+    assert {:error, :merge_parent_mismatch} =
+             SourceControl.verify_merge(
+               @config,
+               candidate_ref,
+               @tree,
+               request_opts(fn path ->
+                 cond do
+                   String.contains?(path, "/pulls/15") ->
+                     %{
+                       "number" => 15,
+                       "merged" => true,
+                       "head" => %{"sha" => @sha_b},
+                       "merge_commit_sha" => @sha_m
+                     }
+
+                   String.contains?(path, "/git/commits/" <> @sha_m) ->
+                     %{
+                       "sha" => @sha_m,
+                       "tree" => %{"sha" => @tree},
+                       "parents" => [%{"sha" => String.duplicate("f", 40)}]
+                     }
+
+                   true ->
+                     base_github_payload().(path)
+                 end
+               end)
+             )
+  end
+
+  test "verify merge fails when main does not contain merge commit" do
+    candidate_ref = candidate_ref()
+    sha_m = String.duplicate("d", 40)
+    sha_main = String.duplicate("e", 40)
+
+    assert {:error, :main_advanced_after_merge} =
+             SourceControl.verify_merge(
+               @config,
+               candidate_ref,
+               @tree,
+               request_opts(fn path ->
+                 cond do
+                   String.contains?(path, "/pulls/15") ->
+                     %{"number" => 15, "merged" => true, "head" => %{"sha" => @sha_b}, "merge_commit_sha" => sha_m}
+
+                   String.contains?(path, "/git/commits/" <> sha_m) ->
+                     %{"sha" => sha_m, "tree" => %{"sha" => @tree}, "parents" => [%{"sha" => @sha_a}, %{"sha" => @sha_b}]}
+
+                   String.contains?(path, "/git/ref/heads/main") ->
+                     %{"object" => %{"sha" => sha_main}}
+
+                   true ->
+                     base_github_payload().(path)
+                 end
+               end)
+             )
+  end
+
+  defp open_pull(number, attrs \\ %{}) do
+    Map.merge(
+      %{
+        "number" => number,
+        "state" => "open",
+        "merged" => false,
+        "draft" => false,
+        "mergeable" => true,
+        "merge_commit_sha" => String.duplicate("9", 40),
+        "head" => %{"sha" => @sha_b, "repo" => %{"id" => 1_368_436_395}},
+        "base" => %{"sha" => @sha_a, "ref" => "main"}
+      },
+      attrs
+    )
+  end
+
+  defp candidate_ref do
+    {:ok, ref} =
+      CandidateRef.new(%{
+        repository_identity: "github:repository:1368436395",
+        base_sha: @sha_a,
+        candidate_sha: @sha_b,
+        pr_identity: "15",
+        observed_pr_head_sha: @sha_b
+      })
+
+    ref
+  end
+
+  defp request_opts(payload_fun) do
+    [
+      token: "token",
+      request_fun: fn _token, path, _params, _opts ->
+        {:ok, payload_fun.(path)}
+      end
+    ]
+  end
+
+  defp duplicate_success_checks do
+    fn path ->
+      if String.contains?(path, "/check-runs") do
+        %{
+          "total_count" => 3,
+          "check_runs" => [
+            check_run("make-all", "success"),
+            check_run("validate-pr-description", "success"),
+            check_run("validate-pr-description", "success")
+          ]
+        }
+      else
+        base_github_payload().(path)
+      end
+    end
+  end
+
+  defp conflicting_duplicate_checks do
+    fn path ->
+      if String.contains?(path, "/check-runs") do
+        %{
+          "total_count" => 3,
+          "check_runs" => [
+            check_run("make-all", "success"),
+            check_run("validate-pr-description", "success"),
+            check_run("validate-pr-description", "failure")
+          ]
+        }
+      else
+        base_github_payload().(path)
+      end
+    end
+  end
+
+  defp check_run(name, conclusion) do
+    %{
+      "name" => name,
+      "head_sha" => @sha_b,
+      "status" => "completed",
+      "conclusion" => conclusion,
+      "app" => %{"id" => 15_368}
+    }
+  end
+
+  defp base_github_payload do
+    fn path ->
+      cond do
+        String.ends_with?(path, "/repos/JCSchoeman96/symphony") ->
+          %{"id" => 1_368_436_395}
+
+        String.contains?(path, "/git/ref/heads/main") ->
+          %{"object" => %{"sha" => @sha_a}}
+
+        String.contains?(path, "/commits/" <> @sha_b <> "/pulls") ->
+          [open_pull(15)]
+
+        String.contains?(path, "/pulls/15") ->
+          open_pull(15)
+
+        String.contains?(path, "/compare/" <> @sha_a <> "..." <> @sha_b) ->
+          %{"status" => "ahead"}
+
+        String.contains?(path, "/check-runs") ->
+          %{
+            "total_count" => 1,
+            "check_runs" => [check_run("make-all", "success")]
+          }
+
+        String.contains?(path, "/commits/" <> @sha_b) ->
+          %{"commit" => %{"tree" => %{"sha" => @tree}}}
+
+        true ->
+          %{}
+      end
+    end
+  end
+end

@@ -4,7 +4,7 @@ defmodule SymphonyElixir.AgentRunner do
   """
 
   require Logger
-  alias SymphonyElixir.{AgentRuntime, Config, PromptBuilder, Tracker, Workspace}
+  alias SymphonyElixir.{AgentRuntime, Config, PromptBuilder, SourceControl, Tracker, Workspace}
   alias SymphonyElixir.AgentRuntime.{Profile, Route, Router}
   alias SymphonyElixir.Dependency.Guard
   alias SymphonyElixir.Tracker.Issue
@@ -590,7 +590,11 @@ defmodule SymphonyElixir.AgentRunner do
       responsibility: route.responsibility,
       dependency_decision: dependency_decision_from_options(issue, route, opts),
       work_control: Keyword.get(opts, :work_control, %{}),
-      guard_evidence: Keyword.get(opts, :guard_evidence, [])
+      guard_evidence:
+        SourceControl.canonical_host_guard_evidence(%{
+          work_item: Keyword.get(opts, :work_item),
+          guard_evidence: Keyword.get(opts, :guard_evidence, [])
+        })
     }
 
     case Keyword.get(opts, :work_item) do

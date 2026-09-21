@@ -424,7 +424,8 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
 
     assert Enum.map(intent.guard_evidence, &Map.get(&1, :name)) == [
              :implementation_attested,
-             :implementation_checks_verified
+             :implementation_checks_verified,
+             :candidate_state_verified
            ]
 
     assert is_nil(intent.runtime_attempt_id)
@@ -1546,7 +1547,8 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
 
     [
       attestation,
-      %{class: :mechanical_guard, name: :implementation_checks_verified}
+      %{class: :mechanical_guard, name: :implementation_checks_verified},
+      %{class: :mechanical_guard, name: :candidate_state_verified, outcome: :verified}
     ]
   end
 

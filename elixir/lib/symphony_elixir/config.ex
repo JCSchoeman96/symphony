@@ -145,7 +145,8 @@ defmodule SymphonyElixir.Config do
     else
       with :ok <- Tracker.validate_config(settings.tracker),
            :ok <- validate_plane_runtime_mode(settings),
-           :ok <- Tracker.validate_routed_capabilities(settings) do
+           :ok <- Tracker.validate_routed_capabilities(settings),
+           :ok <- Schema.validate_source_control(settings) do
         Schema.validate_project_identity(settings)
       end
     end
