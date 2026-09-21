@@ -494,6 +494,20 @@ defmodule SymphonyElixir.SourceControlCoverageTest do
       String.contains?(path, "/git/ref/heads/main") ->
         %{"object" => %{"sha" => sha_m}}
 
+      String.contains?(path, "/check-runs") ->
+        %{
+          "total_count" => 1,
+          "check_runs" => [
+            %{
+              "name" => "make-all",
+              "head_sha" => @sha_b,
+              "status" => "completed",
+              "conclusion" => "success",
+              "app" => %{"id" => 15_368}
+            }
+          ]
+        }
+
       true ->
         %{}
     end

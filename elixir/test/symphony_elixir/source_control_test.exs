@@ -271,6 +271,46 @@ defmodule SymphonyElixir.SourceControlTest do
     assert entry.outcome == :verified
   end
 
+  test "reconcile invalidates merged review acceptance when required checks are no longer green" do
+    {:ok, ref} =
+      CandidateRef.new(%{
+        repository_identity: "github:repository:1368436395",
+        base_sha: @sha_a,
+        candidate_sha: @sha_b,
+        pr_identity: "15",
+        observed_pr_head_sha: @sha_b
+      })
+
+    sha_m = String.duplicate("d", 40)
+    tree = String.duplicate("c", 40)
+
+    evidence = [
+      %{
+        class: :mechanical_guard,
+        name: :review_acceptance_verified,
+        outcome: :verified,
+        candidate_ref: Map.from_struct(ref),
+        candidate_tree_sha: tree,
+        policy_fingerprint: policy_fingerprint()
+      }
+    ]
+
+    assert {:ok, reconciled} =
+             SourceControl.reconcile_stored_evidence(
+               :ready_to_merge,
+               evidence,
+               source_control_config: @config,
+               settings: %{symphony: %{project_id: "project-1"}},
+               token: "token",
+               request_fun: fn _token, path, _params, _opts ->
+                 {:ok, merged_github_payload(path, sha_m, tree, check_conclusion: "failure")}
+               end
+             )
+
+    entry = Enum.find(reconciled, &(&1.name == :review_acceptance_verified))
+    assert entry.outcome == :stale
+  end
+
   test "reconcile still invalidates pre-merge candidate movement" do
     {:ok, ref} =
       CandidateRef.new(%{
@@ -459,7 +499,9 @@ defmodule SymphonyElixir.SourceControlTest do
     }
   end
 
-  defp merged_github_payload(path, sha_m, tree) do
+  defp merged_github_payload(path, sha_m, tree, opts \\ []) do
+    check_conclusion = Keyword.get(opts, :check_conclusion, "success")
+
     cond do
       String.ends_with?(path, "/repos/JCSchoeman96/symphony") ->
         %{"id" => 1_368_436_395}
@@ -481,6 +523,20 @@ defmodule SymphonyElixir.SourceControlTest do
 
       String.contains?(path, "/git/ref/heads/main") ->
         %{"object" => %{"sha" => sha_m}}
+
+      String.contains?(path, "/check-runs") ->
+        %{
+          "total_count" => 1,
+          "check_runs" => [
+            %{
+              "name" => "make-all",
+              "head_sha" => @sha_b,
+              "status" => "completed",
+              "conclusion" => check_conclusion,
+              "app" => %{"id" => 15_368}
+            }
+          ]
+        }
 
       true ->
         %{}

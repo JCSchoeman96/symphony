@@ -126,7 +126,9 @@ defmodule SymphonyElixir.SourceControl do
          {:ok, candidate_tree_sha} <-
            GitHubSourceControl.validate_tree_sha(Map.get(candidate_evidence, :candidate_tree_sha)),
          {:ok, merge_facts} <-
-           GitHubSourceControl.verify_merge(config, candidate_ref, candidate_tree_sha, opts) do
+           GitHubSourceControl.verify_merge(config, candidate_ref, candidate_tree_sha, opts),
+         :ok <-
+           GitHubSourceControl.verify_required_checks(config, candidate_ref, candidate_tree_sha, opts) do
       {:ok,
        MergeVerification.new(%{
          status: :verified,
@@ -365,8 +367,11 @@ defmodule SymphonyElixir.SourceControl do
   end
 
   defp verify_merged_review_acceptance_freshness(config, candidate_ref, candidate_tree_sha, opts) do
-    case GitHubSourceControl.verify_merge(config, candidate_ref, candidate_tree_sha, opts) do
-      {:ok, _facts} -> :ok
+    with {:ok, _facts} <- GitHubSourceControl.verify_merge(config, candidate_ref, candidate_tree_sha, opts),
+         :ok <-
+           GitHubSourceControl.verify_required_checks(config, candidate_ref, candidate_tree_sha, opts) do
+      :ok
+    else
       _ -> {:stale, :candidate_moved}
     end
   end

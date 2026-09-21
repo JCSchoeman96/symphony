@@ -93,6 +93,56 @@ defmodule SymphonyElixir.SourceControl.MergeVerificationTest do
     assert verification.status == :not_merged
   end
 
+  test "host verify_merge_from_evidence requires required checks after exact merge" do
+    evidence = [
+      %{
+        class: :mechanical_guard,
+        name: :review_acceptance_verified,
+        outcome: :verified,
+        candidate_ref: Map.from_struct(candidate_ref()),
+        candidate_tree_sha: @tree,
+        policy_fingerprint: SourceControl.policy_fingerprint_for(@config, %{symphony: %{project_id: "project-1"}})
+      }
+    ]
+
+    assert {:ok, verification} =
+             SourceControl.verify_merge_from_evidence(evidence,
+               source_control_config: @config,
+               settings: %{symphony: %{project_id: "project-1"}},
+               token: "token",
+               request_fun: fn _token, path, _params, _opts ->
+                 {:ok, merged_payload_with_checks(path, "success")}
+               end
+             )
+
+    assert MergeVerification.verified?(verification)
+  end
+
+  test "host verify_merge_from_evidence rejects merged candidate when required checks fail" do
+    evidence = [
+      %{
+        class: :mechanical_guard,
+        name: :review_acceptance_verified,
+        outcome: :verified,
+        candidate_ref: Map.from_struct(candidate_ref()),
+        candidate_tree_sha: @tree,
+        policy_fingerprint: SourceControl.policy_fingerprint_for(@config, %{symphony: %{project_id: "project-1"}})
+      }
+    ]
+
+    assert {:ok, verification} =
+             SourceControl.verify_merge_from_evidence(evidence,
+               source_control_config: @config,
+               settings: %{symphony: %{project_id: "project-1"}},
+               token: "token",
+               request_fun: fn _token, path, _params, _opts ->
+                 {:ok, merged_payload_with_checks(path, "failure")}
+               end
+             )
+
+    refute MergeVerification.verified?(verification)
+  end
+
   test "host verify_merge_from_evidence rejects stale policy fingerprint" do
     evidence = [
       %{
@@ -140,6 +190,48 @@ defmodule SymphonyElixir.SourceControl.MergeVerificationTest do
     if String.ends_with?(path, "/repos/JCSchoeman96/symphony"),
       do: %{"id" => 1_368_436_395},
       else: nil
+  end
+
+  defp merged_payload_with_checks(path, conclusion) do
+    cond do
+      repository_payload(path) ->
+        repository_payload(path)
+
+      String.contains?(path, "/pulls/15") ->
+        %{
+          "number" => 15,
+          "merged" => true,
+          "head" => %{"sha" => @sha_b},
+          "merge_commit_sha" => @sha_m
+        }
+
+      String.contains?(path, "/git/commits/" <> @sha_m) ->
+        %{
+          "sha" => @sha_m,
+          "tree" => %{"sha" => @tree},
+          "parents" => [%{"sha" => @sha_a}, %{"sha" => @sha_b}]
+        }
+
+      String.contains?(path, "/git/ref/heads/main") ->
+        %{"object" => %{"sha" => @sha_m}}
+
+      String.contains?(path, "/check-runs") ->
+        %{
+          "total_count" => 1,
+          "check_runs" => [
+            %{
+              "name" => "make-all",
+              "head_sha" => @sha_b,
+              "status" => "completed",
+              "conclusion" => conclusion,
+              "app" => %{"id" => 15_368}
+            }
+          ]
+        }
+
+      true ->
+        %{}
+    end
   end
 
   defp ordinary_merge_payload do
