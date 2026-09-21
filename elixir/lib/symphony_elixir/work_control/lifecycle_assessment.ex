@@ -331,6 +331,10 @@ defmodule SymphonyElixir.WorkControl.LifecycleAssessment do
     Map.put(context, :subject, {:work_item, work_item_id})
   end
 
+  defp satisfied_evidence([], evidence, _context) do
+    normalize_evidence(evidence)
+  end
+
   defp satisfied_evidence(requirements, evidence, context) do
     evidence = normalize_evidence(evidence)
 

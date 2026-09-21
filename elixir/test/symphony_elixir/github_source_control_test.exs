@@ -314,6 +314,77 @@ defmodule SymphonyElixir.GitHub.SourceControlTest do
     assert tree == @tree
   end
 
+  test "capture fails closed when commit response omits tree sha" do
+    assert {:error, :malformed_candidate_tree} =
+             SourceControl.capture_candidate_ref(
+               @config,
+               @sha_b,
+               request_opts(fn path ->
+                 if String.ends_with?(path, "/commits/" <> @sha_b) do
+                   %{"commit" => %{}}
+                 else
+                   base_github_payload().(path)
+                 end
+               end)
+             )
+  end
+
+  test "verify candidate unchanged fails closed on malformed tree sha" do
+    candidate_ref = candidate_ref()
+
+    assert {:error, :malformed_candidate_tree} =
+             SourceControl.verify_candidate_unchanged(
+               @config,
+               candidate_ref,
+               request_opts(fn path ->
+                 if String.contains?(path, "/commits/" <> @sha_b) do
+                   %{"commit" => %{"tree" => %{"sha" => "not-a-sha"}}}
+                 else
+                   base_github_payload().(path)
+                 end
+               end)
+             )
+  end
+
+  test "verify required checks rejects malformed tree evidence" do
+    candidate_ref = candidate_ref()
+
+    assert {:error, :malformed_candidate_tree} =
+             SourceControl.verify_required_checks(@config, candidate_ref, nil, request_opts(base_github_payload()))
+  end
+
+  test "verify merge rejects malformed merge tree" do
+    candidate_ref = candidate_ref()
+
+    assert {:error, :malformed_candidate_tree} =
+             SourceControl.verify_merge(
+               @config,
+               candidate_ref,
+               @tree,
+               request_opts(fn path ->
+                 cond do
+                   String.contains?(path, "/pulls/15") ->
+                     %{
+                       "number" => 15,
+                       "merged" => true,
+                       "head" => %{"sha" => @sha_b},
+                       "merge_commit_sha" => @sha_m
+                     }
+
+                   String.contains?(path, "/git/commits/" <> @sha_m) ->
+                     %{
+                       "sha" => @sha_m,
+                       "tree" => %{"sha" => "bad-tree"},
+                       "parents" => [%{"sha" => @sha_a}, %{"sha" => @sha_b}]
+                     }
+
+                   true ->
+                     base_github_payload().(path)
+                 end
+               end)
+             )
+  end
+
   test "pending and failed checks fail closed" do
     candidate_ref = candidate_ref()
 

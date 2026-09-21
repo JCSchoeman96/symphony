@@ -231,6 +231,91 @@ defmodule SymphonyElixir.SourceControlTest do
     assert entry.stale_reason == :review_acceptance_missing
   end
 
+  test "reconcile preserves verified review acceptance after exact human merge" do
+    {:ok, ref} =
+      CandidateRef.new(%{
+        repository_identity: "github:repository:1368436395",
+        base_sha: @sha_a,
+        candidate_sha: @sha_b,
+        pr_identity: "15",
+        observed_pr_head_sha: @sha_b
+      })
+
+    sha_m = String.duplicate("d", 40)
+    tree = String.duplicate("c", 40)
+
+    evidence = [
+      %{
+        class: :mechanical_guard,
+        name: :review_acceptance_verified,
+        outcome: :verified,
+        candidate_ref: Map.from_struct(ref),
+        candidate_tree_sha: tree,
+        policy_fingerprint: policy_fingerprint()
+      }
+    ]
+
+    assert {:ok, reconciled} =
+             SourceControl.reconcile_stored_evidence(
+               :ready_to_merge,
+               evidence,
+               source_control_config: @config,
+               settings: %{symphony: %{project_id: "project-1"}},
+               token: "token",
+               request_fun: fn _token, path, _params, _opts ->
+                 {:ok, merged_github_payload(path, sha_m, tree)}
+               end
+             )
+
+    entry = Enum.find(reconciled, &(&1.name == :review_acceptance_verified))
+    assert entry.outcome == :verified
+  end
+
+  test "reconcile still invalidates pre-merge candidate movement" do
+    {:ok, ref} =
+      CandidateRef.new(%{
+        repository_identity: "github:repository:1368436395",
+        base_sha: @sha_a,
+        candidate_sha: @sha_b,
+        pr_identity: "15",
+        observed_pr_head_sha: @sha_b
+      })
+
+    evidence = [
+      %{
+        class: :mechanical_guard,
+        name: :review_acceptance_verified,
+        outcome: :verified,
+        candidate_ref: Map.from_struct(ref),
+        candidate_tree_sha: String.duplicate("c", 40),
+        policy_fingerprint: policy_fingerprint()
+      }
+    ]
+
+    assert {:ok, reconciled} =
+             SourceControl.reconcile_stored_evidence(
+               :ready_to_merge,
+               evidence,
+               source_control_config: @config,
+               settings: %{symphony: %{project_id: "project-1"}},
+               token: "token",
+               request_fun: fn _token, path, _params, _opts ->
+                 {:ok,
+                  if String.contains?(path, "/pulls/15") do
+                    Map.put(eligible_pull(), "head", %{
+                      "sha" => String.duplicate("f", 40),
+                      "repo" => %{"id" => 1_368_436_395}
+                    })
+                  else
+                    github_payload(path)
+                  end}
+               end
+             )
+
+    entry = Enum.find(reconciled, &(&1.name == :review_acceptance_verified))
+    assert entry.outcome == :stale
+  end
+
   test "reconcile invalidates stale review acceptance for ready to merge" do
     {:ok, ref} =
       CandidateRef.new(%{
@@ -372,6 +457,34 @@ defmodule SymphonyElixir.SourceControlTest do
       "head" => %{"sha" => @sha_b, "repo" => %{"id" => 1_368_436_395}},
       "base" => %{"sha" => @sha_a, "ref" => "main"}
     }
+  end
+
+  defp merged_github_payload(path, sha_m, tree) do
+    cond do
+      String.ends_with?(path, "/repos/JCSchoeman96/symphony") ->
+        %{"id" => 1_368_436_395}
+
+      String.contains?(path, "/pulls/15") ->
+        %{
+          "number" => 15,
+          "merged" => true,
+          "head" => %{"sha" => @sha_b},
+          "merge_commit_sha" => sha_m
+        }
+
+      String.contains?(path, "/git/commits/" <> sha_m) ->
+        %{
+          "sha" => sha_m,
+          "tree" => %{"sha" => tree},
+          "parents" => [%{"sha" => @sha_a}, %{"sha" => @sha_b}]
+        }
+
+      String.contains?(path, "/git/ref/heads/main") ->
+        %{"object" => %{"sha" => sha_m}}
+
+      true ->
+        %{}
+    end
   end
 
   defp github_payload(path) do

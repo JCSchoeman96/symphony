@@ -124,7 +124,7 @@ defmodule SymphonyElixir.GitHub.SourceControl do
          :ok <- validate_pull_request(fresh_pull, config, workspace_head_sha, base_sha),
          :ok <- validate_ancestry(config, base_sha, workspace_head_sha, opts),
          {:ok, commit} <- fetch_commit(config, workspace_head_sha, opts),
-         candidate_tree_sha <- commit_tree_sha(commit),
+         {:ok, candidate_tree_sha} <- validate_tree_sha(commit_tree_sha(commit)),
          {:ok, candidate_ref} <-
            CandidateRef.new(%{
              repository_identity: CandidateRef.github_repository_identity(config.repository_id),
@@ -149,24 +149,41 @@ defmodule SymphonyElixir.GitHub.SourceControl do
          :ok <- validate_pull_identity(pull, candidate_ref, config),
          true <- normalize_sha(get_in(pull, ["head", "sha"])) == candidate_ref.candidate_sha,
          :ok <- validate_ancestry(config, base_sha, candidate_ref.candidate_sha, opts),
-         {:ok, commit} <- fetch_commit(config, candidate_ref.candidate_sha, opts) do
-      {:ok, commit_tree_sha(commit)}
+         {:ok, commit} <- fetch_commit(config, candidate_ref.candidate_sha, opts),
+         {:ok, candidate_tree_sha} <- validate_tree_sha(commit_tree_sha(commit)) do
+      {:ok, candidate_tree_sha}
     else
       false -> {:error, :candidate_moved}
       {:error, reason} -> {:error, reason}
     end
   end
 
+  @spec validate_tree_sha(term()) :: {:ok, String.t()} | {:error, term()}
+  def validate_tree_sha(tree_sha) do
+    case normalize_sha(tree_sha) do
+      sha when is_binary(sha) and byte_size(sha) == 40 ->
+        if valid_git_sha?(sha), do: {:ok, sha}, else: {:error, :malformed_candidate_tree}
+
+      _ ->
+        {:error, :malformed_candidate_tree}
+    end
+  end
+
+  defp valid_git_sha?(sha) when is_binary(sha) do
+    String.match?(sha, ~r/^[0-9a-f]{40}$/)
+  end
+
   @spec verify_required_checks(config(), CandidateRef.t(), String.t(), keyword()) ::
           :ok | {:error, term()}
-  def verify_required_checks(config, %CandidateRef{} = candidate_ref, candidate_tree_sha, opts \\ [])
-      when is_binary(candidate_tree_sha) do
-    checks = Map.get(config, :required_checks, [])
+  def verify_required_checks(config, %CandidateRef{} = candidate_ref, candidate_tree_sha, opts \\ []) do
+    with {:ok, tree_sha} <- validate_tree_sha(candidate_tree_sha) do
+      checks = Map.get(config, :required_checks, [])
 
-    if checks == [] do
-      {:error, :required_checks_missing}
-    else
-      verify_required_checks_list(config, candidate_ref, candidate_tree_sha, checks, opts)
+      if checks == [] do
+        {:error, :required_checks_missing}
+      else
+        verify_required_checks_list(config, candidate_ref, tree_sha, checks, opts)
+      end
     end
   end
 
@@ -248,9 +265,9 @@ defmodule SymphonyElixir.GitHub.SourceControl do
 
   @spec verify_merge(config(), CandidateRef.t(), String.t(), keyword()) ::
           {:ok, map()} | {:error, term()}
-  def verify_merge(config, %CandidateRef{} = candidate_ref, candidate_tree_sha, opts \\ [])
-      when is_binary(candidate_tree_sha) do
-    with :ok <- validate_candidate_ref_binding(config, candidate_ref),
+  def verify_merge(config, %CandidateRef{} = candidate_ref, candidate_tree_sha, opts \\ []) do
+    with {:ok, tree_sha} <- validate_tree_sha(candidate_tree_sha),
+         :ok <- validate_candidate_ref_binding(config, candidate_ref),
          {:ok, repository} <- fetch_repository(config, opts),
          :ok <- validate_repository_id(repository, config.repository_id),
          {:ok, pull} <- fetch_pull_request(config, candidate_ref.pr_identity, opts),
@@ -258,7 +275,7 @@ defmodule SymphonyElixir.GitHub.SourceControl do
          true <- normalize_sha(get_in(pull, ["head", "sha"])) == candidate_ref.candidate_sha,
          merge_sha when is_binary(merge_sha) <- normalize_sha(pull["merge_commit_sha"]),
          {:ok, merge_commit} <- fetch_git_commit(config, merge_sha, opts),
-         {:ok, strategy} <- classify_merge_strategy(merge_commit, candidate_ref, candidate_tree_sha),
+         {:ok, strategy} <- classify_merge_strategy(merge_commit, candidate_ref, tree_sha),
          {:ok, current_main_sha} <- fetch_base_sha(config, opts),
          :ok <- verify_main_contains_merge(config, merge_sha, current_main_sha, opts) do
       {:ok,
@@ -278,17 +295,19 @@ defmodule SymphonyElixir.GitHub.SourceControl do
   defp validate_synthetic_merge(merge_commit, candidate_ref, candidate_tree_sha) do
     parents = Map.get(merge_commit, "parents", [])
     parent_shas = Enum.map(parents, fn parent -> normalize_sha(Map.get(parent, "sha")) end)
-    merge_tree_sha = get_in(merge_commit, ["tree", "sha"]) |> normalize_sha()
 
-    cond do
-      parent_shas != [candidate_ref.base_sha, candidate_ref.candidate_sha] ->
-        {:error, :invalid_synthetic_merge_parents}
+    with {:ok, merge_tree_sha} <- validate_tree_sha(get_in(merge_commit, ["tree", "sha"])),
+         {:ok, expected_tree_sha} <- validate_tree_sha(candidate_tree_sha) do
+      cond do
+        parent_shas != [candidate_ref.base_sha, candidate_ref.candidate_sha] ->
+          {:error, :invalid_synthetic_merge_parents}
 
-      merge_tree_sha != normalize_sha(candidate_tree_sha) ->
-        {:error, :invalid_synthetic_merge_tree}
+        merge_tree_sha != expected_tree_sha ->
+          {:error, :invalid_synthetic_merge_tree}
 
-      true ->
-        :ok
+        true ->
+          :ok
+      end
     end
   end
 
@@ -343,25 +362,27 @@ defmodule SymphonyElixir.GitHub.SourceControl do
   defp classify_merge_strategy(merge_commit, candidate_ref, candidate_tree_sha) do
     parents = Map.get(merge_commit, "parents", [])
     parent_shas = Enum.map(parents, fn parent -> normalize_sha(Map.get(parent, "sha")) end)
-    merge_tree_sha = get_in(merge_commit, ["tree", "sha"]) |> normalize_sha()
 
-    cond do
-      parent_shas == [candidate_ref.base_sha, candidate_ref.candidate_sha] and
-          merge_tree_sha == normalize_sha(candidate_tree_sha) ->
-        {:ok, :ordinary}
+    with {:ok, merge_tree_sha} <- validate_tree_sha(get_in(merge_commit, ["tree", "sha"])),
+         {:ok, expected_tree_sha} <- validate_tree_sha(candidate_tree_sha) do
+      cond do
+        parent_shas == [candidate_ref.base_sha, candidate_ref.candidate_sha] and
+            merge_tree_sha == expected_tree_sha ->
+          {:ok, :ordinary}
 
-      length(parent_shas) == 1 and parent_shas == [candidate_ref.base_sha] and
-          merge_tree_sha == normalize_sha(candidate_tree_sha) ->
-        {:ok, :squash}
+        length(parent_shas) == 1 and parent_shas == [candidate_ref.base_sha] and
+            merge_tree_sha == expected_tree_sha ->
+          {:ok, :squash}
 
-      length(parent_shas) == 2 ->
-        {:error, :unsupported_merge_strategy}
+        length(parent_shas) == 2 ->
+          {:error, :unsupported_merge_strategy}
 
-      length(parent_shas) == 1 ->
-        {:error, :merge_parent_mismatch}
+        length(parent_shas) == 1 ->
+          {:error, :merge_parent_mismatch}
 
-      true ->
-        {:error, :unsupported_merge_strategy}
+        true ->
+          {:error, :unsupported_merge_strategy}
+      end
     end
   end
 

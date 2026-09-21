@@ -13,7 +13,7 @@ defmodule SymphonyElixir.SourceControl do
     RepositoryProbe
   }
 
-  alias SymphonyElixir.WorkControl.{SemanticTransitionIntent, WorkflowLifecycle}
+  alias SymphonyElixir.WorkControl.{SemanticTransitionIntent, WorkflowLifecycle, WorkItem}
 
   @capabilities [
     :repository_identity_read,
@@ -123,7 +123,8 @@ defmodule SymphonyElixir.SourceControl do
          {:ok, candidate_evidence} <- extract_review_acceptance_evidence(evidence),
          {:ok, candidate_ref} <- decode_candidate_ref(candidate_evidence),
          :ok <- validate_policy_fingerprint(candidate_evidence, config, opts),
-         candidate_tree_sha <- Map.get(candidate_evidence, :candidate_tree_sha),
+         {:ok, candidate_tree_sha} <-
+           GitHubSourceControl.validate_tree_sha(Map.get(candidate_evidence, :candidate_tree_sha)),
          {:ok, merge_facts} <-
            GitHubSourceControl.verify_merge(config, candidate_ref, candidate_tree_sha, opts) do
       {:ok,
@@ -153,13 +154,29 @@ defmodule SymphonyElixir.SourceControl do
     end
   end
 
+  @spec canonical_host_guard_evidence(map()) :: [map()]
+  def canonical_host_guard_evidence(host_context) when is_map(host_context) do
+    case Map.get(host_context, :work_item) do
+      %WorkItem{lifecycle_assessment: %{satisfied_guards: guards}} when is_list(guards) and guards != [] ->
+        normalize_evidence(guards)
+
+      _ ->
+        case Map.get(host_context, :guard_evidence) do
+          evidence when is_list(evidence) and evidence != [] -> normalize_evidence(evidence)
+          evidence when is_map(evidence) -> [evidence]
+          _ -> []
+        end
+    end
+  end
+
   @spec read_current_candidate_status(map(), keyword()) :: map()
   def read_current_candidate_status(host_context, opts \\ []) when is_map(host_context) do
-    evidence = Map.get(host_context, :guard_evidence, [])
+    evidence = canonical_host_guard_evidence(host_context)
 
     with {:ok, config} <- settings_config(opts),
          {:ok, candidate_evidence} <- find_candidate_state_evidence(evidence),
          {:ok, candidate_ref} <- decode_candidate_ref(candidate_evidence),
+         {:ok, _} <- GitHubSourceControl.validate_tree_sha(Map.get(candidate_evidence, :candidate_tree_sha)),
          {:ok, candidate_tree_sha} <-
            GitHubSourceControl.verify_candidate_unchanged(config, candidate_ref, opts),
          :ok <- GitHubSourceControl.verify_required_checks(config, candidate_ref, candidate_tree_sha, opts) do
@@ -196,14 +213,15 @@ defmodule SymphonyElixir.SourceControl do
              head_sha when is_binary(head_sha) <- probe.head_sha || {:error, :missing_workspace_head},
              {:ok, candidate_ref, candidate_tree_sha} <-
                GitHubSourceControl.capture_candidate_ref(config, head_sha, github_opts(context)),
-             {:ok, settings} <- Config.settings() do
+             {:ok, settings} <- Config.settings(),
+             {:ok, validated_tree_sha} <- GitHubSourceControl.validate_tree_sha(candidate_tree_sha) do
           {:ok,
            evidence ++
              [
                candidate_state_evidence(
                  :verified,
                  candidate_ref,
-                 candidate_tree_sha,
+                 validated_tree_sha,
                  policy_fingerprint_for(config, settings)
                )
              ]}
@@ -320,14 +338,35 @@ defmodule SymphonyElixir.SourceControl do
     with {:ok, candidate_ref} <- decode_candidate_ref(entry),
          :ok <- GitHubSourceControl.validate_candidate_ref_binding(config, candidate_ref),
          :ok <- validate_policy_fingerprint(entry, config, settings_from_opts(opts)),
-         candidate_tree_sha when is_binary(candidate_tree_sha) <- Map.get(entry, :candidate_tree_sha),
-         {:ok, _} <- GitHubSourceControl.verify_candidate_unchanged(config, candidate_ref, opts),
+         {:ok, candidate_tree_sha} <-
+           GitHubSourceControl.validate_tree_sha(Map.get(entry, :candidate_tree_sha)),
+         {:ok, pull} <- GitHubSourceControl.fetch_pull_request(config, candidate_ref.pr_identity, opts) do
+      if pull["merged"] == true do
+        verify_merged_review_acceptance_freshness(config, candidate_ref, candidate_tree_sha, opts)
+      else
+        verify_open_review_acceptance_freshness(config, candidate_ref, candidate_tree_sha, opts)
+      end
+    else
+      {:error, :policy_fingerprint_mismatch} -> {:stale, :policy_fingerprint_mismatch}
+      {:error, :repository_identity_mismatch} -> {:stale, :repository_identity_mismatch}
+      {:error, :malformed_candidate_tree} -> {:stale, :malformed_candidate_tree}
+      _ -> {:stale, :candidate_moved}
+    end
+  end
+
+  defp verify_open_review_acceptance_freshness(config, candidate_ref, candidate_tree_sha, opts) do
+    with {:ok, _} <- GitHubSourceControl.verify_candidate_unchanged(config, candidate_ref, opts),
          :ok <-
            GitHubSourceControl.verify_required_checks(config, candidate_ref, candidate_tree_sha, opts) do
       :ok
     else
-      {:error, :policy_fingerprint_mismatch} -> {:stale, :policy_fingerprint_mismatch}
-      {:error, :repository_identity_mismatch} -> {:stale, :repository_identity_mismatch}
+      _ -> {:stale, :candidate_moved}
+    end
+  end
+
+  defp verify_merged_review_acceptance_freshness(config, candidate_ref, candidate_tree_sha, opts) do
+    case GitHubSourceControl.verify_merge(config, candidate_ref, candidate_tree_sha, opts) do
+      {:ok, _facts} -> :ok
       _ -> {:stale, :candidate_moved}
     end
   end
