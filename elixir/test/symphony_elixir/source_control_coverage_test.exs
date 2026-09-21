@@ -129,20 +129,16 @@ defmodule SymphonyElixir.SourceControlCoverageTest do
   end
 
   test "repository probe reads a clean local workspace head" do
-    workspace = Path.join(System.tmp_dir!(), "scm-probe-#{System.unique_integer()}")
-
-    try do
-      File.mkdir_p!(workspace)
-      System.cmd("git", ["init"], cd: workspace)
-      System.cmd("git", ["commit", "--allow-empty", "-m", "init"], cd: workspace)
-
-      assert {:ok, %{clean?: true, head_sha: head_sha}} =
-               RepositoryProbe.probe(%{workspace_path: workspace})
-
-      assert is_binary(head_sha)
-    after
-      File.rm_rf(workspace)
+    command_runner = fn _workspace, command ->
+      cond do
+        String.contains?(command, "status --porcelain") -> {:ok, ""}
+        String.contains?(command, "rev-parse HEAD") -> {:ok, @sha_b <> "\n"}
+        true -> {:error, {:git_command_failed, "unexpected"}}
+      end
     end
+
+    assert {:ok, %{clean?: true, head_sha: @sha_b}} =
+             RepositoryProbe.probe(%{workspace_path: "/tmp/workspace"}, command_runner: command_runner)
   end
 
   test "reviewer source-control tool returns sanitized status" do
