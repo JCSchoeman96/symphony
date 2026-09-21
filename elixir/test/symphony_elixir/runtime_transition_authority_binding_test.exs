@@ -356,10 +356,24 @@ defmodule SymphonyElixir.RuntimeTransitionAuthorityBindingTest do
 
   defp guard_evidence_names(:planning, :ready), do: [{:semantic_attestation, :plan_attested}, {:mechanical_guard, :planning_requirements_verified}]
   defp guard_evidence_names(:ready, :in_progress), do: [{:mechanical_guard, :dispatch_guard}]
-  defp guard_evidence_names(:in_progress, :in_review), do: [{:semantic_attestation, :implementation_attested}, {:mechanical_guard, :implementation_checks_verified}]
+
+  defp guard_evidence_names(:in_progress, :in_review),
+    do: [
+      {:semantic_attestation, :implementation_attested},
+      {:mechanical_guard, :implementation_checks_verified},
+      {:mechanical_guard, :candidate_state_verified}
+    ]
+
   defp guard_evidence_names(:in_review, :changes_requested), do: [{:semantic_attestation, :review_changes_requested}]
   defp guard_evidence_names(:in_review, :ready_to_merge), do: [{:mechanical_guard, :review_acceptance_verified}, {:semantic_attestation, :review_accepted}]
-  defp guard_evidence_names(:changes_requested, :in_review), do: [{:semantic_attestation, :correction_attested}, {:mechanical_guard, :correction_checks_verified}]
+
+  defp guard_evidence_names(:changes_requested, :in_review),
+    do: [
+      {:semantic_attestation, :correction_attested},
+      {:mechanical_guard, :correction_checks_verified},
+      {:mechanical_guard, :candidate_state_verified}
+    ]
+
   defp guard_evidence_names(:ready_to_merge, :merging), do: [{:human_decision, :merge_approved}, {:mechanical_guard, :merge_guard_verified}]
 
   defp evidence(:semantic_attestation, name, work_item_id, responsibility) do

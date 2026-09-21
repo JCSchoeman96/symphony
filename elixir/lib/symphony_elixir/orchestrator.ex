@@ -4012,6 +4012,10 @@ defmodule SymphonyElixir.Orchestrator do
        lineage_id: Map.get(running, :lineage_id),
        lineage_generation: Map.get(running, :lineage_generation),
        responsibility: WorkflowLifecycle.responsibility(work_item.validated_lifecycle_state),
+       repository_context: %{
+         workspace_path: Map.get(running, :workspace_path),
+         worker_host: Map.get(running, :worker_host)
+       },
        context_token: transition_context_token(work_item, state, dependency_decision, contract)
      }}
   end

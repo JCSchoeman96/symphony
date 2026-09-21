@@ -350,6 +350,64 @@ defmodule SymphonyElixir.Config.Schema do
     end
   end
 
+  defmodule SourceControlRequiredCheck do
+    @moduledoc false
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    @primary_key false
+    embedded_schema do
+      field(:context, :string)
+      field(:app_id, :integer)
+      field(:subject, :string)
+    end
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      schema
+      |> cast(attrs, [:context, :app_id, :subject], empty_values: [])
+      |> validate_required([:context, :app_id, :subject])
+      |> validate_inclusion(:subject, ["head", "synthetic_merge"])
+      |> update_change(:context, &String.trim/1)
+    end
+  end
+
+  defmodule SourceControl do
+    @moduledoc false
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    @primary_key false
+    embedded_schema do
+      field(:kind, :string)
+      field(:repository, :string)
+      field(:repository_id, :integer)
+      field(:base_branch, :string)
+      field(:token_env, :string)
+      embeds_many(:required_checks, SourceControlRequiredCheck, on_replace: :delete)
+    end
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      schema
+      |> cast(attrs, [:kind, :repository, :repository_id, :base_branch, :token_env], empty_values: [])
+      |> cast_embed(:required_checks, with: &SourceControlRequiredCheck.changeset/2)
+      |> validate_inclusion(:kind, ["github"])
+      |> validate_required([:kind, :repository, :repository_id, :base_branch, :token_env])
+      |> update_change(:repository, &String.trim/1)
+      |> update_change(:base_branch, &String.trim/1)
+      |> update_change(:token_env, &String.trim/1)
+      |> validate_change(:repository, fn :repository, repository ->
+        if String.match?(repository, ~r/^[^\/]+\/[^\/]+$/) do
+          []
+        else
+          [repository: "must be owner/repo"]
+        end
+      end)
+      |> validate_number(:repository_id, greater_than: 0)
+    end
+  end
+
   embedded_schema do
     embeds_one(:symphony, Symphony, on_replace: :update, defaults_to_struct: true)
     embeds_one(:tracker, Tracker, on_replace: :update, defaults_to_struct: true)
@@ -361,6 +419,7 @@ defmodule SymphonyElixir.Config.Schema do
     embeds_one(:hooks, Hooks, on_replace: :update, defaults_to_struct: true)
     embeds_one(:observability, Observability, on_replace: :update, defaults_to_struct: true)
     embeds_one(:server, Server, on_replace: :update, defaults_to_struct: true)
+    embeds_one(:source_control, SourceControl, on_replace: :update, defaults_to_struct: true)
     field(:provider_project_contract, :map)
   end
 
@@ -392,6 +451,35 @@ defmodule SymphonyElixir.Config.Schema do
         |> expand_local_workspace_root()
         |> default_turn_sandbox_policy()
     end
+  end
+
+  @spec validate_source_control(%__MODULE__{}) :: :ok | {:error, term()}
+  def validate_source_control(%__MODULE__{source_control: nil}), do: :ok
+
+  def validate_source_control(%__MODULE__{source_control: %{kind: nil}}), do: :ok
+
+  def validate_source_control(%__MODULE__{source_control: source_control}) do
+    attrs = source_control_attrs(source_control)
+
+    case SourceControl.changeset(%SourceControl{}, attrs) |> apply_action(:validate) do
+      {:ok, _} -> :ok
+      {:error, changeset} -> {:error, {:invalid_workflow_config, format_errors(changeset)}}
+    end
+  end
+
+  defp source_control_attrs(%SourceControl{} = source_control) do
+    %{
+      kind: source_control.kind,
+      repository: source_control.repository,
+      repository_id: source_control.repository_id,
+      base_branch: source_control.base_branch,
+      token_env: source_control.token_env,
+      required_checks:
+        Enum.map(source_control.required_checks, fn
+          %SourceControlRequiredCheck{} = check -> Map.from_struct(check)
+          check -> check
+        end)
+    }
   end
 
   @spec validate_project_identity(%__MODULE__{}) :: :ok | {:error, term()}
@@ -502,6 +590,7 @@ defmodule SymphonyElixir.Config.Schema do
     |> cast_embed(:hooks, with: &Hooks.changeset/2)
     |> cast_embed(:observability, with: &Observability.changeset/2)
     |> cast_embed(:server, with: &Server.changeset/2)
+    |> cast_embed(:source_control, with: &SourceControl.changeset/2)
   end
 
   defp finalize_settings(settings) do

@@ -16,6 +16,10 @@ defmodule SymphonyElixir.AgentRuntime.Authority do
     "merge" => []
   }
 
+  @allowed_source_control_operations %{
+    "review" => [:read_current_candidate_status]
+  }
+
   @spec validate_profile(term()) :: :ok | {:error, map()}
   def validate_profile(%Profile{} = profile) do
     case profile_shape_reason(profile) do
@@ -31,6 +35,13 @@ defmodule SymphonyElixir.AgentRuntime.Authority do
     with :ok <- validate_route(subject),
          :ok <- validate_command(source, target) do
       authorize_command(subject.profile.responsibility, source, target)
+    end
+  end
+
+  @spec authorize_source_control_operation(term(), term()) :: :ok | {:error, map()}
+  def authorize_source_control_operation(subject, operation) do
+    with :ok <- validate_route(subject) do
+      authorize_source_control_operation_for(subject.profile.responsibility, operation)
     end
   end
 
@@ -181,6 +192,20 @@ defmodule SymphonyElixir.AgentRuntime.Authority do
          source: source,
          target: target,
          lifecycle_valid?: WorkflowLifecycle.valid_transition?(source, target)
+       }}
+    end
+  end
+
+  defp authorize_source_control_operation_for(responsibility, operation) do
+    if operation in Map.get(@allowed_source_control_operations, responsibility, []) do
+      :ok
+    else
+      {:error,
+       %{
+         code: :not_permitted,
+         reason: :source_control_operation_not_permitted,
+         responsibility: responsibility,
+         operation: operation
        }}
     end
   end

@@ -171,6 +171,12 @@ defmodule SymphonyElixir.TestSupport do
     server_host = Keyword.get(config, :server_host)
     prompt = Keyword.get(config, :prompt)
     symphony_project_id = Keyword.get(config, :symphony_project_id)
+    source_control_kind = Keyword.get(config, :source_control_kind)
+    source_control_repository = Keyword.get(config, :source_control_repository)
+    source_control_repository_id = Keyword.get(config, :source_control_repository_id)
+    source_control_base_branch = Keyword.get(config, :source_control_base_branch)
+    source_control_token_env = Keyword.get(config, :source_control_token_env)
+    source_control_required_checks = Keyword.get(config, :source_control_required_checks)
 
     sections =
       [
@@ -209,6 +215,14 @@ defmodule SymphonyElixir.TestSupport do
         hooks_yaml(hook_after_create, hook_before_run, hook_after_run, hook_before_remove, hook_timeout_ms),
         observability_yaml(observability_enabled, observability_refresh_ms, observability_render_interval_ms),
         server_yaml(server_port, server_host),
+        source_control_yaml(
+          source_control_kind,
+          source_control_repository,
+          source_control_repository_id,
+          source_control_base_branch,
+          source_control_token_env,
+          source_control_required_checks
+        ),
         "---",
         prompt
       ]
@@ -297,6 +311,38 @@ defmodule SymphonyElixir.TestSupport do
       "  refresh_ms: #{yaml_value(refresh_ms)}",
       "  render_interval_ms: #{yaml_value(render_interval_ms)}"
     ]
+    |> Enum.join("\n")
+  end
+
+  defp source_control_yaml(nil, _repository, _repository_id, _base_branch, _token_env, _required_checks), do: nil
+
+  defp source_control_yaml(kind, repository, repository_id, base_branch, token_env, required_checks) do
+    checks_yaml =
+      case required_checks do
+        nil ->
+          ""
+
+        checks ->
+          checks_lines =
+            Enum.map(checks, fn check ->
+              "    - context: #{yaml_value(check["context"] || check[:context])}\n" <>
+                "      app_id: #{yaml_value(check["app_id"] || check[:app_id])}\n" <>
+                "      subject: #{yaml_value(check["subject"] || check[:subject])}"
+            end)
+
+          "  required_checks:\n" <> Enum.join(checks_lines, "\n")
+      end
+
+    [
+      "source_control:",
+      "  kind: #{yaml_value(kind)}",
+      "  repository: #{yaml_value(repository)}",
+      "  repository_id: #{yaml_value(repository_id)}",
+      "  base_branch: #{yaml_value(base_branch)}",
+      "  token_env: #{yaml_value(token_env)}",
+      checks_yaml
+    ]
+    |> Enum.reject(&(&1 in [nil, ""]))
     |> Enum.join("\n")
   end
 

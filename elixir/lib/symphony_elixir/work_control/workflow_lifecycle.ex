@@ -166,7 +166,8 @@ defmodule SymphonyElixir.WorkControl.WorkflowLifecycle do
       responsibility: "implementation",
       guard_requirements: [
         GuardClass.requirement(:semantic_attestation, :implementation_attested),
-        GuardClass.requirement(:mechanical_guard, :implementation_checks_verified)
+        GuardClass.requirement(:mechanical_guard, :implementation_checks_verified),
+        GuardClass.requirement(:mechanical_guard, :candidate_state_verified)
       ],
       side_effects: %{autonomous_merge: false, completion_proof_required: false}
     },
@@ -181,7 +182,8 @@ defmodule SymphonyElixir.WorkControl.WorkflowLifecycle do
       responsibility: "correction",
       guard_requirements: [
         GuardClass.requirement(:semantic_attestation, :correction_attested),
-        GuardClass.requirement(:mechanical_guard, :correction_checks_verified)
+        GuardClass.requirement(:mechanical_guard, :correction_checks_verified),
+        GuardClass.requirement(:mechanical_guard, :candidate_state_verified)
       ],
       side_effects: %{autonomous_merge: false, completion_proof_required: false}
     },
