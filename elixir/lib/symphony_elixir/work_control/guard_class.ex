@@ -17,7 +17,7 @@ defmodule SymphonyElixir.WorkControl.GuardClass do
           name: atom(),
           responsibility: atom() | String.t(),
           runtime_attempt_id: term(),
-          lineage_generation: non_neg_integer(),
+          lineage_generation: non_neg_integer() | String.t(),
           subject: {:work_item, String.t()},
           timestamp: DateTime.t()
         }
@@ -218,6 +218,11 @@ defmodule SymphonyElixir.WorkControl.GuardClass do
   defp validate_lineage_generation(nil), do: {:error, :missing_lineage_generation}
 
   defp validate_lineage_generation(value) when is_integer(value) and value >= 0, do: :ok
+
+  defp validate_lineage_generation(value) when is_binary(value) do
+    if String.trim(value) == "", do: {:error, :invalid_lineage_generation}, else: :ok
+  end
+
   defp validate_lineage_generation(_value), do: {:error, :invalid_lineage_generation}
 
   defp validate_timestamp(nil), do: {:error, :missing_timestamp}

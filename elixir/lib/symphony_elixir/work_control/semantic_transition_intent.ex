@@ -41,7 +41,7 @@ defmodule SymphonyElixir.WorkControl.SemanticTransitionIntent do
           requested_at: DateTime.t(),
           runtime_attempt_id: term(),
           lineage_id: String.t() | nil,
-          lineage_generation: non_neg_integer() | nil
+          lineage_generation: non_neg_integer() | String.t() | nil
         }
 
   @spec new(map()) :: {:ok, t()} | {:error, atom()}
@@ -129,7 +129,7 @@ defmodule SymphonyElixir.WorkControl.SemanticTransitionIntent do
     lineage_id = Map.get(attrs, :lineage_id)
 
     cond do
-      not is_nil(generation) and (not is_integer(generation) or generation < 0) ->
+      not is_nil(generation) and not valid_lineage_generation?(generation) ->
         {:error, :invalid_lineage_generation}
 
       not is_nil(lineage_id) and (not is_binary(lineage_id) or String.trim(lineage_id) == "") ->
@@ -139,6 +139,14 @@ defmodule SymphonyElixir.WorkControl.SemanticTransitionIntent do
         :ok
     end
   end
+
+  defp valid_lineage_generation?(generation) when is_integer(generation) and generation >= 0,
+    do: true
+
+  defp valid_lineage_generation?(generation) when is_binary(generation),
+    do: String.trim(generation) != ""
+
+  defp valid_lineage_generation?(_generation), do: false
 
   defp normalize_optional_string(nil), do: nil
   defp normalize_optional_string(value) when is_binary(value), do: String.trim(value)

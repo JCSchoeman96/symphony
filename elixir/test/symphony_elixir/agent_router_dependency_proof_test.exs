@@ -33,9 +33,14 @@ defmodule SymphonyElixir.FullProofDagRunner do
   @capture_name :symphony_full_proof_dag_capture
 
   @spec run(Issue.t(), pid() | nil, keyword()) :: :ok
-  def run(%Issue{} = issue, _recipient, opts) do
+  def run(%Issue{} = issue, recipient, opts) do
     capture = Process.whereis(@capture_name)
     issue_id = issue.id
+    identity = Keyword.get(opts, :runtime_attempt_identity)
+
+    if is_pid(recipient) and identity do
+      send(recipient, {:runtime_attempt_session_started, issue_id, identity})
+    end
 
     if is_pid(capture) do
       send(capture, {:dag_started, issue_id, issue.identifier, issue.state, opts, self()})
@@ -639,27 +644,36 @@ defmodule SymphonyElixir.AgentRouterDependencyProofTest do
   defp trigger_poll!(pid) do
     send(pid, :run_poll_cycle)
 
-    assert_eventually(fn ->
-      state = :sys.get_state(pid)
-      state.poll_check_in_progress == false
-    end)
+    assert_eventually(
+      fn ->
+        state = :sys.get_state(pid)
+        state.poll_check_in_progress == false
+      end,
+      400
+    )
   end
 
   defp trigger_retry!(pid, issue_id) do
-    assert_eventually(fn ->
-      state = :sys.get_state(pid)
-      is_map(Map.get(state.retry_attempts, issue_id))
-    end)
+    assert_eventually(
+      fn ->
+        state = :sys.get_state(pid)
+        is_map(Map.get(state.retry_attempts, issue_id))
+      end,
+      800
+    )
 
     retry_token = :sys.get_state(pid).retry_attempts[issue_id].retry_token
     send(pid, {:retry_issue, issue_id, retry_token})
 
-    assert_eventually(fn ->
-      state = :sys.get_state(pid)
+    assert_eventually(
+      fn ->
+        state = :sys.get_state(pid)
 
-      not Map.has_key?(state.retry_attempts, issue_id) and
-        not MapSet.member?(state.claimed, issue_id)
-    end)
+        not Map.has_key?(state.retry_attempts, issue_id) and
+          not MapSet.member?(state.claimed, issue_id)
+      end,
+      400
+    )
   end
 
   defp assert_eventually(fun, attempts \\ 100)

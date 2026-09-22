@@ -9,7 +9,16 @@ defmodule SymphonyElixir.Orchestrator do
   import Bitwise, only: [<<<: 2]
 
   alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
-  alias SymphonyElixir.AgentRuntime.{AttemptLedger, AttemptPolicy, Route, Router}
+
+  alias SymphonyElixir.AgentRuntime.{
+    AttemptLedger,
+    AttemptPolicy,
+    Route,
+    Router,
+    RuntimeAttempt
+  }
+
+  alias SymphonyElixir.AgentRuntime.RuntimeAttempt.Identity, as: RuntimeAttemptIdentity
   alias SymphonyElixir.Dependency.{Graph, Guard, Policy}
   alias SymphonyElixir.Plane.ProjectContract
   alias SymphonyElixir.Tracker.Issue
@@ -624,10 +633,47 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  def handle_info(
+        {:runtime_attempt_session_started, issue_id, %RuntimeAttemptIdentity{} = identity},
+        %{running: running} = state
+      )
+      when is_binary(issue_id) do
+    case validate_current_runtime_event(state, issue_id, identity, require_running: false) do
+      {:ok, validated_issue_id, running_entry} ->
+        apply_runtime_attempt_session_started(state, running, validated_issue_id, running_entry)
+
+      :stale ->
+        {:noreply, state}
+    end
+  end
+
+  def handle_info(
+        {:worker_runtime_info, issue_id, %RuntimeAttemptIdentity{} = identity, runtime_info},
+        %{running: running} = state
+      )
+      when is_binary(issue_id) and is_map(runtime_info) do
+    case validate_current_runtime_event(state, issue_id, identity, require_running: false) do
+      {:ok, validated_issue_id, running_entry} ->
+        updated_running_entry =
+          running_entry
+          |> maybe_put_runtime_value(:worker_host, runtime_info[:worker_host])
+          |> maybe_put_runtime_value(:workspace_path, runtime_info[:workspace_path])
+
+        notify_dashboard()
+        {:noreply, %{state | running: Map.put(running, validated_issue_id, updated_running_entry)}}
+
+      :stale ->
+        {:noreply, state}
+    end
+  end
+
   def handle_info({:worker_runtime_info, issue_id, runtime_info}, %{running: running} = state)
       when is_binary(issue_id) and is_map(runtime_info) do
     case Map.get(running, issue_id) do
       nil ->
+        {:noreply, state}
+
+      %{runtime_attempt: %RuntimeAttempt{}} ->
         {:noreply, state}
 
       running_entry ->
@@ -642,6 +688,26 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   def handle_info(
+        {
+          :agent_route_changed,
+          issue_id,
+          %RuntimeAttemptIdentity{} = identity,
+          %Route{} = previous_route,
+          %Route{} = next_route
+        },
+        state
+      )
+      when is_binary(issue_id) do
+    case validate_current_runtime_event(state, issue_id, identity, require_running: true) do
+      {:ok, validated_issue_id, running_entry} ->
+        apply_agent_route_changed(state, validated_issue_id, running_entry, previous_route, next_route)
+
+      :stale ->
+        {:noreply, state}
+    end
+  end
+
+  def handle_info(
         {:agent_route_changed, issue_id, %Route{} = previous_route, %Route{} = next_route},
         %{running: running} = state
       )
@@ -650,21 +716,25 @@ defmodule SymphonyElixir.Orchestrator do
       nil ->
         {:noreply, state}
 
+      %{runtime_attempt: %RuntimeAttempt{}} ->
+        {:noreply, state}
+
       running_entry ->
-        Logger.info(
-          "Agent route changed for issue_id=#{issue_id}; ending worker attempt " <>
-            "previous=#{previous_route.profile_name}/#{previous_route.responsibility} " <>
-            "next=#{next_route.profile_name}/#{next_route.responsibility}"
-        )
+        apply_agent_route_changed(state, issue_id, running_entry, previous_route, next_route)
+    end
+  end
 
-        updated_running_entry =
-          Map.merge(running_entry, %{
-            route_change_termination: true,
-            route_change: route_change_metadata(previous_route, next_route)
-          })
+  def handle_info(
+        {:agent_lifecycle_suspended, issue_id, %RuntimeAttemptIdentity{} = identity, assessment},
+        state
+      )
+      when is_binary(issue_id) do
+    case validate_current_runtime_event(state, issue_id, identity, require_running: true) do
+      {:ok, validated_issue_id, running_entry} ->
+        apply_agent_lifecycle_suspended(state, validated_issue_id, running_entry, assessment)
 
-        notify_dashboard()
-        {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+      :stale ->
+        {:noreply, state}
     end
   end
 
@@ -677,15 +747,25 @@ defmodule SymphonyElixir.Orchestrator do
       nil ->
         {:noreply, state}
 
-      running_entry ->
-        Logger.warning(
-          "Agent lifecycle continuation suspended for issue_id=#{issue_id}: " <>
-            inspect(assessment)
-        )
+      %{runtime_attempt: %RuntimeAttempt{}} ->
+        {:noreply, state}
 
-        updated_running_entry = Map.put(running_entry, :lifecycle_suspension, assessment)
-        notify_dashboard()
-        {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+      running_entry ->
+        apply_agent_lifecycle_suspended(state, issue_id, running_entry, assessment)
+    end
+  end
+
+  def handle_info(
+        {:agent_dependency_blocked, issue_id, %RuntimeAttemptIdentity{} = identity, decision},
+        state
+      )
+      when is_binary(issue_id) and is_map(decision) do
+    case validate_current_runtime_event(state, issue_id, identity, require_running: true) do
+      {:ok, validated_issue_id, running_entry} ->
+        apply_agent_dependency_blocked(state, validated_issue_id, running_entry, decision)
+
+      :stale ->
+        {:noreply, state}
     end
   end
 
@@ -698,22 +778,31 @@ defmodule SymphonyElixir.Orchestrator do
       nil ->
         {:noreply, state}
 
+      %{runtime_attempt: %RuntimeAttempt{}} ->
+        {:noreply, state}
+
       running_entry ->
-        error = dependency_blocker_error(decision)
+        apply_agent_dependency_blocked(state, issue_id, running_entry, decision)
+    end
+  end
 
-        Logger.warning(
-          "Agent dependency guard stopped issue_id=#{issue_id} " <>
-            "issue_identifier=#{running_entry.identifier}: #{error}"
-        )
+  def handle_info(
+        {:codex_worker_update, issue_id, %RuntimeAttemptIdentity{} = identity, %{event: _, timestamp: _} = update},
+        %{running: running} = state
+      ) do
+    case validate_current_runtime_event(state, issue_id, identity, require_running: true) do
+      {:ok, validated_issue_id, running_entry} ->
+        {updated_running_entry, token_delta} = integrate_codex_update(running_entry, update)
 
-        stop_running_task(
-          Map.get(running_entry, :pid),
-          Map.get(running_entry, :ref),
-          state.task_supervisor
-        )
+        state =
+          state
+          |> apply_codex_token_delta(token_delta)
+          |> apply_codex_rate_limits(update)
 
-        state = block_issue_from_entry(state, issue_id, running_entry, error, decision)
         notify_dashboard()
+        {:noreply, %{state | running: Map.put(running, validated_issue_id, updated_running_entry)}}
+
+      :stale ->
         {:noreply, state}
     end
   end
@@ -724,6 +813,9 @@ defmodule SymphonyElixir.Orchestrator do
       ) do
     case Map.get(running, issue_id) do
       nil ->
+        {:noreply, state}
+
+      %{runtime_attempt: %RuntimeAttempt{}} ->
         {:noreply, state}
 
       running_entry ->
@@ -810,25 +902,31 @@ defmodule SymphonyElixir.Orchestrator do
       {:ok, state} ->
         Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; scheduling retry")
 
-        next_attempt = next_retry_attempt_from_running(running_entry)
+        case transition_running_entry_attempt(running_entry, :retry_queued) do
+          {:ok, running_entry} ->
+            next_attempt = next_retry_attempt_from_running(running_entry)
 
-        schedule_issue_retry(
-          state,
-          issue_id,
-          next_attempt,
-          Map.merge(
-            %{
-              identifier: running_entry.identifier,
-              issue_url: running_entry.issue.url,
-              error: "agent exited: #{inspect(reason)}",
-              termination_reason: termination_reason,
-              worker_host: Map.get(running_entry, :worker_host),
-              workspace_path: Map.get(running_entry, :workspace_path)
-            },
-            route_retry_metadata(running_entry)
-          )
-        )
-        |> record_recent_attempt(issue_id, running_entry, termination_reason, "agent exited")
+            schedule_issue_retry(
+              state,
+              issue_id,
+              next_attempt,
+              Map.merge(
+                %{
+                  identifier: running_entry.identifier,
+                  issue_url: running_entry.issue.url,
+                  error: "agent exited: #{inspect(reason)}",
+                  termination_reason: termination_reason,
+                  worker_host: Map.get(running_entry, :worker_host),
+                  workspace_path: Map.get(running_entry, :workspace_path)
+                },
+                route_retry_metadata(running_entry)
+              )
+            )
+            |> record_recent_attempt(issue_id, running_entry, termination_reason, "agent exited")
+
+          {:error, :invalid_runtime_attempt_transition} ->
+            state
+        end
 
       {:stop, state, reason} ->
         Logger.error("Automatic retries exhausted for issue_id=#{issue_id} session_id=#{session_id}; requiring human attention")
@@ -845,29 +943,12 @@ defmodule SymphonyElixir.Orchestrator do
 
     case record_route_change_events(state, issue_id, route_change) do
       {:ok, state} ->
-        case clear_attempt_in_flight(state, issue_id) do
-          {:ok, state} ->
-            state
-            |> record_recent_attempt(issue_id, running_entry, :route_changed)
-            |> complete_issue(issue_id)
-            |> schedule_issue_retry(
-              issue_id,
-              1,
-              Map.merge(
-                %{
-                  identifier: running_entry.identifier,
-                  issue_url: running_entry.issue.url,
-                  delay_type: :route_change,
-                  route_change: route_change,
-                  worker_host: Map.get(running_entry, :worker_host),
-                  workspace_path: Map.get(running_entry, :workspace_path)
-                },
-                route_retry_metadata(running_entry)
-              )
-            )
+        case transition_running_entry_attempt(running_entry, :retry_queued) do
+          {:ok, running_entry} ->
+            schedule_agent_route_change_retry(state, issue_id, running_entry, route_change)
 
-          {:error, state, reason} ->
-            block_issue_from_entry(state, issue_id, running_entry, attempt_ledger_error(reason))
+          {:error, :invalid_runtime_attempt_transition} ->
+            state
         end
 
       {:stop, state, reason} ->
@@ -879,27 +960,30 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp handle_normal_continuation(state, issue_id, running_entry) do
-    case clear_attempt_in_flight(state, issue_id) do
-      {:ok, state} ->
-        {:ok, state} = record_attempt_event(state, issue_id, :continuation)
+    with {:ok, running_entry} <- transition_running_entry_attempt(running_entry, :completed),
+         {:ok, state} <- clear_attempt_in_flight(state, issue_id) do
+      {:ok, state} = record_attempt_event(state, issue_id, :continuation)
 
-        state
-        |> record_recent_attempt(issue_id, running_entry, :normal_completion)
-        |> complete_issue(issue_id)
-        |> schedule_issue_retry(
-          issue_id,
-          1,
-          Map.merge(
-            %{
-              identifier: running_entry.identifier,
-              issue_url: running_entry.issue.url,
-              delay_type: :continuation,
-              worker_host: Map.get(running_entry, :worker_host),
-              workspace_path: Map.get(running_entry, :workspace_path)
-            },
-            route_retry_metadata(running_entry)
-          )
+      state
+      |> record_recent_attempt(issue_id, running_entry, :normal_completion)
+      |> complete_issue(issue_id)
+      |> schedule_issue_retry(
+        issue_id,
+        1,
+        Map.merge(
+          %{
+            identifier: running_entry.identifier,
+            issue_url: running_entry.issue.url,
+            delay_type: :continuation,
+            worker_host: Map.get(running_entry, :worker_host),
+            workspace_path: Map.get(running_entry, :workspace_path)
+          },
+          route_retry_metadata(running_entry)
         )
+      )
+    else
+      {:error, :invalid_runtime_attempt_transition} ->
+        state
 
       {:error, state, reason} ->
         block_issue_from_entry(state, issue_id, running_entry, attempt_ledger_error(reason))
@@ -1195,6 +1279,113 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @doc false
+  @spec reconcile_stalled_running_issues_for_test(State.t()) :: State.t()
+  def reconcile_stalled_running_issues_for_test(%State{} = state), do: reconcile_stalled_running_issues(state)
+
+  @doc false
+  @spec terminate_running_issue_for_test(State.t(), String.t(), boolean(), atom()) :: State.t()
+  def terminate_running_issue_for_test(%State{} = state, issue_id, cleanup_workspace, termination_reason)
+      when is_binary(issue_id) and is_boolean(cleanup_workspace) and is_atom(termination_reason) do
+    terminate_running_issue(state, issue_id, cleanup_workspace, termination_reason)
+  end
+
+  @doc false
+  @spec stop_running_issue_for_route_change_for_test(
+          State.t(),
+          Issue.t(),
+          map(),
+          Route.t(),
+          Route.t()
+        ) :: State.t()
+  def stop_running_issue_for_route_change_for_test(
+        %State{} = state,
+        %Issue{} = issue,
+        running_entry,
+        %Route{} = previous_route,
+        %Route{} = next_route
+      )
+      when is_map(running_entry) do
+    stop_running_issue_for_route_change(state, issue, running_entry, previous_route, next_route)
+  end
+
+  @doc false
+  @spec transition_running_entry_attempt_for_test(map(), atom()) ::
+          {:ok, map()} | {:error, :invalid_runtime_attempt_transition}
+  def transition_running_entry_attempt_for_test(running_entry, to_state)
+      when is_map(running_entry) and is_atom(to_state) do
+    transition_running_entry_attempt(running_entry, to_state)
+  end
+
+  @doc false
+  @spec tracker_terminal_teardown_reason_for_test(Issue.t(), State.t()) :: atom()
+  def tracker_terminal_teardown_reason_for_test(%Issue{} = issue, %State{} = state) do
+    tracker_terminal_teardown_reason(issue, state)
+  end
+
+  @doc false
+  @spec handle_normal_route_change_for_test(State.t(), String.t(), map()) :: State.t()
+  def handle_normal_route_change_for_test(%State{} = state, issue_id, running_entry)
+      when is_binary(issue_id) and is_map(running_entry) do
+    handle_normal_route_change(state, issue_id, running_entry)
+  end
+
+  @doc false
+  @spec schedule_agent_route_change_retry_for_test(State.t(), String.t(), map(), term()) :: State.t()
+  def schedule_agent_route_change_retry_for_test(%State{} = state, issue_id, running_entry, route_change)
+      when is_binary(issue_id) and is_map(running_entry) do
+    schedule_agent_route_change_retry(state, issue_id, running_entry, route_change)
+  end
+
+  @doc false
+  @spec schedule_poll_route_change_retry_for_test(State.t(), Issue.t(), map(), non_neg_integer(), term()) ::
+          State.t()
+  def schedule_poll_route_change_retry_for_test(
+        %State{} = state,
+        %Issue{} = issue,
+        running_entry,
+        next_attempt,
+        route_change
+      )
+      when is_map(running_entry) and is_integer(next_attempt) and next_attempt >= 0 do
+    schedule_poll_route_change_retry(state, issue, running_entry, next_attempt, route_change)
+  end
+
+  @doc false
+  @spec reconcile_blocked_ledger_for_test(State.t()) :: State.t()
+  def reconcile_blocked_ledger_for_test(%State{} = state) do
+    reconcile_blocked_ledger_without_dispatch(state)
+  end
+
+  defp reconcile_blocked_ledger_without_dispatch(%State{attempt_ledger: %AttemptLedger{} = ledger} = state) do
+    case resync_sync_failed_ledger(state, ledger) do
+      {:ok, state} -> finalize_reconciled_ledger_status(state, ledger)
+      {:blocked, state} -> state
+    end
+  end
+
+  defp reconcile_blocked_ledger_without_dispatch(%State{} = state), do: state
+
+  defp finalize_reconciled_ledger_status(%State{} = state, %AttemptLedger{} = ledger) do
+    case reconcile_attempt_ledger(state, ledger) do
+      {:ok, state} -> %{state | attempt_ledger_status: :ready}
+      {:blocked, state, reason} -> %{state | attempt_ledger_status: {:blocked, reason}}
+    end
+  end
+
+  @doc false
+  @spec handle_normal_continuation_for_test(State.t(), String.t(), map()) :: State.t()
+  def handle_normal_continuation_for_test(%State{} = state, issue_id, running_entry)
+      when is_binary(issue_id) and is_map(running_entry) do
+    handle_normal_continuation(state, issue_id, running_entry)
+  end
+
+  @doc false
+  @spec refresh_work_control_for_test(State.t(), [Issue.t()]) :: State.t()
+  def refresh_work_control_for_test(%State{} = state, issues) when is_list(issues) do
+    refresh_work_control(state, issues)
+  end
+
+  @doc false
   @spec reconcile_blocked_issue_states_for_test([Issue.t()], term()) :: term()
   def reconcile_blocked_issue_states_for_test(issues, %State{} = state) when is_list(issues) do
     reconcile_blocked_issue_states(issues, state, active_state_set(), terminal_state_set())
@@ -1254,7 +1445,7 @@ defmodule SymphonyElixir.Orchestrator do
       terminal_issue_state?(issue.state, terminal_states) ->
         Logger.info("Issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; stopping active agent")
 
-        terminate_running_issue(state, issue.id, true, :terminal)
+        terminate_running_issue(state, issue.id, true, tracker_terminal_teardown_reason(issue, state))
 
       routed_lifecycle_suspended?(issue, state) ->
         Logger.info("Stopping active agent after unsafe lifecycle observation for #{issue_context(issue)}")
@@ -1512,36 +1703,7 @@ defmodule SymphonyElixir.Orchestrator do
 
     case record_route_change_events(state, issue.id, route_change, in_flight: true) do
       {:ok, state} ->
-        stop_running_task(Map.get(running_entry, :pid), Map.get(running_entry, :ref), state.task_supervisor)
-
-        state =
-          state
-          |> then(&Map.update!(&1, :running, fn running -> Map.delete(running, issue.id) end))
-
-        case clear_attempt_in_flight(state, issue.id) do
-          {:ok, state} ->
-            state
-            |> record_recent_attempt(issue.id, %{running_entry | issue: issue}, :route_changed)
-            |> schedule_issue_retry(
-              issue.id,
-              next_attempt,
-              Map.merge(
-                %{
-                  identifier: issue.identifier,
-                  issue_url: issue.url,
-                  error: "route changed during poll refresh",
-                  delay_type: :route_change,
-                  route_change: route_change,
-                  worker_host: Map.get(running_entry, :worker_host),
-                  workspace_path: Map.get(running_entry, :workspace_path)
-                },
-                route_retry_metadata(running_entry)
-              )
-            )
-
-          {:error, state, reason} ->
-            block_issue_from_entry(state, issue.id, %{running_entry | issue: issue}, attempt_ledger_error(reason))
-        end
+        apply_poll_route_change_terminal_retry(state, issue, running_entry, next_attempt, route_change)
 
       {:stop, state, reason} ->
         stop_and_block_issue(
@@ -1595,34 +1757,130 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp terminate_running_issue(%State{} = state, issue_id, cleanup_workspace, termination_reason) do
+    case finalize_running_attempt_removal(state, issue_id, cleanup_workspace, termination_reason) do
+      {:ok, state} -> state
+      {:error, state} -> state
+    end
+  end
+
+  defp finalize_running_attempt_removal(%State{} = state, issue_id, cleanup_workspace, termination_reason) do
     case Map.get(state.running, issue_id) do
       nil ->
-        state = release_issue_claim(state, issue_id)
-        if cleanup_workspace, do: reset_attempt_counters(state, issue_id), else: state
+        {:ok, release_running_maps_without_entry(state, issue_id, cleanup_workspace)}
 
       %{pid: pid, ref: ref, identifier: identifier} = running_entry ->
-        state = record_session_completion_totals(state, running_entry)
-        state = record_recent_attempt(state, issue_id, running_entry, termination_reason)
-
-        stop_running_task(pid, ref, state.task_supervisor)
-
-        if cleanup_workspace do
-          cleanup_issue_workspace(Map.get(running_entry, :issue, identifier), running_entry)
-        end
-
-        state = %{
-          state
-          | running: Map.delete(state.running, issue_id),
-            claimed: MapSet.delete(state.claimed, issue_id),
-            blocked: Map.delete(state.blocked, issue_id),
-            retry_attempts: Map.delete(state.retry_attempts, issue_id)
-        }
-
-        if cleanup_workspace, do: reset_attempt_counters(state, issue_id), else: state
+        finalize_existing_running_removal(
+          state,
+          issue_id,
+          running_entry,
+          pid,
+          ref,
+          identifier,
+          cleanup_workspace,
+          termination_reason
+        )
 
       _ ->
-        state = release_issue_claim(state, issue_id)
-        if cleanup_workspace, do: reset_attempt_counters(state, issue_id), else: state
+        {:ok, release_running_maps_without_entry(state, issue_id, cleanup_workspace)}
+    end
+  end
+
+  defp finalize_existing_running_removal(
+         state,
+         issue_id,
+         running_entry,
+         pid,
+         ref,
+         identifier,
+         cleanup_workspace,
+         termination_reason
+       ) do
+    terminal_state = runtime_attempt_terminal_for_teardown(termination_reason)
+
+    case transition_running_entry_attempt(running_entry, terminal_state) do
+      {:ok, running_entry} ->
+        state =
+          complete_terminalized_running_removal(
+            state,
+            issue_id,
+            running_entry,
+            pid,
+            ref,
+            identifier,
+            cleanup_workspace,
+            termination_reason
+          )
+
+        {:ok, state}
+
+      {:error, :invalid_runtime_attempt_transition} ->
+        {:error, state}
+    end
+  end
+
+  defp release_running_maps_without_entry(state, issue_id, cleanup_workspace) do
+    state = release_issue_claim(state, issue_id)
+    if cleanup_workspace, do: reset_attempt_counters(state, issue_id), else: state
+  end
+
+  defp complete_terminalized_running_removal(
+         state,
+         issue_id,
+         running_entry,
+         pid,
+         ref,
+         identifier,
+         cleanup_workspace,
+         termination_reason
+       ) do
+    state = record_session_completion_totals(state, running_entry)
+    state = record_recent_attempt(state, issue_id, running_entry, termination_reason)
+    stop_running_task(pid, ref, state.task_supervisor)
+
+    if cleanup_workspace do
+      cleanup_issue_workspace(Map.get(running_entry, :issue, identifier), running_entry)
+    end
+
+    state = pop_running_issue_maps(state, issue_id)
+
+    if cleanup_workspace, do: reset_attempt_counters(state, issue_id), else: state
+  end
+
+  defp pop_running_issue_maps(%State{} = state, issue_id) do
+    %{
+      state
+      | running: Map.delete(state.running, issue_id),
+        claimed: MapSet.delete(state.claimed, issue_id),
+        blocked: Map.delete(state.blocked, issue_id),
+        retry_attempts: Map.delete(state.retry_attempts, issue_id)
+    }
+  end
+
+  defp tracker_terminal_teardown_reason(%Issue{} = issue, %State{} = state) do
+    if successful_runtime_completion_observation?(issue, state) do
+      :terminal_completed
+    else
+      :terminal_cancelled
+    end
+  end
+
+  defp successful_runtime_completion_observation?(%Issue{} = issue, %State{} = state) do
+    case Map.get(state.work_control, issue.id) do
+      %WorkItem{lifecycle_assessment: %LifecycleAssessment{} = assessment} ->
+        LifecycleAssessment.completion_validated?(assessment)
+
+      _ ->
+        false
+    end
+  end
+
+  defp runtime_attempt_terminal_for_teardown(termination_reason) do
+    case termination_reason do
+      :terminal_completed -> :completed
+      :terminal_cancelled -> :cancelled
+      :runtime_unavailable -> :failed
+      :runtime_stalled -> :retry_queued
+      _ -> :cancelled
     end
   end
 
@@ -1697,15 +1955,13 @@ defmodule SymphonyElixir.Orchestrator do
 
     case record_attempt_event(state, issue_id, :ordinary_failure, in_flight: true) do
       {:ok, state} ->
-        state = terminate_running_issue(state, issue_id, false, :runtime_stalled)
-
-        case clear_attempt_in_flight(state, issue_id) do
-          {:ok, state} ->
-            schedule_issue_retry(state, issue_id, next_attempt, retry_metadata)
-
-          {:error, state, reason} ->
-            block_issue_from_entry(state, issue_id, running_entry, attempt_ledger_error(reason))
-        end
+        schedule_stall_retry_after_terminal_removal(
+          state,
+          issue_id,
+          running_entry,
+          next_attempt,
+          retry_metadata
+        )
 
       {:stop, state, reason} ->
         state
@@ -1854,13 +2110,19 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp stop_and_block_issue(%State{} = state, issue_id, running_entry, error, dependency \\ nil) do
-    stop_running_task(
-      Map.get(running_entry, :pid),
-      Map.get(running_entry, :ref),
-      state.task_supervisor
-    )
+    case transition_running_entry_attempt(running_entry, :blocked) do
+      {:ok, running_entry} ->
+        stop_running_task(
+          Map.get(running_entry, :pid),
+          Map.get(running_entry, :ref),
+          state.task_supervisor
+        )
 
-    block_issue_from_entry(state, issue_id, running_entry, error, dependency)
+        do_block_issue_from_entry(state, issue_id, running_entry, error, dependency)
+
+      {:error, :invalid_runtime_attempt_transition} ->
+        state
+    end
   end
 
   defp record_recent_attempt(state, issue_id, entry, reason, error \\ nil)
@@ -1919,6 +2181,27 @@ defmodule SymphonyElixir.Orchestrator do
   defp dependency_denied?(_dependency), do: false
 
   defp block_issue_from_entry(%State{} = state, issue_id, running_entry, error, dependency \\ nil) do
+    case transition_running_entry_attempt(running_entry, :blocked) do
+      {:ok, running_entry} ->
+        do_block_issue_from_entry(state, issue_id, running_entry, error, dependency)
+
+      {:error, :invalid_runtime_attempt_transition} ->
+        block_issue_from_terminal_attempt(state, issue_id, running_entry, error, dependency)
+    end
+  end
+
+  defp block_issue_from_terminal_attempt(%State{} = state, issue_id, running_entry, error, dependency) do
+    case Map.get(running_entry, :runtime_attempt) do
+      %RuntimeAttempt{state: attempt_state}
+      when attempt_state in [:completed, :retry_queued, :blocked, :failed, :cancelled] ->
+        do_block_issue_from_entry(state, issue_id, running_entry, error, dependency)
+
+      _ ->
+        state
+    end
+  end
+
+  defp do_block_issue_from_entry(%State{} = state, issue_id, running_entry, error, dependency) do
     blocked_entry = %{
       issue_id: issue_id,
       identifier: Map.get(running_entry, :identifier, issue_id),
@@ -2041,7 +2324,12 @@ defmodule SymphonyElixir.Orchestrator do
       observed_at: DateTime.utc_now(),
       prior_validated_lifecycle_state: prior_validated_state(previous),
       prior_authority_disposition: prior_authority_disposition(previous),
-      evidence: evidence_for_observation(issue, previous),
+      evidence:
+        evidence_for_observation(
+          issue,
+          previous,
+          Config.settings!().provider_project_contract
+        ),
       provider_project_contract: Config.settings!().provider_project_contract
     }
 
@@ -2089,7 +2377,22 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp prior_guard_evidence(_previous), do: []
 
-  defp evidence_for_observation(%Issue{state: state}, %WorkItem{} = previous) do
+  defp evidence_for_observation(%Issue{} = issue, %WorkItem{} = previous, %ProviderProjectContract{} = contract) do
+    with true <- stable_provider_state_identity?(issue, previous.provider_observation),
+         {:ok, mapped_state} <-
+           ProviderProjectContract.resolve_provider_state(
+             contract,
+             issue.provider_state_id,
+             issue.provider_state_group
+           ),
+         true <- mapped_state == previous.validated_lifecycle_state do
+      prior_guard_evidence(previous)
+    else
+      _ -> []
+    end
+  end
+
+  defp evidence_for_observation(%Issue{state: state}, %WorkItem{} = previous, _contract) do
     case WorkflowLifecycle.parse(state) do
       {:ok, canonical_state} when canonical_state == previous.validated_lifecycle_state ->
         prior_guard_evidence(previous)
@@ -2099,7 +2402,41 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp evidence_for_observation(_issue, _previous), do: []
+  defp evidence_for_observation(_issue, _previous, _contract), do: []
+
+  defp stable_provider_state_identity?(%Issue{} = issue, %ProviderObservation{} = prior_observation) do
+    present_string?(prior_observation.provider_state_id) and
+      present_string?(issue.provider_state_id) and
+      issue.provider_state_id == prior_observation.provider_state_id and
+      provider_state_groups_equivalent?(
+        issue.provider_state_group,
+        prior_observation.provider_state_group
+      )
+  end
+
+  defp stable_provider_state_identity?(_issue, _prior_observation), do: false
+
+  defp provider_state_groups_equivalent?(left, right) do
+    normalize_provider_state_group(left) == normalize_provider_state_group(right)
+  end
+
+  defp normalize_provider_state_group(group)
+       when group in [:backlog, :unstarted, :started, :completed, :cancelled],
+       do: group
+
+  defp normalize_provider_state_group(group) when is_binary(group) do
+    case String.downcase(String.trim(group)) do
+      "backlog" -> :backlog
+      "unstarted" -> :unstarted
+      "started" -> :started
+      "completed" -> :completed
+      "cancelled" -> :cancelled
+      "canceled" -> :cancelled
+      _ -> nil
+    end
+  end
+
+  defp normalize_provider_state_group(_group), do: nil
 
   defp attach_suspension_context(%WorkItem{} = work_item, %WorkItem{} = previous, _opts) do
     assessment = work_item.lifecycle_assessment
@@ -2568,8 +2905,18 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp spawn_issue_on_worker_host(%State{} = state, issue, route, attempt, recipient, worker_host) do
     case begin_durable_attempt(state, issue, route) do
-      {:ok, state} ->
-        spawn_prepared_issue_on_worker_host(state, issue, route, attempt, recipient, worker_host)
+      {:ok, state, ledger_record} ->
+        runtime_attempt = allocate_runtime_attempt(state, issue, route, ledger_record)
+
+        spawn_prepared_issue_on_worker_host(
+          state,
+          issue,
+          route,
+          attempt,
+          recipient,
+          worker_host,
+          runtime_attempt
+        )
 
       {:error, state, reason} ->
         Logger.error("Unable to reserve durable attempt for #{issue_context(issue)}: #{inspect(reason)}")
@@ -2584,7 +2931,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp begin_durable_attempt(%State{attempt_ledger_status: :disabled} = state, _issue, _route),
-    do: {:ok, state}
+    do: {:ok, state, nil}
 
   defp begin_durable_attempt(
          %State{attempt_ledger_status: :ready, attempt_ledger: %AttemptLedger{} = ledger} = state,
@@ -2592,8 +2939,8 @@ defmodule SymphonyElixir.Orchestrator do
          route
        ) do
     case AttemptLedger.begin_attempt(ledger, issue.id, route_fingerprint: route.fingerprint) do
-      {:ok, _record} ->
-        {:ok, mark_durable_in_flight(state, issue.id, true)}
+      {:ok, record} ->
+        {:ok, mark_durable_in_flight(state, issue.id, true), record}
 
       {:error, :attempt_in_flight} ->
         {:error, state, :attempt_in_flight}
@@ -2614,6 +2961,14 @@ defmodule SymphonyElixir.Orchestrator do
     reason = :invalid_ledger_status
     {:error, block_ledger(state, reason), reason}
   end
+
+  defp allocate_runtime_attempt(%State{attempt_ledger_status: :ready}, issue, route, record)
+       when is_map(record) do
+    identity = RuntimeAttemptIdentity.allocate(issue.id, route, record.lineage_id)
+    RuntimeAttempt.new(identity, :starting)
+  end
+
+  defp allocate_runtime_attempt(_state, _issue, _route, _record), do: nil
 
   defp persist_attempt_failure_fence(%State{attempt_ledger: %AttemptLedger{} = ledger} = state, issue, route) do
     case AttemptLedger.fence_attempt(ledger, issue.id, route_fingerprint: route.fingerprint) do
@@ -2639,8 +2994,17 @@ defmodule SymphonyElixir.Orchestrator do
     }
   end
 
-  defp spawn_prepared_issue_on_worker_host(%State{} = state, issue, route, attempt, recipient, worker_host) do
+  defp spawn_prepared_issue_on_worker_host(
+         %State{} = state,
+         issue,
+         route,
+         attempt,
+         recipient,
+         worker_host,
+         runtime_attempt
+       ) do
     work_item = active_work_item_for_attempt(state, issue.id)
+    runtime_attempt_identity = runtime_attempt_identity_from(runtime_attempt)
 
     case Task.Supervisor.start_child(state.task_supervisor, fn ->
            state.agent_runner.run(issue, recipient,
@@ -2649,7 +3013,8 @@ defmodule SymphonyElixir.Orchestrator do
              route: route,
              work_item: work_item,
              work_control: state.work_control,
-             dependency_decision: Map.get(state.dependency_diagnostics, issue.id)
+             dependency_decision: Map.get(state.dependency_diagnostics, issue.id),
+             runtime_attempt_identity: runtime_attempt_identity
            )
          end) do
       {:ok, pid} ->
@@ -2688,6 +3053,7 @@ defmodule SymphonyElixir.Orchestrator do
             codex_last_reported_total_tokens: 0,
             turn_count: 0,
             retry_attempt: normalize_retry_attempt(attempt),
+            runtime_attempt: runtime_attempt,
             started_at: DateTime.utc_now()
           })
 
@@ -2731,6 +3097,124 @@ defmodule SymphonyElixir.Orchestrator do
               attempt_ledger_error(reason)
             )
         end
+    end
+  end
+
+  defp runtime_attempt_identity_from(%RuntimeAttempt{identity: identity}), do: identity
+  defp runtime_attempt_identity_from(_runtime_attempt), do: nil
+
+  defp apply_runtime_attempt_session_started(state, running, validated_issue_id, running_entry) do
+    with %RuntimeAttempt{state: :starting} = attempt <- Map.get(running_entry, :runtime_attempt),
+         {:ok, running_attempt} <- RuntimeAttempt.mark_running(attempt) do
+      updated_running_entry = Map.put(running_entry, :runtime_attempt, running_attempt)
+
+      notify_dashboard()
+      {:noreply, %{state | running: Map.put(running, validated_issue_id, updated_running_entry)}}
+    else
+      _ -> {:noreply, state}
+    end
+  end
+
+  defp schedule_agent_route_change_retry(state, issue_id, running_entry, route_change) do
+    case clear_attempt_in_flight(state, issue_id) do
+      {:ok, state} ->
+        state
+        |> record_recent_attempt(issue_id, running_entry, :route_changed)
+        |> complete_issue(issue_id)
+        |> schedule_issue_retry(
+          issue_id,
+          1,
+          Map.merge(
+            %{
+              identifier: running_entry.identifier,
+              issue_url: running_entry.issue.url,
+              delay_type: :route_change,
+              route_change: route_change,
+              worker_host: Map.get(running_entry, :worker_host),
+              workspace_path: Map.get(running_entry, :workspace_path)
+            },
+            route_retry_metadata(running_entry)
+          )
+        )
+
+      {:error, state, reason} ->
+        block_issue_from_entry(state, issue_id, running_entry, attempt_ledger_error(reason))
+    end
+  end
+
+  defp apply_poll_route_change_terminal_retry(state, issue, running_entry, next_attempt, route_change) do
+    case transition_running_entry_attempt(running_entry, :retry_queued) do
+      {:ok, running_entry} ->
+        stop_running_task(Map.get(running_entry, :pid), Map.get(running_entry, :ref), state.task_supervisor)
+
+        state = Map.update!(state, :running, &Map.delete(&1, issue.id))
+        schedule_poll_route_change_retry(state, issue, running_entry, next_attempt, route_change)
+
+      {:error, :invalid_runtime_attempt_transition} ->
+        state
+    end
+  end
+
+  defp schedule_poll_route_change_retry(state, issue, running_entry, next_attempt, route_change) do
+    case clear_attempt_in_flight(state, issue.id) do
+      {:ok, state} ->
+        state
+        |> record_recent_attempt(issue.id, %{running_entry | issue: issue}, :route_changed)
+        |> schedule_issue_retry(
+          issue.id,
+          next_attempt,
+          Map.merge(
+            %{
+              identifier: issue.identifier,
+              issue_url: issue.url,
+              error: "route changed during poll refresh",
+              delay_type: :route_change,
+              route_change: route_change,
+              worker_host: Map.get(running_entry, :worker_host),
+              workspace_path: Map.get(running_entry, :workspace_path)
+            },
+            route_retry_metadata(running_entry)
+          )
+        )
+
+      {:error, state, reason} ->
+        block_issue_from_entry(state, issue.id, %{running_entry | issue: issue}, attempt_ledger_error(reason))
+    end
+  end
+
+  defp schedule_stall_retry_after_terminal_removal(
+         state,
+         issue_id,
+         running_entry,
+         next_attempt,
+         retry_metadata
+       ) do
+    case finalize_running_attempt_removal(state, issue_id, false, :runtime_stalled) do
+      {:ok, state} ->
+        case clear_attempt_in_flight(state, issue_id) do
+          {:ok, state} ->
+            schedule_issue_retry(state, issue_id, next_attempt, retry_metadata)
+
+          {:error, state, reason} ->
+            block_issue_from_entry(state, issue_id, running_entry, attempt_ledger_error(reason))
+        end
+
+      {:error, state} ->
+        state
+    end
+  end
+
+  defp transition_running_entry_attempt(running_entry, to_state)
+       when is_map(running_entry) and is_atom(to_state) do
+    case Map.get(running_entry, :runtime_attempt) do
+      %RuntimeAttempt{} = attempt ->
+        case RuntimeAttempt.transition(attempt, to_state) do
+          {:ok, updated} -> {:ok, Map.put(running_entry, :runtime_attempt, updated)}
+          {:error, :invalid_transition} -> {:error, :invalid_runtime_attempt_transition}
+        end
+
+      _ ->
+        {:ok, running_entry}
     end
   end
 
@@ -3576,6 +4060,159 @@ defmodule SymphonyElixir.Orchestrator do
     }
   end
 
+  defp validate_current_runtime_event(
+         %State{running: running},
+         issue_id,
+         %RuntimeAttemptIdentity{} = identity,
+         opts
+       )
+       when is_binary(issue_id) and is_list(opts) do
+    require_running = Keyword.get(opts, :require_running, false)
+
+    with true <- issue_id == identity.work_item_id,
+         {:ok, entry} <- current_running_entry(running, issue_id),
+         %RuntimeAttempt{identity: current, state: attempt_state} <- Map.get(entry, :runtime_attempt),
+         true <- RuntimeAttemptIdentity.same?(identity, current),
+         true <- not require_running or attempt_state == :running do
+      {:ok, issue_id, entry}
+    else
+      _failure -> :stale
+    end
+  end
+
+  defp current_running_entry(running, work_item_id) when is_map(running) and is_binary(work_item_id) do
+    case Map.get(running, work_item_id) do
+      entry when is_map(entry) -> {:ok, entry}
+      _missing -> :stale
+    end
+  end
+
+  defp current_runtime_attempt_identity(%State{running: running}, work_item_id) do
+    case Map.get(running, work_item_id) do
+      %{runtime_attempt: %RuntimeAttempt{identity: identity}} -> identity
+      _ -> nil
+    end
+  end
+
+  defp transition_context_runtime_attempt_id(running) do
+    case Map.get(running, :runtime_attempt) do
+      %RuntimeAttempt{identity: %{runtime_attempt_id: id}} -> id
+      _ -> nil
+    end
+  end
+
+  defp transition_context_lineage_generation(running) do
+    case Map.get(running, :runtime_attempt) do
+      %RuntimeAttempt{identity: %{lineage_generation: generation}} -> generation
+      _ -> nil
+    end
+  end
+
+  defp transition_context_lineage_id(running) do
+    transition_context_lineage_generation(running)
+  end
+
+  defp validate_expected_runtime_identity(context, opts) when is_map(context) do
+    case Keyword.get(opts, :expected_runtime_identity) do
+      nil ->
+        :ok
+
+      %RuntimeAttemptIdentity{} = expected ->
+        if runtime_identity_matches_context?(expected, context), do: :ok, else: {:error, :stale_runtime_attempt}
+
+      expected when is_map(expected) ->
+        if runtime_identity_map_matches_context?(expected, context),
+          do: :ok,
+          else: {:error, :stale_runtime_attempt}
+
+      _invalid ->
+        {:error, :stale_runtime_attempt}
+    end
+  end
+
+  defp runtime_identity_matches_context?(%RuntimeAttemptIdentity{} = identity, context) do
+    runtime_identity_map_matches_context?(
+      %{
+        runtime_attempt_id: identity.runtime_attempt_id,
+        lineage_generation: identity.lineage_generation,
+        work_item_id: identity.work_item_id,
+        responsibility: identity.responsibility,
+        runtime_profile: identity.runtime_profile
+      },
+      context
+    )
+  end
+
+  defp runtime_identity_map_matches_context?(expected, context) do
+    context_identity = %{
+      runtime_attempt_id: Map.get(context, :runtime_attempt_id),
+      lineage_generation: Map.get(context, :lineage_generation),
+      work_item_id: get_in(context, [:work_item, Access.key(:id)]),
+      responsibility: Map.get(context, :responsibility),
+      runtime_profile: Map.get(context, :runtime_profile)
+    }
+
+    Enum.all?(Map.keys(expected), fn key ->
+      normalize_identity_field(key, Map.get(expected, key)) ==
+        normalize_identity_field(key, Map.get(context_identity, key))
+    end)
+  end
+
+  defp normalize_identity_field(:responsibility, value) when is_atom(value), do: Atom.to_string(value)
+  defp normalize_identity_field(:responsibility, value) when is_binary(value), do: String.trim(value)
+  defp normalize_identity_field(_key, value), do: value
+
+  defp apply_agent_route_changed(state, issue_id, running_entry, previous_route, next_route) do
+    %{running: running} = state
+
+    Logger.info(
+      "Agent route changed for issue_id=#{issue_id}; ending worker attempt " <>
+        "previous=#{previous_route.profile_name}/#{previous_route.responsibility} " <>
+        "next=#{next_route.profile_name}/#{next_route.responsibility}"
+    )
+
+    updated_running_entry =
+      Map.merge(running_entry, %{
+        route_change_termination: true,
+        route_change: route_change_metadata(previous_route, next_route)
+      })
+
+    notify_dashboard()
+    {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+  end
+
+  defp apply_agent_lifecycle_suspended(state, issue_id, running_entry, assessment) do
+    %{running: running} = state
+
+    Logger.warning(
+      "Agent lifecycle continuation suspended for issue_id=#{issue_id}: " <>
+        inspect(assessment)
+    )
+
+    updated_running_entry = Map.put(running_entry, :lifecycle_suspension, assessment)
+    notify_dashboard()
+    {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+  end
+
+  defp apply_agent_dependency_blocked(state, issue_id, running_entry, decision) do
+    error = dependency_blocker_error(decision)
+
+    Logger.warning(
+      "Agent dependency guard stopped issue_id=#{issue_id} " <>
+        "issue_identifier=#{running_entry.identifier}: #{error}"
+    )
+
+    stop_running_task(
+      Map.get(running_entry, :pid),
+      Map.get(running_entry, :ref),
+      state.task_supervisor
+    )
+
+    state = block_issue_from_entry(state, issue_id, running_entry, error, decision)
+    notify_dashboard()
+    {:noreply, state}
+  end
+
   defp maybe_put_runtime_value(running_entry, _key, nil), do: running_entry
 
   defp maybe_put_runtime_value(running_entry, key, value) when is_map(running_entry) do
@@ -3799,7 +4436,10 @@ defmodule SymphonyElixir.Orchestrator do
       %WorkItem{} = work_item ->
         with :ok <- transition_context_available?(state, work_item_id, work_item),
              {:ok, context} <- build_transition_context(state, work_item_id, work_item),
-             do: validate_transition_context_token(context, opts)
+             {:ok, context} <- validate_transition_context_token(context, opts),
+             :ok <- validate_expected_runtime_identity(context, opts) do
+          {:ok, context}
+        end
 
       _missing ->
         {:error, :work_item_not_found}
@@ -3826,7 +4466,8 @@ defmodule SymphonyElixir.Orchestrator do
       dependency_epoch_evidence: semantic_tool_dependency_epoch_evidence(state),
       provider_project_contract: contract,
       provider_contract_fingerprint: provider_contract_fingerprint(contract),
-      project_contract_evidence: semantic_tool_project_contract_evidence(state.project_contract_evidence)
+      project_contract_evidence: semantic_tool_project_contract_evidence(state.project_contract_evidence),
+      runtime_attempt_identity: current_runtime_attempt_identity(state, work_item_id)
     }
   end
 
@@ -4013,9 +4654,10 @@ defmodule SymphonyElixir.Orchestrator do
        provider_observation: observation,
        provider_project_contract: contract,
        provider_contract_fingerprint: provider_contract_fingerprint(contract),
-       runtime_attempt_id: Map.get(running, :attempt),
-       lineage_id: Map.get(running, :lineage_id),
-       lineage_generation: Map.get(running, :lineage_generation),
+       runtime_attempt_id: transition_context_runtime_attempt_id(running),
+       lineage_id: transition_context_lineage_id(running),
+       lineage_generation: transition_context_lineage_generation(running),
+       runtime_profile: Map.get(running, :profile_name),
        responsibility: WorkflowLifecycle.responsibility(work_item.validated_lifecycle_state),
        repository_context: %{
          workspace_path: Map.get(running, :workspace_path),

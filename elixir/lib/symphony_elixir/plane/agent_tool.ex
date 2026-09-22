@@ -11,6 +11,7 @@ defmodule SymphonyElixir.Plane.AgentTool do
   """
 
   alias SymphonyElixir.AgentRuntime.{Authority, Route}
+  alias SymphonyElixir.AgentRuntime.RuntimeAttempt.Identity, as: RuntimeAttemptIdentity
   alias SymphonyElixir.Dependency.Policy
   alias SymphonyElixir.Orchestrator
   alias SymphonyElixir.Tracker
@@ -205,6 +206,7 @@ defmodule SymphonyElixir.Plane.AgentTool do
          {:ok, route_source} <- route_source(route),
          :ok <- Authority.authorize_lifecycle_command(route, route_source, target),
          {:ok, context} <- trusted_context(opts),
+         :ok <- validate_runtime_attempt_identity(host_context, context),
          {:ok, work_item} <- fetch_work_item(context),
          {:ok, source} <- work_item_source(work_item),
          :ok <- Authority.authorize_lifecycle_command(route, source, target),
@@ -273,13 +275,15 @@ defmodule SymphonyElixir.Plane.AgentTool do
          host_context,
          opts
        ) do
-    intent_attrs = %{
-      work_item_id: work_item_id,
-      requested_from: source,
-      requested_to: target,
-      responsibility: route.responsibility,
-      guard_evidence: host_guard_evidence(host_context)
-    }
+    intent_attrs =
+      %{
+        work_item_id: work_item_id,
+        requested_from: source,
+        requested_to: target,
+        responsibility: route.responsibility,
+        guard_evidence: host_guard_evidence(host_context)
+      }
+      |> maybe_put_runtime_attempt_intent_fields(host_context)
 
     transition_opts =
       [route: route, intent_attrs: intent_attrs]
@@ -381,6 +385,7 @@ defmodule SymphonyElixir.Plane.AgentTool do
   defp transition_reason_code(_state, :invalid_target_state), do: "invalid_target_state"
   defp transition_reason_code(_state, :invalid_transition_target), do: "invalid_transition_target"
   defp transition_reason_code(_state, :invalid_context), do: "invalid_transition_context"
+  defp transition_reason_code(_state, :stale_runtime_attempt), do: "stale_runtime_attempt"
   defp transition_reason_code(_state, :authority_unavailable), do: "authority_unavailable"
   defp transition_reason_code(_state, :invalid_intent), do: "invalid_intent"
   defp transition_reason_code(_state, :invalid_transition_result), do: "invalid_transition_result"
@@ -418,6 +423,41 @@ defmodule SymphonyElixir.Plane.AgentTool do
 
   defp valid_host_context(context) when is_map(context), do: {:ok, context}
   defp valid_host_context(_context), do: {:error, :invalid_context}
+
+  defp validate_runtime_attempt_identity(host_context, semantic_context)
+       when is_map(host_context) and is_map(semantic_context) do
+    host_identity = Map.get(host_context, :runtime_attempt_identity)
+    current_identity = Map.get(semantic_context, :runtime_attempt_identity)
+
+    case {host_identity, current_identity} do
+      {nil, nil} ->
+        :ok
+
+      {%RuntimeAttemptIdentity{} = host, %RuntimeAttemptIdentity{} = current} ->
+        if RuntimeAttemptIdentity.same?(host, current),
+          do: :ok,
+          else: {:error, :stale_runtime_attempt}
+
+      _ ->
+        {:error, :stale_runtime_attempt}
+    end
+  end
+
+  defp validate_runtime_attempt_identity(_host_context, _semantic_context), do: :ok
+
+  defp maybe_put_runtime_attempt_intent_fields(attrs, host_context) when is_map(attrs) do
+    case Map.get(host_context, :runtime_attempt_identity) do
+      %RuntimeAttemptIdentity{} = identity ->
+        Map.merge(attrs, %{
+          runtime_attempt_id: identity.runtime_attempt_id,
+          lineage_generation: identity.lineage_generation,
+          lineage_id: identity.lineage_generation
+        })
+
+      _ ->
+        attrs
+    end
+  end
 
   defp load_semantic_context(%Route{} = route, host_context, opts) do
     case semantic_context_override(host_context, opts) do

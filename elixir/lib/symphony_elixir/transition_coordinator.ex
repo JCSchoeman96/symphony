@@ -993,7 +993,11 @@ defmodule SymphonyElixir.TransitionCoordinator do
   defp invoke_suspend(fun, args), do: invoke(fun, args)
 
   defp default_load_context(orchestrator, %SemanticTransitionIntent{} = intent, refresh_contract) do
-    case Orchestrator.transition_context(orchestrator, intent.work_item_id) do
+    case Orchestrator.transition_context(
+           orchestrator,
+           intent.work_item_id,
+           expected_runtime_identity: expected_runtime_identity_from_intent(intent)
+         ) do
       {:ok, context} ->
         with {:ok, context} <- refresh_contract_context(context, refresh_contract) do
           fresh_pre_context(intent, context)
@@ -1008,6 +1012,40 @@ defmodule SymphonyElixir.TransitionCoordinator do
   rescue
     _error -> {:error, :transition_context_unavailable}
   end
+
+  defp expected_runtime_identity_from_intent(%SemanticTransitionIntent{
+         runtime_attempt_id: runtime_attempt_id,
+         lineage_generation: lineage_generation,
+         work_item_id: work_item_id,
+         responsibility: responsibility
+       })
+       when is_binary(runtime_attempt_id) and not is_nil(lineage_generation) and
+              is_binary(work_item_id) and is_binary(responsibility) do
+    %{
+      runtime_attempt_id: runtime_attempt_id,
+      lineage_generation: lineage_generation,
+      work_item_id: work_item_id,
+      responsibility: responsibility
+    }
+  end
+
+  defp expected_runtime_identity_from_intent(%SemanticTransitionIntent{
+         runtime_attempt_id: runtime_attempt_id,
+         lineage_generation: lineage_generation,
+         work_item_id: work_item_id,
+         responsibility: responsibility
+       })
+       when not is_nil(runtime_attempt_id) and not is_nil(lineage_generation) and
+              is_binary(work_item_id) and is_binary(responsibility) do
+    %{
+      runtime_attempt_id: runtime_attempt_id,
+      lineage_generation: lineage_generation,
+      work_item_id: work_item_id,
+      responsibility: responsibility
+    }
+  end
+
+  defp expected_runtime_identity_from_intent(_intent), do: nil
 
   defp refresh_contract_context(context, refresh_contract) when is_map(context) do
     case invoke(refresh_contract, [context]) do
