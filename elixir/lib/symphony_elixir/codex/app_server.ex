@@ -4,7 +4,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   """
 
   require Logger
-  alias SymphonyElixir.{Codex.DynamicTool, Config, PathSafety, SSH}
+  alias SymphonyElixir.{Codex.DynamicTool, Config, CredentialBoundary, PathSafety, SSH}
 
   @initialize_id 1
   @thread_start_id 2
@@ -52,7 +52,7 @@ defmodule SymphonyElixir.Codex.AppServer do
            port: port,
            metadata: metadata,
            approval_policy: session_policies.approval_policy,
-           auto_approve_requests: session_policies.approval_policy == "never",
+           auto_approve_requests: auto_approve_requests?(session_policies, opts),
            thread_sandbox: session_policies.thread_sandbox,
            turn_sandbox_policy: session_policies.turn_sandbox_policy,
            thread_id: thread_id,
@@ -214,7 +214,7 @@ defmodule SymphonyElixir.Codex.AppServer do
             :stderr_to_stdout,
             args: [~c"-lc", String.to_charlist(local_launch_command(dynamic_tool_binding, opts))],
             cd: String.to_charlist(workspace),
-            env: tracker_secret_port_env(dynamic_tool_binding),
+            env: CredentialBoundary.port_env(dynamic_tool_binding.secret_environment_names),
             line: @port_line_bytes
           ]
         )
@@ -230,7 +230,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp local_launch_command(dynamic_tool_binding, opts) do
     [
-      tracker_secret_unset_command(dynamic_tool_binding),
+      CredentialBoundary.unset_shell_command(dynamic_tool_binding.secret_environment_names),
       "exec #{runtime_command(opts)}"
     ]
     |> Enum.reject(&is_nil/1)
@@ -240,7 +240,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp remote_launch_command(workspace, dynamic_tool_binding, opts) when is_binary(workspace) do
     [
       "cd #{shell_escape(workspace)}",
-      tracker_secret_unset_command(dynamic_tool_binding),
+      CredentialBoundary.unset_shell_command(dynamic_tool_binding.secret_environment_names),
       "exec #{runtime_command(opts)}"
     ]
     |> Enum.reject(&is_nil/1)
@@ -254,23 +254,15 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp tracker_secret_port_env(dynamic_tool_binding) do
-    dynamic_tool_binding.secret_environment_names
-    |> valid_environment_names()
-    |> Enum.map(fn name -> {String.to_charlist(name), false} end)
+  defp auto_approve_requests?(session_policies, opts) do
+    routed_profile?(opts) == false and session_policies.approval_policy == "never"
   end
 
-  defp tracker_secret_unset_command(dynamic_tool_binding) do
-    case dynamic_tool_binding.secret_environment_names |> valid_environment_names() do
-      [] -> nil
-      names -> "unset " <> Enum.join(names, " ")
+  defp routed_profile?(opts) do
+    case Keyword.get(opts, :sandbox) do
+      sandbox when sandbox in ["read-only", "workspace-write"] -> true
+      _ -> false
     end
-  end
-
-  defp valid_environment_names(names) do
-    Enum.filter(names, fn name ->
-      is_binary(name) and String.match?(name, ~r/^[A-Za-z_][A-Za-z0-9_]*$/)
-    end)
   end
 
   defp port_metadata(port, worker_host) when is_port(port) do

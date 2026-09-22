@@ -310,9 +310,14 @@ defmodule SymphonyElixir.Plane.Adapter do
     provider = provider_settings(tracker_settings)
     {workspace_slug, workspace_id, project_id} = configured_scope(tracker_settings, provider)
     api_key = configured_api_key(tracker_settings)
-    base_url = Application.get_env(:symphony_elixir, :plane_api_base_url, Client.default_base_url())
 
-    validate_client_config(base_url, workspace_slug, workspace_id, project_id, api_key)
+    validate_client_config(
+      Client.default_base_url(),
+      workspace_slug,
+      workspace_id,
+      project_id,
+      api_key
+    )
   end
 
   defp configured_scope(tracker_settings, provider) do

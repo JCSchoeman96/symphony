@@ -120,7 +120,8 @@ defmodule SymphonyElixir.Config do
     {:ok,
      %{
        runtime_settings
-       | thread_sandbox: "read-only",
+       | approval_policy: SymphonyElixir.CredentialBoundary.routed_safe_approval_policy(),
+         thread_sandbox: "read-only",
          turn_sandbox_policy: %{
            "type" => "readOnly",
            "networkAccess" => false,
@@ -131,7 +132,12 @@ defmodule SymphonyElixir.Config do
   end
 
   defp apply_profile_sandbox(runtime_settings, "workspace-write") do
-    {:ok, %{runtime_settings | thread_sandbox: "workspace-write"}}
+    {:ok,
+     %{
+       runtime_settings
+       | approval_policy: SymphonyElixir.CredentialBoundary.routed_safe_approval_policy(),
+         thread_sandbox: "workspace-write"
+     }}
   end
 
   defp apply_profile_sandbox(_runtime_settings, sandbox),

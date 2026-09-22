@@ -398,6 +398,13 @@ defmodule SymphonyElixir.Config.Schema do
       |> update_change(:repository, &String.trim/1)
       |> update_change(:base_branch, &String.trim/1)
       |> update_change(:token_env, &String.trim/1)
+      |> validate_change(:token_env, fn :token_env, token_env ->
+        if SymphonyElixir.CredentialBoundary.valid_environment_name?(token_env) do
+          []
+        else
+          [token_env: "must be a valid environment variable name"]
+        end
+      end)
       |> validate_change(:repository, fn :repository, repository ->
         if String.match?(repository, ~r/^[^\/]+\/[^\/]+$/) do
           []

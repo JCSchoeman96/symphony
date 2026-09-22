@@ -1581,7 +1581,10 @@ defmodule SymphonyElixir.AppServerTest do
       assert argv_line =~ "-T -p 2200 worker-01 bash -lc"
       assert argv_line =~ "cd "
       assert argv_line =~ remote_workspace
-      assert argv_line =~ "unset LINEAR_API_KEY"
+      assert argv_line =~ "unset GITHUB_TOKEN"
+      assert argv_line =~ "LINEAR_API_KEY"
+      assert argv_line =~ "PLANE_API_KEY"
+      assert argv_line =~ "SSH_AUTH_SOCK"
       assert argv_line =~ "exec "
       assert argv_line =~ "fake-remote-codex app-server"
 

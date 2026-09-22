@@ -51,7 +51,9 @@ defmodule SymphonyElixir.PlaneDependencyReaderTest do
     assert {:error, :item_enumeration_incomplete} = DependencyReader.fetch(Map.delete(config, :workspace_slug))
     assert {:error, :item_enumeration_incomplete} = DependencyReader.fetch(Map.put(config, :workspace_id, nil))
     assert {:error, :provider_unavailable} = DependencyReader.fetch(Map.put(config, :api_key, ""))
-    assert {:error, :provider_unavailable} = DependencyReader.fetch(Map.put(config, :base_url, "http://plane.invalid"))
+
+    assert {:error, :provider_unavailable} =
+             DependencyReader.fetch(Map.put(config, :base_url, "http://plane.invalid"))
 
     request_fun = fn request ->
       if String.ends_with?(request.path, "/work-items/"),

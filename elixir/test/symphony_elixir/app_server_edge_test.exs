@@ -183,6 +183,27 @@ defmodule SymphonyElixir.AppServerEdgeTest do
     )
   end
 
+  test "routed profile sandbox disables never-policy auto approval at session start" do
+    with_fixture(
+      [
+        [json_line(%{"id" => 1, "result" => %{}})],
+        [],
+        [json_line(%{"id" => 2, "result" => %{"thread" => %{"id" => "thread-routed-sandbox"}}})]
+      ],
+      [codex_approval_policy: "never"],
+      fn workspace, binary, _issue ->
+        assert {:ok, session} =
+                 AppServer.start_session(workspace,
+                   command: "#{binary} app-server",
+                   sandbox: "read-only"
+                 )
+
+        refute session.auto_approve_requests
+        assert :ok = AppServer.stop_session(session)
+      end
+    )
+  end
+
   test "tool results are normalized into safe JSON-RPC response shapes" do
     test_pid = self()
 

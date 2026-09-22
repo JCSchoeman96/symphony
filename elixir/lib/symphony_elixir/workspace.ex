@@ -4,7 +4,7 @@ defmodule SymphonyElixir.Workspace do
   """
 
   require Logger
-  alias SymphonyElixir.{Config, PathSafety, SSH}
+  alias SymphonyElixir.{Config, CredentialBoundary, PathSafety, SSH}
 
   @remote_workspace_marker "__SYMPHONY_WORKSPACE__"
 
@@ -399,9 +399,15 @@ defmodule SymphonyElixir.Workspace do
 
     Logger.info("Running workspace hook hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=local")
 
+    hook_env = hook_process_env()
+
+    cmd_opts =
+      [cd: workspace, stderr_to_stdout: true]
+      |> maybe_put_hook_env(hook_env)
+
     task =
       Task.async(fn ->
-        System.cmd("sh", ["-lc", command], cd: workspace, stderr_to_stdout: true)
+        System.cmd("sh", ["-lc", command], cmd_opts)
       end)
 
     case Task.yield(task, timeout_ms) do
@@ -422,7 +428,16 @@ defmodule SymphonyElixir.Workspace do
 
     Logger.info("Running workspace hook hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=#{worker_host}")
 
-    case run_remote_command(worker_host, "cd #{shell_escape(workspace)} && #{command}", timeout_ms) do
+    remote_command =
+      [
+        CredentialBoundary.unset_shell_command(CredentialBoundary.configured_secret_environment_names()),
+        "cd #{shell_escape(workspace)}",
+        command
+      ]
+      |> Enum.reject(&is_nil/1)
+      |> Enum.join(" && ")
+
+    case run_remote_command(worker_host, remote_command, timeout_ms) do
       {:ok, cmd_result} ->
         handle_hook_command_result(cmd_result, workspace, issue_context, hook_name)
 
@@ -447,7 +462,10 @@ defmodule SymphonyElixir.Workspace do
   end
 
   defp sanitize_hook_output_for_log(output, max_bytes \\ 2_048) do
-    binary_output = IO.iodata_to_binary(output)
+    binary_output =
+      output
+      |> IO.iodata_to_binary()
+      |> CredentialBoundary.redact(CredentialBoundary.configured_secret_environment_names())
 
     case byte_size(binary_output) <= max_bytes do
       true ->
@@ -457,6 +475,24 @@ defmodule SymphonyElixir.Workspace do
         binary_part(binary_output, 0, max_bytes) <> "... (truncated)"
     end
   end
+
+  defp hook_process_env do
+    if routed_workspace_hooks?() do
+      CredentialBoundary.hook_process_env(CredentialBoundary.configured_secret_environment_names())
+    else
+      nil
+    end
+  end
+
+  defp routed_workspace_hooks? do
+    case Config.settings() do
+      {:ok, %{agent: %{routing: "routed"}}} -> true
+      _ -> false
+    end
+  end
+
+  defp maybe_put_hook_env(opts, nil), do: opts
+  defp maybe_put_hook_env(opts, hook_env), do: Keyword.put(opts, :env, hook_env)
 
   defp validate_workspace_path(workspace, nil) when is_binary(workspace) do
     validate_local_workspace_path(workspace, Config.local_workspace_root())

@@ -9,6 +9,13 @@ defmodule SymphonyElixir.GitHub.SourceControl do
 
   @default_api_url "https://api.github.com"
   @api_version "2022-11-28"
+
+  defmodule Error do
+    @moduledoc "Safe GitHub transport error without authorization data."
+    defstruct [:kind, :detail]
+    @type t :: %__MODULE__{kind: atom(), detail: term() | nil}
+  end
+
   @user_agent "symphony"
   @max_check_runs_per_subject 300
   @max_associated_prs 100
@@ -28,6 +35,9 @@ defmodule SymphonyElixir.GitHub.SourceControl do
   end
 
   def secret_environment_names(_config), do: []
+
+  @spec default_api_url() :: String.t()
+  def default_api_url, do: @default_api_url
 
   @spec fetch_repository(config(), keyword()) :: {:ok, map()} | {:error, term()}
   def fetch_repository(config, opts \\ []) do
@@ -591,9 +601,8 @@ defmodule SymphonyElixir.GitHub.SourceControl do
   end
 
   defp perform_get(token, path, params, opts) do
-    api_url = Keyword.get(opts, :api_url, @default_api_url)
     query = URI.encode_query(params)
-    url = api_url <> path <> if(query == "", do: "", else: "?" <> query)
+    url = @default_api_url <> path <> if(query == "", do: "", else: "?" <> query)
 
     headers = [
       {"accept", "application/vnd.github+json"},
@@ -612,12 +621,19 @@ defmodule SymphonyElixir.GitHub.SourceControl do
         {:error, {:github_status, status}}
 
       {:error, reason} ->
-        {:error, reason}
+        {:error, normalize_transport_error(reason, token)}
     end
   end
 
   defp default_http_request(url, headers) do
-    case Req.request(method: :get, url: url, headers: headers, receive_timeout: 15_000) do
+    case Req.request(
+           method: :get,
+           url: url,
+           headers: headers,
+           receive_timeout: 15_000,
+           redirect: false,
+           retry: false
+         ) do
       {:ok, %{status: status, body: body}} when status in 200..299 ->
         {:ok, %{status: status, body: body}}
 
@@ -625,9 +641,27 @@ defmodule SymphonyElixir.GitHub.SourceControl do
         {:ok, %{status: status, body: nil}}
 
       {:error, reason} ->
-        {:error, reason}
+        {:error, %Error{kind: :transport_failed, detail: safe_transport_detail(reason)}}
     end
   end
+
+  defp normalize_transport_error(%Error{} = error, _token), do: error
+
+  defp normalize_transport_error(reason, token) do
+    %Error{kind: :transport_failed, detail: redact_token(safe_transport_detail(reason), token)}
+  end
+
+  defp safe_transport_detail(reason) when is_atom(reason), do: reason
+
+  defp safe_transport_detail(reason) when is_binary(reason), do: reason
+
+  defp safe_transport_detail(_reason), do: :transport_failed
+
+  defp redact_token(detail, token) when is_binary(detail) and is_binary(token) and token != "" do
+    String.replace(detail, token, "[REDACTED]")
+  end
+
+  defp redact_token(detail, _token), do: detail
 
   defp resolve_token(config, opts) do
     Keyword.get_lazy(opts, :token, fn ->
