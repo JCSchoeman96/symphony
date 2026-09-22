@@ -138,11 +138,16 @@ defmodule SymphonyElixir.CredentialBoundary do
     root
   end
 
-  @spec routed_workspace_shell_hooks_disabled?() :: boolean()
-  def routed_workspace_shell_hooks_disabled? do
+  @routed_skipped_workspace_hooks ~w(before_run after_run before_remove)
+
+  @spec routed_workspace_shell_hook_skipped?(String.t()) :: boolean()
+  def routed_workspace_shell_hook_skipped?(hook_name) when is_binary(hook_name) do
     case Config.settings() do
-      {:ok, %{agent: %{routing: "routed"}}} -> true
-      _ -> false
+      {:ok, %{agent: %{routing: "routed"}}} ->
+        hook_name in @routed_skipped_workspace_hooks
+
+      _ ->
+        false
     end
   end
 

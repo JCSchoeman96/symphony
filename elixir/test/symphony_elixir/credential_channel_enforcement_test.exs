@@ -286,7 +286,27 @@ defmodule SymphonyElixir.CredentialChannelEnforcementTest do
     refute output =~ "sentinel-plane-hook-secret"
   end
 
-  test "routed mode skips workspace shell hooks instead of executing host commands" do
+  test "routed mode still runs after_create to provision new workspaces" do
+    workspace_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-routed-after-create-#{System.unique_integer([:positive])}"
+      )
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      agent_routing: "routed",
+      tracker_kind: "memory",
+      workspace_root: workspace_root,
+      hook_after_create: "touch .symphony-routed-provisioned"
+    )
+
+    on_exit(fn -> File.rm_rf(workspace_root) end)
+
+    assert {:ok, workspace} = Workspace.create_for_issue("ISSUE-PROVISION", nil)
+    assert File.exists?(Path.join(workspace, ".symphony-routed-provisioned"))
+  end
+
+  test "routed mode skips post-agent workspace shell hooks instead of executing host commands" do
     marker =
       Path.join(
         System.tmp_dir!(),
@@ -382,6 +402,17 @@ defmodule SymphonyElixir.CredentialChannelEnforcementTest do
     names = CredentialBoundary.deny_environment_names_from_settings()
     assert "GITHUB_TOKEN" in names
     assert "PLANE_API_KEY" in names
+  end
+
+  test "routed workflows reject unsafe explicit turn sandbox policy types at startup" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      agent_routing: "routed",
+      tracker_kind: "memory",
+      codex_turn_sandbox_policy: %{type: "dangerFullAccess"}
+    )
+
+    assert {:error, {:unsafe_routed_turn_sandbox_policy, "dangerFullAccess"}} =
+             Config.validate!()
   end
 
   test "routed runtime sandbox policies restrict filesystem reads to the workspace" do

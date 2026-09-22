@@ -395,7 +395,7 @@ defmodule SymphonyElixir.Workspace do
   defp ignore_hook_failure({:error, _reason}), do: :ok
 
   defp run_hook(command, workspace, issue_context, hook_name, nil) do
-    if CredentialBoundary.routed_workspace_shell_hooks_disabled?() do
+    if CredentialBoundary.routed_workspace_shell_hook_skipped?(hook_name) do
       Logger.info("Skipping workspace hook in routed mode hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=local")
 
       :ok
@@ -405,7 +405,7 @@ defmodule SymphonyElixir.Workspace do
   end
 
   defp run_hook(command, workspace, issue_context, hook_name, worker_host) when is_binary(worker_host) do
-    if CredentialBoundary.routed_workspace_shell_hooks_disabled?() do
+    if CredentialBoundary.routed_workspace_shell_hook_skipped?(hook_name) do
       Logger.info("Skipping workspace hook in routed mode hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=#{worker_host}")
 
       :ok
