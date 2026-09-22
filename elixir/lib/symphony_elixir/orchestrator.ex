@@ -161,7 +161,12 @@ defmodule SymphonyElixir.Orchestrator do
           Logger.error("Autonomous dispatch is held: #{inspect(ledger_block_reason(state))}")
         end
 
-        state = schedule_tick(state, 0)
+        state =
+          if Keyword.get(opts, :start_quiesced, false) do
+            state
+          else
+            schedule_tick(state, 0)
+          end
 
         {:ok, state}
 
