@@ -233,6 +233,8 @@ defmodule SymphonyElixir.CredentialChannelEnforcementTest do
 
     File.mkdir_p!(root)
     assert {_output, 0} = System.cmd("git", ["init"], cd: root)
+    assert {_output, 0} = System.cmd("git", ["config", "user.email", "probe@example.com"], cd: root)
+    assert {_output, 0} = System.cmd("git", ["config", "user.name", "probe"], cd: root)
     assert {_output, 0} = System.cmd("git", ["commit", "--allow-empty", "-m", "probe"], cd: root)
 
     assert {:ok, %{clean?: true, head_sha: head_sha}} = RepositoryProbe.probe(%{workspace_path: root})
