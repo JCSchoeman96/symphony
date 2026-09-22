@@ -26,12 +26,20 @@ defmodule SymphonyElixir.ProfileRuntimeTest do
     File.mkdir_p!(workspace)
 
     try do
-      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: root)
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: root,
+        agent_routing: "routed",
+        tracker_kind: "memory"
+      )
 
       assert {:ok, settings} = Config.codex_runtime_settings(workspace, sandbox: "read-only")
       assert settings.thread_sandbox == "read-only"
       assert settings.turn_sandbox_policy["type"] == "readOnly"
       refute Map.has_key?(settings.turn_sandbox_policy, "writableRoots")
+
+      assert get_in(settings.turn_sandbox_policy, ["access", "type"]) == "restricted"
+      assert get_in(settings.turn_sandbox_policy, ["access", "includePlatformDefaults"]) == false
+      assert get_in(settings.turn_sandbox_policy, ["access", "readableRoots"]) == [Path.expand(workspace)]
     after
       File.rm_rf(root)
     end
@@ -65,12 +73,18 @@ defmodule SymphonyElixir.ProfileRuntimeTest do
     File.mkdir_p!(workspace)
 
     try do
-      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: root)
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: root,
+        agent_routing: "routed",
+        tracker_kind: "memory"
+      )
 
       assert {:ok, settings} = Config.codex_runtime_settings(workspace, sandbox: "workspace-write")
       assert settings.thread_sandbox == "workspace-write"
       assert settings.turn_sandbox_policy["type"] == "workspaceWrite"
       assert settings.turn_sandbox_policy["writableRoots"] == [Path.expand(workspace)]
+      assert get_in(settings.turn_sandbox_policy, ["readOnlyAccess", "type"]) == "restricted"
+      assert get_in(settings.turn_sandbox_policy, ["readOnlyAccess", "readableRoots"]) == [Path.expand(workspace)]
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: root,

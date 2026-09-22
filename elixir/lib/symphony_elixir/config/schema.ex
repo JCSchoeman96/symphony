@@ -449,15 +449,74 @@ defmodule SymphonyElixir.Config.Schema do
 
   @spec resolve_turn_sandbox_policy(%__MODULE__{}, Path.t() | nil) :: map()
   def resolve_turn_sandbox_policy(settings, workspace \\ nil) do
-    case settings.codex.turn_sandbox_policy do
-      %{} = policy ->
+    policy =
+      case settings.codex.turn_sandbox_policy do
+        %{} = policy ->
+          policy
+
+        _ ->
+          workspace
+          |> default_workspace_root(settings.workspace.root)
+          |> expand_local_workspace_root()
+          |> default_turn_sandbox_policy(routed_credential_safe?(settings))
+      end
+
+    maybe_finalize_routed_turn_sandbox_policy(settings, workspace, policy, [])
+  end
+
+  @spec routed_credential_safe_read_access(Path.t()) :: map()
+  def routed_credential_safe_read_access(workspace) when is_binary(workspace) do
+    %{
+      "type" => "restricted",
+      "includePlatformDefaults" => false,
+      "readableRoots" => [workspace]
+    }
+  end
+
+  @spec routed_credential_safe_read_only_policy(Path.t()) :: map()
+  def routed_credential_safe_read_only_policy(workspace) when is_binary(workspace) do
+    %{
+      "type" => "readOnly",
+      "networkAccess" => false,
+      "excludeTmpdirEnvVar" => true,
+      "excludeSlashTmp" => true,
+      "access" => routed_credential_safe_read_access(workspace)
+    }
+  end
+
+  @spec routed_credential_safe_workspace_write_policy(Path.t()) :: map()
+  def routed_credential_safe_workspace_write_policy(workspace) when is_binary(workspace) do
+    %{
+      "type" => "workspaceWrite",
+      "writableRoots" => [workspace],
+      "readOnlyAccess" => routed_credential_safe_read_access(workspace),
+      "networkAccess" => false,
+      "excludeTmpdirEnvVar" => true,
+      "excludeSlashTmp" => true
+    }
+  end
+
+  @spec finalize_routed_turn_sandbox_policy(map(), Path.t()) :: map()
+  def finalize_routed_turn_sandbox_policy(policy, workspace)
+      when is_map(policy) and is_binary(workspace) do
+    read_access = routed_credential_safe_read_access(workspace)
+
+    case Map.get(policy, "type") do
+      "workspaceWrite" ->
         policy
+        |> Map.put("readOnlyAccess", read_access)
+        |> Map.put("networkAccess", false)
+        |> Map.put("excludeTmpdirEnvVar", true)
+        |> Map.put("excludeSlashTmp", true)
+
+      "readOnly" ->
+        policy
+        |> Map.put("access", read_access)
+        |> Map.put("excludeTmpdirEnvVar", true)
+        |> Map.put("excludeSlashTmp", true)
 
       _ ->
-        workspace
-        |> default_workspace_root(settings.workspace.root)
-        |> expand_local_workspace_root()
-        |> default_turn_sandbox_policy()
+        policy
     end
   end
 
@@ -533,19 +592,27 @@ defmodule SymphonyElixir.Config.Schema do
   @spec resolve_runtime_turn_sandbox_policy(%__MODULE__{}, Path.t() | nil, keyword()) ::
           {:ok, map()} | {:error, term()}
   def resolve_runtime_turn_sandbox_policy(settings, workspace \\ nil, opts \\ []) do
-    case {Keyword.get(opts, :sandbox), settings.codex.turn_sandbox_policy} do
-      {"workspace-write", _policy} ->
+    credential_safe = routed_credential_safe?(settings)
+
+    cond do
+      Keyword.get(opts, :sandbox) == "workspace-write" ->
         workspace
         |> default_workspace_root(settings.workspace.root)
-        |> default_runtime_turn_sandbox_policy(opts)
+        |> default_runtime_turn_sandbox_policy(opts, credential_safe)
 
-      {_sandbox, %{} = policy} ->
-        {:ok, policy}
+      is_map(settings.codex.turn_sandbox_policy) ->
+        finalize_explicit_runtime_turn_sandbox_policy(
+          settings,
+          workspace,
+          opts,
+          credential_safe,
+          settings.codex.turn_sandbox_policy
+        )
 
-      _ ->
+      true ->
         workspace
         |> default_workspace_root(settings.workspace.root)
-        |> default_runtime_turn_sandbox_policy(opts)
+        |> default_runtime_turn_sandbox_policy(opts, credential_safe)
     end
   end
 
@@ -911,7 +978,13 @@ defmodule SymphonyElixir.Config.Schema do
 
   defp normalize_secret_value(_value), do: nil
 
-  defp default_turn_sandbox_policy(workspace) do
+  defp default_turn_sandbox_policy(workspace, credential_safe)
+
+  defp default_turn_sandbox_policy(workspace, true) do
+    routed_credential_safe_workspace_write_policy(workspace)
+  end
+
+  defp default_turn_sandbox_policy(workspace, false) do
     %{
       "type" => "workspaceWrite",
       "writableRoots" => [workspace],
@@ -922,19 +995,72 @@ defmodule SymphonyElixir.Config.Schema do
     }
   end
 
-  defp default_runtime_turn_sandbox_policy(workspace_root, opts) when is_binary(workspace_root) do
+  defp default_runtime_turn_sandbox_policy(workspace_root, opts, credential_safe)
+
+  defp default_runtime_turn_sandbox_policy(workspace_root, opts, credential_safe)
+       when is_binary(workspace_root) do
     if Keyword.get(opts, :remote, false) do
-      {:ok, default_turn_sandbox_policy(workspace_root)}
+      {:ok, default_turn_sandbox_policy(workspace_root, credential_safe)}
     else
       with expanded_workspace_root <- expand_local_workspace_root(workspace_root),
            {:ok, canonical_workspace_root} <- PathSafety.canonicalize(expanded_workspace_root) do
-        {:ok, default_turn_sandbox_policy(canonical_workspace_root)}
+        {:ok, default_turn_sandbox_policy(canonical_workspace_root, credential_safe)}
       end
     end
   end
 
-  defp default_runtime_turn_sandbox_policy(workspace_root, _opts) do
+  defp default_runtime_turn_sandbox_policy(workspace_root, _opts, _credential_safe) do
     {:error, {:unsafe_turn_sandbox_policy, {:invalid_workspace_root, workspace_root}}}
+  end
+
+  defp routed_credential_safe?(%__MODULE__{agent: %{routing: "routed"}}), do: true
+  defp routed_credential_safe?(_settings), do: false
+
+  defp maybe_finalize_routed_turn_sandbox_policy(settings, workspace, policy, opts) do
+    if routed_credential_safe?(settings) do
+      case canonical_turn_sandbox_workspace(settings, workspace, opts) do
+        {:ok, canonical_workspace} ->
+          finalize_routed_turn_sandbox_policy(policy, canonical_workspace)
+
+        {:error, _} ->
+          policy
+      end
+    else
+      policy
+    end
+  end
+
+  @spec canonical_turn_sandbox_workspace(%__MODULE__{}, Path.t() | nil, keyword()) ::
+          {:ok, Path.t()} | {:error, term()}
+  def canonical_turn_sandbox_workspace(settings, workspace, opts) do
+    workspace_root = workspace |> default_workspace_root(settings.workspace.root)
+
+    if Keyword.get(opts, :remote, false) do
+      {:ok, workspace_root}
+    else
+      workspace_root
+      |> expand_local_workspace_root()
+      |> PathSafety.canonicalize()
+    end
+  end
+
+  defp finalize_explicit_runtime_turn_sandbox_policy(
+         settings,
+         workspace,
+         opts,
+         credential_safe,
+         policy
+       ) do
+    with {:ok, canonical_workspace} <- canonical_turn_sandbox_workspace(settings, workspace, opts) do
+      finalized_policy =
+        if credential_safe do
+          finalize_routed_turn_sandbox_policy(policy, canonical_workspace)
+        else
+          policy
+        end
+
+      {:ok, finalized_policy}
+    end
   end
 
   defp default_workspace_root(workspace, _fallback) when is_binary(workspace) and workspace != "",

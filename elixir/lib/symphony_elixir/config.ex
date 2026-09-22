@@ -109,29 +109,28 @@ defmodule SymphonyElixir.Config do
           turn_sandbox_policy: turn_sandbox_policy
         }
 
-        apply_profile_sandbox(runtime_settings, Keyword.get(opts, :sandbox))
+        apply_profile_sandbox(runtime_settings, Keyword.get(opts, :sandbox), workspace, opts)
       end
     end
   end
 
-  defp apply_profile_sandbox(runtime_settings, nil), do: {:ok, runtime_settings}
+  defp apply_profile_sandbox(runtime_settings, nil, _workspace, _opts), do: {:ok, runtime_settings}
 
-  defp apply_profile_sandbox(runtime_settings, "read-only") do
-    {:ok,
-     %{
-       runtime_settings
-       | approval_policy: SymphonyElixir.CredentialBoundary.routed_safe_approval_policy(),
-         thread_sandbox: "read-only",
-         turn_sandbox_policy: %{
-           "type" => "readOnly",
-           "networkAccess" => false,
-           "excludeTmpdirEnvVar" => false,
-           "excludeSlashTmp" => false
-         }
-     }}
+  defp apply_profile_sandbox(runtime_settings, "read-only", workspace, opts) do
+    with {:ok, settings} <- settings(),
+         {:ok, canonical_workspace} <-
+           Schema.canonical_turn_sandbox_workspace(settings, workspace, opts) do
+      {:ok,
+       %{
+         runtime_settings
+         | approval_policy: SymphonyElixir.CredentialBoundary.routed_safe_approval_policy(),
+           thread_sandbox: "read-only",
+           turn_sandbox_policy: Schema.routed_credential_safe_read_only_policy(canonical_workspace)
+       }}
+    end
   end
 
-  defp apply_profile_sandbox(runtime_settings, "workspace-write") do
+  defp apply_profile_sandbox(runtime_settings, "workspace-write", _workspace, _opts) do
     {:ok,
      %{
        runtime_settings
@@ -140,7 +139,7 @@ defmodule SymphonyElixir.Config do
      }}
   end
 
-  defp apply_profile_sandbox(_runtime_settings, sandbox),
+  defp apply_profile_sandbox(_runtime_settings, sandbox, _workspace, _opts),
     do: {:error, {:invalid_profile_sandbox, sandbox}}
 
   @doc false

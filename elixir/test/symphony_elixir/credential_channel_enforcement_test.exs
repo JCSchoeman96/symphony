@@ -384,6 +384,38 @@ defmodule SymphonyElixir.CredentialChannelEnforcementTest do
     assert "PLANE_API_KEY" in names
   end
 
+  test "routed runtime sandbox policies restrict filesystem reads to the workspace" do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-routed-sandbox-read-#{System.unique_integer([:positive])}"
+      )
+
+    workspace = Path.join(root, "ISSUE-1")
+    File.mkdir_p!(workspace)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      agent_routing: "routed",
+      tracker_kind: "memory",
+      workspace_root: root
+    )
+
+    assert {:ok, canonical_workspace} = SymphonyElixir.PathSafety.canonicalize(Path.expand(workspace))
+
+    assert {:ok, write_settings} =
+             Config.codex_runtime_settings(workspace, sandbox: "workspace-write")
+
+    assert write_settings.turn_sandbox_policy ==
+             Config.Schema.routed_credential_safe_workspace_write_policy(canonical_workspace)
+
+    assert {:ok, read_settings} = Config.codex_runtime_settings(workspace, sandbox: "read-only")
+
+    assert read_settings.turn_sandbox_policy ==
+             Config.Schema.routed_credential_safe_read_only_policy(canonical_workspace)
+
+    File.rm_rf(root)
+  end
+
   test "routed profile sandbox forces non-auto approval policy" do
     write_workflow_file!(Workflow.workflow_file_path(),
       agent_routing: "routed",
