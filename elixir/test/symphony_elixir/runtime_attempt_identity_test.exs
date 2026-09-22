@@ -67,6 +67,7 @@ defmodule SymphonyElixir.RuntimeAttemptIdentityTest do
     end
 
     assert RuntimeAttempt.transition_allowed?(:queued, :starting)
+    refute RuntimeAttempt.transition_allowed?(:starting, :completed)
     refute RuntimeAttempt.transition_allowed?(:completed, :running)
     assert RuntimeAttempt.terminal?(:failed)
     refute RuntimeAttempt.terminal?(:running)

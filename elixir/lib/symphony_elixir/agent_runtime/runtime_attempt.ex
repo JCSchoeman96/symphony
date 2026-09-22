@@ -77,7 +77,7 @@ defmodule SymphonyElixir.AgentRuntime.RuntimeAttempt do
 
   @allowed_transitions %{
     queued: [:starting],
-    starting: [:running, :retry_queued, :blocked, :failed, :cancelled, :completed],
+    starting: [:running, :retry_queued, :blocked, :failed, :cancelled],
     running: [:completed, :retry_queued, :blocked, :failed, :cancelled],
     completed: [],
     retry_queued: [],

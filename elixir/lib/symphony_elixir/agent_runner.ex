@@ -153,6 +153,18 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp send_worker_runtime_info(_recipient, _issue, _identity, _worker_host, _workspace), do: :ok
 
+  defp send_runtime_attempt_session_started(
+         recipient,
+         %Issue{id: issue_id},
+         %RuntimeAttemptIdentity{} = identity
+       )
+       when is_binary(issue_id) and is_pid(recipient) do
+    send(recipient, {:runtime_attempt_session_started, issue_id, identity})
+    :ok
+  end
+
+  defp send_runtime_attempt_session_started(_recipient, _issue, _identity), do: :ok
+
   defp run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host) do
     route = Keyword.get(opts, :route)
     max_turns = max_turns_for_run(route, opts)
@@ -171,6 +183,8 @@ defmodule SymphonyElixir.AgentRunner do
     role_prompt = PromptBuilder.role_prompt(route)
 
     with {:ok, session} <- runtime.start_session(workspace, runtime_opts) do
+      send_runtime_attempt_session_started(codex_update_recipient, issue, runtime_identity)
+
       context = %{
         runtime: runtime,
         session: session,
