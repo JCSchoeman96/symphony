@@ -960,11 +960,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp handle_normal_continuation(state, issue_id, running_entry) do
-    with {:ok, running_entry} <-
-           transition_running_entry_attempt(
-             running_entry,
-             continuation_runtime_attempt_terminal(running_entry)
-           ),
+    with {:ok, running_entry} <- transition_running_entry_attempt(running_entry, :completed),
          {:ok, state} <- clear_attempt_in_flight(state, issue_id) do
       {:ok, state} = record_attempt_event(state, issue_id, :continuation)
 
@@ -1331,6 +1327,13 @@ defmodule SymphonyElixir.Orchestrator do
   def handle_normal_route_change_for_test(%State{} = state, issue_id, running_entry)
       when is_binary(issue_id) and is_map(running_entry) do
     handle_normal_route_change(state, issue_id, running_entry)
+  end
+
+  @doc false
+  @spec handle_normal_continuation_for_test(State.t(), String.t(), map()) :: State.t()
+  def handle_normal_continuation_for_test(%State{} = state, issue_id, running_entry)
+      when is_binary(issue_id) and is_map(running_entry) do
+    handle_normal_continuation(state, issue_id, running_entry)
   end
 
   @doc false
@@ -1812,20 +1815,14 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp continuation_runtime_attempt_terminal(running_entry) when is_map(running_entry) do
-    case Map.get(running_entry, :runtime_attempt) do
-      %RuntimeAttempt{state: :running} -> :completed
-      %RuntimeAttempt{state: :starting} -> :cancelled
-      _ -> :completed
-    end
-  end
-
   defp successful_runtime_completion_observation?(%Issue{} = issue, %State{} = state) do
-    WorkflowLifecycle.successful_terminal?(issue.state) and
-      match?(
-        %WorkItem{validated_lifecycle_state: :done},
-        Map.get(state.work_control, issue.id)
-      )
+    case Map.get(state.work_control, issue.id) do
+      %WorkItem{lifecycle_assessment: %LifecycleAssessment{} = assessment} ->
+        LifecycleAssessment.completion_validated?(assessment)
+
+      _ ->
+        false
+    end
   end
 
   defp runtime_attempt_terminal_for_teardown(termination_reason) do

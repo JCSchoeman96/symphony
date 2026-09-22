@@ -6,7 +6,7 @@ defmodule SymphonyElixir.RuntimeAttemptTeardownTest do
   alias SymphonyElixir.AgentRuntime.RuntimeAttempt.Identity
   alias SymphonyElixir.Orchestrator
   alias SymphonyElixir.Tracker.Issue
-  alias SymphonyElixir.WorkControl.WorkItem
+  alias SymphonyElixir.WorkControl.{GuardClass, LifecycleAssessment, ProviderObservation, WorkItem}
 
   @issue_id "runtime-teardown-1"
   @lineage "lineage-teardown"
@@ -51,6 +51,43 @@ defmodule SymphonyElixir.RuntimeAttemptTeardownTest do
       extra
     )
     |> then(&struct(Orchestrator.State, &1))
+  end
+
+  defp provider_observation(state_name) do
+    {:ok, observation} =
+      ProviderObservation.new(%{
+        provider: :memory,
+        work_item_id: @issue_id,
+        provider_state_name: state_name,
+        observed_at: DateTime.utc_now()
+      })
+
+    observation
+  end
+
+  defp completion_validated_assessment(display_name) do
+    proof = GuardClass.requirement(:mechanical_guard, :completion_proof_verified)
+
+    assessment =
+      LifecycleAssessment.assess(provider_observation("Done"), :done, proof)
+
+    observation = %{assessment.provider_observation | provider_state_name: display_name}
+    %{assessment | provider_observation: observation}
+  end
+
+  defp work_item_with_assessment(issue, assessment) do
+    {:ok, work_item} =
+      WorkItem.from_issue(issue, %{
+        provider: :memory,
+        observed_at: DateTime.utc_now(),
+        prior_validated_lifecycle_state: :in_progress
+      })
+
+    %{
+      work_item
+      | lifecycle_assessment: assessment,
+        validated_lifecycle_state: assessment.validated_state
+    }
   end
 
   defp base_running_entry(worker_pid, runtime_state) do
@@ -274,9 +311,24 @@ defmodule SymphonyElixir.RuntimeAttemptTeardownTest do
     refute Map.has_key?(updated.running, @issue_id)
   end
 
-  test "successful completion requires validated done before RuntimeAttempt completed" do
-    worker_pid = running_worker()
+  test "renamed provider display with completion-validated assessment maps to completed teardown" do
+    assessment = completion_validated_assessment("Shipped")
+    assert LifecycleAssessment.completion_validated?(assessment)
 
+    issue = %Issue{
+      id: @issue_id,
+      identifier: "RT-1",
+      state: "Shipped",
+      url: "https://example.org/issues/rt-1"
+    }
+
+    work_item = work_item_with_assessment(issue, assessment)
+    state = base_orchestrator_state(%{}, %{work_control: %{@issue_id => work_item}})
+
+    assert Orchestrator.tracker_terminal_teardown_reason_for_test(issue, state) == :terminal_completed
+  end
+
+  test "provider-observed done without completion-validated assessment maps to cancelled teardown" do
     issue = %Issue{
       id: @issue_id,
       identifier: "RT-1",
@@ -284,29 +336,27 @@ defmodule SymphonyElixir.RuntimeAttemptTeardownTest do
       url: "https://example.org/issues/rt-1"
     }
 
-    {:ok, work_item} =
-      WorkItem.from_issue(issue, %{
-        provider: :memory,
-        observed_at: DateTime.utc_now(),
-        prior_validated_lifecycle_state: :in_progress
-      })
+    assessment = LifecycleAssessment.assess(provider_observation("Done"), :merging, [])
+    work_item = work_item_with_assessment(issue, assessment)
+    state = base_orchestrator_state(%{}, %{work_control: %{@issue_id => work_item}})
 
-    work_item = %{work_item | validated_lifecycle_state: :done}
-    running_entry = base_running_entry(worker_pid, :running) |> Map.put(:issue, issue)
+    refute LifecycleAssessment.completion_validated?(assessment)
+    assert Orchestrator.tracker_terminal_teardown_reason_for_test(issue, state) == :terminal_cancelled
+  end
 
-    state =
-      base_orchestrator_state(%{@issue_id => running_entry}, %{
-        work_control: %{@issue_id => work_item},
-        claimed: MapSet.new([@issue_id])
-      })
+  test "provider-observed canceled maps to cancelled teardown" do
+    issue = %Issue{
+      id: @issue_id,
+      identifier: "RT-1",
+      state: "Canceled",
+      url: "https://example.org/issues/rt-1"
+    }
 
-    assert Orchestrator.tracker_terminal_teardown_reason_for_test(issue, state) == :terminal_completed
+    assessment = LifecycleAssessment.assess(provider_observation("Canceled"), :in_progress, [])
+    work_item = work_item_with_assessment(issue, assessment)
+    state = base_orchestrator_state(%{}, %{work_control: %{@issue_id => work_item}})
 
-    updated =
-      Orchestrator.terminate_running_issue_for_test(state, @issue_id, false, :terminal_completed)
-
-    refute Process.alive?(worker_pid)
-    refute Map.has_key?(updated.running, @issue_id)
+    assert Orchestrator.tracker_terminal_teardown_reason_for_test(issue, state) == :terminal_cancelled
   end
 
   test "tracker done without validated completion semantics maps to cancelled teardown" do
@@ -323,6 +373,29 @@ defmodule SymphonyElixir.RuntimeAttemptTeardownTest do
     state = base_orchestrator_state(%{@issue_id => running_entry})
 
     assert Orchestrator.tracker_terminal_teardown_reason_for_test(issue, state) == :terminal_cancelled
+  end
+
+  test "normal continuation does not schedule when runtime session never reached running" do
+    issue = %Issue{
+      id: @issue_id,
+      identifier: "RT-1",
+      state: "In Progress",
+      url: "https://example.org/issues/rt-1"
+    }
+
+    running_entry =
+      base_running_entry(self(), :starting)
+      |> Map.put(:issue, issue)
+      |> Map.put(:pid, nil)
+      |> Map.put(:ref, nil)
+
+    state = base_orchestrator_state(%{@issue_id => running_entry})
+
+    updated = Orchestrator.handle_normal_continuation_for_test(state, @issue_id, running_entry)
+
+    assert updated == state
+    refute Map.has_key?(updated.retry_attempts, @issue_id)
+    assert updated.running[@issue_id].runtime_attempt.state == :starting
   end
 
   test "worker DOWN route change blocks when review-cycle policy rejects retry before RetryQueued" do

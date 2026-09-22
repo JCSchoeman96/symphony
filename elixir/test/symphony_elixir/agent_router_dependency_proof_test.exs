@@ -33,9 +33,14 @@ defmodule SymphonyElixir.FullProofDagRunner do
   @capture_name :symphony_full_proof_dag_capture
 
   @spec run(Issue.t(), pid() | nil, keyword()) :: :ok
-  def run(%Issue{} = issue, _recipient, opts) do
+  def run(%Issue{} = issue, recipient, opts) do
     capture = Process.whereis(@capture_name)
     issue_id = issue.id
+    identity = Keyword.get(opts, :runtime_attempt_identity)
+
+    if is_pid(recipient) and identity do
+      send(recipient, {:runtime_attempt_session_started, issue_id, identity})
+    end
 
     if is_pid(capture) do
       send(capture, {:dag_started, issue_id, issue.identifier, issue.state, opts, self()})
