@@ -4,7 +4,7 @@ defmodule SymphonyElixir.Workspace do
   """
 
   require Logger
-  alias SymphonyElixir.{Config, PathSafety, SSH}
+  alias SymphonyElixir.{Config, CredentialBoundary, PathSafety, SSH}
 
   @remote_workspace_marker "__SYMPHONY_WORKSPACE__"
 
@@ -361,32 +361,13 @@ defmodule SymphonyElixir.Workspace do
         :ok
 
       command ->
-        script =
-          [
-            remote_shell_assign("workspace", workspace),
-            "if [ -d \"$workspace\" ]; then",
-            "  cd \"$workspace\"",
-            "  #{command}",
-            "fi"
-          ]
-          |> Enum.join("\n")
-
-        run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms)
-        |> case do
-          {:ok, {output, status}} ->
-            handle_hook_command_result(
-              {output, status},
-              workspace,
-              %{issue_id: nil, issue_identifier: Path.basename(workspace)},
-              "before_remove"
-            )
-
-          {:error, {:workspace_hook_timeout, "before_remove", _timeout_ms} = reason} ->
-            {:error, reason}
-
-          {:error, reason} ->
-            {:error, reason}
-        end
+        run_hook(
+          command,
+          workspace,
+          %{issue_id: nil, issue_identifier: Path.basename(workspace)},
+          "before_remove",
+          worker_host
+        )
         |> ignore_hook_failure()
     end
   end
@@ -395,13 +376,39 @@ defmodule SymphonyElixir.Workspace do
   defp ignore_hook_failure({:error, _reason}), do: :ok
 
   defp run_hook(command, workspace, issue_context, hook_name, nil) do
+    if CredentialBoundary.routed_workspace_shell_hook_skipped?(hook_name) do
+      Logger.info("Skipping workspace hook in routed mode hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=local")
+
+      :ok
+    else
+      run_local_hook(command, workspace, issue_context, hook_name)
+    end
+  end
+
+  defp run_hook(command, workspace, issue_context, hook_name, worker_host) when is_binary(worker_host) do
+    if CredentialBoundary.routed_workspace_shell_hook_skipped?(hook_name) do
+      Logger.info("Skipping workspace hook in routed mode hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=#{worker_host}")
+
+      :ok
+    else
+      run_remote_hook(command, workspace, issue_context, hook_name, worker_host)
+    end
+  end
+
+  defp run_local_hook(command, workspace, issue_context, hook_name) do
     timeout_ms = Config.settings!().hooks.timeout_ms
 
     Logger.info("Running workspace hook hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=local")
 
+    hook_env = hook_process_env()
+
+    cmd_opts =
+      [cd: workspace, stderr_to_stdout: true]
+      |> maybe_put_hook_env(hook_env)
+
     task =
       Task.async(fn ->
-        System.cmd("sh", ["-lc", command], cd: workspace, stderr_to_stdout: true)
+        System.cmd("sh", ["-lc", command], cmd_opts)
       end)
 
     case Task.yield(task, timeout_ms) do
@@ -417,12 +424,21 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  defp run_hook(command, workspace, issue_context, hook_name, worker_host) when is_binary(worker_host) do
+  defp run_remote_hook(command, workspace, issue_context, hook_name, worker_host) do
     timeout_ms = Config.settings!().hooks.timeout_ms
 
     Logger.info("Running workspace hook hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=#{worker_host}")
 
-    case run_remote_command(worker_host, "cd #{shell_escape(workspace)} && #{command}", timeout_ms) do
+    remote_command =
+      [
+        CredentialBoundary.unset_shell_command(CredentialBoundary.configured_secret_environment_names()),
+        "cd #{shell_escape(workspace)}",
+        command
+      ]
+      |> Enum.reject(&is_nil/1)
+      |> Enum.join(" && ")
+
+    case run_remote_command(worker_host, remote_command, timeout_ms) do
       {:ok, cmd_result} ->
         handle_hook_command_result(cmd_result, workspace, issue_context, hook_name)
 
@@ -447,7 +463,10 @@ defmodule SymphonyElixir.Workspace do
   end
 
   defp sanitize_hook_output_for_log(output, max_bytes \\ 2_048) do
-    binary_output = IO.iodata_to_binary(output)
+    binary_output =
+      output
+      |> IO.iodata_to_binary()
+      |> CredentialBoundary.redact(CredentialBoundary.configured_secret_environment_names())
 
     case byte_size(binary_output) <= max_bytes do
       true ->
@@ -457,6 +476,12 @@ defmodule SymphonyElixir.Workspace do
         binary_part(binary_output, 0, max_bytes) <> "... (truncated)"
     end
   end
+
+  defp hook_process_env do
+    CredentialBoundary.hook_process_env(CredentialBoundary.configured_secret_environment_names())
+  end
+
+  defp maybe_put_hook_env(opts, hook_env), do: Keyword.put(opts, :env, hook_env)
 
   defp validate_workspace_path(workspace, nil) when is_binary(workspace) do
     validate_local_workspace_path(workspace, Config.local_workspace_root())

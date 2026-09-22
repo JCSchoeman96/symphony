@@ -50,8 +50,8 @@ defmodule SymphonyElixir.SourceControlTest do
       end
     ]
 
-    command_runner = fn _workspace, command ->
-      if String.contains?(command, "rev-parse") do
+    command_runner = fn _workspace, _git, argv ->
+      if Enum.member?(argv, "rev-parse") do
         {:ok, @sha_b <> "\n"}
       else
         {:ok, ""}
@@ -111,8 +111,8 @@ defmodule SymphonyElixir.SourceControlTest do
       repository_context: %{workspace_path: "/tmp/ws"},
       github_opts: [source_control_config: @config],
       probe_opts: [
-        command_runner: fn _workspace, command ->
-          if String.contains?(command, "status --porcelain"), do: {:ok, " M file\n"}, else: {:ok, @sha_b}
+        command_runner: fn _workspace, _git, argv ->
+          if Enum.member?(argv, "status"), do: {:ok, " M file\n"}, else: {:ok, @sha_b}
         end
       ]
     }
@@ -132,8 +132,8 @@ defmodule SymphonyElixir.SourceControlTest do
         request_fun: fn _token, path, _params, _opts -> {:ok, github_payload(path)} end
       ],
       probe_opts: [
-        command_runner: fn _workspace, command ->
-          if String.contains?(command, "rev-parse"), do: {:ok, @sha_b <> "\n"}, else: {:ok, ""}
+        command_runner: fn _workspace, _git, argv ->
+          if Enum.member?(argv, "rev-parse"), do: {:ok, @sha_b <> "\n"}, else: {:ok, ""}
         end
       ]
     }

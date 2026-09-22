@@ -524,21 +524,33 @@ defmodule SymphonyElixir.Plane.Client do
   end
 
   defp validate_base_url(value, test_request?) when is_binary(value) do
-    case URI.parse(value) do
-      %URI{scheme: "https", host: host, userinfo: nil, query: nil, fragment: nil, path: path}
-      when is_binary(host) and host != "" and path in [nil, "", "/"] ->
-        :ok
+    normalized = String.trim_trailing(value, "/")
 
-      %URI{scheme: "http", host: host, userinfo: nil, query: nil, fragment: nil, path: path}
-      when test_request? and is_binary(host) and host != "" and path in [nil, "", "/"] ->
-        :ok
-
-      _ ->
-        :error
+    case parse_base_url_uri(normalized) do
+      {:https, _} when normalized == @default_base_url or test_request? -> :ok
+      {:https, _} -> :error
+      {:http, _} when test_request? -> :ok
+      {:http, _} -> :error
+      :invalid -> :error
     end
   end
 
   defp validate_base_url(_value, _test_request?), do: :error
+
+  defp parse_base_url_uri(value) do
+    case URI.parse(value) do
+      %URI{scheme: "https", host: host, userinfo: nil, query: nil, fragment: nil, path: path}
+      when is_binary(host) and host != "" and path in [nil, "", "/"] ->
+        {:https, host}
+
+      %URI{scheme: "http", host: host, userinfo: nil, query: nil, fragment: nil, path: path}
+      when is_binary(host) and host != "" and path in [nil, "", "/"] ->
+        {:http, host}
+
+      _ ->
+        :invalid
+    end
+  end
 
   defp project_path(config), do: "/api/v1/workspaces/#{encoded(config.workspace_slug)}/projects/#{encoded(config.project_id)}/"
   defp work_item_path(config, id), do: work_items_path(config) <> encoded(id) <> "/"

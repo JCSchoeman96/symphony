@@ -1131,14 +1131,8 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert {:ok, canonical_default_workspace_root} =
              SymphonyElixir.PathSafety.canonicalize(Path.join(System.tmp_dir!(), "symphony_workspaces"))
 
-    assert Config.codex_turn_sandbox_policy() == %{
-             "type" => "workspaceWrite",
-             "writableRoots" => [canonical_default_workspace_root],
-             "readOnlyAccess" => %{"type" => "fullAccess"},
-             "networkAccess" => false,
-             "excludeTmpdirEnvVar" => false,
-             "excludeSlashTmp" => false
-           }
+    assert Config.codex_turn_sandbox_policy() ==
+             Schema.routed_credential_safe_workspace_write_policy(canonical_default_workspace_root)
 
     assert config.codex.turn_timeout_ms == 3_600_000
     assert config.codex.read_timeout_ms == 5_000

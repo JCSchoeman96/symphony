@@ -157,10 +157,10 @@ defmodule SymphonyElixir.SourceControlCoverageTest do
   end
 
   test "repository probe reads a clean local workspace head" do
-    command_runner = fn _workspace, command ->
+    command_runner = fn _workspace, _git_executable, argv ->
       cond do
-        String.contains?(command, "status --porcelain") -> {:ok, ""}
-        String.contains?(command, "rev-parse HEAD") -> {:ok, @sha_b <> "\n"}
+        Enum.member?(argv, "status") -> {:ok, ""}
+        Enum.member?(argv, "rev-parse") -> {:ok, @sha_b <> "\n"}
         true -> {:error, {:git_command_failed, "unexpected"}}
       end
     end
@@ -274,7 +274,9 @@ defmodule SymphonyElixir.SourceControlCoverageTest do
     assert {:error, {:git_command_failed, _message}} =
              RepositoryProbe.probe(
                %{workspace_path: "/definitely/missing/workspace"},
-               command_runner: fn _workspace, _command -> {:error, {:git_command_failed, "boom"}} end
+               command_runner: fn _workspace, _git, _argv ->
+                 {:error, {:git_command_failed, "boom"}}
+               end
              )
   end
 
@@ -282,8 +284,8 @@ defmodule SymphonyElixir.SourceControlCoverageTest do
     assert {:error, :workspace_unavailable} = RepositoryProbe.probe(%{})
     assert {:error, :workspace_unavailable} = RepositoryProbe.probe(%{workspace_path: ""})
 
-    remote_runner = fn _host, _command, _opts ->
-      {:ok, "\n" <> @sha_b}
+    remote_runner = fn _host, _workspace, _git, _secrets ->
+      {:ok, %{clean?: true, head_sha: @sha_b, error: nil}}
     end
 
     assert {:ok, %{clean?: true, head_sha: @sha_b}} =

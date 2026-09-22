@@ -375,6 +375,9 @@ defmodule SymphonyElixir.PlaneClientTest do
 
   test "rejects unsafe production base URLs while allowing HTTP only through an injected test request" do
     assert {:error, :invalid_base_url} =
+             Client.get_project(%{@config | base_url: "https://attacker.invalid"})
+
+    assert {:error, :invalid_base_url} =
              Client.get_project(%{@config | base_url: "http://user:pass@example.invalid/api?x=1"})
 
     assert {:ok, _project} =

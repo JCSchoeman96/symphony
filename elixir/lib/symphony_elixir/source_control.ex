@@ -4,6 +4,7 @@ defmodule SymphonyElixir.SourceControl do
   """
 
   alias SymphonyElixir.Config
+  alias SymphonyElixir.CredentialBoundary
   alias SymphonyElixir.GitHub.SourceControl, as: GitHubSourceControl
 
   alias SymphonyElixir.SourceControl.{
@@ -599,7 +600,17 @@ defmodule SymphonyElixir.SourceControl do
   defp normalize_evidence(_), do: []
 
   defp probe_opts(context) do
-    Keyword.take(Map.get(context, :probe_opts, []), [:command_runner, :remote_command_runner])
+    base = [secret_environment_names: CredentialBoundary.configured_secret_environment_names()]
+
+    Keyword.merge(
+      base,
+      Keyword.take(Map.get(context, :probe_opts, []), [
+        :command_runner,
+        :remote_command_runner,
+        :git_executable,
+        :secret_environment_names
+      ])
+    )
   end
 
   defp github_opts(context) do

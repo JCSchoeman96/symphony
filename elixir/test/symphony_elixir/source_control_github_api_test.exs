@@ -51,7 +51,24 @@ defmodule SymphonyElixir.SourceControlGitHubApiTest do
       http_request: fn _url, _headers -> {:error, :timeout} end
     ]
 
-    assert {:error, :timeout} = SourceControl.fetch_repository(@config, opts)
+    assert {:error, %SourceControl.Error{kind: :transport_failed}} =
+             SourceControl.fetch_repository(@config, opts)
+  end
+
+  test "http helper does not follow redirects" do
+    parent = self()
+
+    opts = [
+      token: "token",
+      http_request: fn url, _headers ->
+        send(parent, {:url, url})
+        {:ok, %{status: 302, body: nil}}
+      end
+    ]
+
+    assert {:error, {:github_status, 302}} = SourceControl.fetch_repository(@config, opts)
+    assert_receive {:url, "https://api.github.com/repos/JCSchoeman96/symphony"}
+    refute_receive {:url, _}
   end
 
   defp payload(path) do

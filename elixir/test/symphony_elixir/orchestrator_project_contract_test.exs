@@ -121,7 +121,7 @@ defmodule SymphonyElixir.OrchestratorProjectContractTest do
 
   test "public reconciliation call hands a trusted snapshot to the orchestrator" do
     name = String.to_atom("project-contract-orchestrator-#{System.unique_integer([:positive])}")
-    {:ok, pid} = Orchestrator.start_link(name: name)
+    {:ok, pid} = Orchestrator.start_link(name: name, start_quiesced: true)
 
     on_exit(fn ->
       if Process.alive?(pid), do: Process.exit(pid, :normal)

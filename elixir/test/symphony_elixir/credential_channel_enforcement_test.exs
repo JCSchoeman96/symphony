@@ -1,0 +1,531 @@
+defmodule SymphonyElixir.CredentialChannelEnforcementTest do
+  use SymphonyElixir.TestSupport
+
+  alias SymphonyElixir.Codex.DynamicTool
+  alias SymphonyElixir.{Config, CredentialBoundary, Workflow, Workspace}
+  alias SymphonyElixir.GitHub.SourceControl
+  alias SymphonyElixir.Plane.Client
+  alias SymphonyElixir.SourceControl.RepositoryProbe
+
+  @plane_config %{
+    base_url: "https://api.plane.so",
+    workspace_slug: "workspace-1",
+    workspace_id: "workspace-id-1",
+    project_id: "project-1",
+    api_key: "secret"
+  }
+
+  @github_config %{
+    kind: :github,
+    repository: "JCSchoeman96/symphony",
+    repository_id: 1,
+    base_branch: "main",
+    token_env: "GITHUB_TOKEN",
+    required_checks: [%{context: "ci", app_id: 1, subject: "head"}]
+  }
+
+  test "credential boundary expands configured secrets and standard SCM channels" do
+    names = CredentialBoundary.deny_environment_names(["CUSTOM_GITHUB_TOKEN"])
+
+    assert "PLANE_API_KEY" in names
+    assert "GITHUB_TOKEN" in names
+    assert "GH_TOKEN" in names
+    assert "CUSTOM_GITHUB_TOKEN" in names
+    assert "SSH_AUTH_SOCK" in names
+    assert "GIT_SSH_COMMAND" in names
+  end
+
+  test "credential boundary builds port env, unset commands, and hook env" do
+    deny = CredentialBoundary.deny_environment_names(["CUSTOM_TOKEN"])
+    assert CredentialBoundary.unset_shell_command(["CUSTOM_TOKEN"]) =~ "unset "
+    assert CredentialBoundary.unset_shell_command(["CUSTOM_TOKEN"]) =~ "CUSTOM_TOKEN"
+    assert CredentialBoundary.port_env(["CUSTOM_TOKEN"]) != []
+    assert {"CUSTOM_TOKEN", nil} in CredentialBoundary.hook_process_env(["CUSTOM_TOKEN"])
+    assert "PLANE_API_KEY" in deny
+  end
+
+  test "credential boundary redacts configured secret values from strings" do
+    previous = System.get_env("PLANE_API_KEY")
+    System.put_env("PLANE_API_KEY", "sentinel-plane-secret")
+
+    on_exit(fn -> restore_env("PLANE_API_KEY", previous) end)
+
+    redacted =
+      CredentialBoundary.redact("leaked sentinel-plane-secret in output", ["PLANE_API_KEY"])
+
+    refute redacted =~ "sentinel-plane-secret"
+    assert redacted =~ "[REDACTED]"
+  end
+
+  test "credential boundary rejects malformed environment names" do
+    refute CredentialBoundary.valid_environment_name?("")
+    refute CredentialBoundary.valid_environment_name?("not-valid")
+    assert CredentialBoundary.valid_environment_name?("VALID_TOKEN_1")
+  end
+
+  test "plane production transport rejects alternate https origins" do
+    assert {:error, :invalid_base_url} =
+             Client.get_project(%{@plane_config | base_url: "https://attacker.invalid"})
+  end
+
+  test "plane production transport keeps the canonical origin" do
+    assert :ok = Client.validate_config(@plane_config)
+    assert Client.default_base_url() == "https://api.plane.so"
+  end
+
+  test "github transport preserves already-normalized errors" do
+    error = %SourceControl.Error{kind: :transport_failed, detail: :timeout}
+
+    opts = [
+      token: "token",
+      http_request: fn _url, _headers -> {:error, error} end
+    ]
+
+    assert {:error, %SourceControl.Error{kind: :transport_failed, detail: :timeout}} =
+             SourceControl.fetch_repository(@github_config, opts)
+  end
+
+  test "github transport ignores production api_url overrides" do
+    parent = self()
+
+    opts = [
+      token: "sentinel-token-value",
+      http_request: fn url, _headers ->
+        send(parent, {:url, url})
+        {:error, "sentinel-token-value leaked in transport"}
+      end,
+      api_url: "https://attacker.invalid"
+    ]
+
+    assert {:error, %SourceControl.Error{kind: :transport_failed, detail: detail}} =
+             SourceControl.fetch_repository(@github_config, opts)
+
+    refute inspect(detail) =~ "sentinel-token-value"
+    assert_receive {:url, "https://api.github.com/repos/JCSchoeman96/symphony"}
+  end
+
+  test "invalid github token_env is rejected during schema validation" do
+    alias SymphonyElixir.Config.Schema.SourceControl
+
+    changeset =
+      SourceControl.changeset(%SourceControl{}, %{
+        kind: "github",
+        repository: "octo/symphony",
+        repository_id: 1_368_436_395,
+        base_branch: "main",
+        token_env: "not a valid env",
+        required_checks: [%{context: "ci", app_id: 1, subject: "head"}]
+      })
+
+    refute changeset.valid?
+    assert {"must be a valid environment variable name", _} = changeset.errors[:token_env]
+  end
+
+  test "remote repository probe uses sanitized git argv over ssh" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-remote-probe-#{System.unique_integer([:positive])}"
+      )
+
+    File.mkdir_p!(test_root)
+    trace_file = Path.join(test_root, "ssh.trace")
+    fake_ssh = Path.join(test_root, "ssh")
+    workspace = Path.join(test_root, "workspace")
+    File.mkdir_p!(workspace)
+    sha = String.duplicate("b", 40)
+
+    previous_path = System.get_env("PATH")
+    System.put_env("SYMP_TEST_SSH_TRACE", trace_file)
+    System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
+
+    File.write!(fake_ssh, """
+    #!/bin/sh
+    trace_file="${SYMP_TEST_SSH_TRACE}"
+    printf 'ARGV:%s\\n' "$*" >> "$trace_file"
+    printf '\\n%s\\n' "#{sha}"
+    exit 0
+    """)
+
+    File.chmod!(fake_ssh, 0o755)
+
+    on_exit(fn ->
+      restore_env("PATH", previous_path)
+      File.rm_rf(test_root)
+    end)
+
+    assert {:ok, %{clean?: true, head_sha: head_sha}} =
+             RepositoryProbe.probe(%{workspace_path: workspace, worker_host: "worker:22"})
+
+    assert head_sha == sha
+    trace = File.read!(trace_file)
+    assert trace =~ "core.fsmonitor="
+    assert trace =~ "rev-parse"
+  end
+
+  test "remote repository probe surfaces ssh git command failures" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-remote-probe-fail-#{System.unique_integer([:positive])}"
+      )
+
+    File.mkdir_p!(test_root)
+    fake_ssh = Path.join(test_root, "ssh")
+    workspace = Path.join(test_root, "workspace")
+    File.mkdir_p!(workspace)
+
+    previous_path = System.get_env("PATH")
+    System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
+
+    File.write!(fake_ssh, """
+    #!/bin/sh
+    echo git failed
+    exit 1
+    """)
+
+    File.chmod!(fake_ssh, 0o755)
+
+    on_exit(fn ->
+      restore_env("PATH", previous_path)
+      File.rm_rf(test_root)
+    end)
+
+    assert {:error, {:git_command_failed, "git failed"}} =
+             RepositoryProbe.probe(%{workspace_path: workspace, worker_host: "worker:22"})
+  end
+
+  test "remote repository probe surfaces runner failures" do
+    assert {:error, :ssh_unavailable} =
+             RepositoryProbe.probe(
+               %{workspace_path: "/tmp/workspace", worker_host: "worker-1"},
+               remote_command_runner: fn _host, _workspace, _git, _secrets ->
+                 {:error, :ssh_unavailable}
+               end
+             )
+  end
+
+  test "repository probe returns git_not_found when git is unavailable" do
+    assert {:error, :git_not_found} =
+             RepositoryProbe.probe(%{workspace_path: "/tmp/workspace"}, git_executable: nil)
+  end
+
+  test "repository probe surfaces local git command failures from the default runner" do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-probe-fail-#{System.unique_integer([:positive])}"
+      )
+
+    File.mkdir_p!(root)
+
+    assert {:error, {:git_command_failed, _message}} =
+             RepositoryProbe.probe(%{workspace_path: root})
+
+    File.rm_rf(root)
+  end
+
+  test "repository probe observes a clean local repository through trusted git argv" do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-probe-#{System.unique_integer([:positive])}"
+      )
+
+    File.mkdir_p!(root)
+    assert {_output, 0} = System.cmd("git", ["init"], cd: root)
+    assert {_output, 0} = System.cmd("git", ["config", "user.email", "probe@example.com"], cd: root)
+    assert {_output, 0} = System.cmd("git", ["config", "user.name", "probe"], cd: root)
+    assert {_output, 0} = System.cmd("git", ["commit", "--allow-empty", "-m", "probe"], cd: root)
+
+    assert {:ok, %{clean?: true, head_sha: head_sha}} = RepositoryProbe.probe(%{workspace_path: root})
+    assert is_binary(head_sha)
+    assert byte_size(head_sha) == 40
+
+    File.rm_rf(root)
+  end
+
+  test "repository probe uses argv git invocation" do
+    command_runner = fn workspace, git_executable, argv ->
+      assert is_binary(git_executable)
+      assert List.starts_with?(argv, ["-C", workspace])
+      assert Enum.member?(argv, "-c")
+      assert Enum.member?(argv, "core.fsmonitor=")
+      {:ok, ""}
+    end
+
+    assert {:ok, %{clean?: true}} =
+             RepositoryProbe.probe(%{workspace_path: "/tmp/workspace"},
+               command_runner: fn workspace, git, argv ->
+                 if Enum.member?(argv, "rev-parse") do
+                   {:ok, String.duplicate("a", 40) <> "\n"}
+                 else
+                   command_runner.(workspace, git, argv)
+                 end
+               end
+             )
+  end
+
+  test "routed workspace hook environment clears symphony provider secrets in child processes" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      agent_routing: "routed",
+      tracker_kind: "memory"
+    )
+
+    previous = System.get_env("PLANE_API_KEY")
+    System.put_env("PLANE_API_KEY", "sentinel-plane-hook-secret")
+    on_exit(fn -> restore_env("PLANE_API_KEY", previous) end)
+
+    env =
+      CredentialBoundary.hook_process_env(CredentialBoundary.configured_secret_environment_names())
+
+    assert {"PLANE_API_KEY", nil} in env
+    assert Config.settings!().agent.routing == "routed"
+
+    {output, _} = System.cmd("sh", ["-c", "printenv PLANE_API_KEY || true"], env: env)
+    refute output =~ "sentinel-plane-hook-secret"
+  end
+
+  test "routed mode still runs after_create to provision new workspaces" do
+    workspace_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-routed-after-create-#{System.unique_integer([:positive])}"
+      )
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      agent_routing: "routed",
+      tracker_kind: "memory",
+      workspace_root: workspace_root,
+      hook_after_create: "touch .symphony-routed-provisioned"
+    )
+
+    on_exit(fn -> File.rm_rf(workspace_root) end)
+
+    assert {:ok, workspace} = Workspace.create_for_issue("ISSUE-PROVISION", nil)
+    assert File.exists?(Path.join(workspace, ".symphony-routed-provisioned"))
+  end
+
+  test "routed mode skips remote before_remove hooks during workspace removal" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-routed-remote-before-remove-#{System.unique_integer([:positive])}"
+      )
+
+    previous_path = System.get_env("PATH")
+    previous_trace = System.get_env("SYMP_TEST_SSH_TRACE")
+    marker = "SYMPHONY_ROUTED_BEFORE_REMOVE_MARKER"
+
+    on_exit(fn ->
+      restore_env("PATH", previous_path)
+      restore_env("SYMP_TEST_SSH_TRACE", previous_trace)
+      File.rm_rf(test_root)
+    end)
+
+    trace_file = Path.join(test_root, "ssh.trace")
+    fake_ssh = Path.join(test_root, "ssh")
+    workspace_path = "/remote/workspaces/ISSUE-REMOTE-REMOVE"
+
+    File.mkdir_p!(test_root)
+    System.put_env("SYMP_TEST_SSH_TRACE", trace_file)
+    System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
+
+    File.write!(fake_ssh, """
+    #!/bin/sh
+    trace_file="${SYMP_TEST_SSH_TRACE:-/tmp/symphony-fake-ssh.trace}"
+    printf 'ARGV:%s\\n' "$*" >> "$trace_file"
+    exit 0
+    """)
+
+    File.chmod!(fake_ssh, 0o755)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      agent_routing: "routed",
+      tracker_kind: "memory",
+      workspace_root: "/remote/workspaces",
+      worker_ssh_hosts: ["worker-01:2200"],
+      hook_before_remove: "echo #{marker}"
+    )
+
+    assert {:ok, []} = Workspace.remove(workspace_path, "worker-01:2200")
+
+    trace = File.read!(trace_file)
+    refute trace =~ marker
+    assert trace =~ "rm -rf"
+    assert trace =~ workspace_path
+  end
+
+  test "routed mode skips post-agent workspace shell hooks instead of executing host commands" do
+    marker =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-routed-hook-skip-#{System.unique_integer([:positive])}"
+      )
+
+    workspace_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-routed-hook-ws-#{System.unique_integer([:positive])}"
+      )
+
+    workspace = Path.join(workspace_root, "ISSUE-1")
+    File.mkdir_p!(workspace)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      agent_routing: "routed",
+      tracker_kind: "memory",
+      workspace_root: workspace_root,
+      hook_after_run: "touch #{marker}"
+    )
+
+    on_exit(fn -> File.rm_rf(workspace_root) end)
+
+    assert :ok = Workspace.run_after_run_hook(workspace, "ISSUE-1", nil)
+    refute File.exists?(marker)
+  end
+
+  test "dynamic tool catalogue excludes suspension and attempt rearm raw channels" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      agent_routing: "routed"
+    )
+
+    binding = DynamicTool.bind()
+
+    tool_names = Enum.map(binding.tool_specs, &Map.fetch!(&1, "name"))
+
+    for forbidden <-
+          ~w(attempt_rearm clear_suspension rearm_suspension suspension_clear symphony_attempt_rearm) do
+      refute forbidden in tool_names
+    end
+
+    response = DynamicTool.execute("attempt_rearm", %{}, binding)
+    assert response["success"] == false
+    assert Jason.decode!(response["output"])["error"]["message"] =~ "Unsupported dynamic tool"
+  end
+
+  test "suspension context remains host-only and is not callable through dynamic tools" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory", agent_routing: "routed")
+    binding = DynamicTool.bind()
+
+    for raw_tool <- ~w(suspension_context clear_suspension begin_resolution) do
+      response = DynamicTool.execute(raw_tool, %{}, binding)
+      assert response["success"] == false
+      assert Jason.decode!(response["output"])["error"]["message"] =~ "Unsupported dynamic tool"
+    end
+
+    refute Enum.any?(binding.tool_specs, fn spec ->
+             name = Map.fetch!(spec, "name")
+             String.contains?(name, "suspension") or String.contains?(name, "rearm")
+           end)
+  end
+
+  test "github transport requires a host token" do
+    previous = System.get_env("GITHUB_TOKEN")
+    System.delete_env("GITHUB_TOKEN")
+    on_exit(fn -> restore_env("GITHUB_TOKEN", previous) end)
+
+    assert {:error, :missing_source_control_token} =
+             SourceControl.fetch_repository(@github_config)
+  end
+
+  test "github default transport disables redirects and retries" do
+    parent = self()
+
+    Req.default_options(
+      adapter: fn request ->
+        send(parent, {:request, request})
+        {request, Req.Response.new(status: 200, body: %{"id" => 1})}
+      end
+    )
+
+    on_exit(fn -> Req.default_options([]) end)
+
+    assert {:ok, %{"id" => 1}} = SourceControl.fetch_repository(@github_config, token: "token")
+    assert_receive {:request, request}
+    assert request.options[:redirect] == false
+    assert request.options[:retry] == false
+  end
+
+  test "deny_environment_names_from_settings includes tracker and source-control secrets" do
+    names = CredentialBoundary.deny_environment_names_from_settings()
+    assert "GITHUB_TOKEN" in names
+    assert "PLANE_API_KEY" in names
+  end
+
+  test "routed workflows reject unsafe explicit turn sandbox policy types at startup" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      agent_routing: "routed",
+      tracker_kind: "memory",
+      codex_turn_sandbox_policy: %{type: "dangerFullAccess"}
+    )
+
+    assert {:error, {:unsafe_routed_turn_sandbox_policy, "dangerFullAccess"}} =
+             Config.validate!()
+  end
+
+  test "routed runtime sandbox policies restrict filesystem reads to the workspace" do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-routed-sandbox-read-#{System.unique_integer([:positive])}"
+      )
+
+    workspace = Path.join(root, "ISSUE-1")
+    File.mkdir_p!(workspace)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      agent_routing: "routed",
+      tracker_kind: "memory",
+      workspace_root: root
+    )
+
+    assert {:ok, canonical_workspace} = SymphonyElixir.PathSafety.canonicalize(Path.expand(workspace))
+
+    assert {:ok, write_settings} =
+             Config.codex_runtime_settings(workspace, sandbox: "workspace-write")
+
+    assert write_settings.turn_sandbox_policy ==
+             Config.Schema.routed_credential_safe_workspace_write_policy(canonical_workspace)
+
+    assert {:ok, read_settings} = Config.codex_runtime_settings(workspace, sandbox: "read-only")
+
+    assert read_settings.turn_sandbox_policy ==
+             Config.Schema.routed_credential_safe_read_only_policy(canonical_workspace)
+
+    File.rm_rf(root)
+  end
+
+  test "routed profile sandbox forces non-auto approval policy" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      agent_routing: "routed",
+      codex_approval_policy: "never"
+    )
+
+    assert {:ok, settings} =
+             Config.codex_runtime_settings("/tmp/workspace", sandbox: "read-only")
+
+    refute settings.approval_policy == "never"
+    assert settings.approval_policy == CredentialBoundary.routed_safe_approval_policy()
+
+    assert {:ok, write_settings} =
+             Config.codex_runtime_settings("/tmp/workspace", sandbox: "workspace-write")
+
+    assert write_settings.approval_policy == CredentialBoundary.routed_safe_approval_policy()
+  end
+
+  test "github default api url stays pinned" do
+    assert SourceControl.default_api_url() == "https://api.github.com"
+  end
+
+  test "github transport normalizes unexpected failure shapes" do
+    opts = [
+      token: "sentinel-token-value",
+      http_request: fn _url, _headers -> {:error, %{unexpected: true}} end
+    ]
+
+    assert {:error, %SourceControl.Error{kind: :transport_failed, detail: :transport_failed}} =
+             SourceControl.fetch_repository(@github_config, opts)
+  end
+end
