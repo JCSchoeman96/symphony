@@ -6,6 +6,7 @@ defmodule SymphonyElixir.RuntimeAttemptTeardownTest do
   alias SymphonyElixir.AgentRuntime.RuntimeAttempt.Identity
   alias SymphonyElixir.Orchestrator
   alias SymphonyElixir.Tracker.Issue
+  alias SymphonyElixir.WorkControl.WorkItem
 
   @issue_id "runtime-teardown-1"
   @lineage "lineage-teardown"
@@ -225,6 +226,177 @@ defmodule SymphonyElixir.RuntimeAttemptTeardownTest do
     assert Process.alive?(worker_pid)
     assert updated.running[@issue_id].runtime_attempt.state == :completed
     refute Map.has_key?(updated.retry_attempts, @issue_id)
+  end
+
+  test "tracker canceled during starting maps to cancelled terminal teardown" do
+    worker_pid = running_worker()
+
+    issue = %Issue{
+      id: @issue_id,
+      identifier: "RT-1",
+      state: "Canceled",
+      url: "https://example.org/issues/rt-1"
+    }
+
+    running_entry = base_running_entry(worker_pid, :starting) |> Map.put(:issue, issue)
+
+    state =
+      base_orchestrator_state(%{@issue_id => running_entry}, %{claimed: MapSet.new([@issue_id])})
+
+    assert Orchestrator.tracker_terminal_teardown_reason_for_test(issue, state) == :terminal_cancelled
+
+    updated =
+      Orchestrator.terminate_running_issue_for_test(state, @issue_id, false, :terminal_cancelled)
+
+    refute Process.alive?(worker_pid)
+    refute Map.has_key?(updated.running, @issue_id)
+  end
+
+  test "tracker canceled while running maps to cancelled terminal teardown" do
+    worker_pid = running_worker()
+
+    issue = %Issue{
+      id: @issue_id,
+      identifier: "RT-1",
+      state: "Canceled",
+      url: "https://example.org/issues/rt-1"
+    }
+
+    running_entry = base_running_entry(worker_pid, :running) |> Map.put(:issue, issue)
+    state = base_orchestrator_state(%{@issue_id => running_entry})
+
+    assert Orchestrator.tracker_terminal_teardown_reason_for_test(issue, state) == :terminal_cancelled
+
+    updated =
+      Orchestrator.reconcile_issue_states_for_test([issue], state)
+
+    refute Process.alive?(worker_pid)
+    refute Map.has_key?(updated.running, @issue_id)
+  end
+
+  test "successful completion requires validated done before RuntimeAttempt completed" do
+    worker_pid = running_worker()
+
+    issue = %Issue{
+      id: @issue_id,
+      identifier: "RT-1",
+      state: "Done",
+      url: "https://example.org/issues/rt-1"
+    }
+
+    {:ok, work_item} =
+      WorkItem.from_issue(issue, %{
+        provider: :memory,
+        observed_at: DateTime.utc_now(),
+        prior_validated_lifecycle_state: :in_progress
+      })
+
+    work_item = %{work_item | validated_lifecycle_state: :done}
+    running_entry = base_running_entry(worker_pid, :running) |> Map.put(:issue, issue)
+
+    state =
+      base_orchestrator_state(%{@issue_id => running_entry}, %{
+        work_control: %{@issue_id => work_item},
+        claimed: MapSet.new([@issue_id])
+      })
+
+    assert Orchestrator.tracker_terminal_teardown_reason_for_test(issue, state) == :terminal_completed
+
+    updated =
+      Orchestrator.terminate_running_issue_for_test(state, @issue_id, false, :terminal_completed)
+
+    refute Process.alive?(worker_pid)
+    refute Map.has_key?(updated.running, @issue_id)
+  end
+
+  test "tracker done without validated completion semantics maps to cancelled teardown" do
+    worker_pid = running_worker()
+
+    issue = %Issue{
+      id: @issue_id,
+      identifier: "RT-1",
+      state: "Done",
+      url: "https://example.org/issues/rt-1"
+    }
+
+    running_entry = base_running_entry(worker_pid, :running) |> Map.put(:issue, issue)
+    state = base_orchestrator_state(%{@issue_id => running_entry})
+
+    assert Orchestrator.tracker_terminal_teardown_reason_for_test(issue, state) == :terminal_cancelled
+  end
+
+  test "worker DOWN route change blocks when review-cycle policy rejects retry before RetryQueued" do
+    identity = sample_identity("route-down")
+
+    issue = %Issue{
+      id: @issue_id,
+      identifier: "RT-1",
+      title: "Route change teardown",
+      state: "In Progress",
+      url: "https://example.org/issues/rt-1"
+    }
+
+    route_change = %{
+      previous: %{profile_name: "review", responsibility: "review"},
+      next: %{profile_name: "correction", responsibility: "correction"}
+    }
+
+    running_entry = %{
+      identifier: "RT-1",
+      issue: issue,
+      retry_attempt: 0,
+      runtime_attempt: RuntimeAttempt.new(identity, :running),
+      route_change: route_change
+    }
+
+    state = %Orchestrator.State{
+      attempt_ledger_status: :disabled,
+      attempt_counters: %{
+        @issue_id => %{ordinary_failures: 0, ordinary_retries: 0, review_cycles: 3}
+      }
+    }
+
+    updated = Orchestrator.handle_normal_route_change_for_test(state, @issue_id, running_entry)
+
+    assert Map.has_key?(updated.blocked, @issue_id)
+    refute Map.has_key?(updated.retry_attempts, @issue_id)
+    assert updated.blocked[@issue_id].termination_reason == :review_cycle_exhausted
+  end
+
+  test "worker DOWN route change blocks when durable review-cycle accounting fails before RetryQueued" do
+    identity = sample_identity("route-down-accounting")
+
+    issue = %Issue{
+      id: @issue_id,
+      identifier: "RT-1",
+      title: "Route change teardown",
+      state: "In Progress",
+      url: "https://example.org/issues/rt-1"
+    }
+
+    route_change = %{
+      previous: %{profile_name: "review", responsibility: "review"},
+      next: %{profile_name: "correction", responsibility: "correction"}
+    }
+
+    running_entry = %{
+      identifier: "RT-1",
+      issue: issue,
+      retry_attempt: 0,
+      runtime_attempt: RuntimeAttempt.new(identity, :running),
+      route_change: route_change
+    }
+
+    state = %Orchestrator.State{
+      attempt_ledger_status: :ready,
+      attempt_counters: %{@issue_id => %{ordinary_failures: 0, ordinary_retries: 0, review_cycles: 0}}
+    }
+
+    updated = Orchestrator.handle_normal_route_change_for_test(state, @issue_id, running_entry)
+
+    assert Map.has_key?(updated.blocked, @issue_id)
+    refute Map.has_key?(updated.retry_attempts, @issue_id)
+    assert updated.blocked[@issue_id].error =~ "attempt ledger unavailable"
   end
 
   test "runtime unavailable teardown applies failed terminal transition before removal" do

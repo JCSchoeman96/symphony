@@ -941,17 +941,30 @@ defmodule SymphonyElixir.Orchestrator do
   defp handle_normal_route_change(state, issue_id, running_entry) do
     route_change = Map.get(running_entry, :route_change)
 
-    case transition_running_entry_attempt(running_entry, :retry_queued) do
-      {:ok, running_entry} ->
-        dispatch_agent_route_change_retry(state, issue_id, running_entry, route_change)
+    case record_route_change_events(state, issue_id, route_change) do
+      {:ok, state} ->
+        case transition_running_entry_attempt(running_entry, :retry_queued) do
+          {:ok, running_entry} ->
+            schedule_agent_route_change_retry(state, issue_id, running_entry, route_change)
 
-      {:error, :invalid_runtime_attempt_transition} ->
-        state
+          {:error, :invalid_runtime_attempt_transition} ->
+            state
+        end
+
+      {:stop, state, reason} ->
+        block_issue_from_entry(state, issue_id, running_entry, attempt_policy_error(reason))
+
+      {:error, state, reason} ->
+        block_issue_from_entry(state, issue_id, running_entry, attempt_ledger_error(reason))
     end
   end
 
   defp handle_normal_continuation(state, issue_id, running_entry) do
-    with {:ok, running_entry} <- transition_running_entry_attempt(running_entry, :completed),
+    with {:ok, running_entry} <-
+           transition_running_entry_attempt(
+             running_entry,
+             continuation_runtime_attempt_terminal(running_entry)
+           ),
          {:ok, state} <- clear_attempt_in_flight(state, issue_id) do
       {:ok, state} = record_attempt_event(state, issue_id, :continuation)
 
@@ -1308,6 +1321,19 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @doc false
+  @spec tracker_terminal_teardown_reason_for_test(Issue.t(), State.t()) :: atom()
+  def tracker_terminal_teardown_reason_for_test(%Issue{} = issue, %State{} = state) do
+    tracker_terminal_teardown_reason(issue, state)
+  end
+
+  @doc false
+  @spec handle_normal_route_change_for_test(State.t(), String.t(), map()) :: State.t()
+  def handle_normal_route_change_for_test(%State{} = state, issue_id, running_entry)
+      when is_binary(issue_id) and is_map(running_entry) do
+    handle_normal_route_change(state, issue_id, running_entry)
+  end
+
+  @doc false
   @spec reconcile_blocked_issue_states_for_test([Issue.t()], term()) :: term()
   def reconcile_blocked_issue_states_for_test(issues, %State{} = state) when is_list(issues) do
     reconcile_blocked_issue_states(issues, state, active_state_set(), terminal_state_set())
@@ -1367,7 +1393,7 @@ defmodule SymphonyElixir.Orchestrator do
       terminal_issue_state?(issue.state, terminal_states) ->
         Logger.info("Issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; stopping active agent")
 
-        terminate_running_issue(state, issue.id, true, :terminal)
+        terminate_running_issue(state, issue.id, true, tracker_terminal_teardown_reason(issue, state))
 
       routed_lifecycle_suspended?(issue, state) ->
         Logger.info("Stopping active agent after unsafe lifecycle observation for #{issue_context(issue)}")
@@ -1778,9 +1804,34 @@ defmodule SymphonyElixir.Orchestrator do
     }
   end
 
+  defp tracker_terminal_teardown_reason(%Issue{} = issue, %State{} = state) do
+    if successful_runtime_completion_observation?(issue, state) do
+      :terminal_completed
+    else
+      :terminal_cancelled
+    end
+  end
+
+  defp continuation_runtime_attempt_terminal(running_entry) when is_map(running_entry) do
+    case Map.get(running_entry, :runtime_attempt) do
+      %RuntimeAttempt{state: :running} -> :completed
+      %RuntimeAttempt{state: :starting} -> :cancelled
+      _ -> :completed
+    end
+  end
+
+  defp successful_runtime_completion_observation?(%Issue{} = issue, %State{} = state) do
+    WorkflowLifecycle.successful_terminal?(issue.state) and
+      match?(
+        %WorkItem{validated_lifecycle_state: :done},
+        Map.get(state.work_control, issue.id)
+      )
+  end
+
   defp runtime_attempt_terminal_for_teardown(termination_reason) do
     case termination_reason do
-      :terminal -> :completed
+      :terminal_completed -> :completed
+      :terminal_cancelled -> :cancelled
       :runtime_unavailable -> :failed
       :runtime_stalled -> :retry_queued
       _ -> :cancelled
@@ -2953,36 +3004,27 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp dispatch_agent_route_change_retry(state, issue_id, running_entry, route_change) do
-    case record_route_change_events(state, issue_id, route_change) do
+  defp schedule_agent_route_change_retry(state, issue_id, running_entry, route_change) do
+    case clear_attempt_in_flight(state, issue_id) do
       {:ok, state} ->
-        case clear_attempt_in_flight(state, issue_id) do
-          {:ok, state} ->
-            state
-            |> record_recent_attempt(issue_id, running_entry, :route_changed)
-            |> complete_issue(issue_id)
-            |> schedule_issue_retry(
-              issue_id,
-              1,
-              Map.merge(
-                %{
-                  identifier: running_entry.identifier,
-                  issue_url: running_entry.issue.url,
-                  delay_type: :route_change,
-                  route_change: route_change,
-                  worker_host: Map.get(running_entry, :worker_host),
-                  workspace_path: Map.get(running_entry, :workspace_path)
-                },
-                route_retry_metadata(running_entry)
-              )
-            )
-
-          {:error, state, reason} ->
-            block_issue_from_entry(state, issue_id, running_entry, attempt_ledger_error(reason))
-        end
-
-      {:stop, state, reason} ->
-        block_issue_from_entry(state, issue_id, running_entry, attempt_policy_error(reason))
+        state
+        |> record_recent_attempt(issue_id, running_entry, :route_changed)
+        |> complete_issue(issue_id)
+        |> schedule_issue_retry(
+          issue_id,
+          1,
+          Map.merge(
+            %{
+              identifier: running_entry.identifier,
+              issue_url: running_entry.issue.url,
+              delay_type: :route_change,
+              route_change: route_change,
+              worker_host: Map.get(running_entry, :worker_host),
+              workspace_path: Map.get(running_entry, :workspace_path)
+            },
+            route_retry_metadata(running_entry)
+          )
+        )
 
       {:error, state, reason} ->
         block_issue_from_entry(state, issue_id, running_entry, attempt_ledger_error(reason))
