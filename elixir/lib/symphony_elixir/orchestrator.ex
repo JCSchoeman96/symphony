@@ -902,104 +902,79 @@ defmodule SymphonyElixir.Orchestrator do
       {:ok, state} ->
         Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; scheduling retry")
 
-        running_entry = transition_running_entry_attempt(running_entry, :retry_queued)
-        next_attempt = next_retry_attempt_from_running(running_entry)
+        case transition_running_entry_attempt(running_entry, :retry_queued) do
+          {:ok, running_entry} ->
+            next_attempt = next_retry_attempt_from_running(running_entry)
 
-        schedule_issue_retry(
-          state,
-          issue_id,
-          next_attempt,
-          Map.merge(
-            %{
-              identifier: running_entry.identifier,
-              issue_url: running_entry.issue.url,
-              error: "agent exited: #{inspect(reason)}",
-              termination_reason: termination_reason,
-              worker_host: Map.get(running_entry, :worker_host),
-              workspace_path: Map.get(running_entry, :workspace_path)
-            },
-            route_retry_metadata(running_entry)
-          )
-        )
-        |> record_recent_attempt(issue_id, running_entry, termination_reason, "agent exited")
-
-      {:stop, state, reason} ->
-        Logger.error("Automatic retries exhausted for issue_id=#{issue_id} session_id=#{session_id}; requiring human attention")
-
-        running_entry = transition_running_entry_attempt(running_entry, :blocked)
-        block_issue_from_entry(state, issue_id, running_entry, attempt_policy_error(reason))
-
-      {:error, state, reason} ->
-        Logger.error("Automatic retry blocked for issue_id=#{issue_id} session_id=#{session_id}: #{inspect(reason)}")
-
-        running_entry = transition_running_entry_attempt(running_entry, :blocked)
-        block_issue_from_entry(state, issue_id, running_entry, attempt_ledger_error(reason))
-    end
-  end
-
-  defp handle_normal_route_change(state, issue_id, running_entry) do
-    running_entry = transition_running_entry_attempt(running_entry, :retry_queued)
-    route_change = Map.get(running_entry, :route_change)
-
-    case record_route_change_events(state, issue_id, route_change) do
-      {:ok, state} ->
-        case clear_attempt_in_flight(state, issue_id) do
-          {:ok, state} ->
-            state
-            |> record_recent_attempt(issue_id, running_entry, :route_changed)
-            |> complete_issue(issue_id)
-            |> schedule_issue_retry(
+            schedule_issue_retry(
+              state,
               issue_id,
-              1,
+              next_attempt,
               Map.merge(
                 %{
                   identifier: running_entry.identifier,
                   issue_url: running_entry.issue.url,
-                  delay_type: :route_change,
-                  route_change: route_change,
+                  error: "agent exited: #{inspect(reason)}",
+                  termination_reason: termination_reason,
                   worker_host: Map.get(running_entry, :worker_host),
                   workspace_path: Map.get(running_entry, :workspace_path)
                 },
                 route_retry_metadata(running_entry)
               )
             )
+            |> record_recent_attempt(issue_id, running_entry, termination_reason, "agent exited")
 
-          {:error, state, reason} ->
-            block_issue_from_entry(state, issue_id, running_entry, attempt_ledger_error(reason))
+          {:error, :invalid_runtime_attempt_transition} ->
+            state
         end
 
       {:stop, state, reason} ->
+        Logger.error("Automatic retries exhausted for issue_id=#{issue_id} session_id=#{session_id}; requiring human attention")
         block_issue_from_entry(state, issue_id, running_entry, attempt_policy_error(reason))
 
       {:error, state, reason} ->
+        Logger.error("Automatic retry blocked for issue_id=#{issue_id} session_id=#{session_id}: #{inspect(reason)}")
         block_issue_from_entry(state, issue_id, running_entry, attempt_ledger_error(reason))
     end
   end
 
-  defp handle_normal_continuation(state, issue_id, running_entry) do
-    running_entry = transition_running_entry_attempt(running_entry, :completed)
+  defp handle_normal_route_change(state, issue_id, running_entry) do
+    route_change = Map.get(running_entry, :route_change)
 
-    case clear_attempt_in_flight(state, issue_id) do
-      {:ok, state} ->
-        {:ok, state} = record_attempt_event(state, issue_id, :continuation)
+    case transition_running_entry_attempt(running_entry, :retry_queued) do
+      {:ok, running_entry} ->
+        dispatch_agent_route_change_retry(state, issue_id, running_entry, route_change)
 
+      {:error, :invalid_runtime_attempt_transition} ->
         state
-        |> record_recent_attempt(issue_id, running_entry, :normal_completion)
-        |> complete_issue(issue_id)
-        |> schedule_issue_retry(
-          issue_id,
-          1,
-          Map.merge(
-            %{
-              identifier: running_entry.identifier,
-              issue_url: running_entry.issue.url,
-              delay_type: :continuation,
-              worker_host: Map.get(running_entry, :worker_host),
-              workspace_path: Map.get(running_entry, :workspace_path)
-            },
-            route_retry_metadata(running_entry)
-          )
+    end
+  end
+
+  defp handle_normal_continuation(state, issue_id, running_entry) do
+    with {:ok, running_entry} <- transition_running_entry_attempt(running_entry, :completed),
+         {:ok, state} <- clear_attempt_in_flight(state, issue_id) do
+      {:ok, state} = record_attempt_event(state, issue_id, :continuation)
+
+      state
+      |> record_recent_attempt(issue_id, running_entry, :normal_completion)
+      |> complete_issue(issue_id)
+      |> schedule_issue_retry(
+        issue_id,
+        1,
+        Map.merge(
+          %{
+            identifier: running_entry.identifier,
+            issue_url: running_entry.issue.url,
+            delay_type: :continuation,
+            worker_host: Map.get(running_entry, :worker_host),
+            workspace_path: Map.get(running_entry, :workspace_path)
+          },
+          route_retry_metadata(running_entry)
         )
+      )
+    else
+      {:error, :invalid_runtime_attempt_transition} ->
+        state
 
       {:error, state, reason} ->
         block_issue_from_entry(state, issue_id, running_entry, attempt_ledger_error(reason))
@@ -1292,6 +1267,44 @@ defmodule SymphonyElixir.Orchestrator do
 
   def reconcile_issue_states_for_test(issues, state) when is_list(issues) do
     reconcile_running_issue_states(issues, state, active_state_set(), terminal_state_set())
+  end
+
+  @doc false
+  @spec reconcile_stalled_running_issues_for_test(State.t()) :: State.t()
+  def reconcile_stalled_running_issues_for_test(%State{} = state), do: reconcile_stalled_running_issues(state)
+
+  @doc false
+  @spec terminate_running_issue_for_test(State.t(), String.t(), boolean(), atom()) :: State.t()
+  def terminate_running_issue_for_test(%State{} = state, issue_id, cleanup_workspace, termination_reason)
+      when is_binary(issue_id) and is_boolean(cleanup_workspace) and is_atom(termination_reason) do
+    terminate_running_issue(state, issue_id, cleanup_workspace, termination_reason)
+  end
+
+  @doc false
+  @spec stop_running_issue_for_route_change_for_test(
+          State.t(),
+          Issue.t(),
+          map(),
+          Route.t(),
+          Route.t()
+        ) :: State.t()
+  def stop_running_issue_for_route_change_for_test(
+        %State{} = state,
+        %Issue{} = issue,
+        running_entry,
+        %Route{} = previous_route,
+        %Route{} = next_route
+      )
+      when is_map(running_entry) do
+    stop_running_issue_for_route_change(state, issue, running_entry, previous_route, next_route)
+  end
+
+  @doc false
+  @spec transition_running_entry_attempt_for_test(map(), atom()) ::
+          {:ok, map()} | {:error, :invalid_runtime_attempt_transition}
+  def transition_running_entry_attempt_for_test(running_entry, to_state)
+      when is_map(running_entry) and is_atom(to_state) do
+    transition_running_entry_attempt(running_entry, to_state)
   end
 
   @doc false
@@ -1612,36 +1625,7 @@ defmodule SymphonyElixir.Orchestrator do
 
     case record_route_change_events(state, issue.id, route_change, in_flight: true) do
       {:ok, state} ->
-        stop_running_task(Map.get(running_entry, :pid), Map.get(running_entry, :ref), state.task_supervisor)
-
-        state =
-          state
-          |> then(&Map.update!(&1, :running, fn running -> Map.delete(running, issue.id) end))
-
-        case clear_attempt_in_flight(state, issue.id) do
-          {:ok, state} ->
-            state
-            |> record_recent_attempt(issue.id, %{running_entry | issue: issue}, :route_changed)
-            |> schedule_issue_retry(
-              issue.id,
-              next_attempt,
-              Map.merge(
-                %{
-                  identifier: issue.identifier,
-                  issue_url: issue.url,
-                  error: "route changed during poll refresh",
-                  delay_type: :route_change,
-                  route_change: route_change,
-                  worker_host: Map.get(running_entry, :worker_host),
-                  workspace_path: Map.get(running_entry, :workspace_path)
-                },
-                route_retry_metadata(running_entry)
-              )
-            )
-
-          {:error, state, reason} ->
-            block_issue_from_entry(state, issue.id, %{running_entry | issue: issue}, attempt_ledger_error(reason))
-        end
+        apply_poll_route_change_terminal_retry(state, issue, running_entry, next_attempt, route_change)
 
       {:stop, state, reason} ->
         stop_and_block_issue(
@@ -1695,34 +1679,111 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp terminate_running_issue(%State{} = state, issue_id, cleanup_workspace, termination_reason) do
+    case finalize_running_attempt_removal(state, issue_id, cleanup_workspace, termination_reason) do
+      {:ok, state} -> state
+      {:error, state} -> state
+    end
+  end
+
+  defp finalize_running_attempt_removal(%State{} = state, issue_id, cleanup_workspace, termination_reason) do
     case Map.get(state.running, issue_id) do
       nil ->
-        state = release_issue_claim(state, issue_id)
-        if cleanup_workspace, do: reset_attempt_counters(state, issue_id), else: state
+        {:ok, release_running_maps_without_entry(state, issue_id, cleanup_workspace)}
 
       %{pid: pid, ref: ref, identifier: identifier} = running_entry ->
-        state = record_session_completion_totals(state, running_entry)
-        state = record_recent_attempt(state, issue_id, running_entry, termination_reason)
-
-        stop_running_task(pid, ref, state.task_supervisor)
-
-        if cleanup_workspace do
-          cleanup_issue_workspace(Map.get(running_entry, :issue, identifier), running_entry)
-        end
-
-        state = %{
-          state
-          | running: Map.delete(state.running, issue_id),
-            claimed: MapSet.delete(state.claimed, issue_id),
-            blocked: Map.delete(state.blocked, issue_id),
-            retry_attempts: Map.delete(state.retry_attempts, issue_id)
-        }
-
-        if cleanup_workspace, do: reset_attempt_counters(state, issue_id), else: state
+        finalize_existing_running_removal(
+          state,
+          issue_id,
+          running_entry,
+          pid,
+          ref,
+          identifier,
+          cleanup_workspace,
+          termination_reason
+        )
 
       _ ->
-        state = release_issue_claim(state, issue_id)
-        if cleanup_workspace, do: reset_attempt_counters(state, issue_id), else: state
+        {:ok, release_running_maps_without_entry(state, issue_id, cleanup_workspace)}
+    end
+  end
+
+  defp finalize_existing_running_removal(
+         state,
+         issue_id,
+         running_entry,
+         pid,
+         ref,
+         identifier,
+         cleanup_workspace,
+         termination_reason
+       ) do
+    terminal_state = runtime_attempt_terminal_for_teardown(termination_reason)
+
+    case transition_running_entry_attempt(running_entry, terminal_state) do
+      {:ok, running_entry} ->
+        state =
+          complete_terminalized_running_removal(
+            state,
+            issue_id,
+            running_entry,
+            pid,
+            ref,
+            identifier,
+            cleanup_workspace,
+            termination_reason
+          )
+
+        {:ok, state}
+
+      {:error, :invalid_runtime_attempt_transition} ->
+        {:error, state}
+    end
+  end
+
+  defp release_running_maps_without_entry(state, issue_id, cleanup_workspace) do
+    state = release_issue_claim(state, issue_id)
+    if cleanup_workspace, do: reset_attempt_counters(state, issue_id), else: state
+  end
+
+  defp complete_terminalized_running_removal(
+         state,
+         issue_id,
+         running_entry,
+         pid,
+         ref,
+         identifier,
+         cleanup_workspace,
+         termination_reason
+       ) do
+    state = record_session_completion_totals(state, running_entry)
+    state = record_recent_attempt(state, issue_id, running_entry, termination_reason)
+    stop_running_task(pid, ref, state.task_supervisor)
+
+    if cleanup_workspace do
+      cleanup_issue_workspace(Map.get(running_entry, :issue, identifier), running_entry)
+    end
+
+    state = pop_running_issue_maps(state, issue_id)
+
+    if cleanup_workspace, do: reset_attempt_counters(state, issue_id), else: state
+  end
+
+  defp pop_running_issue_maps(%State{} = state, issue_id) do
+    %{
+      state
+      | running: Map.delete(state.running, issue_id),
+        claimed: MapSet.delete(state.claimed, issue_id),
+        blocked: Map.delete(state.blocked, issue_id),
+        retry_attempts: Map.delete(state.retry_attempts, issue_id)
+    }
+  end
+
+  defp runtime_attempt_terminal_for_teardown(termination_reason) do
+    case termination_reason do
+      :terminal -> :completed
+      :runtime_unavailable -> :failed
+      :runtime_stalled -> :retry_queued
+      _ -> :cancelled
     end
   end
 
@@ -1797,15 +1858,13 @@ defmodule SymphonyElixir.Orchestrator do
 
     case record_attempt_event(state, issue_id, :ordinary_failure, in_flight: true) do
       {:ok, state} ->
-        state = terminate_running_issue(state, issue_id, false, :runtime_stalled)
-
-        case clear_attempt_in_flight(state, issue_id) do
-          {:ok, state} ->
-            schedule_issue_retry(state, issue_id, next_attempt, retry_metadata)
-
-          {:error, state, reason} ->
-            block_issue_from_entry(state, issue_id, running_entry, attempt_ledger_error(reason))
-        end
+        schedule_stall_retry_after_terminal_removal(
+          state,
+          issue_id,
+          running_entry,
+          next_attempt,
+          retry_metadata
+        )
 
       {:stop, state, reason} ->
         state
@@ -1954,13 +2013,19 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp stop_and_block_issue(%State{} = state, issue_id, running_entry, error, dependency \\ nil) do
-    stop_running_task(
-      Map.get(running_entry, :pid),
-      Map.get(running_entry, :ref),
-      state.task_supervisor
-    )
+    case transition_running_entry_attempt(running_entry, :blocked) do
+      {:ok, running_entry} ->
+        stop_running_task(
+          Map.get(running_entry, :pid),
+          Map.get(running_entry, :ref),
+          state.task_supervisor
+        )
 
-    block_issue_from_entry(state, issue_id, running_entry, error, dependency)
+        do_block_issue_from_entry(state, issue_id, running_entry, error, dependency)
+
+      {:error, :invalid_runtime_attempt_transition} ->
+        state
+    end
   end
 
   defp record_recent_attempt(state, issue_id, entry, reason, error \\ nil)
@@ -2019,8 +2084,16 @@ defmodule SymphonyElixir.Orchestrator do
   defp dependency_denied?(_dependency), do: false
 
   defp block_issue_from_entry(%State{} = state, issue_id, running_entry, error, dependency \\ nil) do
-    running_entry = transition_running_entry_attempt(running_entry, :blocked)
+    case transition_running_entry_attempt(running_entry, :blocked) do
+      {:ok, running_entry} ->
+        do_block_issue_from_entry(state, issue_id, running_entry, error, dependency)
 
+      {:error, :invalid_runtime_attempt_transition} ->
+        state
+    end
+  end
+
+  defp do_block_issue_from_entry(%State{} = state, issue_id, running_entry, error, dependency) do
     blocked_entry = %{
       issue_id: issue_id,
       identifier: Map.get(running_entry, :identifier, issue_id),
@@ -2880,17 +2953,115 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp dispatch_agent_route_change_retry(state, issue_id, running_entry, route_change) do
+    case record_route_change_events(state, issue_id, route_change) do
+      {:ok, state} ->
+        case clear_attempt_in_flight(state, issue_id) do
+          {:ok, state} ->
+            state
+            |> record_recent_attempt(issue_id, running_entry, :route_changed)
+            |> complete_issue(issue_id)
+            |> schedule_issue_retry(
+              issue_id,
+              1,
+              Map.merge(
+                %{
+                  identifier: running_entry.identifier,
+                  issue_url: running_entry.issue.url,
+                  delay_type: :route_change,
+                  route_change: route_change,
+                  worker_host: Map.get(running_entry, :worker_host),
+                  workspace_path: Map.get(running_entry, :workspace_path)
+                },
+                route_retry_metadata(running_entry)
+              )
+            )
+
+          {:error, state, reason} ->
+            block_issue_from_entry(state, issue_id, running_entry, attempt_ledger_error(reason))
+        end
+
+      {:stop, state, reason} ->
+        block_issue_from_entry(state, issue_id, running_entry, attempt_policy_error(reason))
+
+      {:error, state, reason} ->
+        block_issue_from_entry(state, issue_id, running_entry, attempt_ledger_error(reason))
+    end
+  end
+
+  defp apply_poll_route_change_terminal_retry(state, issue, running_entry, next_attempt, route_change) do
+    case transition_running_entry_attempt(running_entry, :retry_queued) do
+      {:ok, running_entry} ->
+        stop_running_task(Map.get(running_entry, :pid), Map.get(running_entry, :ref), state.task_supervisor)
+
+        state = Map.update!(state, :running, &Map.delete(&1, issue.id))
+        schedule_poll_route_change_retry(state, issue, running_entry, next_attempt, route_change)
+
+      {:error, :invalid_runtime_attempt_transition} ->
+        state
+    end
+  end
+
+  defp schedule_poll_route_change_retry(state, issue, running_entry, next_attempt, route_change) do
+    case clear_attempt_in_flight(state, issue.id) do
+      {:ok, state} ->
+        state
+        |> record_recent_attempt(issue.id, %{running_entry | issue: issue}, :route_changed)
+        |> schedule_issue_retry(
+          issue.id,
+          next_attempt,
+          Map.merge(
+            %{
+              identifier: issue.identifier,
+              issue_url: issue.url,
+              error: "route changed during poll refresh",
+              delay_type: :route_change,
+              route_change: route_change,
+              worker_host: Map.get(running_entry, :worker_host),
+              workspace_path: Map.get(running_entry, :workspace_path)
+            },
+            route_retry_metadata(running_entry)
+          )
+        )
+
+      {:error, state, reason} ->
+        block_issue_from_entry(state, issue.id, %{running_entry | issue: issue}, attempt_ledger_error(reason))
+    end
+  end
+
+  defp schedule_stall_retry_after_terminal_removal(
+         state,
+         issue_id,
+         running_entry,
+         next_attempt,
+         retry_metadata
+       ) do
+    case finalize_running_attempt_removal(state, issue_id, false, :runtime_stalled) do
+      {:ok, state} ->
+        case clear_attempt_in_flight(state, issue_id) do
+          {:ok, state} ->
+            schedule_issue_retry(state, issue_id, next_attempt, retry_metadata)
+
+          {:error, state, reason} ->
+            block_issue_from_entry(state, issue_id, running_entry, attempt_ledger_error(reason))
+        end
+
+      {:error, state} ->
+        state
+    end
+  end
+
   defp transition_running_entry_attempt(running_entry, to_state)
        when is_map(running_entry) and is_atom(to_state) do
     case Map.get(running_entry, :runtime_attempt) do
       %RuntimeAttempt{} = attempt ->
         case RuntimeAttempt.transition(attempt, to_state) do
-          {:ok, updated} -> Map.put(running_entry, :runtime_attempt, updated)
-          {:error, _reason} -> running_entry
+          {:ok, updated} -> {:ok, Map.put(running_entry, :runtime_attempt, updated)}
+          {:error, :invalid_transition} -> {:error, :invalid_runtime_attempt_transition}
         end
 
       _ ->
-        running_entry
+        {:ok, running_entry}
     end
   end
 
