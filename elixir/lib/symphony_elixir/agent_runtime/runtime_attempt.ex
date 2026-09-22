@@ -109,13 +109,8 @@ defmodule SymphonyElixir.AgentRuntime.RuntimeAttempt do
     %__MODULE__{identity: identity, state: state}
   end
 
-  @spec mark_running(t()) :: t()
-  def mark_running(%__MODULE__{} = attempt) do
-    case transition(attempt, :running) do
-      {:ok, next} -> next
-      {:error, _reason} -> %{attempt | state: :running}
-    end
-  end
+  @spec mark_running(t()) :: {:ok, t()} | {:error, :invalid_transition}
+  def mark_running(%__MODULE__{} = attempt), do: transition(attempt, :running)
 
   @spec terminal?(state() | t()) :: boolean()
   def terminal?(%__MODULE__{state: state}), do: terminal?(state)

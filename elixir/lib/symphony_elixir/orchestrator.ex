@@ -638,15 +638,15 @@ defmodule SymphonyElixir.Orchestrator do
         %{running: running} = state
       )
       when is_binary(issue_id) and is_map(runtime_info) do
-    case validate_current_runtime_event(state, identity) do
-      {:ok, running_entry} ->
+    case validate_current_runtime_event(state, issue_id, identity) do
+      {:ok, validated_issue_id, running_entry} ->
         updated_running_entry =
           running_entry
           |> maybe_put_runtime_value(:worker_host, runtime_info[:worker_host])
           |> maybe_put_runtime_value(:workspace_path, runtime_info[:workspace_path])
 
         notify_dashboard()
-        {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+        {:noreply, %{state | running: Map.put(running, validated_issue_id, updated_running_entry)}}
 
       :stale ->
         {:noreply, state}
@@ -684,9 +684,9 @@ defmodule SymphonyElixir.Orchestrator do
         state
       )
       when is_binary(issue_id) do
-    case validate_current_runtime_event(state, identity) do
-      {:ok, running_entry} ->
-        apply_agent_route_changed(state, issue_id, running_entry, previous_route, next_route)
+    case validate_current_runtime_event(state, issue_id, identity) do
+      {:ok, validated_issue_id, running_entry} ->
+        apply_agent_route_changed(state, validated_issue_id, running_entry, previous_route, next_route)
 
       :stale ->
         {:noreply, state}
@@ -715,9 +715,9 @@ defmodule SymphonyElixir.Orchestrator do
         state
       )
       when is_binary(issue_id) do
-    case validate_current_runtime_event(state, identity) do
-      {:ok, running_entry} ->
-        apply_agent_lifecycle_suspended(state, issue_id, running_entry, assessment)
+    case validate_current_runtime_event(state, issue_id, identity) do
+      {:ok, validated_issue_id, running_entry} ->
+        apply_agent_lifecycle_suspended(state, validated_issue_id, running_entry, assessment)
 
       :stale ->
         {:noreply, state}
@@ -746,9 +746,9 @@ defmodule SymphonyElixir.Orchestrator do
         state
       )
       when is_binary(issue_id) and is_map(decision) do
-    case validate_current_runtime_event(state, identity) do
-      {:ok, running_entry} ->
-        apply_agent_dependency_blocked(state, issue_id, running_entry, decision)
+    case validate_current_runtime_event(state, issue_id, identity) do
+      {:ok, validated_issue_id, running_entry} ->
+        apply_agent_dependency_blocked(state, validated_issue_id, running_entry, decision)
 
       :stale ->
         {:noreply, state}
@@ -776,8 +776,8 @@ defmodule SymphonyElixir.Orchestrator do
         {:codex_worker_update, issue_id, %RuntimeAttemptIdentity{} = identity, %{event: _, timestamp: _} = update},
         %{running: running} = state
       ) do
-    case validate_current_runtime_event(state, identity) do
-      {:ok, running_entry} ->
+    case validate_current_runtime_event(state, issue_id, identity) do
+      {:ok, validated_issue_id, running_entry} ->
         {updated_running_entry, token_delta} = integrate_codex_update(running_entry, update)
 
         state =
@@ -786,7 +786,7 @@ defmodule SymphonyElixir.Orchestrator do
           |> apply_codex_rate_limits(update)
 
         notify_dashboard()
-        {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+        {:noreply, %{state | running: Map.put(running, validated_issue_id, updated_running_entry)}}
 
       :stale ->
         {:noreply, state}
@@ -2844,8 +2844,12 @@ defmodule SymphonyElixir.Orchestrator do
   defp runtime_attempt_identity_from(%RuntimeAttempt{identity: identity}), do: identity
   defp runtime_attempt_identity_from(_runtime_attempt), do: nil
 
-  defp mark_runtime_attempt_running(%RuntimeAttempt{} = runtime_attempt),
-    do: RuntimeAttempt.mark_running(runtime_attempt)
+  defp mark_runtime_attempt_running(%RuntimeAttempt{} = runtime_attempt) do
+    case RuntimeAttempt.mark_running(runtime_attempt) do
+      {:ok, running} -> running
+      {:error, _reason} -> nil
+    end
+  end
 
   defp mark_runtime_attempt_running(_runtime_attempt), do: nil
 
@@ -3691,11 +3695,13 @@ defmodule SymphonyElixir.Orchestrator do
     }
   end
 
-  defp validate_current_runtime_event(%State{running: running}, %RuntimeAttemptIdentity{} = identity) do
-    with {:ok, entry} <- current_running_entry(running, identity.work_item_id),
+  defp validate_current_runtime_event(%State{running: running}, issue_id, %RuntimeAttemptIdentity{} = identity)
+       when is_binary(issue_id) do
+    with true <- issue_id == identity.work_item_id,
+         {:ok, entry} <- current_running_entry(running, issue_id),
          %RuntimeAttempt{identity: current} <- Map.get(entry, :runtime_attempt),
          true <- RuntimeAttemptIdentity.same?(identity, current) do
-      {:ok, entry}
+      {:ok, issue_id, entry}
     else
       _failure -> :stale
     end

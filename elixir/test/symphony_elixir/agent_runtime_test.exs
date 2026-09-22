@@ -60,7 +60,7 @@ defmodule SymphonyElixir.AgentRuntimeTest do
   use SymphonyElixir.TestSupport
 
   alias SymphonyElixir.AgentRuntime
-  alias SymphonyElixir.AgentRuntime.{Codex, Router}
+  alias SymphonyElixir.AgentRuntime.{Codex, Router, RuntimeAttempt}
   alias SymphonyElixir.Codex.AppServer
   alias SymphonyElixir.WorkControl.{GuardClass, WorkItem}
 
@@ -421,6 +421,8 @@ defmodule SymphonyElixir.AgentRuntimeTest do
 
     assert {:ok, route} = Router.resolve(work_item, Config.settings!().agent.profiles)
 
+    runtime_identity = RuntimeAttempt.Identity.allocate(issue.id, route, "lineage-catalogue-refresh")
+
     try do
       assert :ok =
                AgentRunner.run(issue, test_pid,
@@ -428,6 +430,7 @@ defmodule SymphonyElixir.AgentRuntimeTest do
                  test_pid: test_pid,
                  route: route,
                  work_item: work_item,
+                 runtime_attempt_identity: runtime_identity,
                  guard_evidence: [GuardClass.requirement(:mechanical_guard, :dispatch_guard)],
                  issue_state_fetcher: fn [_issue_id] -> {:ok, [refreshed_issue]} end
                )
@@ -438,6 +441,8 @@ defmodule SymphonyElixir.AgentRuntimeTest do
 
       assert_receive {:plane_catalogue_runtime_turn, ^first_session, first_prompt, ^issue, first_turn_opts}
       refute first_prompt =~ "new runtime thread"
+      assert first_turn_opts[:runtime_attempt_identity] == runtime_identity
+      assert first_turn_opts[:agent_tool_context].runtime_attempt_identity == runtime_identity
       assert first_turn_opts[:agent_tool_context].route.starting_state == "ready"
       assert_receive {:plane_catalogue_runtime_stopped, ^first_session}
 
@@ -448,6 +453,8 @@ defmodule SymphonyElixir.AgentRuntimeTest do
 
       assert_receive {:plane_catalogue_runtime_turn, ^second_session, second_prompt, ^refreshed_issue, second_turn_opts}
       assert second_prompt =~ "new runtime thread"
+      assert second_turn_opts[:runtime_attempt_identity] == runtime_identity
+      assert second_turn_opts[:agent_tool_context].runtime_attempt_identity == runtime_identity
       assert second_turn_opts[:agent_tool_context].route.starting_state == "in progress"
       assert_receive {:plane_catalogue_runtime_stopped, ^second_session}
       refute_receive {:plane_catalogue_runtime_started, _session, _specs, _context}, 50

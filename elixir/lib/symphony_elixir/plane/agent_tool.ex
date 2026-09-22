@@ -426,16 +426,20 @@ defmodule SymphonyElixir.Plane.AgentTool do
 
   defp validate_runtime_attempt_identity(host_context, semantic_context)
        when is_map(host_context) and is_map(semantic_context) do
-    with %RuntimeAttemptIdentity{} = host_identity <-
-           Map.get(host_context, :runtime_attempt_identity),
-         %RuntimeAttemptIdentity{} = current_identity <-
-           Map.get(semantic_context, :runtime_attempt_identity) do
-      if RuntimeAttemptIdentity.same?(host_identity, current_identity),
-        do: :ok,
-        else: {:error, :stale_runtime_attempt}
-    else
-      nil -> :ok
-      _ -> {:error, :stale_runtime_attempt}
+    host_identity = Map.get(host_context, :runtime_attempt_identity)
+    current_identity = Map.get(semantic_context, :runtime_attempt_identity)
+
+    case {host_identity, current_identity} do
+      {nil, nil} ->
+        :ok
+
+      {%RuntimeAttemptIdentity{} = host, %RuntimeAttemptIdentity{} = current} ->
+        if RuntimeAttemptIdentity.same?(host, current),
+          do: :ok,
+          else: {:error, :stale_runtime_attempt}
+
+      _ ->
+        {:error, :stale_runtime_attempt}
     end
   end
 

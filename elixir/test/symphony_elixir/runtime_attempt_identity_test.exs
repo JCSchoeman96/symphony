@@ -11,6 +11,7 @@ defmodule SymphonyElixir.RuntimeAttemptIdentityTest do
   alias SymphonyElixir.WorkControl.WorkItem
 
   @issue_id "work-stale-1"
+  @issue_b "work-stale-2"
   @lineage "lineage-abc"
 
   defp sample_route do
@@ -54,13 +55,17 @@ defmodule SymphonyElixir.RuntimeAttemptIdentityTest do
     identity = Identity.allocate(@issue_id, sample_route(), @lineage)
     attempt = RuntimeAttempt.new(identity, :starting)
 
-    assert {:ok, running} = RuntimeAttempt.transition(attempt, :running)
+    assert {:ok, running} = RuntimeAttempt.mark_running(attempt)
     assert running.state == :running
 
-    completed = RuntimeAttempt.mark_running(running)
-    assert RuntimeAttempt.terminal?(RuntimeAttempt.transition(completed, :completed) |> elem(1))
+    assert {:ok, completed} = RuntimeAttempt.transition(running, :completed)
 
-    assert {:error, :invalid_transition} = RuntimeAttempt.transition(%{completed | state: :completed}, :running)
+    for terminal <- [:completed, :retry_queued, :blocked, :failed, :cancelled] do
+      terminal_attempt = if terminal == :completed, do: completed, else: RuntimeAttempt.new(identity, terminal)
+      assert {:error, :invalid_transition} = RuntimeAttempt.mark_running(terminal_attempt)
+      assert {:error, :invalid_transition} = RuntimeAttempt.transition(terminal_attempt, :running)
+    end
+
     assert RuntimeAttempt.transition_allowed?(:queued, :starting)
     refute RuntimeAttempt.transition_allowed?(:completed, :running)
     assert RuntimeAttempt.terminal?(:failed)
@@ -91,6 +96,89 @@ defmodule SymphonyElixir.RuntimeAttemptIdentityTest do
     }
 
     assert GuardClass.valid_evidence?(evidence, context)
+  end
+
+  test "envelope work item mismatch fails closed before worker, codex, route, lifecycle, and dependency effects" do
+    identity_a = sample_identity("attempt-a")
+    identity_b = %{identity_a | work_item_id: @issue_b, runtime_attempt_id: "attempt-b"}
+
+    state =
+      dual_running_state(
+        {@issue_id, identity_a, "host-a", "/workspace-a"},
+        {@issue_b, identity_b, "host-b", "/workspace-b"}
+      )
+
+    assert {:noreply, unchanged} =
+             Orchestrator.handle_info(
+               {:worker_runtime_info, @issue_b, identity_a, %{worker_host: "evil", workspace_path: "/evil"}},
+               state
+             )
+
+    assert unchanged.running[@issue_id].worker_host == "host-a"
+    assert unchanged.running[@issue_b].worker_host == "host-b"
+
+    codex_state = %{
+      state
+      | codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    update = %{event: :session_started, session_id: "evil", timestamp: DateTime.utc_now()}
+
+    assert {:noreply, codex_unchanged} =
+             Orchestrator.handle_info({:codex_worker_update, @issue_b, identity_a, update}, codex_state)
+
+    assert is_nil(get_in(codex_unchanged.running, [@issue_b, :session_id]))
+
+    previous_route = sample_route()
+    next_route = %{previous_route | profile_name: "review", responsibility: "review"}
+
+    assert {:noreply, route_unchanged} =
+             Orchestrator.handle_info(
+               {:agent_route_changed, @issue_b, identity_a, previous_route, next_route},
+               state
+             )
+
+    refute get_in(route_unchanged.running, [@issue_id, :route_change_termination])
+    refute get_in(route_unchanged.running, [@issue_b, :route_change_termination])
+
+    assessment = %{status: :suspended}
+
+    assert {:noreply, lifecycle_unchanged} =
+             Orchestrator.handle_info(
+               {:agent_lifecycle_suspended, @issue_b, identity_a, assessment},
+               state
+             )
+
+    refute get_in(lifecycle_unchanged.running, [@issue_id, :lifecycle_suspension])
+    refute get_in(lifecycle_unchanged.running, [@issue_b, :lifecycle_suspension])
+
+    assert {:noreply, dependency_unchanged} =
+             Orchestrator.handle_info(
+               {:agent_dependency_blocked, @issue_b, identity_a, %{allowed?: false, reason: :blocked}},
+               state
+             )
+
+    refute Map.has_key?(dependency_unchanged.blocked || %{}, @issue_id)
+    refute Map.has_key?(dependency_unchanged.blocked || %{}, @issue_b)
+  end
+
+  test "wrong responsibility in identity fails closed even when envelope work item matches" do
+    identity = sample_identity("attempt-a")
+    forged = %{identity | responsibility: "review", runtime_profile: "review"}
+
+    state =
+      dual_running_state(
+        {@issue_id, identity, "host-a", "/workspace-a"},
+        {@issue_b, %{identity | work_item_id: @issue_b, runtime_attempt_id: "attempt-b"}, "host-b", "/workspace-b"}
+      )
+
+    assert {:noreply, unchanged} =
+             Orchestrator.handle_info(
+               {:worker_runtime_info, @issue_id, forged, %{worker_host: "evil", workspace_path: "/evil"}},
+               state
+             )
+
+    assert unchanged.running[@issue_id].worker_host == "host-a"
   end
 
   test "stale worker runtime metadata cannot overwrite the current running entry" do
@@ -302,6 +390,27 @@ defmodule SymphonyElixir.RuntimeAttemptIdentityTest do
                from,
                state
              )
+  end
+
+  defp dual_running_state({id_a, identity_a, host_a, path_a}, {id_b, identity_b, host_b, path_b}) do
+    %Orchestrator.State{
+      running: %{
+        id_a => running_entry(id_a, identity_a, host_a, path_a),
+        id_b => running_entry(id_b, identity_b, host_b, path_b)
+      }
+    }
+  end
+
+  defp running_entry(issue_id, identity, host, path) do
+    %{
+      identifier: issue_id,
+      worker_host: host,
+      workspace_path: path,
+      pid: nil,
+      ref: make_ref(),
+      route_change_termination: false,
+      runtime_attempt: RuntimeAttempt.new(identity, :running)
+    }
   end
 
   defp orchestrator_handoff_state(identity) do

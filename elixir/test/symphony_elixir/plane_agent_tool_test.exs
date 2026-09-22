@@ -26,6 +26,7 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
   use ExUnit.Case, async: true
 
   alias SymphonyElixir.AgentRuntime.{Profile, Route}
+  alias SymphonyElixir.AgentRuntime.RuntimeAttempt.Identity, as: RuntimeAttemptIdentity
   alias SymphonyElixir.Dependency.Graph
   alias SymphonyElixir.Orchestrator
   alias SymphonyElixir.Plane.AgentTool
@@ -1634,5 +1635,62 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
       })
 
     contract
+  end
+
+  test "lifecycle transition rejects orchestrator runtime identity when host context lacks one" do
+    parent = self()
+    work_item = work_item(:in_progress)
+    contract = contract()
+    route = route(:in_progress, "implementation")
+    coordinator = transition_coordinator(parent)
+
+    identity =
+      RuntimeAttemptIdentity.allocate(work_item.id, route, "lineage-plane-host-missing")
+
+    response =
+      AgentTool.execute(
+        "plane_request_lifecycle_transition",
+        %{"targetState" => "In Review"},
+        host_opts(route, semantic_context(work_item, contract, %{runtime_attempt_identity: identity}), nil, @settings)
+        |> Keyword.put(:coordinator, coordinator)
+        |> Keyword.put(:agent_tool_context, %{
+          route: route,
+          guard_evidence: transition_guard_evidence()
+        })
+      )
+
+    refute response["success"]
+    assert Jason.decode!(response["output"])["error"]["code"] == "stale_runtime_attempt"
+    refute_received :transition_context_loaded
+    GenServer.stop(coordinator)
+  end
+
+  test "lifecycle transition rejects host runtime identity when orchestrator context lacks one" do
+    parent = self()
+    work_item = work_item(:in_progress)
+    contract = contract()
+    route = route(:in_progress, "implementation")
+    coordinator = transition_coordinator(parent)
+
+    identity =
+      RuntimeAttemptIdentity.allocate(work_item.id, route, "lineage-plane-orchestrator-missing")
+
+    response =
+      AgentTool.execute(
+        "plane_request_lifecycle_transition",
+        %{"targetState" => "In Review"},
+        host_opts(route, semantic_context(work_item, contract), nil, @settings)
+        |> Keyword.put(:coordinator, coordinator)
+        |> Keyword.put(:agent_tool_context, %{
+          route: route,
+          guard_evidence: transition_guard_evidence(),
+          runtime_attempt_identity: identity
+        })
+      )
+
+    refute response["success"]
+    assert Jason.decode!(response["output"])["error"]["code"] == "stale_runtime_attempt"
+    refute_received :transition_context_loaded
+    GenServer.stop(coordinator)
   end
 end
