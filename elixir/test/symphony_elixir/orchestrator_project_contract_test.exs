@@ -1,6 +1,9 @@
 defmodule SymphonyElixir.OrchestratorProjectContractTest do
   use ExUnit.Case, async: true
 
+  alias SymphonyElixir.AgentRuntime.Route
+  alias SymphonyElixir.AgentRuntime.RuntimeAttempt
+  alias SymphonyElixir.AgentRuntime.RuntimeAttempt.Identity, as: RuntimeAttemptIdentity
   alias SymphonyElixir.Dependency.Graph
   alias SymphonyElixir.Orchestrator
   alias SymphonyElixir.Tracker.Capabilities
@@ -271,6 +274,43 @@ defmodule SymphonyElixir.OrchestratorProjectContractTest do
     assert context.provider_project_contract == contract
     assert context.provider_contract_fingerprint == ProviderProjectContract.fingerprint(contract)
     assert context.project_contract_evidence == ProjectContractEvidence.observability(evidence)
+    assert is_nil(context.runtime_attempt_identity)
+  end
+
+  test "semantic tool context includes the current runtime attempt identity when running" do
+    {state, work_item} = handoff_state()
+
+    identity =
+      RuntimeAttemptIdentity.allocate(
+        work_item.id,
+        %Route{
+          issue_id: work_item.id,
+          starting_state: "Ready",
+          profile_name: "implementation",
+          runtime_name: "codex",
+          responsibility: "implementation",
+          fingerprint: "fp",
+          starting_state_fingerprint: "sfp"
+        },
+        "lineage-handoff"
+      )
+
+    state = %{
+      state
+      | running: %{
+          work_item.id => %{
+            profile_name: "implementation",
+            runtime_attempt: RuntimeAttempt.new(identity, :running)
+          }
+        }
+    }
+
+    from = {self(), make_ref()}
+
+    assert {:reply, {:ok, context}, _state} =
+             Orchestrator.handle_call({:semantic_tool_context, "work-1"}, from, state)
+
+    assert RuntimeAttemptIdentity.same?(context.runtime_attempt_identity, identity)
   end
 
   test "semantic tool context preserves suspended and incomplete local facts" do

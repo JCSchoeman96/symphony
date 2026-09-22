@@ -9,7 +9,16 @@ defmodule SymphonyElixir.Orchestrator do
   import Bitwise, only: [<<<: 2]
 
   alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
-  alias SymphonyElixir.AgentRuntime.{AttemptLedger, AttemptPolicy, Route, Router}
+
+  alias SymphonyElixir.AgentRuntime.{
+    AttemptLedger,
+    AttemptPolicy,
+    Route,
+    Router,
+    RuntimeAttempt
+  }
+
+  alias SymphonyElixir.AgentRuntime.RuntimeAttempt.Identity, as: RuntimeAttemptIdentity
   alias SymphonyElixir.Dependency.{Graph, Guard, Policy}
   alias SymphonyElixir.Plane.ProjectContract
   alias SymphonyElixir.Tracker.Issue
@@ -624,10 +633,33 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  def handle_info(
+        {:worker_runtime_info, issue_id, %RuntimeAttemptIdentity{} = identity, runtime_info},
+        %{running: running} = state
+      )
+      when is_binary(issue_id) and is_map(runtime_info) do
+    case validate_current_runtime_event(state, identity) do
+      {:ok, running_entry} ->
+        updated_running_entry =
+          running_entry
+          |> maybe_put_runtime_value(:worker_host, runtime_info[:worker_host])
+          |> maybe_put_runtime_value(:workspace_path, runtime_info[:workspace_path])
+
+        notify_dashboard()
+        {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+
+      :stale ->
+        {:noreply, state}
+    end
+  end
+
   def handle_info({:worker_runtime_info, issue_id, runtime_info}, %{running: running} = state)
       when is_binary(issue_id) and is_map(runtime_info) do
     case Map.get(running, issue_id) do
       nil ->
+        {:noreply, state}
+
+      %{runtime_attempt: %RuntimeAttempt{}} ->
         {:noreply, state}
 
       running_entry ->
@@ -642,6 +674,26 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   def handle_info(
+        {
+          :agent_route_changed,
+          issue_id,
+          %RuntimeAttemptIdentity{} = identity,
+          %Route{} = previous_route,
+          %Route{} = next_route
+        },
+        state
+      )
+      when is_binary(issue_id) do
+    case validate_current_runtime_event(state, identity) do
+      {:ok, running_entry} ->
+        apply_agent_route_changed(state, issue_id, running_entry, previous_route, next_route)
+
+      :stale ->
+        {:noreply, state}
+    end
+  end
+
+  def handle_info(
         {:agent_route_changed, issue_id, %Route{} = previous_route, %Route{} = next_route},
         %{running: running} = state
       )
@@ -650,21 +702,25 @@ defmodule SymphonyElixir.Orchestrator do
       nil ->
         {:noreply, state}
 
+      %{runtime_attempt: %RuntimeAttempt{}} ->
+        {:noreply, state}
+
       running_entry ->
-        Logger.info(
-          "Agent route changed for issue_id=#{issue_id}; ending worker attempt " <>
-            "previous=#{previous_route.profile_name}/#{previous_route.responsibility} " <>
-            "next=#{next_route.profile_name}/#{next_route.responsibility}"
-        )
+        apply_agent_route_changed(state, issue_id, running_entry, previous_route, next_route)
+    end
+  end
 
-        updated_running_entry =
-          Map.merge(running_entry, %{
-            route_change_termination: true,
-            route_change: route_change_metadata(previous_route, next_route)
-          })
+  def handle_info(
+        {:agent_lifecycle_suspended, issue_id, %RuntimeAttemptIdentity{} = identity, assessment},
+        state
+      )
+      when is_binary(issue_id) do
+    case validate_current_runtime_event(state, identity) do
+      {:ok, running_entry} ->
+        apply_agent_lifecycle_suspended(state, issue_id, running_entry, assessment)
 
-        notify_dashboard()
-        {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+      :stale ->
+        {:noreply, state}
     end
   end
 
@@ -677,15 +733,25 @@ defmodule SymphonyElixir.Orchestrator do
       nil ->
         {:noreply, state}
 
-      running_entry ->
-        Logger.warning(
-          "Agent lifecycle continuation suspended for issue_id=#{issue_id}: " <>
-            inspect(assessment)
-        )
+      %{runtime_attempt: %RuntimeAttempt{}} ->
+        {:noreply, state}
 
-        updated_running_entry = Map.put(running_entry, :lifecycle_suspension, assessment)
-        notify_dashboard()
-        {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+      running_entry ->
+        apply_agent_lifecycle_suspended(state, issue_id, running_entry, assessment)
+    end
+  end
+
+  def handle_info(
+        {:agent_dependency_blocked, issue_id, %RuntimeAttemptIdentity{} = identity, decision},
+        state
+      )
+      when is_binary(issue_id) and is_map(decision) do
+    case validate_current_runtime_event(state, identity) do
+      {:ok, running_entry} ->
+        apply_agent_dependency_blocked(state, issue_id, running_entry, decision)
+
+      :stale ->
+        {:noreply, state}
     end
   end
 
@@ -698,22 +764,31 @@ defmodule SymphonyElixir.Orchestrator do
       nil ->
         {:noreply, state}
 
+      %{runtime_attempt: %RuntimeAttempt{}} ->
+        {:noreply, state}
+
       running_entry ->
-        error = dependency_blocker_error(decision)
+        apply_agent_dependency_blocked(state, issue_id, running_entry, decision)
+    end
+  end
 
-        Logger.warning(
-          "Agent dependency guard stopped issue_id=#{issue_id} " <>
-            "issue_identifier=#{running_entry.identifier}: #{error}"
-        )
+  def handle_info(
+        {:codex_worker_update, issue_id, %RuntimeAttemptIdentity{} = identity, %{event: _, timestamp: _} = update},
+        %{running: running} = state
+      ) do
+    case validate_current_runtime_event(state, identity) do
+      {:ok, running_entry} ->
+        {updated_running_entry, token_delta} = integrate_codex_update(running_entry, update)
 
-        stop_running_task(
-          Map.get(running_entry, :pid),
-          Map.get(running_entry, :ref),
-          state.task_supervisor
-        )
+        state =
+          state
+          |> apply_codex_token_delta(token_delta)
+          |> apply_codex_rate_limits(update)
 
-        state = block_issue_from_entry(state, issue_id, running_entry, error, decision)
         notify_dashboard()
+        {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+
+      :stale ->
         {:noreply, state}
     end
   end
@@ -724,6 +799,9 @@ defmodule SymphonyElixir.Orchestrator do
       ) do
     case Map.get(running, issue_id) do
       nil ->
+        {:noreply, state}
+
+      %{runtime_attempt: %RuntimeAttempt{}} ->
         {:noreply, state}
 
       running_entry ->
@@ -2568,8 +2646,18 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp spawn_issue_on_worker_host(%State{} = state, issue, route, attempt, recipient, worker_host) do
     case begin_durable_attempt(state, issue, route) do
-      {:ok, state} ->
-        spawn_prepared_issue_on_worker_host(state, issue, route, attempt, recipient, worker_host)
+      {:ok, state, ledger_record} ->
+        runtime_attempt = allocate_runtime_attempt(state, issue, route, ledger_record)
+
+        spawn_prepared_issue_on_worker_host(
+          state,
+          issue,
+          route,
+          attempt,
+          recipient,
+          worker_host,
+          runtime_attempt
+        )
 
       {:error, state, reason} ->
         Logger.error("Unable to reserve durable attempt for #{issue_context(issue)}: #{inspect(reason)}")
@@ -2584,7 +2672,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp begin_durable_attempt(%State{attempt_ledger_status: :disabled} = state, _issue, _route),
-    do: {:ok, state}
+    do: {:ok, state, nil}
 
   defp begin_durable_attempt(
          %State{attempt_ledger_status: :ready, attempt_ledger: %AttemptLedger{} = ledger} = state,
@@ -2592,8 +2680,8 @@ defmodule SymphonyElixir.Orchestrator do
          route
        ) do
     case AttemptLedger.begin_attempt(ledger, issue.id, route_fingerprint: route.fingerprint) do
-      {:ok, _record} ->
-        {:ok, mark_durable_in_flight(state, issue.id, true)}
+      {:ok, record} ->
+        {:ok, mark_durable_in_flight(state, issue.id, true), record}
 
       {:error, :attempt_in_flight} ->
         {:error, state, :attempt_in_flight}
@@ -2614,6 +2702,14 @@ defmodule SymphonyElixir.Orchestrator do
     reason = :invalid_ledger_status
     {:error, block_ledger(state, reason), reason}
   end
+
+  defp allocate_runtime_attempt(%State{attempt_ledger_status: :ready}, issue, route, record)
+       when is_map(record) do
+    identity = RuntimeAttemptIdentity.allocate(issue.id, route, record.lineage_id)
+    RuntimeAttempt.new(identity, :starting)
+  end
+
+  defp allocate_runtime_attempt(_state, _issue, _route, _record), do: nil
 
   defp persist_attempt_failure_fence(%State{attempt_ledger: %AttemptLedger{} = ledger} = state, issue, route) do
     case AttemptLedger.fence_attempt(ledger, issue.id, route_fingerprint: route.fingerprint) do
@@ -2639,8 +2735,17 @@ defmodule SymphonyElixir.Orchestrator do
     }
   end
 
-  defp spawn_prepared_issue_on_worker_host(%State{} = state, issue, route, attempt, recipient, worker_host) do
+  defp spawn_prepared_issue_on_worker_host(
+         %State{} = state,
+         issue,
+         route,
+         attempt,
+         recipient,
+         worker_host,
+         runtime_attempt
+       ) do
     work_item = active_work_item_for_attempt(state, issue.id)
+    runtime_attempt_identity = runtime_attempt_identity_from(runtime_attempt)
 
     case Task.Supervisor.start_child(state.task_supervisor, fn ->
            state.agent_runner.run(issue, recipient,
@@ -2649,7 +2754,8 @@ defmodule SymphonyElixir.Orchestrator do
              route: route,
              work_item: work_item,
              work_control: state.work_control,
-             dependency_decision: Map.get(state.dependency_diagnostics, issue.id)
+             dependency_decision: Map.get(state.dependency_diagnostics, issue.id),
+             runtime_attempt_identity: runtime_attempt_identity
            )
          end) do
       {:ok, pid} ->
@@ -2688,6 +2794,7 @@ defmodule SymphonyElixir.Orchestrator do
             codex_last_reported_total_tokens: 0,
             turn_count: 0,
             retry_attempt: normalize_retry_attempt(attempt),
+            runtime_attempt: mark_runtime_attempt_running(runtime_attempt),
             started_at: DateTime.utc_now()
           })
 
@@ -2733,6 +2840,14 @@ defmodule SymphonyElixir.Orchestrator do
         end
     end
   end
+
+  defp runtime_attempt_identity_from(%RuntimeAttempt{identity: identity}), do: identity
+  defp runtime_attempt_identity_from(_runtime_attempt), do: nil
+
+  defp mark_runtime_attempt_running(%RuntimeAttempt{} = runtime_attempt),
+    do: RuntimeAttempt.mark_running(runtime_attempt)
+
+  defp mark_runtime_attempt_running(_runtime_attempt), do: nil
 
   defp active_work_item_for_attempt(%State{} = state, issue_id) when is_binary(issue_id) do
     case Map.get(state.work_control, issue_id) do
@@ -3576,6 +3691,149 @@ defmodule SymphonyElixir.Orchestrator do
     }
   end
 
+  defp validate_current_runtime_event(%State{running: running}, %RuntimeAttemptIdentity{} = identity) do
+    with {:ok, entry} <- current_running_entry(running, identity.work_item_id),
+         %RuntimeAttempt{identity: current} <- Map.get(entry, :runtime_attempt),
+         true <- RuntimeAttemptIdentity.same?(identity, current) do
+      {:ok, entry}
+    else
+      _failure -> :stale
+    end
+  end
+
+  defp current_running_entry(running, work_item_id) when is_map(running) and is_binary(work_item_id) do
+    case Map.get(running, work_item_id) do
+      entry when is_map(entry) -> {:ok, entry}
+      _missing -> :stale
+    end
+  end
+
+  defp current_runtime_attempt_identity(%State{running: running}, work_item_id) do
+    case Map.get(running, work_item_id) do
+      %{runtime_attempt: %RuntimeAttempt{identity: identity}} -> identity
+      _ -> nil
+    end
+  end
+
+  defp transition_context_runtime_attempt_id(running) do
+    case Map.get(running, :runtime_attempt) do
+      %RuntimeAttempt{identity: %{runtime_attempt_id: id}} -> id
+      _ -> nil
+    end
+  end
+
+  defp transition_context_lineage_generation(running) do
+    case Map.get(running, :runtime_attempt) do
+      %RuntimeAttempt{identity: %{lineage_generation: generation}} -> generation
+      _ -> nil
+    end
+  end
+
+  defp transition_context_lineage_id(running) do
+    transition_context_lineage_generation(running)
+  end
+
+  defp validate_expected_runtime_identity(context, opts) when is_map(context) do
+    case Keyword.get(opts, :expected_runtime_identity) do
+      nil ->
+        :ok
+
+      %RuntimeAttemptIdentity{} = expected ->
+        if runtime_identity_matches_context?(expected, context), do: :ok, else: {:error, :stale_runtime_attempt}
+
+      expected when is_map(expected) ->
+        if runtime_identity_map_matches_context?(expected, context),
+          do: :ok,
+          else: {:error, :stale_runtime_attempt}
+
+      _invalid ->
+        {:error, :stale_runtime_attempt}
+    end
+  end
+
+  defp runtime_identity_matches_context?(%RuntimeAttemptIdentity{} = identity, context) do
+    runtime_identity_map_matches_context?(
+      %{
+        runtime_attempt_id: identity.runtime_attempt_id,
+        lineage_generation: identity.lineage_generation,
+        work_item_id: identity.work_item_id,
+        responsibility: identity.responsibility,
+        runtime_profile: identity.runtime_profile
+      },
+      context
+    )
+  end
+
+  defp runtime_identity_map_matches_context?(expected, context) do
+    context_identity = %{
+      runtime_attempt_id: Map.get(context, :runtime_attempt_id),
+      lineage_generation: Map.get(context, :lineage_generation),
+      work_item_id: get_in(context, [:work_item, Access.key(:id)]),
+      responsibility: Map.get(context, :responsibility),
+      runtime_profile: Map.get(context, :runtime_profile)
+    }
+
+    Enum.all?(Map.keys(expected), fn key ->
+      normalize_identity_field(key, Map.get(expected, key)) ==
+        normalize_identity_field(key, Map.get(context_identity, key))
+    end)
+  end
+
+  defp normalize_identity_field(:responsibility, value) when is_atom(value), do: Atom.to_string(value)
+  defp normalize_identity_field(:responsibility, value) when is_binary(value), do: String.trim(value)
+  defp normalize_identity_field(_key, value), do: value
+
+  defp apply_agent_route_changed(state, issue_id, running_entry, previous_route, next_route) do
+    %{running: running} = state
+
+    Logger.info(
+      "Agent route changed for issue_id=#{issue_id}; ending worker attempt " <>
+        "previous=#{previous_route.profile_name}/#{previous_route.responsibility} " <>
+        "next=#{next_route.profile_name}/#{next_route.responsibility}"
+    )
+
+    updated_running_entry =
+      Map.merge(running_entry, %{
+        route_change_termination: true,
+        route_change: route_change_metadata(previous_route, next_route)
+      })
+
+    notify_dashboard()
+    {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+  end
+
+  defp apply_agent_lifecycle_suspended(state, issue_id, running_entry, assessment) do
+    %{running: running} = state
+
+    Logger.warning(
+      "Agent lifecycle continuation suspended for issue_id=#{issue_id}: " <>
+        inspect(assessment)
+    )
+
+    updated_running_entry = Map.put(running_entry, :lifecycle_suspension, assessment)
+    notify_dashboard()
+    {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+  end
+
+  defp apply_agent_dependency_blocked(state, issue_id, running_entry, decision) do
+    error = dependency_blocker_error(decision)
+
+    Logger.warning(
+      "Agent dependency guard stopped issue_id=#{issue_id} " <>
+        "issue_identifier=#{running_entry.identifier}: #{error}"
+    )
+
+    stop_running_task(
+      Map.get(running_entry, :pid),
+      Map.get(running_entry, :ref),
+      state.task_supervisor
+    )
+
+    state = block_issue_from_entry(state, issue_id, running_entry, error, decision)
+    notify_dashboard()
+    {:noreply, state}
+  end
+
   defp maybe_put_runtime_value(running_entry, _key, nil), do: running_entry
 
   defp maybe_put_runtime_value(running_entry, key, value) when is_map(running_entry) do
@@ -3799,7 +4057,10 @@ defmodule SymphonyElixir.Orchestrator do
       %WorkItem{} = work_item ->
         with :ok <- transition_context_available?(state, work_item_id, work_item),
              {:ok, context} <- build_transition_context(state, work_item_id, work_item),
-             do: validate_transition_context_token(context, opts)
+             {:ok, context} <- validate_transition_context_token(context, opts),
+             :ok <- validate_expected_runtime_identity(context, opts) do
+          {:ok, context}
+        end
 
       _missing ->
         {:error, :work_item_not_found}
@@ -3826,7 +4087,8 @@ defmodule SymphonyElixir.Orchestrator do
       dependency_epoch_evidence: semantic_tool_dependency_epoch_evidence(state),
       provider_project_contract: contract,
       provider_contract_fingerprint: provider_contract_fingerprint(contract),
-      project_contract_evidence: semantic_tool_project_contract_evidence(state.project_contract_evidence)
+      project_contract_evidence: semantic_tool_project_contract_evidence(state.project_contract_evidence),
+      runtime_attempt_identity: current_runtime_attempt_identity(state, work_item_id)
     }
   end
 
@@ -4013,9 +4275,10 @@ defmodule SymphonyElixir.Orchestrator do
        provider_observation: observation,
        provider_project_contract: contract,
        provider_contract_fingerprint: provider_contract_fingerprint(contract),
-       runtime_attempt_id: Map.get(running, :attempt),
-       lineage_id: Map.get(running, :lineage_id),
-       lineage_generation: Map.get(running, :lineage_generation),
+       runtime_attempt_id: transition_context_runtime_attempt_id(running),
+       lineage_id: transition_context_lineage_id(running),
+       lineage_generation: transition_context_lineage_generation(running),
+       runtime_profile: Map.get(running, :profile_name),
        responsibility: WorkflowLifecycle.responsibility(work_item.validated_lifecycle_state),
        repository_context: %{
          workspace_path: Map.get(running, :workspace_path),

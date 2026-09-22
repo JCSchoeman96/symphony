@@ -6,6 +6,7 @@ defmodule SymphonyElixir.AgentRunner do
   require Logger
   alias SymphonyElixir.{AgentRuntime, Config, PromptBuilder, SourceControl, Tracker, Workspace}
   alias SymphonyElixir.AgentRuntime.{Profile, Route, Router}
+  alias SymphonyElixir.AgentRuntime.RuntimeAttempt.Identity, as: RuntimeAttemptIdentity
   alias SymphonyElixir.Dependency.Guard
   alias SymphonyElixir.Tracker.Issue
   alias SymphonyElixir.WorkControl.{LifecycleAssessment, WorkflowLifecycle, WorkItem}
@@ -77,10 +78,11 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
     Logger.info("Starting worker attempt for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
+    runtime_identity = runtime_attempt_identity(opts)
 
     case Workspace.create_for_issue(issue, worker_host) do
       {:ok, workspace} ->
-        send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace)
+        send_worker_runtime_info(codex_update_recipient, issue, runtime_identity, worker_host, workspace)
 
         try do
           with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host) do
@@ -95,21 +97,47 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp codex_message_handler(recipient, issue) do
+  defp codex_message_handler(recipient, issue, runtime_identity) do
     fn message ->
-      send_codex_update(recipient, issue, message)
+      send_codex_update(recipient, issue, runtime_identity, message)
     end
   end
 
-  defp send_codex_update(recipient, %Issue{id: issue_id}, message)
+  defp send_codex_update(recipient, %Issue{id: issue_id}, %RuntimeAttemptIdentity{} = identity, message)
+       when is_binary(issue_id) and is_pid(recipient) do
+    send(recipient, {:codex_worker_update, issue_id, identity, message})
+    :ok
+  end
+
+  defp send_codex_update(recipient, %Issue{id: issue_id}, _identity, message)
        when is_binary(issue_id) and is_pid(recipient) do
     send(recipient, {:codex_worker_update, issue_id, message})
     :ok
   end
 
-  defp send_codex_update(_recipient, _issue, _message), do: :ok
+  defp send_codex_update(_recipient, _issue, _identity, _message), do: :ok
 
-  defp send_worker_runtime_info(recipient, %Issue{id: issue_id}, worker_host, workspace)
+  defp send_worker_runtime_info(
+         recipient,
+         %Issue{id: issue_id},
+         %RuntimeAttemptIdentity{} = identity,
+         worker_host,
+         workspace
+       )
+       when is_binary(issue_id) and is_pid(recipient) and is_binary(workspace) do
+    send(
+      recipient,
+      {:worker_runtime_info, issue_id, identity,
+       %{
+         worker_host: worker_host,
+         workspace_path: workspace
+       }}
+    )
+
+    :ok
+  end
+
+  defp send_worker_runtime_info(recipient, %Issue{id: issue_id}, _identity, worker_host, workspace)
        when is_binary(issue_id) and is_pid(recipient) and is_binary(workspace) do
     send(
       recipient,
@@ -123,13 +151,15 @@ defmodule SymphonyElixir.AgentRunner do
     :ok
   end
 
-  defp send_worker_runtime_info(_recipient, _issue, _worker_host, _workspace), do: :ok
+  defp send_worker_runtime_info(_recipient, _issue, _identity, _worker_host, _workspace), do: :ok
 
   defp run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host) do
     route = Keyword.get(opts, :route)
     max_turns = max_turns_for_run(route, opts)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issues_by_ids/1)
     runtime = Keyword.get(opts, :runtime, AgentRuntime.Codex)
+
+    runtime_identity = runtime_attempt_identity(opts)
 
     runtime_opts =
       opts
@@ -147,6 +177,7 @@ defmodule SymphonyElixir.AgentRunner do
         workspace: workspace,
         issue: issue,
         codex_update_recipient: codex_update_recipient,
+        runtime_attempt_identity: runtime_identity,
         opts: runtime_opts,
         issue_state_fetcher: issue_state_fetcher,
         route: route,
@@ -178,7 +209,11 @@ defmodule SymphonyElixir.AgentRunner do
              Keyword.put(
                context.opts,
                :on_message,
-               codex_message_handler(context.codex_update_recipient, context.issue)
+               codex_message_handler(
+                 context.codex_update_recipient,
+                 context.issue,
+                 context.runtime_attempt_identity
+               )
              )
            ) do
       Logger.info(
@@ -220,6 +255,7 @@ defmodule SymphonyElixir.AgentRunner do
           notify_lifecycle_suspended(
             context.codex_update_recipient,
             refreshed_issue,
+            context.runtime_attempt_identity,
             assessment
           )
 
@@ -291,13 +327,20 @@ defmodule SymphonyElixir.AgentRunner do
 
     cond do
       decision.allowed? != true ->
-        notify_dependency_blocked(context.codex_update_recipient, refreshed_issue, decision)
+        notify_dependency_blocked(
+          context.codex_update_recipient,
+          refreshed_issue,
+          context.runtime_attempt_identity,
+          decision
+        )
+
         :ok
 
       route_changed?(context.route, refreshed_route) ->
         notify_route_change(
           context.codex_update_recipient,
           refreshed_issue,
+          context.runtime_attempt_identity,
           context.route,
           refreshed_route
         )
@@ -514,13 +557,13 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp continue_with_routed_issue?(issue, _issue_state_fetcher), do: {:done, issue}
 
-  defp notify_lifecycle_suspended(recipient, %Issue{id: issue_id}, assessment)
+  defp notify_lifecycle_suspended(recipient, %Issue{id: issue_id}, identity, assessment)
        when is_pid(recipient) and is_binary(issue_id) do
-    send(recipient, {:agent_lifecycle_suspended, issue_id, assessment})
+    send_runtime_event(recipient, {:agent_lifecycle_suspended, issue_id, assessment}, identity)
     :ok
   end
 
-  defp notify_lifecycle_suspended(_recipient, _issue, _assessment), do: :ok
+  defp notify_lifecycle_suspended(_recipient, _issue, _identity, _assessment), do: :ok
 
   defp route_changed?(nil, nil), do: false
   defp route_changed?(%Route{} = left, %Route{} = right), do: not Route.same?(left, right)
@@ -537,23 +580,67 @@ defmodule SymphonyElixir.AgentRunner do
   defp notify_route_change(
          recipient,
          %Issue{id: issue_id},
+         identity,
          %Route{} = previous_route,
          %Route{} = next_route
        )
        when is_pid(recipient) and is_binary(issue_id) do
-    send(recipient, {:agent_route_changed, issue_id, previous_route, next_route})
+    send_runtime_event(
+      recipient,
+      {:agent_route_changed, issue_id, previous_route, next_route},
+      identity
+    )
+
     :ok
   end
 
-  defp notify_route_change(_recipient, _issue, _previous_route, _next_route), do: :ok
+  defp notify_route_change(_recipient, _issue, _identity, _previous_route, _next_route), do: :ok
 
-  defp notify_dependency_blocked(recipient, %Issue{id: issue_id}, decision)
+  defp notify_dependency_blocked(recipient, %Issue{id: issue_id}, identity, decision)
        when is_pid(recipient) and is_binary(issue_id) do
-    send(recipient, {:agent_dependency_blocked, issue_id, dependency_metadata(decision)})
+    send_runtime_event(
+      recipient,
+      {:agent_dependency_blocked, issue_id, dependency_metadata(decision)},
+      identity
+    )
+
     :ok
   end
 
-  defp notify_dependency_blocked(_recipient, _issue, _decision), do: :ok
+  defp notify_dependency_blocked(_recipient, _issue, _identity, _decision), do: :ok
+
+  defp send_runtime_event(recipient, {event, issue_id, payload}, %RuntimeAttemptIdentity{} = identity)
+       when is_pid(recipient) and is_binary(issue_id) do
+    send(recipient, {event, issue_id, identity, payload})
+    :ok
+  end
+
+  defp send_runtime_event(recipient, {event, issue_id, left, right}, %RuntimeAttemptIdentity{} = identity)
+       when is_pid(recipient) and is_binary(issue_id) do
+    send(recipient, {event, issue_id, identity, left, right})
+    :ok
+  end
+
+  defp send_runtime_event(recipient, {event, issue_id, payload}, _identity)
+       when is_pid(recipient) and is_binary(issue_id) do
+    send(recipient, {event, issue_id, payload})
+    :ok
+  end
+
+  defp send_runtime_event(recipient, {event, issue_id, left, right}, _identity)
+       when is_pid(recipient) and is_binary(issue_id) do
+    send(recipient, {event, issue_id, left, right})
+    :ok
+  end
+
+  defp send_runtime_event(_recipient, _event, _identity), do: :ok
+
+  defp runtime_attempt_identity(opts) when is_list(opts) do
+    case Keyword.get(opts, :runtime_attempt_identity) do
+      %RuntimeAttemptIdentity{} = identity -> identity
+      _ -> nil
+    end
+  end
 
   defp maybe_put_work_item(opts, %WorkItem{} = work_item),
     do: Keyword.put(opts, :work_item, work_item)
@@ -590,6 +677,7 @@ defmodule SymphonyElixir.AgentRunner do
       responsibility: route.responsibility,
       dependency_decision: dependency_decision_from_options(issue, route, opts),
       work_control: Keyword.get(opts, :work_control, %{}),
+      runtime_attempt_identity: runtime_attempt_identity(opts),
       guard_evidence:
         SourceControl.canonical_host_guard_evidence(%{
           work_item: Keyword.get(opts, :work_item),
