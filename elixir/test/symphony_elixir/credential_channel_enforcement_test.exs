@@ -1,7 +1,8 @@
 defmodule SymphonyElixir.CredentialChannelEnforcementTest do
   use SymphonyElixir.TestSupport
 
-  alias SymphonyElixir.{Config, CredentialBoundary, Workflow}
+  alias SymphonyElixir.Codex.DynamicTool
+  alias SymphonyElixir.{Config, CredentialBoundary, Workflow, Workspace}
   alias SymphonyElixir.GitHub.SourceControl
   alias SymphonyElixir.Plane.Client
   alias SymphonyElixir.SourceControl.RepositoryProbe
@@ -39,7 +40,7 @@ defmodule SymphonyElixir.CredentialChannelEnforcementTest do
     assert CredentialBoundary.unset_shell_command(["CUSTOM_TOKEN"]) =~ "unset "
     assert CredentialBoundary.unset_shell_command(["CUSTOM_TOKEN"]) =~ "CUSTOM_TOKEN"
     assert CredentialBoundary.port_env(["CUSTOM_TOKEN"]) != []
-    refute Enum.any?(CredentialBoundary.hook_process_env(["CUSTOM_TOKEN"]), fn {name, _} -> name == "CUSTOM_TOKEN" end)
+    assert {"CUSTOM_TOKEN", nil} in CredentialBoundary.hook_process_env(["CUSTOM_TOKEN"])
     assert "PLANE_API_KEY" in deny
   end
 
@@ -265,7 +266,7 @@ defmodule SymphonyElixir.CredentialChannelEnforcementTest do
              )
   end
 
-  test "routed workspace hook environment omits symphony provider secrets" do
+  test "routed workspace hook environment clears symphony provider secrets in child processes" do
     write_workflow_file!(Workflow.workflow_file_path(),
       agent_routing: "routed",
       tracker_kind: "memory"
@@ -278,8 +279,76 @@ defmodule SymphonyElixir.CredentialChannelEnforcementTest do
     env =
       CredentialBoundary.hook_process_env(CredentialBoundary.configured_secret_environment_names())
 
-    refute Enum.any?(env, fn {name, _} -> name == "PLANE_API_KEY" end)
+    assert {"PLANE_API_KEY", nil} in env
     assert Config.settings!().agent.routing == "routed"
+
+    {output, _} = System.cmd("sh", ["-c", "printenv PLANE_API_KEY || true"], env: env)
+    refute output =~ "sentinel-plane-hook-secret"
+  end
+
+  test "routed mode skips workspace shell hooks instead of executing host commands" do
+    marker =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-routed-hook-skip-#{System.unique_integer([:positive])}"
+      )
+
+    workspace_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-routed-hook-ws-#{System.unique_integer([:positive])}"
+      )
+
+    workspace = Path.join(workspace_root, "ISSUE-1")
+    File.mkdir_p!(workspace)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      agent_routing: "routed",
+      tracker_kind: "memory",
+      workspace_root: workspace_root,
+      hook_after_run: "touch #{marker}"
+    )
+
+    on_exit(fn -> File.rm_rf(workspace_root) end)
+
+    assert :ok = Workspace.run_after_run_hook(workspace, "ISSUE-1", nil)
+    refute File.exists?(marker)
+  end
+
+  test "dynamic tool catalogue excludes suspension and attempt rearm raw channels" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      agent_routing: "routed"
+    )
+
+    binding = DynamicTool.bind()
+
+    tool_names = Enum.map(binding.tool_specs, &Map.fetch!(&1, "name"))
+
+    for forbidden <-
+          ~w(attempt_rearm clear_suspension rearm_suspension suspension_clear symphony_attempt_rearm) do
+      refute forbidden in tool_names
+    end
+
+    response = DynamicTool.execute("attempt_rearm", %{}, binding)
+    assert response["success"] == false
+    assert Jason.decode!(response["output"])["error"]["message"] =~ "Unsupported dynamic tool"
+  end
+
+  test "suspension context remains host-only and is not callable through dynamic tools" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory", agent_routing: "routed")
+    binding = DynamicTool.bind()
+
+    for raw_tool <- ~w(suspension_context clear_suspension begin_resolution) do
+      response = DynamicTool.execute(raw_tool, %{}, binding)
+      assert response["success"] == false
+      assert Jason.decode!(response["output"])["error"]["message"] =~ "Unsupported dynamic tool"
+    end
+
+    refute Enum.any?(binding.tool_specs, fn spec ->
+             name = Map.fetch!(spec, "name")
+             String.contains?(name, "suspension") or String.contains?(name, "rearm")
+           end)
   end
 
   test "github transport requires a host token" do

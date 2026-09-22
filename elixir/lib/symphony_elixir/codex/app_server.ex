@@ -21,7 +21,8 @@ defmodule SymphonyElixir.Codex.AppServer do
           thread_id: String.t(),
           workspace: Path.t(),
           worker_host: String.t() | nil,
-          dynamic_tool_binding: map()
+          dynamic_tool_binding: map(),
+          ephemeral_home: Path.t() | nil
         }
 
   @spec run(Path.t(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
@@ -41,7 +42,8 @@ defmodule SymphonyElixir.Codex.AppServer do
     dynamic_tool_binding = DynamicTool.bind(opts)
 
     with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
-         {:ok, port} <- start_port(expanded_workspace, worker_host, dynamic_tool_binding, opts) do
+         {:ok, port, ephemeral_home} <-
+           start_port(expanded_workspace, worker_host, dynamic_tool_binding, opts) do
       metadata = port_metadata(port, worker_host)
 
       with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host, opts),
@@ -58,10 +60,12 @@ defmodule SymphonyElixir.Codex.AppServer do
            thread_id: thread_id,
            workspace: expanded_workspace,
            worker_host: worker_host,
-           dynamic_tool_binding: dynamic_tool_binding
+           dynamic_tool_binding: dynamic_tool_binding,
+           ephemeral_home: ephemeral_home
          }}
       else
         {:error, reason} ->
+          cleanup_ephemeral_home(ephemeral_home)
           stop_port(port)
           {:error, reason}
       end
@@ -153,7 +157,8 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   @spec stop_session(session()) :: :ok | {:error, {:stop_failed, term()}}
-  def stop_session(%{port: port}) when is_port(port) do
+  def stop_session(%{port: port} = session) when is_port(port) do
+    cleanup_ephemeral_home(Map.get(session, :ephemeral_home))
     stop_port(port)
   end
 
@@ -205,6 +210,8 @@ defmodule SymphonyElixir.Codex.AppServer do
     if is_nil(executable) do
       {:error, :bash_not_found}
     else
+      {port_env, ephemeral_home} = local_port_env(dynamic_tool_binding, opts)
+
       port =
         Port.open(
           {:spawn_executable, String.to_charlist(executable)},
@@ -214,33 +221,68 @@ defmodule SymphonyElixir.Codex.AppServer do
             :stderr_to_stdout,
             args: [~c"-lc", String.to_charlist(local_launch_command(dynamic_tool_binding, opts))],
             cd: String.to_charlist(workspace),
-            env: CredentialBoundary.port_env(dynamic_tool_binding.secret_environment_names),
+            env: port_env,
             line: @port_line_bytes
           ]
         )
 
-      {:ok, port}
+      {:ok, port, ephemeral_home}
     end
   end
 
   defp start_port(workspace, worker_host, dynamic_tool_binding, opts) when is_binary(worker_host) do
     remote_command = remote_launch_command(workspace, dynamic_tool_binding, opts)
-    SSH.start_port(worker_host, remote_command, line: @port_line_bytes)
+
+    case SSH.start_port(worker_host, remote_command, line: @port_line_bytes) do
+      {:ok, port} -> {:ok, port, nil}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp local_port_env(dynamic_tool_binding, opts) do
+    if routed_profile?(opts) do
+      home_dir = CredentialBoundary.create_routed_ephemeral_home!()
+
+      {CredentialBoundary.routed_port_env(dynamic_tool_binding.secret_environment_names, home_dir), home_dir}
+    else
+      {CredentialBoundary.port_env(dynamic_tool_binding.secret_environment_names), nil}
+    end
   end
 
   defp local_launch_command(dynamic_tool_binding, opts) do
+    unset_command =
+      if routed_profile?(opts) do
+        CredentialBoundary.routed_unset_shell_command(dynamic_tool_binding.secret_environment_names)
+      else
+        CredentialBoundary.unset_shell_command(dynamic_tool_binding.secret_environment_names)
+      end
+
     [
-      CredentialBoundary.unset_shell_command(dynamic_tool_binding.secret_environment_names),
+      unset_command,
       "exec #{runtime_command(opts)}"
     ]
     |> Enum.reject(&is_nil/1)
     |> Enum.join(" && ")
   end
 
+  defp cleanup_ephemeral_home(nil), do: :ok
+
+  defp cleanup_ephemeral_home(home_dir) when is_binary(home_dir) do
+    File.rm_rf(home_dir)
+    :ok
+  end
+
   defp remote_launch_command(workspace, dynamic_tool_binding, opts) when is_binary(workspace) do
+    unset_command =
+      if routed_profile?(opts) do
+        CredentialBoundary.routed_unset_shell_command(dynamic_tool_binding.secret_environment_names)
+      else
+        CredentialBoundary.unset_shell_command(dynamic_tool_binding.secret_environment_names)
+      end
+
     [
       "cd #{shell_escape(workspace)}",
-      CredentialBoundary.unset_shell_command(dynamic_tool_binding.secret_environment_names),
+      unset_command,
       "exec #{runtime_command(opts)}"
     ]
     |> Enum.reject(&is_nil/1)

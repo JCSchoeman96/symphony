@@ -1494,6 +1494,83 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  test "routed sandbox uses an ephemeral HOME so login profiles are not sourced" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-routed-home-#{System.unique_integer([:positive])}"
+      )
+
+    profile_marker_env = "SYMP_TEST_BASH_PROFILE_LOADED_#{System.unique_integer([:positive])}"
+    previous_home = System.get_env("HOME")
+    previous_trace = System.get_env("SYMP_TEST_CODEx_TRACE")
+
+    on_exit(fn ->
+      restore_env("HOME", previous_home)
+      restore_env("SYMP_TEST_CODEx_TRACE", previous_trace)
+    end)
+
+    try do
+      bash_home = Path.join(test_root, "bash-home")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex-routed-home.trace")
+
+      File.mkdir_p!(bash_home)
+
+      File.write!(Path.join(bash_home, ".bash_profile"), """
+      export #{profile_marker_env}=1
+      export LINEAR_API_KEY='profile-secret'
+      """)
+
+      System.put_env("HOME", bash_home)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="$SYMP_TEST_CODEx_TRACE"
+      printf 'PROFILE_LOADED:%s\\n' "$#{profile_marker_env}" >> "$trace_file"
+      printf 'HOME:%s\\n' "$HOME" >> "$trace_file"
+      count=0
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+
+        case "$count" in
+          1) printf '%s\\n' '{"id":1,"result":{}}' ;;
+          2) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-routed-home"}}}' ;;
+          *) sleep 3600 ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        agent_routing: "routed",
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      workspace_root = Config.settings!().workspace.root
+      workspace = Path.join(workspace_root, "MT-ROUTED-HOME")
+      File.mkdir_p!(workspace)
+
+      assert {:ok, session} =
+               AppServer.start_session(workspace,
+                 command: "#{codex_binary} app-server",
+                 sandbox: "read-only"
+               )
+
+      trace = File.read!(trace_file)
+      refute trace =~ "PROFILE_LOADED:1"
+      assert trace =~ "HOME:"
+      refute String.contains?(trace, bash_home)
+      assert trace =~ "symphony-routed-home"
+      assert :ok = AppServer.stop_session(session)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "app server launches over ssh for remote workers" do
     test_root =
       Path.join(

@@ -395,6 +395,26 @@ defmodule SymphonyElixir.Workspace do
   defp ignore_hook_failure({:error, _reason}), do: :ok
 
   defp run_hook(command, workspace, issue_context, hook_name, nil) do
+    if CredentialBoundary.routed_workspace_shell_hooks_disabled?() do
+      Logger.info("Skipping workspace hook in routed mode hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=local")
+
+      :ok
+    else
+      run_local_hook(command, workspace, issue_context, hook_name)
+    end
+  end
+
+  defp run_hook(command, workspace, issue_context, hook_name, worker_host) when is_binary(worker_host) do
+    if CredentialBoundary.routed_workspace_shell_hooks_disabled?() do
+      Logger.info("Skipping workspace hook in routed mode hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=#{worker_host}")
+
+      :ok
+    else
+      run_remote_hook(command, workspace, issue_context, hook_name, worker_host)
+    end
+  end
+
+  defp run_local_hook(command, workspace, issue_context, hook_name) do
     timeout_ms = Config.settings!().hooks.timeout_ms
 
     Logger.info("Running workspace hook hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=local")
@@ -423,7 +443,7 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  defp run_hook(command, workspace, issue_context, hook_name, worker_host) when is_binary(worker_host) do
+  defp run_remote_hook(command, workspace, issue_context, hook_name, worker_host) do
     timeout_ms = Config.settings!().hooks.timeout_ms
 
     Logger.info("Running workspace hook hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=#{worker_host}")
@@ -477,21 +497,9 @@ defmodule SymphonyElixir.Workspace do
   end
 
   defp hook_process_env do
-    if routed_workspace_hooks?() do
-      CredentialBoundary.hook_process_env(CredentialBoundary.configured_secret_environment_names())
-    else
-      nil
-    end
+    CredentialBoundary.hook_process_env(CredentialBoundary.configured_secret_environment_names())
   end
 
-  defp routed_workspace_hooks? do
-    case Config.settings() do
-      {:ok, %{agent: %{routing: "routed"}}} -> true
-      _ -> false
-    end
-  end
-
-  defp maybe_put_hook_env(opts, nil), do: opts
   defp maybe_put_hook_env(opts, hook_env), do: Keyword.put(opts, :env, hook_env)
 
   defp validate_workspace_path(workspace, nil) when is_binary(workspace) do
