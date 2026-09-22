@@ -4,9 +4,20 @@ defmodule SymphonyElixir.RuntimeAttemptTeardownTest do
   alias SymphonyElixir.AgentRuntime.Route
   alias SymphonyElixir.AgentRuntime.RuntimeAttempt
   alias SymphonyElixir.AgentRuntime.RuntimeAttempt.Identity
+  alias SymphonyElixir.Config
   alias SymphonyElixir.Orchestrator
   alias SymphonyElixir.Tracker.Issue
-  alias SymphonyElixir.WorkControl.{GuardClass, LifecycleAssessment, ProviderObservation, WorkItem}
+  alias SymphonyElixir.Workflow
+  alias SymphonyElixir.WorkflowStore
+
+  alias SymphonyElixir.WorkControl.{
+    GuardClass,
+    LifecycleAssessment,
+    ProviderObservation,
+    ProviderProjectContract,
+    WorkflowLifecycle,
+    WorkItem
+  }
 
   @issue_id "runtime-teardown-1"
   @lineage "lineage-teardown"
@@ -73,6 +84,50 @@ defmodule SymphonyElixir.RuntimeAttemptTeardownTest do
 
     observation = %{assessment.provider_observation | provider_state_name: display_name}
     %{assessment | provider_observation: observation}
+  end
+
+  defp plane_contract_config do
+    %{
+      schema_version: 1,
+      provider: :plane,
+      workspace_id: "workspace-1",
+      project_id: "project-1",
+      state_mappings:
+        Map.new(WorkflowLifecycle.states(), fn state ->
+          {state, %{state_id: "state-#{state}", name: WorkflowLifecycle.display(state)}}
+        end)
+    }
+  end
+
+  defp plane_done_issue(display_name) do
+    %Issue{
+      id: @issue_id,
+      identifier: "RT-1",
+      state: display_name,
+      url: "https://example.org/issues/rt-1",
+      workspace_id: "workspace-1",
+      project_id: "project-1",
+      provider_state_id: "state-done",
+      provider_state_group: :completed
+    }
+  end
+
+  defp configure_plane_routed_workflow! do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      agent_routing: "routed",
+      tracker_active_states: ["In Progress"],
+      tracker_terminal_states: ["Done", "Shipped", "Canceled", "Cancelled"],
+      provider_project_contract: plane_contract_config()
+    )
+
+    case WorkflowStore.force_reload() do
+      :ok -> :ok
+      {:error, reason} -> flunk("plane workflow reload failed: #{inspect(reason)}")
+    end
+
+    assert Config.settings!().agent.routing == "routed"
+    assert %ProviderProjectContract{} = Config.settings!().provider_project_contract
   end
 
   defp work_item_with_assessment(issue, assessment) do
@@ -326,6 +381,82 @@ defmodule SymphonyElixir.RuntimeAttemptTeardownTest do
     state = base_orchestrator_state(%{}, %{work_control: %{@issue_id => work_item}})
 
     assert Orchestrator.tracker_terminal_teardown_reason_for_test(issue, state) == :terminal_completed
+  end
+
+  test "reconcile refresh retains completion proof when only Plane display name changes" do
+    configure_plane_routed_workflow!()
+    contract = Config.settings!().provider_project_contract
+    proof = GuardClass.requirement(:mechanical_guard, :completion_proof_verified)
+    issue_done = plane_done_issue("Done")
+
+    assert {:ok, previous} =
+             WorkItem.from_issue(issue_done, %{
+               provider: :memory,
+               prior_validated_lifecycle_state: :merging,
+               evidence: [proof],
+               provider_project_contract: contract
+             })
+
+    assert LifecycleAssessment.completion_validated?(previous.lifecycle_assessment)
+
+    worker_pid = running_worker()
+    running_entry = base_running_entry(worker_pid, :running) |> Map.put(:issue, issue_done)
+
+    state =
+      base_orchestrator_state(%{@issue_id => running_entry}, %{
+        work_control: %{@issue_id => previous},
+        claimed: MapSet.new([@issue_id])
+      })
+
+    issue_shipped = %{issue_done | state: "Shipped"}
+
+    updated = Orchestrator.reconcile_issue_states_for_test([issue_shipped], state)
+
+    refute Process.alive?(worker_pid)
+    refute Map.has_key?(updated.running, @issue_id)
+
+    refreshed = updated.work_control[@issue_id]
+    assert refreshed.provider_observation.provider_state_name == "Shipped"
+    assert LifecycleAssessment.completion_validated?(refreshed.lifecycle_assessment)
+    assert Orchestrator.tracker_terminal_teardown_reason_for_test(issue_shipped, updated) == :terminal_completed
+  end
+
+  test "reconcile refresh drops completion proof when provider state UUID changes" do
+    configure_plane_routed_workflow!()
+    contract = Config.settings!().provider_project_contract
+    proof = GuardClass.requirement(:mechanical_guard, :completion_proof_verified)
+    issue_done = plane_done_issue("Done")
+
+    assert {:ok, previous} =
+             WorkItem.from_issue(issue_done, %{
+               provider: :memory,
+               prior_validated_lifecycle_state: :merging,
+               evidence: [proof],
+               provider_project_contract: contract
+             })
+
+    worker_pid = running_worker()
+    running_entry = base_running_entry(worker_pid, :running) |> Map.put(:issue, issue_done)
+
+    state =
+      base_orchestrator_state(%{@issue_id => running_entry}, %{
+        work_control: %{@issue_id => previous},
+        claimed: MapSet.new([@issue_id])
+      })
+
+    issue_in_progress =
+      %{
+        issue_done
+        | state: "In Progress",
+          provider_state_id: "state-in_progress",
+          provider_state_group: :started
+      }
+
+    updated = Orchestrator.refresh_work_control_for_test(state, [issue_in_progress])
+
+    refreshed = updated.work_control[@issue_id]
+    refute LifecycleAssessment.completion_validated?(refreshed.lifecycle_assessment)
+    assert refreshed.lifecycle_assessment.mapped_state == :in_progress
   end
 
   test "provider-observed done without completion-validated assessment maps to cancelled teardown" do

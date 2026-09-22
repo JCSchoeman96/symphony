@@ -129,6 +129,7 @@ defmodule SymphonyElixir.TestSupport do
         observability_render_interval_ms: 16,
         server_port: nil,
         server_host: nil,
+        provider_project_contract: nil,
         prompt: @workflow_prompt
       ]
       |> Keyword.merge(overrides)
@@ -170,6 +171,7 @@ defmodule SymphonyElixir.TestSupport do
     observability_render_interval_ms = Keyword.get(config, :observability_render_interval_ms)
     server_port = Keyword.get(config, :server_port)
     server_host = Keyword.get(config, :server_host)
+    provider_project_contract = Keyword.get(config, :provider_project_contract)
     prompt = Keyword.get(config, :prompt)
     symphony_project_id = Keyword.get(config, :symphony_project_id)
     source_control_kind = Keyword.get(config, :source_control_kind)
@@ -182,6 +184,7 @@ defmodule SymphonyElixir.TestSupport do
     sections =
       [
         "---",
+        provider_project_contract_yaml(provider_project_contract),
         "tracker:",
         "  kind: #{yaml_value(tracker_kind)}",
         "  endpoint: #{yaml_value(tracker_endpoint)}",
@@ -253,6 +256,12 @@ defmodule SymphonyElixir.TestSupport do
   end
 
   defp yaml_value(value), do: yaml_value(to_string(value))
+
+  defp provider_project_contract_yaml(nil), do: nil
+
+  defp provider_project_contract_yaml(contract) when is_map(contract) do
+    "provider_project_contract: #{yaml_value(contract)}"
+  end
 
   defp default_identity_override(path, overrides) do
     if Keyword.get(overrides, :tracker_kind, "linear") == "memory" and

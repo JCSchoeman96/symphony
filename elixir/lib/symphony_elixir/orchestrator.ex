@@ -1337,6 +1337,12 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @doc false
+  @spec refresh_work_control_for_test(State.t(), [Issue.t()]) :: State.t()
+  def refresh_work_control_for_test(%State{} = state, issues) when is_list(issues) do
+    refresh_work_control(state, issues)
+  end
+
+  @doc false
   @spec reconcile_blocked_issue_states_for_test([Issue.t()], term()) :: term()
   def reconcile_blocked_issue_states_for_test(issues, %State{} = state) when is_list(issues) do
     reconcile_blocked_issue_states(issues, state, active_state_set(), terminal_state_set())
@@ -2264,7 +2270,12 @@ defmodule SymphonyElixir.Orchestrator do
       observed_at: DateTime.utc_now(),
       prior_validated_lifecycle_state: prior_validated_state(previous),
       prior_authority_disposition: prior_authority_disposition(previous),
-      evidence: evidence_for_observation(issue, previous),
+      evidence:
+        evidence_for_observation(
+          issue,
+          previous,
+          Config.settings!().provider_project_contract
+        ),
       provider_project_contract: Config.settings!().provider_project_contract
     }
 
@@ -2312,7 +2323,22 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp prior_guard_evidence(_previous), do: []
 
-  defp evidence_for_observation(%Issue{state: state}, %WorkItem{} = previous) do
+  defp evidence_for_observation(%Issue{} = issue, %WorkItem{} = previous, %ProviderProjectContract{} = contract) do
+    with true <- stable_provider_state_identity?(issue, previous.provider_observation),
+         {:ok, mapped_state} <-
+           ProviderProjectContract.resolve_provider_state(
+             contract,
+             issue.provider_state_id,
+             issue.provider_state_group
+           ),
+         true <- mapped_state == previous.validated_lifecycle_state do
+      prior_guard_evidence(previous)
+    else
+      _ -> []
+    end
+  end
+
+  defp evidence_for_observation(%Issue{state: state}, %WorkItem{} = previous, _contract) do
     case WorkflowLifecycle.parse(state) do
       {:ok, canonical_state} when canonical_state == previous.validated_lifecycle_state ->
         prior_guard_evidence(previous)
@@ -2322,7 +2348,41 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp evidence_for_observation(_issue, _previous), do: []
+  defp evidence_for_observation(_issue, _previous, _contract), do: []
+
+  defp stable_provider_state_identity?(%Issue{} = issue, %ProviderObservation{} = prior_observation) do
+    present_string?(prior_observation.provider_state_id) and
+      present_string?(issue.provider_state_id) and
+      issue.provider_state_id == prior_observation.provider_state_id and
+      provider_state_groups_equivalent?(
+        issue.provider_state_group,
+        prior_observation.provider_state_group
+      )
+  end
+
+  defp stable_provider_state_identity?(_issue, _prior_observation), do: false
+
+  defp provider_state_groups_equivalent?(left, right) do
+    normalize_provider_state_group(left) == normalize_provider_state_group(right)
+  end
+
+  defp normalize_provider_state_group(group)
+       when group in [:backlog, :unstarted, :started, :completed, :cancelled],
+       do: group
+
+  defp normalize_provider_state_group(group) when is_binary(group) do
+    case String.downcase(String.trim(group)) do
+      "backlog" -> :backlog
+      "unstarted" -> :unstarted
+      "started" -> :started
+      "completed" -> :completed
+      "cancelled" -> :cancelled
+      "canceled" -> :cancelled
+      _ -> nil
+    end
+  end
+
+  defp normalize_provider_state_group(_group), do: nil
 
   defp attach_suspension_context(%WorkItem{} = work_item, %WorkItem{} = previous, _opts) do
     assessment = work_item.lifecycle_assessment
