@@ -1330,6 +1330,49 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @doc false
+  @spec schedule_agent_route_change_retry_for_test(State.t(), String.t(), map(), term()) :: State.t()
+  def schedule_agent_route_change_retry_for_test(%State{} = state, issue_id, running_entry, route_change)
+      when is_binary(issue_id) and is_map(running_entry) do
+    schedule_agent_route_change_retry(state, issue_id, running_entry, route_change)
+  end
+
+  @doc false
+  @spec schedule_poll_route_change_retry_for_test(State.t(), Issue.t(), map(), non_neg_integer(), term()) ::
+          State.t()
+  def schedule_poll_route_change_retry_for_test(
+        %State{} = state,
+        %Issue{} = issue,
+        running_entry,
+        next_attempt,
+        route_change
+      )
+      when is_map(running_entry) and is_integer(next_attempt) and next_attempt >= 0 do
+    schedule_poll_route_change_retry(state, issue, running_entry, next_attempt, route_change)
+  end
+
+  @doc false
+  @spec reconcile_blocked_ledger_for_test(State.t()) :: State.t()
+  def reconcile_blocked_ledger_for_test(%State{} = state) do
+    reconcile_blocked_ledger_without_dispatch(state)
+  end
+
+  defp reconcile_blocked_ledger_without_dispatch(%State{attempt_ledger: %AttemptLedger{} = ledger} = state) do
+    case resync_sync_failed_ledger(state, ledger) do
+      {:ok, state} -> finalize_reconciled_ledger_status(state, ledger)
+      {:blocked, state} -> state
+    end
+  end
+
+  defp reconcile_blocked_ledger_without_dispatch(%State{} = state), do: state
+
+  defp finalize_reconciled_ledger_status(%State{} = state, %AttemptLedger{} = ledger) do
+    case reconcile_attempt_ledger(state, ledger) do
+      {:ok, state} -> %{state | attempt_ledger_status: :ready}
+      {:blocked, state, reason} -> %{state | attempt_ledger_status: {:blocked, reason}}
+    end
+  end
+
+  @doc false
   @spec handle_normal_continuation_for_test(State.t(), String.t(), map()) :: State.t()
   def handle_normal_continuation_for_test(%State{} = state, issue_id, running_entry)
       when is_binary(issue_id) and is_map(running_entry) do
@@ -2143,6 +2186,17 @@ defmodule SymphonyElixir.Orchestrator do
         do_block_issue_from_entry(state, issue_id, running_entry, error, dependency)
 
       {:error, :invalid_runtime_attempt_transition} ->
+        block_issue_from_terminal_attempt(state, issue_id, running_entry, error, dependency)
+    end
+  end
+
+  defp block_issue_from_terminal_attempt(%State{} = state, issue_id, running_entry, error, dependency) do
+    case Map.get(running_entry, :runtime_attempt) do
+      %RuntimeAttempt{state: attempt_state}
+      when attempt_state in [:completed, :retry_queued, :blocked, :failed, :cancelled] ->
+        do_block_issue_from_entry(state, issue_id, running_entry, error, dependency)
+
+      _ ->
         state
     end
   end

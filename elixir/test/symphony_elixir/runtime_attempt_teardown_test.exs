@@ -1,11 +1,13 @@
 defmodule SymphonyElixir.RuntimeAttemptTeardownTest do
   use SymphonyElixir.TestSupport, async: true
 
+  alias SymphonyElixir.AgentRuntime.AttemptLedger
   alias SymphonyElixir.AgentRuntime.Route
   alias SymphonyElixir.AgentRuntime.RuntimeAttempt
   alias SymphonyElixir.AgentRuntime.RuntimeAttempt.Identity
   alias SymphonyElixir.Config
   alias SymphonyElixir.Orchestrator
+  alias SymphonyElixir.Tracker
   alias SymphonyElixir.Tracker.Issue
   alias SymphonyElixir.Workflow
   alias SymphonyElixir.WorkflowStore
@@ -50,6 +52,28 @@ defmodule SymphonyElixir.RuntimeAttemptTeardownTest do
         :done -> :ok
       end
     end)
+  end
+
+  defp temporary_ledger_root do
+    Path.join(
+      System.tmp_dir!(),
+      "symphony-attempt-ledger-#{System.unique_integer([:positive])}"
+    )
+  end
+
+  defp open_ledger_with_in_flight! do
+    project_id = "teardown-ledger-#{System.unique_integer([:positive])}"
+    root = temporary_ledger_root()
+    File.mkdir_p!(root)
+    path = AttemptLedger.path_for(project_id, root: root)
+
+    {:ok, ledger} =
+      AttemptLedger.open(project_id, Tracker.identity(Config.settings!().tracker), path: path)
+
+    assert {:ok, %{in_flight: true}} =
+             AttemptLedger.begin_attempt(ledger, @issue_id, route_fingerprint: "fp-teardown")
+
+    {ledger, path, project_id}
   end
 
   defp base_orchestrator_state(running, extra \\ %{}) do
@@ -529,6 +553,44 @@ defmodule SymphonyElixir.RuntimeAttemptTeardownTest do
     assert updated.running[@issue_id].runtime_attempt.state == :starting
   end
 
+  test "agent route change schedules retry when durable clear succeeds after RetryQueued" do
+    identity = sample_identity("route-clear-ok")
+    route_change = %{previous: %{profile_name: "implementation"}, next: %{profile_name: "review"}}
+
+    issue = %Issue{
+      id: @issue_id,
+      identifier: "RT-1",
+      state: "In Progress",
+      url: "https://example.org/issues/rt-1"
+    }
+
+    running_entry = %{
+      identifier: "RT-1",
+      issue: issue,
+      retry_attempt: 0,
+      runtime_attempt: RuntimeAttempt.new(identity, :retry_queued),
+      route: sample_route(),
+      route_change: route_change
+    }
+
+    {ledger, _path, _project_id} = open_ledger_with_in_flight!()
+
+    state = %Orchestrator.State{
+      attempt_ledger: ledger,
+      attempt_ledger_status: :ready,
+      running: %{@issue_id => running_entry},
+      claimed: MapSet.new([@issue_id])
+    }
+
+    updated =
+      Orchestrator.schedule_agent_route_change_retry_for_test(state, @issue_id, running_entry, route_change)
+
+    assert updated.running[@issue_id].runtime_attempt.state == :retry_queued
+    assert %{delay_type: :route_change} = updated.retry_attempts[@issue_id]
+    assert updated.attempt_ledger_status == :ready
+    refute Map.has_key?(updated.blocked, @issue_id)
+  end
+
   test "worker DOWN route change blocks when review-cycle policy rejects retry before RetryQueued" do
     identity = sample_identity("route-down")
 
@@ -601,6 +663,155 @@ defmodule SymphonyElixir.RuntimeAttemptTeardownTest do
     assert Map.has_key?(updated.blocked, @issue_id)
     refute Map.has_key?(updated.retry_attempts, @issue_id)
     assert updated.blocked[@issue_id].error =~ "attempt ledger unavailable"
+  end
+
+  test "agent route change blocks issue when durable clear fails after RetryQueued" do
+    identity = sample_identity("route-clear-fail")
+    route_change = %{previous: %{profile_name: "implementation"}, next: %{profile_name: "review"}}
+
+    issue = %Issue{
+      id: @issue_id,
+      identifier: "RT-1",
+      state: "In Progress",
+      url: "https://example.org/issues/rt-1"
+    }
+
+    running_entry = %{
+      identifier: "RT-1",
+      issue: issue,
+      retry_attempt: 0,
+      runtime_attempt: RuntimeAttempt.new(identity, :retry_queued),
+      route: sample_route(),
+      route_change: route_change
+    }
+
+    {ledger, _path, _project_id} = open_ledger_with_in_flight!()
+    :ok = :dets.insert(ledger.table, {{:current, @issue_id}, :corrupt})
+
+    state = %Orchestrator.State{
+      attempt_ledger: ledger,
+      attempt_ledger_status: :ready,
+      running: %{@issue_id => running_entry},
+      claimed: MapSet.new([@issue_id])
+    }
+
+    updated =
+      Orchestrator.schedule_agent_route_change_retry_for_test(state, @issue_id, running_entry, route_change)
+
+    refute Map.has_key?(updated.retry_attempts, @issue_id)
+    refute Map.has_key?(updated.running, @issue_id)
+    assert Map.has_key?(updated.blocked, @issue_id)
+    assert MapSet.member?(updated.claimed, @issue_id)
+    assert match?({:blocked, {:attempt_ledger_unavailable, _}}, updated.attempt_ledger_status)
+    assert updated.blocked[@issue_id].error =~ "attempt ledger unavailable"
+    assert RuntimeAttempt.terminal?(running_entry.runtime_attempt)
+  end
+
+  test "poll route change blocks issue when durable clear fails after RetryQueued" do
+    identity = sample_identity("poll-clear-fail")
+    route_change = %{previous: %{profile_name: "implementation"}, next: %{profile_name: "review"}}
+
+    issue = %Issue{
+      id: @issue_id,
+      identifier: "RT-1",
+      state: "In Progress",
+      url: "https://example.org/issues/rt-1"
+    }
+
+    running_entry = %{
+      identifier: "RT-1",
+      issue: issue,
+      retry_attempt: 0,
+      runtime_attempt: RuntimeAttempt.new(identity, :retry_queued),
+      route: sample_route()
+    }
+
+    {ledger, _path, _project_id} = open_ledger_with_in_flight!()
+    :ok = :dets.insert(ledger.table, {{:current, @issue_id}, :corrupt})
+
+    state = %Orchestrator.State{
+      attempt_ledger: ledger,
+      attempt_ledger_status: :ready,
+      claimed: MapSet.new([@issue_id])
+    }
+
+    updated =
+      Orchestrator.schedule_poll_route_change_retry_for_test(
+        state,
+        issue,
+        running_entry,
+        1,
+        route_change
+      )
+
+    refute Map.has_key?(updated.retry_attempts, @issue_id)
+    refute Map.has_key?(updated.running, @issue_id)
+    assert Map.has_key?(updated.blocked, @issue_id)
+    assert MapSet.member?(updated.claimed, @issue_id)
+    assert match?({:blocked, {:attempt_ledger_unavailable, _}}, updated.attempt_ledger_status)
+  end
+
+  test "route-change durable clear failure stays visible after ledger reconciliation" do
+    identity = sample_identity("route-recovery")
+    route_change = %{previous: %{profile_name: "implementation"}, next: %{profile_name: "review"}}
+
+    issue = %Issue{
+      id: @issue_id,
+      identifier: "RT-1",
+      state: "In Progress",
+      url: "https://example.org/issues/rt-1"
+    }
+
+    running_entry = %{
+      identifier: "RT-1",
+      issue: issue,
+      retry_attempt: 0,
+      runtime_attempt: RuntimeAttempt.new(identity, :retry_queued),
+      route: sample_route(),
+      route_change: route_change
+    }
+
+    {ledger, _path, project_id} = open_ledger_with_in_flight!()
+    :ok = :dets.insert(ledger.table, {{:current, @issue_id}, :corrupt})
+
+    blocked_state =
+      Orchestrator.schedule_agent_route_change_retry_for_test(
+        %Orchestrator.State{
+          attempt_ledger: ledger,
+          attempt_ledger_status: :ready,
+          running: %{@issue_id => running_entry},
+          claimed: MapSet.new([@issue_id])
+        },
+        @issue_id,
+        running_entry,
+        route_change
+      )
+
+    assert Map.has_key?(blocked_state.blocked, @issue_id)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      symphony_project_id: project_id,
+      tracker_active_states: ["In Progress"],
+      poll_interval_ms: 60_000
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+    :ok = :dets.delete(ledger.table, {:current, @issue_id})
+
+    assert {:ok, %{in_flight: true}} =
+             AttemptLedger.begin_attempt(ledger, @issue_id, route_fingerprint: "fp-teardown")
+
+    assert :ok = AttemptLedger.sync(ledger)
+
+    recovered = Orchestrator.reconcile_blocked_ledger_for_test(blocked_state)
+
+    assert recovered.attempt_ledger_status == :ready
+    assert Map.has_key?(recovered.blocked, @issue_id)
+    assert MapSet.member?(recovered.claimed, @issue_id)
+    refute Map.has_key?(recovered.running, @issue_id)
+    refute Map.has_key?(recovered.retry_attempts, @issue_id)
   end
 
   test "runtime unavailable teardown applies failed terminal transition before removal" do
