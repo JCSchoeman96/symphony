@@ -3677,7 +3677,7 @@ defmodule SymphonyElixir.Orchestrator do
          true <- String.trim(rearm_reason) != "",
          rearmed_by when is_binary(rearmed_by) <- Map.get(old, :rearmed_by),
          true <- String.trim(rearmed_by) != "",
-         rearmed_at when is_integer(rearmed_at) and rearmed_at > 0 <- Map.get(old, :rearmed_at) do
+         rearmed_at when is_integer(rearmed_at) and rearmed_at >= 0 <- Map.get(old, :rearmed_at) do
       %{
         explicitly_rearmed?: true,
         old_lineage: old_lineage,

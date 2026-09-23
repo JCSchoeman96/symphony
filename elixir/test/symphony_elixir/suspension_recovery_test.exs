@@ -9,6 +9,10 @@ defmodule SymphonyElixir.WorkControl.SuspensionRecoveryTest do
     assert SuspensionRecovery.classify_reason(:indeterminate) == :h040_reconciliation
     assert SuspensionRecovery.classify_reason(:dependency_data_incomplete) == :dependency_incomplete
     assert SuspensionRecovery.classify_reason(:dependency_cycle) == :dependency_cycle
+
+    assert SuspensionRecovery.classify_reason(%{reason: :provider_blocked, status: :resolving}) ==
+             :provider_blocked
+
     assert SuspensionRecovery.classify_reason(:candidate_moved) == :candidate_evidence
     assert SuspensionRecovery.classify_reason(:runtime_unavailable) == :runtime_unavailable
     assert SuspensionRecovery.classify_reason(:security_boundary_failed) == :security
@@ -197,6 +201,24 @@ defmodule SymphonyElixir.WorkControl.SuspensionRecoveryTest do
 
     assert decision.status == :suspended
     assert :lifecycle_assessment in decision.missing_facts
+  end
+
+  test "provider-blocked suspension requires explicit operator recovery" do
+    decision =
+      SuspensionRecovery.evaluate(
+        %{reason: :provider_blocked, status: :resolving},
+        %{
+          fresh_reconciliation: true,
+          resume_target: :ready,
+          trusted_resume_target?: true,
+          lifecycle_assessment_validated?: true
+        }
+      )
+
+    assert decision.reason_class == :provider_blocked
+    assert decision.status == :suspended
+    assert decision.action == :remain_suspended
+    assert decision.missing_facts == [:provider_blocked_operator_recovery]
   end
 
   test "runtime recovery requires health and discards the old runtime" do

@@ -8,6 +8,10 @@ defmodule SymphonyElixir.WorkControl.SuspensionRecovery do
   grants runtime authority. A decision with `status: :resolved` only says
   that the host may persist the resolution before releasing authority.
 
+  A provider-reported blocked lifecycle remains suspended until a separate
+  authorized operator recovery path exists. A fresh provider observation or a
+  validated lifecycle movement alone cannot resolve it.
+
   `fresh_reconciliation` must be exactly `true`. `resume_target` must be a
   canonical `WorkflowLifecycle` atom. Provider display names are not accepted
   as resume targets. The target is trusted because the caller supplies it from
@@ -22,6 +26,7 @@ defmodule SymphonyElixir.WorkControl.SuspensionRecovery do
           | :h040_reconciliation
           | :dependency_incomplete
           | :dependency_cycle
+          | :provider_blocked
           | :provider_lifecycle_unknown
           | :manual_lifecycle_movement
           | :candidate_evidence
@@ -115,6 +120,8 @@ defmodule SymphonyElixir.WorkControl.SuspensionRecovery do
     :candidate_state_changed
   ]
 
+  @provider_blocked_reasons [:provider_blocked]
+
   @candidate_evidence_reasons [
     :candidate_moved,
     :candidate_evidence_invalid,
@@ -157,6 +164,7 @@ defmodule SymphonyElixir.WorkControl.SuspensionRecovery do
                               {:provider_configuration, @provider_configuration_reasons},
                               {:h040_reconciliation, @h040_reconciliation_reasons},
                               {:dependency_incomplete, @dependency_incomplete_reasons},
+                              {:provider_blocked, @provider_blocked_reasons},
                               {:provider_lifecycle_unknown, @provider_lifecycle_unknown_reasons},
                               {:manual_lifecycle_movement, @manual_lifecycle_reasons},
                               {:candidate_evidence, @candidate_evidence_reasons},
@@ -203,6 +211,9 @@ defmodule SymphonyElixir.WorkControl.SuspensionRecovery do
     common_missing = common_missing_facts(facts)
 
     cond do
+      reason_class == :provider_blocked ->
+        suspend(decision, append_missing(common_missing, :provider_blocked_operator_recovery))
+
       reason_class in [:security, :durability] ->
         suspend(decision, common_missing)
 

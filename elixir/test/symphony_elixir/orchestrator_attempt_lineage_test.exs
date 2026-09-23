@@ -16,6 +16,7 @@ defmodule SymphonyElixir.OrchestratorAttemptLineageTest do
   alias SymphonyElixir.AgentRuntime.{Route, Router}
   alias SymphonyElixir.AgentRuntime.RuntimeAttempt.Identity, as: RuntimeAttemptIdentity
   alias SymphonyElixir.WorkControl.RecoveryLedger
+  alias SymphonyElixir.WorkControl.SuspensionRecovery
   alias SymphonyElixir.WorkControl.WorkItem
 
   test "restores consumed ordinary retry budget across orchestrator restart" do
@@ -117,7 +118,7 @@ defmodule SymphonyElixir.OrchestratorAttemptLineageTest do
     assert Map.has_key?(Map.get(state, :durable_exhausted, %{}), issue.id)
   end
 
-  test "a zero timestamp cannot prove an H-030 operator rearm" do
+  test "a zero timestamp proves a valid H-030 operator rearm" do
     project_id = "rearm-zero-#{System.unique_integer([:positive])}"
     issue_id = "rearm-zero-issue"
     ledger_root = temporary_ledger_root()
@@ -145,7 +146,19 @@ defmodule SymphonyElixir.OrchestratorAttemptLineageTest do
     assert {:ok, rearmed} = AttemptLedger.rearm(ledger, issue_id, "operator verified", "operator", 0)
 
     state = %Orchestrator.State{attempt_ledger: ledger, attempt_lineages: %{issue_id => rearmed.lineage_id}}
-    assert is_nil(Orchestrator.h030_rearm_proof_for_test(state, issue_id, exhausted.lineage_id))
+    proof = Orchestrator.h030_rearm_proof_for_test(state, issue_id, exhausted.lineage_id)
+
+    assert proof.explicitly_rearmed?
+    assert proof.old_lineage == exhausted.lineage_id
+    assert proof.replacement_lineage == rearmed.lineage_id
+    assert proof.rearmed_at == 0
+    assert proof.old_history_retained?
+
+    assert SuspensionRecovery.evaluate(:retry_exhausted, %{
+             fresh_reconciliation: true,
+             resume_target: :ready,
+             h030_rearm: proof
+           }).status == :resolved
   end
 
   test "a complete retained-history H-030 rearm proves a replacement lineage" do
