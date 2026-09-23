@@ -32,7 +32,7 @@ The original V4.1 ledger became stale after V4.1-000. The discrepancy is preserv
 | H-050D | ACCEPTED | [#17](https://github.com/JCSchoeman96/symphony/pull/17) | `d9167352a5a06d6627e1b7a149b21604711d48f7` | `99a7533c7128dd8e9f8b37b02b961ff53de4d66f` | [Reconciliation](GOVERNANCE_RECONCILIATION.md) | H-060A |
 | H-060A | ACCEPTED per supplied starting authority | [#18](https://github.com/JCSchoeman96/symphony/pull/18) | `d346a91395608242317be4a7375b1052f3000f52` | `baac1c1d0bcaaf9104dad3496015210341bd5a42` | [Reconciliation](GOVERNANCE_RECONCILIATION.md) | GOV-RECON-A; H-060B remains unauthorized |
 | GOV-RECON-A | ACCEPTED | #19 | `e113dda4a58c51df8f56159a9daad3f1854d9d3b` | `be9d1c348a6d2be7a8e9475a4a0a9e077f52a9d2` | [Reconciliation](GOVERNANCE_RECONCILIATION.md) | GOV-RECON-B closure only; H-060B remains unauthorized |
-| GOV-RECON-B | IN REVIEW (candidate) | Not assigned | Not accepted | Not accepted | [Reconciliation](GOVERNANCE_RECONCILIATION.md) | None from this candidate |
+| GOV-RECON-B | IN REVIEW (candidate) | [#20](https://github.com/JCSchoeman96/symphony/pull/20) | Not accepted | Not accepted | [Reconciliation](GOVERNANCE_RECONCILIATION.md) | None from this candidate |
 | H-060B | NOT AUTHORIZED | N/A | N/A | N/A | [Roadmap](V4_1_MASTER_ROADMAP.md) | Planning only after GOV-RECON-B is merged, post-merge verified, and explicitly Master-accepted |
 
 GOV-RECON-A is accepted. GOV-RECON-B is an in-review candidate and is not accepted. H-060B is not authorized for planning or implementation by this candidate.
