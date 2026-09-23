@@ -1,19 +1,23 @@
 # Governance reconciliation
 
-**Record:** GOV-RECON-A candidate<br>
-**Status:** IN REVIEW<br>
+**Record:** GOV-RECON-A closure / GOV-RECON-B candidate<br>
+**Status:** GOV-RECON-A ACCEPTED; GOV-RECON-B IN REVIEW<br>
 **Evidence checked:** 2026-09-23<br>
-**Scope:** V4.1-000 through H-060A
+**Scope:** V4.1-000 through GOV-RECON-A closure
 
 This record reconciles the governance history visible in the repository and GitHub. It does not claim that the earlier ledger was accurate when it was written. It does not create missing GitHub review objects or convert external review into a GitHub approval.
 
-GOV-RECON-A cannot record its own final candidate commit, merge commit, or post-merge acceptance in the same commit. GOV-RECON-B can append those facts after GOV-RECON-A has merged and passed post-merge acceptance.
+GOV-RECON-A could not record its own final candidate commit, merge commit, or post-merge acceptance in the same commit. GOV-RECON-B records GOV-RECON-A's verified closure facts. This GOV-RECON-B candidate cannot record its own future merge or acceptance.
 
-## Reconciliation baseline
+## GOV-RECON-A historical starting baseline
 
-The supplied accepted starting baseline is protected `main` at commit `d346a91395608242317be4a7375b1052f3000f52`, tree `baac1c1d0bcaaf9104dad3496015210341bd5a42`. A fresh GitHub query confirmed `origin/main` still points to that commit. PR #18 is the merge that produced it.
+GOV-RECON-A started from protected `main` at commit `d346a91395608242317be4a7375b1052f3000f52`, tree `baac1c1d0bcaaf9104dad3496015210341bd5a42`. PR #18 produced that baseline.
 
-The V4.1 roadmap remains unchanged at blob `4b0528bdc0647d889b42ebc478081d5b873898fe`. The accepted V3 evidence remains unchanged. At the starting commit, the V3 directory tree is `f6b51d53ca51818528f7ed6747ea1d7bc51bc8dd`; its H-010, H-020, and H-030 evidence blobs are `931bf13f96f3ee7899e803ed03c2b03e5f9a7e6f`, `f7750130b0a95cedce07ed2522cd5fdc7478475c`, and `92605628806ddd8fcb4404d466a43d8e68bdb868` respectively.
+## Current accepted baseline after GOV-RECON-A
+
+Protected `main` is at commit `e113dda4a58c51df8f56159a9daad3f1854d9d3b`, tree `be9d1c348a6d2be7a8e9475a4a0a9e077f52a9d2`. This is the accepted programme baseline for GOV-RECON-B. It is not the GOV-RECON-B candidate HEAD or tree.
+
+The V4.1 roadmap remains unchanged at blob `4b0528bdc0647d889b42ebc478081d5b873898fe`. The accepted V3 evidence remains unchanged. At GOV-RECON-A's starting commit, the V3 directory tree was `f6b51d53ca51818528f7ed6747ea1d7bc51bc8dd`; its H-010, H-020, and H-030 evidence blobs are `931bf13f96f3ee7899e803ed03c2b03e5f9a7e6f`, `f7750130b0a95cedce07ed2522cd5fdc7478475c`, and `92605628806ddd8fcb4404d466a43d8e68bdb868` respectively.
 
 ## Historical discrepancy
 
@@ -24,7 +28,7 @@ This record preserves that discrepancy. The old statements describe what the led
 ## Evidence classes and acceptance rules
 
 - **Repository-mechanical:** Git commit and tree objects, PR base and head, merge commit ancestry, check runs, and observed protected-branch configuration.
-- **Repository-review:** submitted GitHub reviews, review comments, or issue comments on the PR.
+- **Repository-review:** submitted GitHub reviews, inline review comments or threads, and PR or issue comments.
 - **External-governance:** an independent review or Master gate performed outside GitHub. The source must be identified. Do not label it a GitHub review.
 
 A missing record is `unavailable` in the sources checked. It does not prove that an external event did not happen. Candidate SHA, merge SHA, and resulting tree are separate facts. `MERGED` alone does not mean `ACCEPTED`; acceptance also needs post-merge verification and the applicable governance decision.
@@ -47,7 +51,7 @@ The authorized base in each row is the PR's `main` base SHA and its tree. The ca
 | H-050B / [#15](https://github.com/JCSchoeman96/symphony/pull/15) | `7ad57bc059dbcd7e49b813021e84a797bc71437a` / `3734f8ebeb65f900bbd0022bbfbc1f1805059c9b` | `4291343422c199ee5f47a99206a82b2c2205b6dc` / `a7dd2f13cdfa202c82c0c16786b4fa7546da28e8` | Two-parent merge commit: `5fb71b0c87f298454eb2b0fa52eb90a281c5c537` / `a7dd2f13cdfa202c82c0c16786b4fa7546da28e8` / parents `7ad57bc059dbcd7e49b813021e84a797bc71437a`, `4291343422c199ee5f47a99206a82b2c2205b6dc` | Candidate: `make-all` [106111645023](https://github.com/JCSchoeman96/symphony/actions/runs/35523539355/job/106111645023), `validate-pr-description` [106111729769](https://github.com/JCSchoeman96/symphony/actions/runs/35523568996/job/106111729769), both success. Merge: `make-all` [106144119477](https://github.com/JCSchoeman96/symphony/actions/runs/35535663798/job/106144119477), success. | GitHub: no submitted review, issue comment, or review comment. External governance: unavailable. | H-050C |
 | H-050C / [#16](https://github.com/JCSchoeman96/symphony/pull/16) | `5fb71b0c87f298454eb2b0fa52eb90a281c5c537` / `a7dd2f13cdfa202c82c0c16786b4fa7546da28e8` | `5bed264786e5303e6763f8a0d6c9e8fdf6d80da0` / `85d30175cc7190f96b2a1bb4063ff27ff9094cdb` | Squash-style, one parent: `8c9794a621805d248c39a74c5019e3b65d297840` / `85d30175cc7190f96b2a1bb4063ff27ff9094cdb` / parent `5fb71b0c87f298454eb2b0fa52eb90a281c5c537` | Candidate: `make-all` [106479155802](https://github.com/JCSchoeman96/symphony/actions/runs/35643774956/job/106479155802), `validate-pr-description` [106479156139](https://github.com/JCSchoeman96/symphony/actions/runs/35643774910/job/106479156139), both success. Merge: `make-all` [106498619631](https://github.com/JCSchoeman96/symphony/actions/runs/35649657338/job/106498619631), success. | GitHub: no submitted review, issue comment, or review comment. External governance: unavailable. | H-050D |
 | H-050D / [#17](https://github.com/JCSchoeman96/symphony/pull/17) | `8c9794a621805d248c39a74c5019e3b65d297840` / `85d30175cc7190f96b2a1bb4063ff27ff9094cdb` | `ec20fb838492e0a4671640dfa08156c99754e8eb` / `99a7533c7128dd8e9f8b37b02b961ff53de4d66f` | Two-parent merge commit: `d9167352a5a06d6627e1b7a149b21604711d48f7` / `99a7533c7128dd8e9f8b37b02b961ff53de4d66f` / parents `8c9794a621805d248c39a74c5019e3b65d297840`, `ec20fb838492e0a4671640dfa08156c99754e8eb` | Candidate: `make-all` [106667330588](https://github.com/JCSchoeman96/symphony/actions/runs/35703662750/job/106667330588), `validate-pr-description` [106667330201](https://github.com/JCSchoeman96/symphony/actions/runs/35703662667/job/106667330201), both success. Merge: `make-all` [106672849115](https://github.com/JCSchoeman96/symphony/actions/runs/35705361942/job/106672849115), success. | GitHub: no submitted review, issue comment, or review comment. External governance: unavailable. | H-060A |
-| H-060A / [#18](https://github.com/JCSchoeman96/symphony/pull/18) | `d9167352a5a06d6627e1b7a149b21604711d48f7` / `99a7533c7128dd8e9f8b37b02b961ff53de4d66f` | `a4d892215e2390340dbeb0cc263c3a8466016e45` / `baac1c1d0bcaaf9104dad3496015210341bd5a42` | Two-parent merge commit: `d346a91395608242317be4a7375b1052f3000f52` / `baac1c1d0bcaaf9104dad3496015210341bd5a42` / parents `d9167352a5a06d6627e1b7a149b21604711d48f7`, `a4d892215e2390340dbeb0cc263c3a8466016e45` | Candidate: `make-all` [106886175337](https://github.com/JCSchoeman96/symphony/actions/runs/35769158562/job/106886175337), `validate-pr-description` [106886176029](https://github.com/JCSchoeman96/symphony/actions/runs/35769158582/job/106886176029), both success. Merge: `make-all` [106912508887](https://github.com/JCSchoeman96/symphony/actions/runs/35776962438/job/106912508887), success. | GitHub: no submitted review, issue comment, or review comment. External governance: the supplied GOV-RECON planning brief reports an independent review; its source transcript and reviewer identity are unavailable here. | The current user request authorizes GOV-RECON-A implementation. It does not authorize H-060B, which remains blocked on GOV-RECON-B acceptance. |
+| H-060A / [#18](https://github.com/JCSchoeman96/symphony/pull/18) | `d9167352a5a06d6627e1b7a149b21604711d48f7` / `99a7533c7128dd8e9f8b37b02b961ff53de4d66f` | `a4d892215e2390340dbeb0cc263c3a8466016e45` / `baac1c1d0bcaaf9104dad3496015210341bd5a42` | Two-parent merge commit: `d346a91395608242317be4a7375b1052f3000f52` / `baac1c1d0bcaaf9104dad3496015210341bd5a42` / parents `d9167352a5a06d6627e1b7a149b21604711d48f7`, `a4d892215e2390340dbeb0cc263c3a8466016e45` | Candidate: `make-all` [106886175337](https://github.com/JCSchoeman96/symphony/actions/runs/35769158562/job/106886175337), `validate-pr-description` [106886176029](https://github.com/JCSchoeman96/symphony/actions/runs/35769158582/job/106886176029), both success. Merge: `make-all` [106912508887](https://github.com/JCSchoeman96/symphony/actions/runs/35776962438/job/106912508887), success. | GitHub: no submitted review, issue comment, or review comment. External governance: the supplied GOV-RECON planning brief reports an independent review; its source transcript and reviewer identity are unavailable here. | GOV-RECON-A was authorized for closure; H-060B remained unauthorized. |
 
 GitHub's REST pull-request object did not report a merge-method field. The labels above are inferred from the resulting commit's parent count, tree, PR commit count, and message. PRs #8-#14 and #16 each contain multiple PR commits, but their resulting commit has one parent equal to the PR base and a tree equal to the PR head tree. Its message matches the PR title. Those facts identify squash-style integration. PRs #15, #17, and #18 have two-parent merge commits whose first parent is the PR base and second parent is the candidate head.
 
@@ -55,7 +59,30 @@ GitHub's REST pull-request object did not report a merge-method field. The label
 
 GitHub contains zero submitted reviews, zero review comments, and zero issue comments for every PR from #8 through #18. For H-060A, the supplied planning brief says an external independent review occurred. The review artifact, reviewer identity, and transcript were not present in the repository or the GitHub PR. For V4.1-000 through H-050D, external-governance review evidence was unavailable in the sources checked. No row describes a GitHub approval.
 
-The supplied starting authority identifies H-060A as accepted. This reconciliation confirms the exact PR head, merge ancestry, tree, candidate CI, and post-merge `make-all` result. GitHub's records alone do not establish any external Master approval. Review provenance remains an explicit evidence gap for the earlier phases.
+The supplied starting authority identifies H-060A as accepted. This reconciliation confirms the exact PR head, merge ancestry, tree, candidate CI, and post-merge `make-all` result. GitHub's records alone do not establish external Master approval for earlier phases. GOV-RECON-A's external review and Master decisions are recorded separately below.
+
+## GOV-RECON-A closure evidence
+
+PR [#19](https://github.com/JCSchoeman96/symphony/pull/19) is closed and merged. Its repository-mechanical evidence is:
+
+| Item | Verified identity |
+|---|---|
+| Authorized base commit / tree | `d346a91395608242317be4a7375b1052f3000f52` / `baac1c1d0bcaaf9104dad3496015210341bd5a42` |
+| Reviewed candidate HEAD / tree | `e663020a4cd4cdc940d49b6d67e77c80d1b0d084` / `be9d1c348a6d2be7a8e9475a4a0a9e077f52a9d2` |
+| Synthetic merge / tree | `0c2516d9805593f3d3171f7af180624d8d684834` / `be9d1c348a6d2be7a8e9475a4a0a9e077f52a9d2` |
+| Synthetic merge parents, in order | `d346a91395608242317be4a7375b1052f3000f52`, `e663020a4cd4cdc940d49b6d67e77c80d1b0d084` |
+| Actual merge / tree | `e113dda4a58c51df8f56159a9daad3f1854d9d3b` / `be9d1c348a6d2be7a8e9475a4a0a9e077f52a9d2` |
+| Actual merge parents, in order | `d346a91395608242317be4a7375b1052f3000f52`, `e663020a4cd4cdc940d49b6d67e77c80d1b0d084` |
+
+The reviewed candidate SHA `e663020a4cd4cdc940d49b6d67e77c80d1b0d084` and the actual merge SHA `e113dda4a58c51df8f56159a9daad3f1854d9d3b` are distinct identities.
+
+The candidate required contexts `make-all` and `validate-pr-description` both succeeded. Protected `main` binds both contexts to GitHub Actions app ID `15368`. The `make-all` run [35832042358](https://github.com/JCSchoeman96/symphony/actions/runs/35832042358), job `107086672998`, and the `pr-description-lint` workflow run [35832042366](https://github.com/JCSchoeman96/symphony/actions/runs/35832042366), required job context `validate-pr-description`, job `107086672733`, both checked out the exact synthetic merge `0c2516d9805593f3d3171f7af180624d8d684834`.
+
+The post-merge `make-all` run [35834420271](https://github.com/JCSchoeman96/symphony/actions/runs/35834420271), job `107094351376`, succeeded on `push` to `main` and checked out the exact actual merge `e113dda4a58c51df8f56159a9daad3f1854d9d3b`. Its results were 1125 tests, 0 failures, 6 skipped, 90.19% coverage, formatting check passed, specs check passed, Credo found no issues across 5125 modules/functions, and Dialyzer reported 0 errors, 0 skipped, and 0 unnecessary skips.
+
+Repository-review queries for PR #19 found 0 submitted GitHub reviews, 0 review threads, and 0 PR or issue comments. This describes the GitHub record only. It does not negate the external-governance events supplied by the governing brief.
+
+External-governance provenance, supplied by the governing brief: a fresh independent reviewer approved the exact candidate `e663020a4cd4cdc940d49b6d67e77c80d1b0d084` for the Master gate; Master approved that same candidate for merge; a human performed the merge; and Master verified merged `main` and accepted GOV-RECON-A after post-merge verification. These decisions are not GitHub reviews, comments, or approvals, and no repository identity is assigned to them here.
 
 ## Runtime lineage clarification
 
@@ -73,17 +100,33 @@ These items remain future work. This reconciliation does not authorize their imp
 
 Do not reopen H-050C synthetic-merge behavior or change runtime naming here. Record dependency-security requirements for a later authorized phase; do not upgrade packages in GOV-RECON.
 
-## GOV-RECON-A state
+## Historical GOV-RECON-A candidate state
 
-At this local candidate stage:
+When PR #19 was the current candidate, its state was:
 
 ```text
 GOV-RECON-A = IN REVIEW
 H-060B = NOT AUTHORIZED
 ```
 
-PR #19 records this candidate. GitHub is the source of truth for its exact-head CI and submitted review status. `IN REVIEW` names the candidate state and does not claim that an independent review has already passed. After the PR merges and receives post-merge acceptance, GOV-RECON-B can append its exact candidate, merge, CI, review provenance, and accepted baseline. GOV-RECON-B may then authorize H-060B for planning. It does not authorize H-060B implementation.
+PR #19 recorded that candidate state. GOV-RECON-A later reached ACCEPTED after its merge, successful post-merge verification, and explicit Master acceptance, as documented above.
 
 ## Performance and scope
 
-This is documentation-only. Hot data, warm data, Redis, Postgres, PubSub, Oban, and runtime provider calls are not applicable. Evidence collection read the bounded PR sequence #8-#18 and the associated commit and check records. No production latency or concurrency behavior changes.
+This is documentation-only. Hot data, warm data, Redis, Postgres, PubSub, Oban, and runtime provider calls are not applicable. Evidence collection read the bounded PR sequence #8-#19 and the associated commit and check records. No production latency or concurrency behavior changes.
+
+## Current candidate state
+
+```text
+GOV-RECON-A = ACCEPTED
+GOV-RECON-B = IN REVIEW
+H-060B = NOT AUTHORIZED
+```
+
+GOV-RECON-B being open, reviewed, green, or merged does not by itself authorize H-060B. Only successful post-merge verification followed by explicit Master acceptance of GOV-RECON-B may permit a separate Master governance decision:
+
+```text
+H-060B = AUTHORIZED FOR PLANNING
+```
+
+This candidate does not make that decision and does not authorize H-060B implementation. `MERGED` is an intermediate mechanical state, not `ACCEPTED`.
