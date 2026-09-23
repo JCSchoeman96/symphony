@@ -141,6 +141,29 @@ defmodule SymphonyElixir.TransitionCoordinatorDefaultPathTest do
     assert {:ok, %{state: :provider_failed}} = TransitionCoordinator.request_transition(coordinator, intent())
   end
 
+  test "default contract refresh fails closed without a trusted provider snapshot" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory", symphony_project_id: "project-1")
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue("Ready", "state-ready")])
+
+    for transition_context <- [{:ok, context()}, {:ok, Map.delete(context(), :provider_project_contract)}] do
+      {:ok, orchestrator} =
+        SymphonyElixir.TransitionCoordinatorDefaultPathOrchestrator.start_link(transition_context: transition_context)
+
+      {:ok, coordinator} =
+        TransitionCoordinator.start_link(
+          name: nil,
+          ledger: nil,
+          orchestrator: orchestrator,
+          require_durable?: false
+        )
+
+      assert {:ok, %{state: :provider_failed}} = TransitionCoordinator.request_transition(coordinator, intent())
+
+      GenServer.stop(coordinator)
+      GenServer.stop(orchestrator)
+    end
+  end
+
   test "default verification classifies a proven non-submission against the source state" do
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory", symphony_project_id: "project-1")
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue("Ready", "state-ready")])

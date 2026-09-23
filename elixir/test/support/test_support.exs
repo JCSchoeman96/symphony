@@ -1,4 +1,10 @@
 defmodule SymphonyElixir.TestSupport do
+  alias SymphonyElixir.Config
+  alias SymphonyElixir.Tracker
+  alias SymphonyElixir.Tracker.Issue
+  alias SymphonyElixir.WorkControl.RecoveryLedger
+  alias SymphonyElixir.WorkControl.WorkflowLifecycle
+
   @workflow_prompt "You are an agent for this repository."
 
   defmacro __using__(_opts) do
@@ -22,7 +28,16 @@ defmodule SymphonyElixir.TestSupport do
       alias SymphonyElixir.Workspace
 
       import SymphonyElixir.TestSupport,
-        only: [write_workflow_file!: 1, write_workflow_file!: 2, restore_env: 2, stop_default_http_server: 0]
+        only: [
+          write_workflow_file!: 1,
+          write_workflow_file!: 2,
+          restore_env: 2,
+          seed_recovery_checkpoint!: 1,
+          seed_recovery_checkpoint!: 2,
+          seed_orchestrator_recovery_checkpoint!: 2,
+          seed_orchestrator_recovery_checkpoint!: 3,
+          stop_default_http_server: 0
+        ]
 
       setup do
         workflow_root =
@@ -71,6 +86,62 @@ defmodule SymphonyElixir.TestSupport do
 
   def restore_env(key, nil), do: System.delete_env(key)
   def restore_env(key, value), do: System.put_env(key, value)
+
+  def seed_recovery_checkpoint!(%Issue{} = issue, opts \\ []) when is_list(opts) do
+    config = Config.settings!()
+    {:ok, lifecycle_state} = WorkflowLifecycle.parse(Keyword.get(opts, :lifecycle_state, issue.state))
+    root = Path.join(Application.fetch_env!(:symphony_elixir, :attempt_ledger_root), "work-control-recovery")
+
+    {:ok, ledger} =
+      RecoveryLedger.open(
+        config.symphony.project_id,
+        Tracker.identity(config.tracker),
+        root: root
+      )
+
+    checkpoint = recovery_checkpoint(issue.id, lifecycle_state, Keyword.get(opts, :evidence, []))
+    :ok = RecoveryLedger.put_sync(ledger, checkpoint)
+    :ok = RecoveryLedger.close(ledger)
+    :ok
+  end
+
+  def seed_orchestrator_recovery_checkpoint!(orchestrator, %Issue{} = issue, opts \\ [])
+      when is_pid(orchestrator) and is_list(opts) do
+    state = :sys.get_state(orchestrator)
+    {:ok, lifecycle_state} = WorkflowLifecycle.parse(Keyword.get(opts, :lifecycle_state, issue.state))
+    checkpoint = recovery_checkpoint(issue.id, lifecycle_state, Keyword.get(opts, :evidence, []))
+
+    case RecoveryLedger.put_sync(state.recovery_ledger, checkpoint) do
+      :ok ->
+        :sys.replace_state(orchestrator, fn current ->
+          %{current | recovery_checkpoints: Map.put(current.recovery_checkpoints, issue.id, checkpoint)}
+        end)
+
+        :ok
+
+      {:error, reason} ->
+        raise "unable to seed recovery checkpoint: #{inspect(reason)}"
+    end
+  end
+
+  defp recovery_checkpoint(work_item_id, lifecycle_state, evidence) do
+    %{
+      schema_version: RecoveryLedger.schema_version(),
+      project_namespace: Config.settings!().symphony.project_id,
+      work_item_id: work_item_id,
+      last_validated_lifecycle_state: lifecycle_state,
+      durable_guard_evidence: durable_mechanical_evidence(evidence),
+      active_suspension_context: nil,
+      last_terminal_suspension_context: nil,
+      updated_at: DateTime.utc_now()
+    }
+  end
+
+  defp durable_mechanical_evidence(evidence) do
+    evidence
+    |> Enum.filter(&match?(%{class: :mechanical_guard}, &1))
+    |> Enum.map(&Map.take(&1, [:class, :name, :outcome]))
+  end
 
   def stop_default_http_server do
     case Enum.find(Supervisor.which_children(SymphonyElixir.Supervisor), fn

@@ -68,11 +68,29 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
     {:ok, intent} = SemanticTransitionIntent.new(intent_attrs())
     unavailable_server = String.to_atom("missing-transition-coordinator-#{System.unique_integer([:positive])}")
 
+    assert {:error, :invalid_request_options} =
+             TransitionCoordinator.request_transition(unavailable_server, intent, :invalid_options)
+
     assert {:error, :coordinator_unavailable} =
              TransitionCoordinator.request_transition(unavailable_server, intent)
 
     assert {:error, :coordinator_unavailable} =
              TransitionCoordinator.request_transition(unavailable_server, intent)
+
+    assert {:error, :coordinator_unavailable} =
+             TransitionCoordinator.list_reconciliation_candidates(unavailable_server)
+
+    assert {:error, :coordinator_unavailable} =
+             TransitionCoordinator.sync_reconciliation_ledger(unavailable_server)
+
+    assert {:error, :coordinator_unavailable} =
+             TransitionCoordinator.reconciliation_marker_for_work_item(unavailable_server, "work-1")
+
+    assert {:error, :coordinator_unavailable} =
+             TransitionCoordinator.reconcile_candidate(unavailable_server, %{}, :verified, "evidence")
+
+    assert {:error, :invalid_work_item_id} =
+             TransitionCoordinator.reconciliation_marker_for_work_item(unavailable_server, nil)
 
     {:ok, coordinator} =
       TransitionCoordinator.start_link(
@@ -85,6 +103,17 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
     :sys.replace_state(coordinator, fn state ->
       %{state | active_work_items: MapSet.put(state.active_work_items, intent.work_item_id)}
     end)
+
+    assert {:error, :transitions_disabled} =
+             TransitionCoordinator.reconciliation_marker_for_work_item(coordinator, intent.work_item_id)
+
+    assert {:error, :transitions_disabled} = TransitionCoordinator.sync_reconciliation_ledger(coordinator)
+
+    assert {:error, :transitions_disabled} =
+             TransitionCoordinator.reconcile_candidate(coordinator, %{}, :verified, "evidence")
+
+    assert {:error, {:reconciliation_marker, :invalid_marker_attributes}} =
+             TransitionCoordinator.reconcile_candidate(coordinator, %{}, %{})
 
     assert {:error, :transition_in_progress} = TransitionCoordinator.request_transition(coordinator, intent)
     GenServer.stop(coordinator)
@@ -131,6 +160,48 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
     assert {:error, :transitions_disabled} = TransitionCoordinator.request_transition(coordinator, intent)
 
     refute_received :submitted
+  end
+
+  test "keeps transitions disabled when a persisted reconciliation marker is malformed" do
+    root = Path.join(System.tmp_dir!(), "symphony-transition-marker-corrupt-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(root)
+    path = Path.join(root, "attempts.dets")
+    on_exit(fn -> File.rm_rf(root) end)
+
+    identity = %{tracker_kind: "plane", provider_scope: %{project_id: "project-a"}}
+    {:ok, ledger} = TransitionAttemptLedger.open("project-a", identity, path: path)
+    {:ok, intent} = SemanticTransitionIntent.new(intent_attrs())
+    candidate = prepared_attempt(intent)
+    assert :ok = TransitionAttemptLedger.put_sync(ledger, candidate)
+
+    malformed = %{
+      schema_version: 1,
+      marker_type: :transition_reconciliation,
+      project_namespace: "project-a",
+      attempt_id: candidate.attempt_id,
+      work_item_id: "other-work",
+      outcome: :verified,
+      evidence_identity: "provider-observation-1",
+      reconciled_at: ~U[2026-09-23 10:00:00Z]
+    }
+
+    assert :ok = :dets.insert(ledger.table, {{:reconciliation, candidate.attempt_id}, malformed})
+    assert :ok = :dets.sync(ledger.table)
+    assert :ok = TransitionAttemptLedger.close(ledger)
+
+    {:ok, coordinator} =
+      TransitionCoordinator.start_link(
+        name: nil,
+        project_id: "project-a",
+        tracker_identity: identity,
+        ledger_opts: [path: path],
+        load_context: fn _intent -> {:ok, context()} end
+      )
+
+    state = :sys.get_state(coordinator)
+    assert state.transition_disabled?
+    assert {:error, :transitions_disabled} = TransitionCoordinator.list_reconciliation_candidates(coordinator)
+    GenServer.stop(coordinator)
   end
 
   test "rejects an unauthorized responsibility before loading provider context" do
@@ -365,6 +436,94 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
 
     assert {:error, :transition_fenced} = TransitionCoordinator.request_transition(coordinator, intent)
     assert Agent.get(submissions, & &1) == 0
+  end
+
+  test "reconciles one candidate durably and releases only its work-item fence" do
+    root = Path.join(System.tmp_dir!(), "symphony-transition-reconcile-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(root)
+    path = Path.join(root, "attempts.dets")
+    on_exit(fn -> File.rm_rf(root) end)
+
+    identity = %{tracker_kind: "plane", provider_scope: %{project_id: "project-a"}}
+    {:ok, ledger} = TransitionAttemptLedger.open("project-a", identity, path: path)
+    {:ok, intent} = SemanticTransitionIntent.new(intent_attrs())
+    candidate = prepared_attempt(intent)
+    assert :ok = TransitionAttemptLedger.put_sync(ledger, candidate)
+    assert :ok = TransitionAttemptLedger.close(ledger)
+
+    {:ok, coordinator} =
+      TransitionCoordinator.start_link(
+        name: nil,
+        project_id: "project-a",
+        tracker_identity: identity,
+        ledger_opts: [path: path],
+        load_context: fn _intent -> {:ok, context()} end,
+        submit: fn _attempt, _context -> send(self(), :submitted) end,
+        verify: fn _attempt, _context -> {:verified, verified_context()} end
+      )
+
+    assert {:ok, [listed]} = TransitionCoordinator.list_reconciliation_candidates(coordinator)
+    assert listed.attempt_id == candidate.attempt_id
+
+    assert {:ok, marker} =
+             TransitionCoordinator.reconcile_candidate(
+               coordinator,
+               listed,
+               :verified,
+               "provider-observation-1",
+               ~U[2026-09-23 10:00:00Z]
+             )
+
+    assert marker.work_item_id == intent.work_item_id
+    state = :sys.get_state(coordinator)
+    refute MapSet.member?(state.fenced_work_items, intent.work_item_id)
+    assert {:ok, []} = TransitionCoordinator.list_reconciliation_candidates(coordinator)
+    refute_received :submitted
+    GenServer.stop(coordinator)
+  end
+
+  test "keeps a work-item fenced while another unresolved candidate remains" do
+    root = Path.join(System.tmp_dir!(), "symphony-transition-reconcile-many-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(root)
+    path = Path.join(root, "attempts.dets")
+    on_exit(fn -> File.rm_rf(root) end)
+
+    identity = %{tracker_kind: "plane", provider_scope: %{project_id: "project-a"}}
+    {:ok, ledger} = TransitionAttemptLedger.open("project-a", identity, path: path)
+    {:ok, intent} = SemanticTransitionIntent.new(intent_attrs())
+    first = prepared_attempt(intent)
+    second = prepared_attempt(intent)
+    assert first.attempt_id != second.attempt_id
+    assert :ok = TransitionAttemptLedger.put_sync(ledger, first)
+    assert :ok = TransitionAttemptLedger.put_sync(ledger, second)
+    assert :ok = TransitionAttemptLedger.close(ledger)
+
+    {:ok, coordinator} =
+      TransitionCoordinator.start_link(
+        name: nil,
+        project_id: "project-a",
+        tracker_identity: identity,
+        ledger_opts: [path: path],
+        load_context: fn _intent -> {:ok, context()} end
+      )
+
+    assert {:ok, candidates} = TransitionCoordinator.list_reconciliation_candidates(coordinator)
+    assert Enum.map(candidates, & &1.attempt_id) |> Enum.sort() == Enum.sort([first.attempt_id, second.attempt_id])
+
+    assert {:ok, _marker} =
+             TransitionCoordinator.reconcile_candidate(
+               coordinator,
+               first,
+               :verified,
+               "provider-observation-1",
+               ~U[2026-09-23 10:00:00Z]
+             )
+
+    state = :sys.get_state(coordinator)
+    assert MapSet.member?(state.fenced_work_items, intent.work_item_id)
+    assert {:ok, [remaining]} = TransitionCoordinator.list_reconciliation_candidates(coordinator)
+    assert remaining.attempt_id == second.attempt_id
+    GenServer.stop(coordinator)
   end
 
   test "rejects a concurrent request before the first provider call completes" do
@@ -1055,6 +1214,25 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
       dependency_decision: %{allowed?: true, dependency_completeness: :complete, dependency_status: :none},
       dependency_epoch_evidence: %{complete?: true}
     }
+  end
+
+  defp prepared_attempt(intent) do
+    {:ok, attempt} = TransitionAttempt.new(Map.from_struct(intent))
+    {:ok, attempt} = TransitionAttempt.authorize_intent(attempt, intent)
+    {:ok, attempt} = TransitionAttempt.fresh_context_loaded(attempt, context())
+
+    prepare_context =
+      context()
+      |> Map.merge(%{
+        workspace_id: "workspace-1",
+        project_id: "project-1",
+        target_provider_state_id: "state-in-progress",
+        target_provider_state_group: :started,
+        provider_contract_fingerprint: ProviderProjectContract.fingerprint(contract())
+      })
+
+    {:ok, attempt} = TransitionAttempt.prepare(attempt, prepare_context)
+    attempt
   end
 
   defp contract do

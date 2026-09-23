@@ -83,6 +83,59 @@ defmodule SymphonyElixir.WorkControlWorkItemTest do
     refute WorkItem.authority_available?(suspended)
   end
 
+  test "a validated provider observation does not clear a suspended disposition" do
+    {:ok, first} =
+      WorkItem.from_issue(issue("Ready"), %{
+        provider: :memory,
+        observed_at: @now,
+        prior_validated_lifecycle_state: :ready
+      })
+
+    {:ok, suspended_disposition} =
+      AuthorityDisposition.suspend(first.authority_disposition, :provider_configuration_drift)
+
+    assert {:ok, still_suspended} =
+             WorkItem.from_issue(issue("Ready"), %{
+               provider: :memory,
+               observed_at: @now,
+               prior_validated_lifecycle_state: :ready,
+               prior_authority_disposition: suspended_disposition
+             })
+
+    assert still_suspended.lifecycle_assessment.status == :validated
+    assert still_suspended.authority_disposition.status == :suspended
+    assert still_suspended.authority_disposition.reason == :provider_configuration_drift
+    refute WorkItem.dispatchable?(still_suspended)
+  end
+
+  test "suspension lineage generation accepts only opaque non-empty tokens" do
+    {:ok, observation} =
+      ProviderObservation.new(%{
+        provider: :memory,
+        work_item_id: "issue-1",
+        provider_state_name: "Ready",
+        observed_at: @now
+      })
+
+    attrs = %{
+      work_item_id: "issue-1",
+      last_validated_lifecycle_state: :ready,
+      provider_observation: observation,
+      reason: :provider_configuration_drift,
+      lineage_generation: "lineage-opaque-1",
+      created_at: @now,
+      recovery_policy: :fresh_reconciliation,
+      required_evidence: [],
+      resume_target: :ready,
+      status: :open
+    }
+
+    assert {:ok, context} = SuspensionContext.new(attrs)
+    assert context.lineage_generation == "lineage-opaque-1"
+    assert {:error, :invalid_lineage_generation} = SuspensionContext.new(%{attrs | lineage_generation: 1})
+    assert {:error, :invalid_lineage_generation} = SuspensionContext.new(%{attrs | lineage_generation: "  "})
+  end
+
   test "canonical suspension rejects invalid reasons and unavailable authority" do
     assert {:ok, work_item} =
              WorkItem.from_issue(issue("Ready"), %{

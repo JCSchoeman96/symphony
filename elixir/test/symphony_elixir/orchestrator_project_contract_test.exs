@@ -43,6 +43,21 @@ defmodule SymphonyElixir.OrchestratorProjectContractTest do
     refute Orchestrator.autonomous_dispatch_allowed_for_test?(drifted)
   end
 
+  test "startup stays fenced after a valid provider contract until recovery reconciliation finishes" do
+    contract = contract!()
+
+    state = %Orchestrator.State{
+      attempt_ledger_status: :disabled,
+      startup_reconciliation: :pending,
+      project_contract_evidence: ProjectContractEvidence.new(contract)
+    }
+
+    reconciled = Orchestrator.reconcile_project_contract_for_test(state, snapshot())
+
+    assert reconciled.project_contract_evidence.validation.status == :valid
+    refute Orchestrator.autonomous_dispatch_allowed_for_test?(reconciled)
+  end
+
   test "contract drift suspends existing WorkItems through canonical P-010 authority" do
     contract = contract!()
     issue = %Issue{id: "issue-1", identifier: "SYM-1", title: "Contract guard", state: "Ready"}
@@ -92,7 +107,8 @@ defmodule SymphonyElixir.OrchestratorProjectContractTest do
 
     assert recovered.project_contract_evidence.validation.status == :valid
     refute ProjectContractEvidence.reconciliation_required?(recovered.project_contract_evidence)
-    assert Orchestrator.autonomous_dispatch_allowed_for_test?(recovered)
+    assert recovered.startup_reconciliation == :pending
+    refute Orchestrator.autonomous_dispatch_allowed_for_test?(recovered)
   end
 
   test "provider snapshot transport failure reuses the canonical incomplete-contract fence" do

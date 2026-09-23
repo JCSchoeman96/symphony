@@ -241,6 +241,7 @@ defmodule SymphonyElixir.AgentRouterOrchestratorTest do
     )
 
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+    seed_recovery_checkpoint!(issue)
 
     orchestrator_name =
       Module.concat(__MODULE__, "Orchestrator#{System.unique_integer([:positive])}")
@@ -249,6 +250,7 @@ defmodule SymphonyElixir.AgentRouterOrchestratorTest do
       Orchestrator.start_link(
         name: orchestrator_name,
         agent_runner: SymphonyElixir.AgentRouterOrchestratorRunnerFake,
+        start_quiesced: true,
         work_control: %{issue.id => trusted_work_item(issue)}
       )
 
@@ -259,7 +261,16 @@ defmodule SymphonyElixir.AgentRouterOrchestratorTest do
         do: Process.unregister(:symphony_agent_router_capture)
     end)
 
+    pending_state = :sys.get_state(pid)
+    assert pending_state.startup_reconciliation == :pending
+    assert Map.has_key?(pending_state.recovery_checkpoints, issue.id)
+    refute Orchestrator.autonomous_dispatch_allowed_for_test?(pending_state)
+    refute_receive {:fake_agent_run, ^issue, _opts}, 50
+
+    send(pid, :tick)
+
     assert_receive {:fake_agent_run, ^issue, opts}, 1_000
+    assert :sys.get_state(pid).startup_reconciliation == :ready
     assert opts[:route].profile_name == "planner"
     assert opts[:route].runtime_name == "codex"
     assert opts[:route].responsibility == "planning"
@@ -347,6 +358,8 @@ defmodule SymphonyElixir.AgentRouterOrchestratorTest do
     }
 
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [planning_issue, ready_issue, blocker_issue])
+    seed_recovery_checkpoint!(planning_issue)
+    seed_recovery_checkpoint!(blocker_issue)
 
     orchestrator_name =
       Module.concat(__MODULE__, "Orchestrator#{System.unique_integer([:positive])}")
@@ -644,6 +657,7 @@ defmodule SymphonyElixir.AgentRouterOrchestratorTest do
     )
 
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+    seed_recovery_checkpoint!(issue)
 
     orchestrator_name =
       Module.concat(__MODULE__, "PollDependencyOrchestrator#{System.unique_integer([:positive])}")
@@ -715,6 +729,7 @@ defmodule SymphonyElixir.AgentRouterOrchestratorTest do
     )
 
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+    seed_recovery_checkpoint!(issue)
 
     orchestrator_name =
       Module.concat(__MODULE__, "PollRouteOrchestrator#{System.unique_integer([:positive])}")

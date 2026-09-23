@@ -117,6 +117,65 @@ defmodule SymphonyElixir.TransitionCoordinator do
 
   def request_transition(_server, _intent, _opts), do: {:error, :invalid_request_options}
 
+  @spec list_reconciliation_candidates(GenServer.server()) :: term()
+  def list_reconciliation_candidates(server) do
+    GenServer.call(server, :list_reconciliation_candidates, :infinity)
+  catch
+    :exit, _reason -> {:error, :coordinator_unavailable}
+  end
+
+  @spec sync_reconciliation_ledger(GenServer.server()) :: :ok | {:error, term()}
+  def sync_reconciliation_ledger(server) do
+    GenServer.call(server, :sync_reconciliation_ledger, :infinity)
+  catch
+    :exit, _reason -> {:error, :coordinator_unavailable}
+  end
+
+  @spec reconciliation_marker_for_work_item(GenServer.server(), String.t()) :: {:ok, map()} | :not_found | {:error, term()}
+  def reconciliation_marker_for_work_item(server, work_item_id) when is_binary(work_item_id) do
+    GenServer.call(server, {:reconciliation_marker_for_work_item, work_item_id}, :infinity)
+  catch
+    :exit, _reason -> {:error, :coordinator_unavailable}
+  end
+
+  def reconciliation_marker_for_work_item(_server, _work_item_id), do: {:error, :invalid_work_item_id}
+
+  @spec reconcile_candidate(GenServer.server(), term(), atom(), term()) ::
+          {:ok, map()} | {:error, term()}
+  def reconcile_candidate(server, candidate, outcome, evidence_identity) do
+    reconcile_candidate(server, candidate, outcome, evidence_identity, DateTime.utc_now())
+  end
+
+  @spec reconcile_candidate(GenServer.server(), term(), map()) :: {:ok, map()} | {:error, term()}
+  def reconcile_candidate(server, candidate, attrs) when is_map(attrs) do
+    if Enum.sort(Map.keys(attrs)) == Enum.sort([:outcome, :evidence_identity, :reconciled_at]) do
+      reconcile_candidate(
+        server,
+        candidate,
+        Map.fetch!(attrs, :outcome),
+        Map.fetch!(attrs, :evidence_identity),
+        Map.fetch!(attrs, :reconciled_at)
+      )
+    else
+      {:error, {:reconciliation_marker, :invalid_marker_attributes}}
+    end
+  end
+
+  def reconcile_candidate(_server, _candidate, _attrs),
+    do: {:error, {:reconciliation_marker, :invalid_marker_attributes}}
+
+  @spec reconcile_candidate(GenServer.server(), term(), atom(), term(), DateTime.t() | non_neg_integer()) ::
+          {:ok, map()} | {:error, term()}
+  def reconcile_candidate(server, candidate, outcome, evidence_identity, reconciled_at) do
+    GenServer.call(
+      server,
+      {:reconcile_candidate, candidate, outcome, evidence_identity, reconciled_at},
+      :infinity
+    )
+  catch
+    :exit, _reason -> {:error, :coordinator_unavailable}
+  end
+
   defp call_transition(server, intent, opts) do
     GenServer.call(server, {:request_transition, intent, opts}, :infinity)
   catch
@@ -189,6 +248,29 @@ defmodule SymphonyElixir.TransitionCoordinator do
   def terminate(_reason, %State{ledger: ledger}), do: TransitionAttemptLedger.close(ledger)
 
   @impl true
+  def handle_call(:list_reconciliation_candidates, _from, %State{} = state) do
+    {:reply, list_candidates(state), state}
+  end
+
+  def handle_call(:sync_reconciliation_ledger, _from, %State{} = state) do
+    {:reply, sync_ledger_for_coordinator(state), state}
+  end
+
+  def handle_call({:reconciliation_marker_for_work_item, work_item_id}, _from, %State{} = state) do
+    {:reply, marker_for_work_item(state, work_item_id), state}
+  end
+
+  @impl true
+  def handle_call(
+        {:reconcile_candidate, candidate, outcome, evidence_identity, reconciled_at},
+        _from,
+        %State{} = state
+      ) do
+    {reply, next_state} = reconcile_candidate_request(state, candidate, outcome, evidence_identity, reconciled_at)
+    {:reply, reply, next_state}
+  end
+
+  @impl true
   def handle_call({:request_transition, raw_intent, opts}, _from, %State{} = state) do
     case normalize_intent(raw_intent) do
       {:ok, intent} -> execute_if_claimed(state, intent, opts)
@@ -218,6 +300,59 @@ defmodule SymphonyElixir.TransitionCoordinator do
         state = %{state | active_work_items: MapSet.put(state.active_work_items, work_item_id)}
         {reply, state} = execute(state, intent, route)
         {:reply, reply, %{state | active_work_items: MapSet.delete(state.active_work_items, work_item_id)}}
+    end
+  end
+
+  defp list_candidates(%State{ledger: nil}), do: {:error, :transitions_disabled}
+
+  defp list_candidates(%State{ledger: ledger}) do
+    TransitionAttemptLedger.list_reconciliation_candidates(ledger)
+  end
+
+  defp sync_ledger_for_coordinator(%State{ledger: nil}), do: {:error, :transitions_disabled}
+
+  defp sync_ledger_for_coordinator(%State{ledger: ledger}) do
+    TransitionAttemptLedger.sync(ledger)
+  end
+
+  defp marker_for_work_item(%State{ledger: nil}, _work_item_id), do: {:error, :transitions_disabled}
+
+  defp marker_for_work_item(%State{ledger: ledger}, work_item_id) do
+    TransitionAttemptLedger.reconciliation_marker_for_work_item(ledger, work_item_id)
+  end
+
+  defp reconcile_candidate_request(%State{ledger: nil} = state, _candidate, _outcome, _evidence_identity, _reconciled_at),
+    do: {{:error, :transitions_disabled}, state}
+
+  defp reconcile_candidate_request(
+         %State{ledger: ledger} = state,
+         candidate,
+         outcome,
+         evidence_identity,
+         reconciled_at
+       ) do
+    with {:ok, marker} <-
+           TransitionAttemptLedger.reconcile_candidate(
+             ledger,
+             candidate,
+             outcome,
+             evidence_identity,
+             reconciled_at
+           ),
+         {:ok, candidates} <- TransitionAttemptLedger.list_reconciliation_candidates(ledger) do
+      unresolved? =
+        Enum.any?(candidates, fn unresolved ->
+          Map.get(unresolved, :work_item_id) == marker.work_item_id
+        end)
+
+      if unresolved? do
+        {{:ok, marker}, state}
+      else
+        next_state = %{state | fenced_work_items: MapSet.delete(state.fenced_work_items, marker.work_item_id)}
+        {{:ok, marker}, next_state}
+      end
+    else
+      {:error, reason} -> {{:error, reason}, state}
     end
   end
 

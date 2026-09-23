@@ -276,6 +276,7 @@ defmodule SymphonyElixir.AgentRouterDependencyProofTest do
 
     issues = dag_issues()
     Application.put_env(:symphony_elixir, :memory_tracker_issues, issues)
+    Enum.each(issues, &seed_recovery_checkpoint!/1)
 
     orchestrator_name =
       Module.concat(__MODULE__, "DagOrchestrator#{System.unique_integer([:positive])}")
@@ -520,6 +521,15 @@ defmodule SymphonyElixir.AgentRouterDependencyProofTest do
       issues
       |> Enum.filter(&(&1.state == "Done"))
       |> Map.new(fn issue -> {issue.id, completed_work_item(issue)} end)
+
+    Enum.each(completed, fn {work_item_id, work_item} ->
+      issue = Enum.find(issues, &(&1.id == work_item_id))
+
+      seed_orchestrator_recovery_checkpoint!(pid, issue,
+        lifecycle_state: :done,
+        evidence: work_item.lifecycle_assessment.satisfied_guards
+      )
+    end)
 
     :sys.replace_state(pid, fn state ->
       %{state | work_control: Map.merge(state.work_control, completed)}
