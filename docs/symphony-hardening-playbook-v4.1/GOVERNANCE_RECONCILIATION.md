@@ -82,7 +82,7 @@ GOV-RECON-A = IN REVIEW
 H-060B = NOT AUTHORIZED
 ```
 
-PR #19 is open. Exact-head GitHub CI and independent review remain pending for the final PR head. `IN REVIEW` names the candidate state and does not claim that an independent review has already passed. After the PR merges and receives post-merge acceptance, GOV-RECON-B can append its exact candidate, merge, CI, review provenance, and accepted baseline. GOV-RECON-B may then authorize H-060B for planning. It does not authorize H-060B implementation.
+PR #19 records this candidate. GitHub is the source of truth for its exact-head CI and submitted review status. `IN REVIEW` names the candidate state and does not claim that an independent review has already passed. After the PR merges and receives post-merge acceptance, GOV-RECON-B can append its exact candidate, merge, CI, review provenance, and accepted baseline. GOV-RECON-B may then authorize H-060B for planning. It does not authorize H-060B implementation.
 
 ## Performance and scope
 
