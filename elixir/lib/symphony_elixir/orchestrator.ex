@@ -507,13 +507,14 @@ defmodule SymphonyElixir.Orchestrator do
   defp reconcile_visible_durable_record(%Issue{} = issue, record, ledger, {state, missing, errors}) do
     cond do
       record.status == :exhausted ->
-        {state, missing, errors}
+        {clear_missing_attempt_ledger_block(state, issue.id), missing, errors}
 
       terminal_issue_state?(issue.state, terminal_state_set()) ->
         close_visible_terminal_lineage(issue, ledger, {state, missing, errors})
 
       true ->
-        reconcile_visible_in_flight(issue, record, {state, missing, errors})
+        {state, missing, errors} = reconcile_visible_in_flight(issue, record, {state, missing, errors})
+        {clear_missing_attempt_ledger_block(state, issue.id), missing, errors}
     end
   end
 
@@ -574,6 +575,47 @@ defmodule SymphonyElixir.Orchestrator do
   defp mark_durable_blocked(%State{} = state, issue_id, reason) do
     %{state | durable_blocked: Map.put(state.durable_blocked, issue_id, reason)}
   end
+
+  defp clear_missing_attempt_ledger_block(%State{} = state, issue_id) do
+    case Map.get(state.durable_blocked, issue_id) do
+      {:attempt_ledger_issue_missing, ^issue_id} ->
+        %{state | durable_blocked: Map.delete(state.durable_blocked, issue_id)}
+
+      _reason ->
+        state
+    end
+  end
+
+  defp reconcile_visible_missing_attempt_lineages(%State{} = state, issues) when is_list(issues) do
+    if Enum.any?(issues, fn
+         %Issue{id: issue_id} when is_binary(issue_id) ->
+           Map.get(state.durable_blocked, issue_id) == {:attempt_ledger_issue_missing, issue_id}
+
+         _issue ->
+           false
+       end) do
+      reconcile_visible_missing_attempt_lineages(state)
+    else
+      state
+    end
+  end
+
+  defp reconcile_visible_missing_attempt_lineages(
+         %State{
+           attempt_ledger_status: :ready,
+           attempt_ledger: %AttemptLedger{} = ledger
+         } = state
+       ) do
+    case reconcile_attempt_ledger(state, ledger) do
+      {:ok, reconciled_state} ->
+        reconciled_state
+
+      {:blocked, blocked_state, reason} ->
+        %{blocked_state | attempt_ledger_status: {:blocked, reason}}
+    end
+  end
+
+  defp reconcile_visible_missing_attempt_lineages(%State{} = state), do: state
 
   defp mark_pending_lineage_close(%State{} = state, issue_id) do
     %{
@@ -1992,10 +2034,12 @@ defmodule SymphonyElixir.Orchestrator do
   defp fetch_and_dispatch_ready(%State{} = state) do
     with :ok <- Config.validate!(),
          {:ok, issues} <- Tracker.fetch_issues_by_states(Config.settings!().tracker.active_states) do
-      state
-      |> clear_visible_durable_blocks(issues)
-      |> ensure_graph_contains_active_issues(issues)
-      |> dispatch_ready_issues(issues)
+      state =
+        state
+        |> ensure_graph_contains_active_issues(issues)
+        |> reconcile_visible_missing_attempt_lineages(issues)
+
+      if autonomous_dispatch_allowed?(state), do: dispatch_ready_issues(state, issues), else: state
     else
       {:error, :missing_linear_api_token} ->
         Logger.error("Tracker API token missing in WORKFLOW.md")
@@ -4080,16 +4124,6 @@ defmodule SymphonyElixir.Orchestrator do
       else
         state_acc
       end
-    end)
-  end
-
-  defp clear_visible_durable_blocks(%State{} = state, issues) when is_list(issues) do
-    Enum.reduce(issues, state, fn
-      %Issue{id: issue_id}, state_acc when is_binary(issue_id) ->
-        %{state_acc | durable_blocked: Map.delete(state_acc.durable_blocked, issue_id)}
-
-      _issue, state_acc ->
-        state_acc
     end)
   end
 

@@ -302,6 +302,20 @@ defmodule SymphonyElixir.OrchestratorAttemptLineageTest do
     assert {:ok, snapshot} = read_snapshot(path, project_id, issue_id)
     assert snapshot.safety_counters.ordinary_failures == 2
     refute_receive {:attempt_ledger_runner_started, ^issue_id, _opts}, 300
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [active_issue(issue_id)])
+    send(pid, :run_poll_cycle)
+
+    assert eventually(fn ->
+             state = :sys.get_state(pid)
+
+             not Map.has_key?(state.durable_blocked, issue_id) and
+               state.attempt_lineages[issue_id] == snapshot.lineage_id
+           end)
+
+    assert {:ok, visible_snapshot} = read_snapshot(path, project_id, issue_id)
+    assert visible_snapshot.lineage_id == snapshot.lineage_id
+    assert visible_snapshot.safety_counters.ordinary_failures == snapshot.safety_counters.ordinary_failures
   end
 
   test "a missing durable issue does not fence unrelated autonomous work" do
@@ -336,6 +350,56 @@ defmodule SymphonyElixir.OrchestratorAttemptLineageTest do
     state = :sys.get_state(pid)
     assert state.attempt_ledger_status == :ready
     assert state.durable_blocked[missing_issue_id] == {:attempt_ledger_issue_missing, missing_issue_id}
+  end
+
+  test "tracker visibility alone does not clear a missing durable-lineage block" do
+    project_id = "missing-lineage-visible-#{System.unique_integer([:positive])}"
+    issue = active_issue("missing-lineage-visible-issue")
+    issue_id = issue.id
+    ledger_root = temporary_ledger_root()
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      symphony_project_id: project_id,
+      tracker_active_states: ["In Progress"],
+      poll_interval_ms: 60_000
+    )
+
+    Application.put_env(:symphony_elixir, :attempt_ledger_root, ledger_root)
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
+    Application.put_env(:symphony_elixir, :attempt_ledger_test_pid, self())
+
+    {:ok, work_item} =
+      WorkItem.from_issue(issue, %{
+        provider: :memory,
+        observed_at: DateTime.utc_now(),
+        prior_validated_lifecycle_state: issue.state
+      })
+
+    name = Module.concat(__MODULE__, "MissingLineageVisible#{System.unique_integer([:positive])}")
+    {:ok, pid} = start_orchestrator(name, work_control: %{issue_id => work_item})
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: GenServer.stop(pid)
+      Application.delete_env(:symphony_elixir, :attempt_ledger_root)
+      Application.delete_env(:symphony_elixir, :attempt_ledger_test_pid)
+    end)
+
+    assert eventually(fn -> :sys.get_state(pid).startup_reconciliation == :ready end)
+
+    :sys.replace_state(pid, fn state ->
+      %{state | durable_blocked: Map.put(state.durable_blocked, issue_id, {:attempt_ledger_issue_missing, issue_id})}
+    end)
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+    send(pid, :run_poll_cycle)
+
+    assert eventually(fn ->
+             state = :sys.get_state(pid)
+             state.durable_blocked[issue_id] == {:attempt_ledger_issue_missing, issue_id}
+           end)
+
+    refute_receive {:attempt_ledger_runner_started, ^issue_id, _opts}, 300
   end
 
   test "blocks startup when a terminal lineage cannot be durably closed" do
