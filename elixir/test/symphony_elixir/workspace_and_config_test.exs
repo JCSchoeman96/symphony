@@ -370,7 +370,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
         symphony_project_id: "workspace-post-hook-replacement",
-        hook_after_create: "cd .. && rm -rf MT-POST-HOOK && mkdir MT-POST-HOOK"
+        hook_after_create: "cd .. && mv MT-POST-HOOK MT-POST-HOOK.original && mkdir MT-POST-HOOK"
       )
 
       config = Config.settings!()
