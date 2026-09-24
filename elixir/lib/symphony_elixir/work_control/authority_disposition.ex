@@ -37,6 +37,14 @@ defmodule SymphonyElixir.WorkControl.AuthorityDisposition do
     %{previous | lifecycle_state: assessment.validated_state, updated_at: DateTime.utc_now()}
   end
 
+  def derive(%LifecycleAssessment{} = assessment, %__MODULE__{status: :suspended} = previous) do
+    %{
+      previous
+      | lifecycle_state: previous.lifecycle_state || assessment.validated_state,
+        updated_at: DateTime.utc_now()
+    }
+  end
+
   def derive(%LifecycleAssessment{} = assessment, previous) do
     case assessment.status do
       :authority_reducing -> suspended(assessment, assessment.reason)

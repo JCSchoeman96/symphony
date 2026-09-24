@@ -8,7 +8,7 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, TransitionCoordinator, Workspace}
 
   alias SymphonyElixir.AgentRuntime.{
     AttemptLedger,
@@ -25,11 +25,14 @@ defmodule SymphonyElixir.Orchestrator do
 
   alias SymphonyElixir.WorkControl.{
     AuthorityDisposition,
+    GuardClass,
     LifecycleAssessment,
     ProjectContractEvidence,
     ProviderObservation,
     ProviderProjectContract,
+    RecoveryLedger,
     SuspensionContext,
+    SuspensionRecovery,
     WorkflowLifecycle,
     WorkItem
   }
@@ -102,6 +105,8 @@ defmodule SymphonyElixir.Orchestrator do
 
     @type t :: %__MODULE__{}
 
+    # The GenServer owns this shared orchestration aggregate; splitting these fields would duplicate state ownership.
+    # credo:disable-for-next-line Credo.Check.Warning.StructFieldAmount
     defstruct [
       :poll_interval_ms,
       :max_concurrent_agents,
@@ -109,6 +114,7 @@ defmodule SymphonyElixir.Orchestrator do
       :poll_check_in_progress,
       :tick_timer_ref,
       :tick_token,
+      :transition_coordinator,
       task_supervisor: SymphonyElixir.TaskSupervisor,
       agent_runner: AgentRunner,
       running: %{},
@@ -119,6 +125,7 @@ defmodule SymphonyElixir.Orchestrator do
       dependency_diagnostics: %{},
       retry_attempts: %{},
       attempt_counters: %{},
+      attempt_lineages: %{},
       attempt_ledger: nil,
       attempt_ledger_status: :disabled,
       attempt_ledger_opts: [],
@@ -127,6 +134,13 @@ defmodule SymphonyElixir.Orchestrator do
       durable_blocked: %{},
       durable_exhausted: %{},
       recent_attempts: [],
+      startup_reconciliation: :ready,
+      recovery_ledger: nil,
+      recovery_ledger_status: :disabled,
+      recovery_ledger_opts: [],
+      recovery_checkpoints: %{},
+      startup_cleanup_ran?: false,
+      transition_reconciliation_candidates: [],
       work_control: %{},
       project_contract_evidence: nil,
       codex_totals: nil,
@@ -156,19 +170,17 @@ defmodule SymphonyElixir.Orchestrator do
           tick_token: nil,
           task_supervisor: Keyword.get(opts, :task_supervisor, SymphonyElixir.TaskSupervisor),
           agent_runner: Keyword.get(opts, :agent_runner, AgentRunner),
+          transition_coordinator: Keyword.get(opts, :transition_coordinator, TransitionCoordinator),
           work_control: initial_work_control(Keyword.get(opts, :work_control, %{})),
           project_contract_evidence: ProjectContractEvidence.new(config.provider_project_contract),
+          startup_reconciliation: startup_reconciliation_initial_state(config.agent.routing),
           codex_totals: @empty_codex_totals,
           codex_rate_limits: nil
         }
 
         state = initialize_attempt_ledger(state, config, opts)
-
-        if autonomous_dispatch_allowed?(state) do
-          run_terminal_workspace_cleanup()
-        else
-          Logger.error("Autonomous dispatch is held: #{inspect(ledger_block_reason(state))}")
-        end
+        state = initialize_recovery_ledger(state, config, opts)
+        state = maybe_cleanup_legacy_startup_workspaces(state, config.agent.routing)
 
         state =
           if Keyword.get(opts, :start_quiesced, false) do
@@ -184,15 +196,25 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  @impl true
-  def terminate(_reason, %State{attempt_ledger: nil}), do: :ok
+  defp startup_reconciliation_initial_state("legacy"), do: :ready
+  defp startup_reconciliation_initial_state(_routing), do: :pending
 
-  def terminate(_reason, %State{attempt_ledger: ledger}) do
-    case AttemptLedger.close(ledger) do
-      :ok -> :ok
-      {:error, reason} -> Logger.error("Failed to close attempt ledger: #{inspect(reason)}")
+  defp maybe_cleanup_legacy_startup_workspaces(%State{} = state, "legacy") do
+    if autonomous_dispatch_allowed?(state) do
+      run_terminal_workspace_cleanup()
+      %{state | startup_cleanup_ran?: true}
+    else
+      Logger.error("Autonomous dispatch is held: #{inspect(ledger_block_reason(state))}")
+      state
     end
+  end
 
+  defp maybe_cleanup_legacy_startup_workspaces(%State{} = state, _routing), do: state
+
+  @impl true
+  def terminate(_reason, %State{} = state) do
+    close_attempt_ledger(state.attempt_ledger)
+    close_recovery_ledger(state.recovery_ledger)
     :ok
   end
 
@@ -207,20 +229,22 @@ defmodule SymphonyElixir.Orchestrator do
 
     case AttemptLedger.open(project_id, tracker_identity, ledger_opts) do
       {:ok, ledger} ->
-        case reconcile_attempt_ledger(state, ledger) do
-          {:ok, state} ->
+        case AttemptLedger.open_lineages(ledger) do
+          {:ok, records} ->
+            restored = restore_durable_lineages(state, records)
+
             %{
-              state
+              restored
               | attempt_ledger: ledger,
                 attempt_ledger_status: :ready,
                 attempt_ledger_opts: ledger_opts
             }
 
-          {:blocked, state, reason} ->
+          {:error, reason} ->
             %{
               state
               | attempt_ledger: ledger,
-                attempt_ledger_status: {:blocked, reason},
+                attempt_ledger_status: {:blocked, {:attempt_ledger_unavailable, reason}},
                 attempt_ledger_opts: ledger_opts
             }
         end
@@ -231,6 +255,77 @@ defmodule SymphonyElixir.Orchestrator do
           | attempt_ledger_status: {:blocked, {:attempt_ledger_unavailable, reason}},
             attempt_ledger_opts: ledger_opts
         }
+    end
+  end
+
+  defp initialize_recovery_ledger(%State{} = state, %{agent: %{routing: "legacy"}}, _opts) do
+    %{state | recovery_ledger_status: :disabled, recovery_ledger_opts: []}
+  end
+
+  defp initialize_recovery_ledger(%State{} = state, config, opts) do
+    project_id = config.symphony.project_id
+    tracker_identity = Tracker.identity(config.tracker)
+    ledger_opts = recovery_ledger_options(opts)
+
+    case RecoveryLedger.open(project_id, tracker_identity, ledger_opts) do
+      {:ok, ledger} ->
+        case RecoveryLedger.list(ledger) do
+          {:ok, checkpoints} ->
+            %{
+              state
+              | recovery_ledger: ledger,
+                recovery_ledger_status: :ready,
+                recovery_ledger_opts: ledger_opts,
+                recovery_checkpoints: Map.new(checkpoints, &{&1.work_item_id, &1})
+            }
+
+          {:error, reason} ->
+            _ = RecoveryLedger.close(ledger)
+
+            %{
+              state
+              | recovery_ledger_status: {:blocked, {:recovery_ledger_unavailable, reason}},
+                recovery_ledger_opts: ledger_opts
+            }
+        end
+
+      {:error, reason} ->
+        %{
+          state
+          | recovery_ledger_status: {:blocked, {:recovery_ledger_unavailable, reason}},
+            recovery_ledger_opts: ledger_opts
+        }
+    end
+  end
+
+  defp recovery_ledger_options(opts) do
+    ledger_opts = Keyword.get(opts, :recovery_ledger_opts, [])
+
+    if Keyword.has_key?(ledger_opts, :path) or Keyword.has_key?(ledger_opts, :root) do
+      ledger_opts
+    else
+      case Application.get_env(:symphony_elixir, :attempt_ledger_root) do
+        root when is_binary(root) -> Keyword.put(ledger_opts, :root, Path.join(root, "work-control-recovery"))
+        _unset -> ledger_opts
+      end
+    end
+  end
+
+  defp close_attempt_ledger(nil), do: :ok
+
+  defp close_attempt_ledger(%AttemptLedger{} = ledger) do
+    case AttemptLedger.close(ledger) do
+      :ok -> :ok
+      {:error, reason} -> Logger.error("Failed to close attempt ledger: #{inspect(reason)}")
+    end
+  end
+
+  defp close_recovery_ledger(nil), do: :ok
+
+  defp close_recovery_ledger(%RecoveryLedger{} = ledger) do
+    case RecoveryLedger.close(ledger) do
+      :ok -> :ok
+      {:error, reason} -> Logger.error("Failed to close work-control recovery ledger: #{inspect(reason)}")
     end
   end
 
@@ -294,7 +389,10 @@ defmodule SymphonyElixir.Orchestrator do
       {:ok, %{status: :closed}} ->
         confirm_pending_lineage_close(state, ledger, issue_id)
 
-      {:ok, %{status: status}} when status in [:open, :exhausted] ->
+      {:ok, %{status: :exhausted} = record} ->
+        {:cont, {:ok, preserve_exhausted_lineage(state, issue_id, record)}}
+
+      {:ok, %{status: :open}} ->
         retry_pending_lineage_close(state, ledger, issue_id)
 
       :not_found ->
@@ -328,27 +426,28 @@ defmodule SymphonyElixir.Orchestrator do
 
       state_acc = %{
         state_acc
-        | attempt_counters: Map.put(state_acc.attempt_counters, record.issue_id, counters)
+        | attempt_counters: Map.put(state_acc.attempt_counters, record.issue_id, counters),
+          attempt_lineages: Map.put(state_acc.attempt_lineages, record.issue_id, record.lineage_id)
       }
 
       state_acc =
         if Map.get(record, :close_pending, false) do
           mark_pending_lineage_close(state_acc, record.issue_id)
         else
-          state_acc
+          %{state_acc | attempt_ledger_pending_closes: MapSet.delete(state_acc.attempt_ledger_pending_closes, record.issue_id)}
         end
 
       state_acc =
         if record.status == :exhausted do
           %{state_acc | durable_exhausted: Map.put(state_acc.durable_exhausted, record.issue_id, record)}
         else
-          state_acc
+          %{state_acc | durable_exhausted: Map.delete(state_acc.durable_exhausted, record.issue_id)}
         end
 
       if Map.get(record, :in_flight, false) do
         %{state_acc | durable_in_flight: MapSet.put(state_acc.durable_in_flight, record.issue_id)}
       else
-        state_acc
+        %{state_acc | durable_in_flight: MapSet.delete(state_acc.durable_in_flight, record.issue_id)}
       end
     end)
   end
@@ -406,25 +505,39 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp reconcile_visible_durable_record(%Issue{} = issue, record, ledger, {state, missing, errors}) do
-    if terminal_issue_state?(issue.state, terminal_state_set()) do
-      case AttemptLedger.close_lineage(ledger, issue.id, reason: :terminal) do
-        :ok ->
-          {reset_durable_lineage(state, issue.id), missing, errors}
+    cond do
+      record.status == :exhausted ->
+        {clear_missing_attempt_ledger_block(state, issue.id), missing, errors}
 
-        {:error, reason} ->
-          state = mark_pending_lineage_close(state, issue.id)
-          {state, missing, [{issue.id, reason} | errors]}
-      end
-    else
-      state =
-        if Map.get(record, :in_flight, false) do
-          mark_durable_in_flight(state, issue.id, true)
-        else
-          clear_durable_in_flight(state, issue.id)
-        end
+      terminal_issue_state?(issue.state, terminal_state_set()) ->
+        close_visible_terminal_lineage(issue, ledger, {state, missing, errors})
 
-      {state, missing, errors}
+      true ->
+        {state, missing, errors} = reconcile_visible_in_flight(issue, record, {state, missing, errors})
+        {clear_missing_attempt_ledger_block(state, issue.id), missing, errors}
     end
+  end
+
+  defp close_visible_terminal_lineage(issue, ledger, {state, missing, errors}) do
+    case AttemptLedger.close_lineage(ledger, issue.id, reason: :terminal) do
+      :ok ->
+        {reset_durable_lineage(state, issue.id), missing, errors}
+
+      {:error, reason} ->
+        state = mark_pending_lineage_close(state, issue.id)
+        {state, missing, [{issue.id, reason} | errors]}
+    end
+  end
+
+  defp reconcile_visible_in_flight(issue, record, {state, missing, errors}) do
+    state =
+      if Map.get(record, :in_flight, false) do
+        mark_durable_in_flight(state, issue.id, true)
+      else
+        clear_durable_in_flight(state, issue.id)
+      end
+
+    {state, missing, errors}
   end
 
   defp finish_durable_reconciliation({state, [], []}), do: {:ok, state}
@@ -439,6 +552,7 @@ defmodule SymphonyElixir.Orchestrator do
     %{
       state
       | attempt_counters: Map.delete(state.attempt_counters, issue_id),
+        attempt_lineages: Map.delete(state.attempt_lineages, issue_id),
         durable_exhausted: Map.delete(state.durable_exhausted, issue_id),
         attempt_ledger_pending_closes: MapSet.delete(state.attempt_ledger_pending_closes, issue_id),
         durable_in_flight: MapSet.delete(state.durable_in_flight, issue_id),
@@ -462,6 +576,47 @@ defmodule SymphonyElixir.Orchestrator do
     %{state | durable_blocked: Map.put(state.durable_blocked, issue_id, reason)}
   end
 
+  defp clear_missing_attempt_ledger_block(%State{} = state, issue_id) do
+    case Map.get(state.durable_blocked, issue_id) do
+      {:attempt_ledger_issue_missing, ^issue_id} ->
+        %{state | durable_blocked: Map.delete(state.durable_blocked, issue_id)}
+
+      _reason ->
+        state
+    end
+  end
+
+  defp reconcile_visible_missing_attempt_lineages(%State{} = state, issues) when is_list(issues) do
+    if Enum.any?(issues, fn
+         %Issue{id: issue_id} when is_binary(issue_id) ->
+           Map.get(state.durable_blocked, issue_id) == {:attempt_ledger_issue_missing, issue_id}
+
+         _issue ->
+           false
+       end) do
+      reconcile_visible_missing_attempt_lineages(state)
+    else
+      state
+    end
+  end
+
+  defp reconcile_visible_missing_attempt_lineages(
+         %State{
+           attempt_ledger_status: :ready,
+           attempt_ledger: %AttemptLedger{} = ledger
+         } = state
+       ) do
+    case reconcile_attempt_ledger(state, ledger) do
+      {:ok, reconciled_state} ->
+        reconciled_state
+
+      {:blocked, blocked_state, reason} ->
+        %{blocked_state | attempt_ledger_status: {:blocked, reason}}
+    end
+  end
+
+  defp reconcile_visible_missing_attempt_lineages(%State{} = state), do: state
+
   defp mark_pending_lineage_close(%State{} = state, issue_id) do
     %{
       state
@@ -477,9 +632,12 @@ defmodule SymphonyElixir.Orchestrator do
     %{state | durable_in_flight: MapSet.delete(state.durable_in_flight, issue_id)}
   end
 
-  defp autonomous_dispatch_allowed?(%State{attempt_ledger_status: status} = state)
-       when status in [:disabled, :ready],
-       do: not ProjectContractEvidence.reconciliation_required?(state.project_contract_evidence)
+  defp autonomous_dispatch_allowed?(%State{attempt_ledger_status: attempt_status} = state)
+       when attempt_status in [:disabled, :ready] do
+    state.startup_reconciliation == :ready and
+      state.recovery_ledger_status in [:disabled, :ready] and
+      not ProjectContractEvidence.reconciliation_required?(state.project_contract_evidence)
+  end
 
   defp autonomous_dispatch_allowed?(%State{}), do: false
 
@@ -513,6 +671,7 @@ defmodule SymphonyElixir.Orchestrator do
       reason = evidence.reason || :provider_configuration_drift
 
       state
+      |> Map.put(:startup_reconciliation, :pending)
       |> suspend_work_control_for_project_contract(reason)
       |> suspend_running_for_project_contract(reason)
     else
@@ -991,16 +1150,768 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp maybe_dispatch(%State{} = state) do
-    case state.attempt_ledger_status do
-      {:blocked, reason} ->
-        maybe_reconcile_blocked_ledger(state, reason)
+    if state.startup_reconciliation == :ready do
+      case state.attempt_ledger_status do
+        {:blocked, reason} ->
+          maybe_reconcile_blocked_ledger(state, reason)
 
-      status when status in [:disabled, :ready] ->
-        maybe_dispatch_ready(state)
+        status when status in [:disabled, :ready] ->
+          maybe_dispatch_ready(state)
 
-      status ->
-        Logger.debug("Skipping autonomous dispatch with invalid attempt ledger status: #{inspect(status)}")
+        status ->
+          Logger.debug("Skipping autonomous dispatch with invalid attempt ledger status: #{inspect(status)}")
+          state
+      end
+    else
+      state = reconcile_startup(state)
+
+      if autonomous_dispatch_allowed?(state) do
+        dispatch_ready_if_allowed(state)
+      else
+        Logger.debug("Skipping autonomous dispatch while startup reconciliation is #{inspect(state.startup_reconciliation)}")
+
         state
+      end
+    end
+  end
+
+  defp reconcile_startup(%State{} = state) do
+    state = %{state | startup_reconciliation: :reconciling}
+
+    case do_reconcile_startup(state) do
+      {:ok, %State{} = ready_state} ->
+        ready_state = %{ready_state | startup_reconciliation: :ready}
+
+        ready_state =
+          if ready_state.startup_cleanup_ran? do
+            ready_state
+          else
+            run_terminal_workspace_cleanup()
+            %{ready_state | startup_cleanup_ran?: true}
+          end
+
+        reschedule_pending_retries(ready_state)
+
+      {:blocked, %State{} = blocked_state, reason} ->
+        Logger.warning("Startup reconciliation is blocked: #{inspect(reason)}")
+        %{blocked_state | startup_reconciliation: {:blocked, reason}}
+    end
+  end
+
+  defp do_reconcile_startup(%State{} = state) do
+    with {:ok, state} <- refresh_startup_ledgers(state),
+         {:ok, candidates} <- fetch_startup_transition_candidates(state),
+         {:ok, state} <- validate_startup_project_contract(state),
+         {:ok, graph} <- acquire_startup_dependency_graph(),
+         state <- refresh_dependency_graph_epoch(%{state | transition_reconciliation_candidates: candidates}, graph),
+         {:ok, state} <- startup_work_items_reconciled(state, graph),
+         {:ok, state} <- reconcile_attempt_ledger_from_snapshot(state, graph.nodes |> Map.values()),
+         {:ok, state} <- reconcile_startup_transition_candidates(state, candidates, graph),
+         {:ok, state} <- clear_reconciled_stale_in_flight(state),
+         {:ok, state} <- startup_durable_stores_ready(state) do
+      {:ok, state}
+    else
+      {:blocked, %State{} = blocked_state, reason} -> {:blocked, blocked_state, reason}
+      {:error, reason} -> {:blocked, state, reason}
+    end
+  end
+
+  defp refresh_startup_ledgers(%State{} = state) do
+    config = Config.settings!()
+
+    state =
+      if config.agent.routing == "legacy" or match?(%AttemptLedger{}, state.attempt_ledger) do
+        state
+      else
+        initialize_attempt_ledger(state, config, attempt_ledger_opts: state.attempt_ledger_opts)
+      end
+
+    state =
+      if config.agent.routing == "legacy" or match?(%RecoveryLedger{}, state.recovery_ledger) do
+        state
+      else
+        initialize_recovery_ledger(state, config, recovery_ledger_opts: state.recovery_ledger_opts)
+      end
+
+    with {:ok, state} <- reload_attempt_ledger_records(state, config) do
+      reload_recovery_ledger_records(state, config)
+    end
+  end
+
+  defp reload_attempt_ledger_records(%State{attempt_ledger_status: :disabled} = state, %{agent: %{routing: "legacy"}}),
+    do: {:ok, state}
+
+  defp reload_attempt_ledger_records(%State{attempt_ledger: %AttemptLedger{} = ledger} = state, _config) do
+    case resync_attempt_ledger_if_needed(state, ledger) do
+      {:ok, state} ->
+        case AttemptLedger.open_lineages(ledger) do
+          {:ok, records} ->
+            restored = restore_durable_lineages(state, records)
+            {:ok, %{restored | attempt_ledger_status: :ready}}
+
+          {:error, reason} ->
+            blocked_reason = {:attempt_ledger_unavailable, reason}
+            blocked_state = %{state | attempt_ledger_status: {:blocked, blocked_reason}}
+            {:blocked, blocked_state, blocked_reason}
+        end
+
+      {:error, state, reason} ->
+        {:blocked, state, reason}
+    end
+  end
+
+  defp reload_attempt_ledger_records(%State{} = state, _config) do
+    reason = ledger_block_reason(state) || :missing_ledger_handle
+    {:blocked, state, reason}
+  end
+
+  defp resync_attempt_ledger_if_needed(
+         %State{
+           attempt_ledger_status: {:blocked, {:attempt_ledger_unavailable, {:ledger_sync_failed, _reason}}}
+         } = state,
+         %AttemptLedger{} = ledger
+       ) do
+    case AttemptLedger.sync(ledger) do
+      :ok ->
+        {:ok, state}
+
+      {:error, reason} ->
+        blocked_reason = {:attempt_ledger_unavailable, reason}
+        {:error, %{state | attempt_ledger_status: {:blocked, blocked_reason}}, blocked_reason}
+    end
+  end
+
+  defp resync_attempt_ledger_if_needed(%State{} = state, %AttemptLedger{}), do: {:ok, state}
+
+  defp reload_recovery_ledger_records(%State{recovery_ledger_status: :disabled} = state, %{agent: %{routing: "legacy"}}),
+    do: {:ok, state}
+
+  defp reload_recovery_ledger_records(%State{recovery_ledger: %RecoveryLedger{} = ledger} = state, _config) do
+    case resync_recovery_ledger_if_needed(state, ledger) do
+      {:ok, state} ->
+        case RecoveryLedger.list(ledger) do
+          {:ok, checkpoints} ->
+            {:ok, %{state | recovery_ledger_status: :ready, recovery_checkpoints: Map.new(checkpoints, &{&1.work_item_id, &1})}}
+
+          {:error, reason} ->
+            next_state = %{state | recovery_ledger_status: {:blocked, {:recovery_ledger_unavailable, reason}}}
+            {:blocked, next_state, {:recovery_ledger_unavailable, reason}}
+        end
+
+      {:error, state, reason} ->
+        {:blocked, state, reason}
+    end
+  end
+
+  defp reload_recovery_ledger_records(%State{} = state, _config) do
+    reason = {:recovery_ledger_unavailable, state.recovery_ledger_status}
+    {:blocked, state, reason}
+  end
+
+  defp resync_recovery_ledger_if_needed(%State{recovery_ledger_status: :ready} = state, %RecoveryLedger{}),
+    do: {:ok, state}
+
+  defp resync_recovery_ledger_if_needed(%State{} = state, %RecoveryLedger{} = ledger) do
+    case RecoveryLedger.sync(ledger) do
+      :ok ->
+        {:ok, state}
+
+      {:error, reason} ->
+        next_state = fence_recovery_ledger(state, reason)
+        {:error, next_state, {:recovery_ledger_unavailable, reason}}
+    end
+  end
+
+  defp fetch_startup_transition_candidates(%State{} = state) do
+    tracker_kind = Config.settings!().tracker.kind
+
+    case TransitionCoordinator.sync_reconciliation_ledger(state.transition_coordinator) do
+      :ok ->
+        case TransitionCoordinator.list_reconciliation_candidates(state.transition_coordinator) do
+          {:ok, candidates} when is_list(candidates) -> {:ok, candidates}
+          {:error, reason} -> {:blocked, state, {:transition_coordinator_unavailable, reason}}
+          _invalid -> {:blocked, state, :invalid_transition_reconciliation_candidates}
+        end
+
+      {:error, :transitions_disabled} when tracker_kind != "plane" ->
+        {:ok, []}
+
+      {:error, reason} ->
+        {:blocked, state, {:transition_coordinator_unavailable, reason}}
+    end
+  end
+
+  defp validate_startup_project_contract(%State{} = state) do
+    config = Config.settings!()
+
+    case state.project_contract_evidence do
+      %ProjectContractEvidence{contract: %ProviderProjectContract{}} ->
+        result = apply_provider_project_snapshot(state, Tracker.fetch_project_snapshot())
+
+        if match?(%ProjectContractEvidence{validation: %{status: :valid}}, result.project_contract_evidence) do
+          {:ok, result}
+        else
+          {:blocked, result, result.project_contract_evidence.reason || :provider_contract_not_validated}
+        end
+
+      _missing_contract when config.tracker.kind == "plane" ->
+        {:blocked, state, :provider_project_contract_not_configured}
+
+      _no_contract ->
+        {:ok, state}
+    end
+  end
+
+  defp acquire_startup_dependency_graph do
+    case Tracker.fetch_dependency_graph() do
+      {:ok, %Graph{} = graph} ->
+        if Graph.complete?(graph), do: {:ok, graph}, else: {:error, {:dependency_graph_incomplete, graph.completeness}}
+
+      {:ok, issues} when is_list(issues) ->
+        graph =
+          Graph.build(issues,
+            source: Config.settings!().tracker.kind,
+            scope: Tracker.identity(Config.settings!().tracker).provider_scope,
+            completeness: :complete
+          )
+
+        if Graph.complete?(graph), do: {:ok, graph}, else: {:error, {:dependency_graph_incomplete, graph.completeness}}
+
+      {:error, reason} ->
+        {:error, {:dependency_graph_unavailable, reason}}
+
+      _invalid ->
+        {:error, :invalid_dependency_graph}
+    end
+  end
+
+  defp startup_work_items_reconciled(%State{} = state, %Graph{} = graph) do
+    if Config.settings!().agent.routing == "legacy" do
+      {:ok, state}
+    else
+      missing_ids =
+        graph.nodes
+        |> Map.keys()
+        |> Enum.reject(&match?(%WorkItem{}, Map.get(state.work_control, &1)))
+
+      state =
+        Enum.reduce(missing_ids, state, fn issue_id, state_acc ->
+          mark_durable_blocked(state_acc, issue_id, :work_control_reconciliation_incomplete)
+        end)
+
+      {:ok, state}
+    end
+  end
+
+  defp reconcile_attempt_ledger_from_snapshot(%State{attempt_ledger_status: :disabled} = state, _issues),
+    do: {:ok, state}
+
+  defp reconcile_attempt_ledger_from_snapshot(
+         %State{attempt_ledger_status: :ready, attempt_ledger: %AttemptLedger{} = ledger} = state,
+         issues
+       )
+       when is_list(issues) do
+    with {:ok, state} <- reconcile_pending_lineage_closes(state, ledger),
+         {:ok, records} <- AttemptLedger.open_lineages(ledger),
+         state <- restore_durable_lineages(state, records),
+         {:ok, issues_by_id} <- durable_issue_map_result(issues) do
+      case reconcile_fetched_durable_issue_states(state, ledger, records, issues_by_id) do
+        {:ok, reconciled_state} ->
+          {:ok, reconciled_state}
+
+        {:blocked, blocked_state, reason} ->
+          {:blocked, %{blocked_state | attempt_ledger_status: {:blocked, reason}}, reason}
+      end
+    else
+      {:blocked, %State{} = blocked_state, reason} ->
+        {:blocked, %{blocked_state | attempt_ledger_status: {:blocked, reason}}, reason}
+
+      {:error, reason} ->
+        blocked_reason = {:attempt_ledger_unavailable, reason}
+        {:blocked, %{state | attempt_ledger_status: {:blocked, blocked_reason}}, blocked_reason}
+    end
+  end
+
+  defp reconcile_attempt_ledger_from_snapshot(%State{} = state, _issues) do
+    {:blocked, state, ledger_block_reason(state) || :missing_attempt_ledger}
+  end
+
+  defp durable_issue_map_result(issues) do
+    case durable_issue_map(issues) do
+      {:ok, issues_by_id} -> {:ok, issues_by_id}
+      :error -> {:error, :invalid_issue_collection}
+    end
+  end
+
+  defp reconcile_startup_transition_candidates(%State{} = state, candidates, %Graph{} = graph)
+       when is_list(candidates) do
+    case reconcile_transition_candidate_list(state, candidates, graph.nodes) do
+      {:blocked, blocked_state, reason} ->
+        {:blocked, blocked_state, reason}
+
+      {:ok, state, unresolved} ->
+        sync_and_store_transition_candidates(state, unresolved)
+    end
+  end
+
+  defp reconcile_transition_candidate_list(state, candidates, graph_issues) do
+    Enum.reduce_while(candidates, {:ok, state, []}, fn candidate, accumulator ->
+      reduce_transition_candidate(candidate, accumulator, graph_issues)
+    end)
+  end
+
+  defp reduce_transition_candidate(candidate, {:ok, state, unresolved}, graph_issues) do
+    case reconcile_startup_transition_candidate(state, candidate, graph_issues) do
+      {:reconciled, next_state} ->
+        {:cont, {:ok, next_state, unresolved}}
+
+      {:unresolved, next_state} ->
+        {:cont, {:ok, next_state, [candidate | unresolved]}}
+
+      {:blocked, blocked_state, reason} ->
+        {:halt, {:blocked, blocked_state, reason}}
+    end
+  end
+
+  defp sync_and_store_transition_candidates(state, unresolved) do
+    case TransitionCoordinator.sync_reconciliation_ledger(state.transition_coordinator) do
+      :ok -> store_synced_transition_candidates(state, unresolved)
+      {:error, :transitions_disabled} -> transitions_disabled_reconciliation(state)
+      {:error, reason} -> {:blocked, state, {:transition_coordinator_unavailable, reason}}
+    end
+  end
+
+  defp store_synced_transition_candidates(state, unresolved) do
+    case TransitionCoordinator.list_reconciliation_candidates(state.transition_coordinator) do
+      {:ok, remaining} when is_list(remaining) ->
+        candidates = merge_transition_candidates(remaining, unresolved)
+        {:ok, %{state | transition_reconciliation_candidates: candidates}}
+
+      {:error, reason} ->
+        {:blocked, state, {:transition_coordinator_unavailable, reason}}
+
+      _invalid ->
+        {:blocked, state, :invalid_transition_reconciliation_candidates}
+    end
+  end
+
+  defp transitions_disabled_reconciliation(state) do
+    if Config.settings!().tracker.kind != "plane" do
+      {:ok, %{state | transition_reconciliation_candidates: []}}
+    else
+      {:blocked, state, :transitions_disabled}
+    end
+  end
+
+  defp reconcile_startup_transition_candidate(%State{} = state, candidate, graph_issues) when is_map(candidate) do
+    work_item_id = Map.get(candidate, :work_item_id)
+    work_item = Map.get(state.work_control, work_item_id)
+    issue = Map.get(graph_issues, work_item_id)
+    dependency = Map.get(state.dependency_diagnostics, work_item_id)
+
+    with %WorkItem{} <- work_item,
+         %Issue{} <- issue,
+         :ok <- startup_transition_item_safe(state, work_item, dependency),
+         {:ok, state, work_item} <- ensure_startup_transition_suspension(state, work_item),
+         {:ok, evidence_identity} <- startup_transition_evidence_identity(work_item),
+         outcome when not is_nil(outcome) <- startup_transition_outcome(candidate, work_item),
+         {:ok, state, work_item, recovery_resolved?} <-
+           prepare_startup_transition_recovery(state, issue, candidate, outcome, work_item) do
+      case TransitionCoordinator.reconcile_candidate(state.transition_coordinator, candidate, %{
+             outcome: outcome,
+             evidence_identity: evidence_identity,
+             reconciled_at: DateTime.utc_now()
+           }) do
+        {:ok, _marker} ->
+          {:reconciled, finish_startup_transition_recovery(state, work_item, recovery_resolved?)}
+
+        {:error, {:ledger_sync_failed, reason}} ->
+          {:blocked, state, {:transition_reconciliation_marker_sync_failed, work_item_id, reason}}
+
+        {:error, _reason} ->
+          {:unresolved, mark_transition_reconciliation_blocked(state, work_item_id)}
+      end
+    else
+      {:error, blocked_state, {:ledger_sync_failed, reason}} ->
+        {:blocked, blocked_state, {:recovery_ledger_sync_failed, work_item_id, reason}}
+
+      {:error, blocked_state, {:transition_coordinator_unavailable, reason}} ->
+        {:blocked, blocked_state, {:transition_coordinator_unavailable, reason}}
+
+      {:error, blocked_state, _reason} ->
+        {:unresolved, mark_transition_reconciliation_blocked(blocked_state, work_item_id)}
+
+      _unresolved ->
+        {:unresolved, mark_transition_reconciliation_blocked(state, work_item_id)}
+    end
+  end
+
+  defp reconcile_startup_transition_candidate(%State{} = state, _candidate, _graph_issues), do: {:unresolved, state}
+
+  defp mark_transition_reconciliation_blocked(%State{} = state, work_item_id) when is_binary(work_item_id),
+    do: mark_durable_blocked(state, work_item_id, :transition_reconciliation_unresolved)
+
+  defp mark_transition_reconciliation_blocked(%State{} = state, _work_item_id), do: state
+
+  defp merge_transition_candidates(remaining, unresolved) do
+    Enum.uniq_by(remaining ++ Enum.reverse(unresolved), fn candidate ->
+      Map.get(candidate, :attempt_id) || Map.get(candidate, :work_item_id)
+    end)
+  end
+
+  defp startup_transition_item_safe(%State{} = state, %WorkItem{} = work_item, dependency) do
+    resumable_h040_context? = resumable_h040_checkpoint_context?(state, work_item.id)
+
+    cond do
+      Map.has_key?(state.durable_exhausted, work_item.id) ->
+        {:error, :retry_lineage_exhausted}
+
+      (WorkItem.suspended?(work_item) and not resumable_h040_context?) or
+          not LifecycleAssessment.validated?(work_item.lifecycle_assessment) ->
+        {:error, :work_item_suspended}
+
+      not match?(%{allowed?: true}, dependency) ->
+        {:error, :dependency_not_reconciled}
+
+      not WorkflowLifecycle.canonical?(work_item.validated_lifecycle_state) ->
+        {:error, :lifecycle_not_reconciled}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp resumable_h040_checkpoint_context?(state, work_item_id) do
+    checkpoint_context = state.recovery_checkpoints |> Map.get(work_item_id) |> checkpoint_suspension_context()
+
+    match?(%SuspensionContext{status: status} when status in [:open, :resolving], checkpoint_context) and
+      SuspensionRecovery.classify_reason(checkpoint_context.reason) == :h040_reconciliation
+  end
+
+  defp ensure_startup_transition_suspension(%State{} = state, %WorkItem{} = work_item) do
+    checkpoint = Map.get(state.recovery_checkpoints, work_item.id)
+
+    case checkpoint_suspension_context(checkpoint) do
+      %SuspensionContext{status: status} = context when status in [:open, :resolving] ->
+        if SuspensionRecovery.classify_reason(context.reason) == :h040_reconciliation do
+          work_item =
+            %{work_item | suspension_context: context}
+            |> force_transition_suspension(context)
+
+          {:ok, %{state | work_control: Map.put(state.work_control, work_item.id, work_item)}, work_item}
+        else
+          {:error, state, :another_suspension_context_is_active}
+        end
+
+      nil ->
+        persist_startup_transition_suspension(state, checkpoint, work_item)
+
+      _other_context ->
+        {:error, state, :another_suspension_context_is_active}
+    end
+  end
+
+  defp persist_startup_transition_suspension(
+         %State{recovery_ledger_status: :ready} = state,
+         %{last_validated_lifecycle_state: last_state} = checkpoint,
+         %WorkItem{provider_observation: %ProviderObservation{} = observation} = work_item
+       ) do
+    with true <- WorkflowLifecycle.canonical?(last_state),
+         {:ok, context} <-
+           SuspensionContext.new(%{
+             work_item_id: work_item.id,
+             last_validated_lifecycle_state: last_state,
+             provider_observation: observation,
+             reason: :transition_indeterminate,
+             lineage_generation: Map.get(state.attempt_lineages, work_item.id),
+             created_at: observation.observed_at,
+             recovery_policy: :fresh_reconciliation,
+             required_evidence: [],
+             resume_target: last_state,
+             status: :open
+           }),
+         next_checkpoint <-
+           checkpoint_record(
+             state,
+             work_item.id,
+             last_state,
+             checkpoint.durable_guard_evidence,
+             context,
+             checkpoint.last_terminal_suspension_context
+           ),
+         {:ok, state, _persisted_checkpoint} <- persist_recovery_checkpoint(state, next_checkpoint) do
+      work_item = work_item |> force_transition_suspension(context)
+
+      {:ok, %{state | work_control: Map.put(state.work_control, work_item.id, work_item)}, work_item}
+    else
+      false -> {:error, state, :missing_trusted_lifecycle_checkpoint}
+      {:error, blocked_state, reason} -> {:error, blocked_state, reason}
+      {:error, reason} -> {:error, state, reason}
+    end
+  end
+
+  defp persist_startup_transition_suspension(%State{} = state, _checkpoint, _work_item),
+    do: {:error, state, :missing_recovery_ledger_or_checkpoint}
+
+  defp force_transition_suspension(%WorkItem{} = work_item, %SuspensionContext{} = context) do
+    disposition =
+      AuthorityDisposition.new(%{
+        status: :suspended,
+        lifecycle_state: context.last_validated_lifecycle_state,
+        reason: context.reason,
+        resume_target: context.last_validated_lifecycle_state
+      })
+
+    %{work_item | authority_disposition: disposition, suspension_context: context}
+  end
+
+  defp prepare_startup_transition_recovery(state, issue, candidate, outcome, %WorkItem{} = work_item) do
+    context = work_item.suspension_context
+
+    with %SuspensionContext{} <- context,
+         {:ok, last_candidate_for_item?} <- last_unresolved_transition_candidate_for_item(state, candidate),
+         resolving <- begin_suspension_resolution(context),
+         %{
+           last_validated_lifecycle_state: last_state,
+           durable_guard_evidence: evidence,
+           last_terminal_suspension_context: terminal_context
+         } <-
+           Map.get(state.recovery_checkpoints, work_item.id),
+         resolving_checkpoint <-
+           checkpoint_record(
+             state,
+             work_item.id,
+             last_state,
+             evidence,
+             resolving,
+             terminal_context
+           ),
+         {:ok, state, _stored_checkpoint} <- persist_recovery_checkpoint(state, resolving_checkpoint),
+         resolving_work_item <- %{work_item | suspension_context: resolving},
+         state <- %{state | work_control: Map.put(state.work_control, work_item.id, resolving_work_item)},
+         facts <-
+           state
+           |> suspension_recovery_facts(issue, resolving, resolving_work_item)
+           |> Map.put(:transition_candidate_reconciled?, last_candidate_for_item? and not is_nil(outcome)),
+         decision <- SuspensionRecovery.evaluate(resolving, facts),
+         {:ok, state, resolved?, next_work_item} <-
+           resolve_startup_transition_checkpoint(state, resolving_work_item, resolving, facts, decision) do
+      {:ok, state, next_work_item, resolved?}
+    else
+      {:error, blocked_state, reason} -> {:error, blocked_state, reason}
+      {:error, reason} -> {:error, state, reason}
+      _missing_or_invalid -> {:ok, state, work_item, false}
+    end
+  end
+
+  defp resolve_startup_transition_checkpoint(state, work_item, context, facts, decision) do
+    if decision.status == :resolved and decision.resume_target == work_item.validated_lifecycle_state and
+         LifecycleAssessment.validated?(work_item.lifecycle_assessment) do
+      supplied_evidence = work_item.lifecycle_assessment.satisfied_guards
+
+      with {:ok, resolved_context} <-
+             SuspensionContext.resolve(context, %{
+               fresh_reconciliation: true,
+               resume_target: Map.get(facts, :resume_target),
+               required_evidence: supplied_evidence
+             }),
+           checkpoint <-
+             checkpoint_record(
+               state,
+               work_item.id,
+               work_item.validated_lifecycle_state,
+               durable_mechanical_evidence(supplied_evidence),
+               nil,
+               resolved_context
+             ),
+           {:ok, state, _stored_checkpoint} <- persist_recovery_checkpoint(state, checkpoint) do
+        {:ok, state, true, work_item}
+      else
+        {:error, blocked_state, reason} -> {:error, blocked_state, reason}
+        {:error, reason} -> {:error, state, reason}
+      end
+    else
+      {:ok, state, false, work_item}
+    end
+  end
+
+  defp last_unresolved_transition_candidate_for_item(state, candidate) do
+    candidate_id = Map.get(candidate, :attempt_id) || Map.get(candidate, :work_item_id)
+    work_item_id = Map.get(candidate, :work_item_id)
+
+    case TransitionCoordinator.list_reconciliation_candidates(state.transition_coordinator) do
+      {:ok, candidates} when is_list(candidates) ->
+        {:ok, last_candidate_for_work_item?(candidates, candidate_id, work_item_id)}
+
+      {:error, reason} ->
+        {:error, {:transition_coordinator_unavailable, reason}}
+
+      _invalid ->
+        {:error, {:transition_coordinator_unavailable, :invalid_transition_reconciliation_candidates}}
+    end
+  end
+
+  defp last_candidate_for_work_item?(candidates, candidate_id, work_item_id) do
+    current_present? =
+      Enum.any?(candidates, fn entry ->
+        transition_candidate_id(entry) == candidate_id and Map.get(entry, :work_item_id) == work_item_id
+      end)
+
+    other_unresolved? =
+      Enum.any?(candidates, fn entry ->
+        Map.get(entry, :work_item_id) == work_item_id and transition_candidate_id(entry) != candidate_id
+      end)
+
+    current_present? and not other_unresolved?
+  end
+
+  defp transition_candidate_id(candidate),
+    do: Map.get(candidate, :attempt_id) || Map.get(candidate, :work_item_id)
+
+  defp finish_startup_transition_recovery(state, work_item, true) do
+    disposition = AuthorityDisposition.derive(work_item.lifecycle_assessment)
+    work_item = %{work_item | authority_disposition: disposition, suspension_context: nil}
+
+    %{
+      state
+      | work_control: Map.put(state.work_control, work_item.id, work_item),
+        durable_blocked: Map.delete(state.durable_blocked, work_item.id)
+    }
+  end
+
+  defp finish_startup_transition_recovery(state, _work_item, false), do: state
+
+  defp startup_transition_evidence_identity(%WorkItem{provider_observation: %ProviderObservation{snapshot_identity: identity}})
+       when not is_nil(identity) and
+              (is_binary(identity) or is_atom(identity) or is_integer(identity) or is_map(identity)) do
+    if is_binary(identity) and String.trim(identity) == "" do
+      {:error, :missing_provider_observation_identity}
+    else
+      {:ok, identity}
+    end
+  end
+
+  defp startup_transition_evidence_identity(_work_item), do: {:error, :missing_provider_observation_identity}
+
+  defp startup_transition_outcome(candidate, %WorkItem{validated_lifecycle_state: current_state}) do
+    requested_to = Map.get(candidate, :requested_to) || Map.get(candidate, :target_state)
+    requested_from = Map.get(candidate, :requested_from) || Map.get(candidate, :source_state)
+    status = Map.get(candidate, :status) || Map.get(candidate, :state)
+
+    cond do
+      current_state == requested_to -> :verified
+      status == :prepared and current_state == requested_from -> :provider_failed
+      current_state not in [requested_from, requested_to] -> :conflict
+      true -> nil
+    end
+  end
+
+  defp clear_reconciled_stale_in_flight(%State{} = state) do
+    Enum.reduce_while(MapSet.to_list(state.durable_in_flight), {:ok, state}, fn issue_id, {:ok, state_acc} ->
+      case clear_reconciled_stale_in_flight_for_issue(state_acc, issue_id) do
+        {:ok, next_state} -> {:cont, {:ok, next_state}}
+        {:blocked, blocked_state, reason} -> {:halt, {:blocked, blocked_state, reason}}
+      end
+    end)
+  end
+
+  defp clear_reconciled_stale_in_flight_for_issue(%State{} = state, issue_id) do
+    case stale_in_flight_block_reason(state, issue_id) do
+      nil ->
+        clear_reconciled_in_flight_record(state, issue_id)
+
+      :running ->
+        {:ok, state}
+
+      :stale_in_flight_attempt_ledger_unavailable ->
+        {:blocked, state, {:stale_in_flight_attempt_ledger_unavailable, issue_id}}
+
+      reason ->
+        {:ok, mark_durable_blocked(state, issue_id, reason)}
+    end
+  end
+
+  defp stale_in_flight_block_reason(state, issue_id) do
+    work_item = Map.get(state.work_control, issue_id)
+    dependency = Map.get(state.dependency_diagnostics, issue_id)
+    checkpoint = Map.get(state.recovery_checkpoints, issue_id)
+
+    checks = [
+      {Map.has_key?(state.running, issue_id), :running},
+      {Map.has_key?(state.durable_exhausted, issue_id), :stale_in_flight_lineage_exhausted},
+      {transition_candidate_pending?(state, issue_id), :stale_in_flight_transition_unresolved},
+      {match?(%SuspensionContext{}, checkpoint_suspension_context(checkpoint)), :stale_in_flight_suspension_unresolved},
+      {not eligible_work_item?(work_item), :stale_in_flight_work_item_unavailable},
+      {not validated_work_item?(work_item), :stale_in_flight_lifecycle_unvalidated},
+      {not match?(%{allowed?: true}, dependency), :stale_in_flight_dependency_unavailable},
+      {not match?(%AttemptLedger{}, state.attempt_ledger), :stale_in_flight_attempt_ledger_unavailable}
+    ]
+
+    case Enum.find(checks, &elem(&1, 0)) do
+      {_blocked?, reason} -> reason
+      nil -> nil
+    end
+  end
+
+  defp transition_candidate_pending?(state, issue_id) do
+    Enum.any?(state.transition_reconciliation_candidates, &(Map.get(&1, :work_item_id) == issue_id))
+  end
+
+  defp eligible_work_item?(%WorkItem{authority_disposition: %AuthorityDisposition{status: :eligible}}), do: true
+  defp eligible_work_item?(_work_item), do: false
+
+  defp validated_work_item?(%WorkItem{lifecycle_assessment: %LifecycleAssessment{status: :validated}}), do: true
+  defp validated_work_item?(_work_item), do: false
+
+  defp clear_reconciled_in_flight_record(state, issue_id) do
+    case AttemptLedger.clear_in_flight(state.attempt_ledger, issue_id) do
+      :ok ->
+        {:ok,
+         state
+         |> clear_durable_in_flight(issue_id)
+         |> then(&%{&1 | durable_blocked: Map.delete(&1.durable_blocked, issue_id)})}
+
+      {:error, reason} ->
+        blocked_state = block_ledger(state, reason)
+        {:blocked, blocked_state, {:attempt_ledger_clear_in_flight_failed, issue_id, reason}}
+    end
+  end
+
+  defp startup_durable_stores_ready(%State{} = state) do
+    routed? = Config.settings!().agent.routing == "routed"
+
+    with :ok <- attempt_store_ready(state, routed?),
+         :ok <- recovery_store_ready(state, routed?) do
+      {:ok, state}
+    else
+      {:error, reason} ->
+        {:blocked, state, reason}
+    end
+  end
+
+  defp attempt_store_ready(state, routed?) do
+    cond do
+      routed? and state.attempt_ledger_status != :ready ->
+        {:error, ledger_block_reason(state) || :attempt_ledger_unavailable}
+
+      state.attempt_ledger_status in [:disabled, :ready] ->
+        :ok
+
+      true ->
+        {:error, ledger_block_reason(state) || :attempt_ledger_unavailable}
+    end
+  end
+
+  defp recovery_store_ready(state, routed?) do
+    cond do
+      routed? and state.recovery_ledger_status != :ready ->
+        {:error, {:recovery_ledger_unavailable, state.recovery_ledger_status}}
+
+      state.recovery_ledger_status in [:disabled, :ready] ->
+        :ok
+
+      true ->
+        {:error, {:recovery_ledger_unavailable, state.recovery_ledger_status}}
     end
   end
 
@@ -1123,10 +2034,12 @@ defmodule SymphonyElixir.Orchestrator do
   defp fetch_and_dispatch_ready(%State{} = state) do
     with :ok <- Config.validate!(),
          {:ok, issues} <- Tracker.fetch_issues_by_states(Config.settings!().tracker.active_states) do
-      state
-      |> clear_visible_durable_blocks(issues)
-      |> ensure_graph_contains_active_issues(issues)
-      |> dispatch_ready_issues(issues)
+      state =
+        state
+        |> ensure_graph_contains_active_issues(issues)
+        |> reconcile_visible_missing_attempt_lineages(issues)
+
+      if autonomous_dispatch_allowed?(state), do: dispatch_ready_issues(state, issues), else: state
     else
       {:error, :missing_linear_api_token} ->
         Logger.error("Tracker API token missing in WORKFLOW.md")
@@ -1354,6 +2267,25 @@ defmodule SymphonyElixir.Orchestrator do
   @spec reconcile_blocked_ledger_for_test(State.t()) :: State.t()
   def reconcile_blocked_ledger_for_test(%State{} = state) do
     reconcile_blocked_ledger_without_dispatch(state)
+  end
+
+  @doc false
+  @spec reconcile_startup_transition_candidate_for_test(State.t(), map(), map()) :: term()
+  def reconcile_startup_transition_candidate_for_test(%State{} = state, candidate, issues) when is_map(issues) do
+    reconcile_startup_transition_candidate(state, candidate, issues)
+  end
+
+  @doc false
+  @spec reconcile_startup_transition_candidates_for_test(State.t(), [map()], Graph.t()) :: term()
+  def reconcile_startup_transition_candidates_for_test(%State{} = state, candidates, %Graph{} = graph)
+      when is_list(candidates) do
+    reconcile_startup_transition_candidates(state, candidates, graph)
+  end
+
+  @doc false
+  @spec clear_stale_in_flight_for_test(State.t(), String.t()) :: term()
+  def clear_stale_in_flight_for_test(%State{} = state, issue_id) when is_binary(issue_id) do
+    clear_reconciled_stale_in_flight_for_issue(state, issue_id)
   end
 
   defp reconcile_blocked_ledger_without_dispatch(%State{attempt_ledger: %AttemptLedger{} = ledger} = state) do
@@ -2317,28 +3249,79 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp refresh_routed_work_item(%Issue{id: issue_id} = issue, %State{} = state)
        when is_binary(issue_id) do
+    if state.recovery_ledger_status == :disabled do
+      refresh_routed_work_item_without_recovery_ledger(issue, state)
+    else
+      refresh_routed_work_item_with_recovery_ledger(issue, state)
+    end
+  end
+
+  defp refresh_routed_work_item(_issue, %State{} = state), do: state
+
+  defp refresh_routed_work_item_with_recovery_ledger(%Issue{id: issue_id} = issue, %State{} = state) do
     previous = Map.get(state.work_control, issue_id)
+    checkpoint = recovery_checkpoint_for_refresh(state, issue_id, previous)
+    contract = Config.settings!().provider_project_contract
+    active_context = checkpoint_suspension_context(checkpoint)
+    prior_state = checkpoint && checkpoint.last_validated_lifecycle_state
+
+    prior_disposition =
+      cond do
+        match?(%SuspensionContext{status: :escalated}, active_context) ->
+          %AuthorityDisposition{status: :escalated, lifecycle_state: prior_state, reason: active_context.reason}
+
+        match?(%SuspensionContext{status: status} when status in [:open, :resolving], active_context) ->
+          %AuthorityDisposition{status: :suspended, lifecycle_state: prior_state, reason: active_context.reason}
+
+        state.startup_reconciliation == :ready ->
+          prior_authority_disposition(previous)
+
+        true ->
+          nil
+      end
 
     opts = %{
       provider: Config.settings!().tracker.kind,
       observed_at: DateTime.utc_now(),
-      prior_validated_lifecycle_state: prior_validated_state(previous),
-      prior_authority_disposition: prior_authority_disposition(previous),
-      evidence:
-        evidence_for_observation(
-          issue,
-          previous,
-          Config.settings!().provider_project_contract
-        ),
-      provider_project_contract: Config.settings!().provider_project_contract
+      prior_validated_lifecycle_state: prior_state,
+      prior_authority_disposition: prior_disposition,
+      evidence: recovery_evidence(issue, checkpoint, contract),
+      provider_project_contract: contract
+    }
+
+    case WorkItem.from_issue(issue, opts) do
+      {:ok, work_item} ->
+        persist_refreshed_work_item(state, issue, checkpoint, work_item)
+
+      {:error, reason} ->
+        Logger.warning("Unable to derive routed WorkItem for #{issue_context(issue)}: #{inspect(reason)}")
+
+        state
+        |> mark_durable_blocked(issue_id, {:work_item_derivation_failed, reason})
+        |> then(&%{&1 | work_control: Map.delete(&1.work_control, issue_id)})
+    end
+  end
+
+  defp refresh_routed_work_item_without_recovery_ledger(%Issue{id: issue_id} = issue, %State{} = state) do
+    previous = Map.get(state.work_control, issue_id)
+    contract = Config.settings!().provider_project_contract
+
+    opts = %{
+      provider: Config.settings!().tracker.kind,
+      observed_at: DateTime.utc_now(),
+      prior_validated_lifecycle_state: ephemeral_prior_validated_state(previous),
+      prior_authority_disposition: ephemeral_prior_authority_disposition(previous),
+      evidence: ephemeral_evidence_for_observation(issue, previous, contract),
+      provider_project_contract: contract
     }
 
     case WorkItem.from_issue(issue, opts) do
       {:ok, work_item} ->
         work_item =
           work_item
-          |> attach_suspension_context(previous, opts)
+          |> attach_ephemeral_suspension_context(previous, opts)
           |> apply_project_contract_guard(state)
+          |> suspend_ephemeral_exhausted_lineage(state)
 
         %{state | work_control: Map.put(state.work_control, issue_id, work_item)}
 
@@ -2348,15 +3331,12 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp refresh_routed_work_item(_issue, %State{} = state), do: state
-
-  defp prior_validated_state(%WorkItem{
+  defp ephemeral_prior_validated_state(%WorkItem{
          authority_disposition: %AuthorityDisposition{status: :suspended, lifecycle_state: :canceled}
-       }) do
-    :canceled
-  end
+       }),
+       do: :canceled
 
-  defp prior_validated_state(%WorkItem{
+  defp ephemeral_prior_validated_state(%WorkItem{
          suspension_context: %SuspensionContext{last_validated_lifecycle_state: state},
          validated_lifecycle_state: fallback_state
        }) do
@@ -2366,18 +3346,15 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp prior_validated_state(%WorkItem{validated_lifecycle_state: state}), do: state
-  defp prior_validated_state(_previous), do: nil
+  defp ephemeral_prior_validated_state(%WorkItem{validated_lifecycle_state: state}), do: state
+  defp ephemeral_prior_validated_state(_previous), do: nil
 
-  defp prior_authority_disposition(%WorkItem{authority_disposition: disposition}), do: disposition
-  defp prior_authority_disposition(_previous), do: nil
+  defp ephemeral_prior_authority_disposition(%WorkItem{authority_disposition: %AuthorityDisposition{status: :suspended}}),
+    do: nil
 
-  defp prior_guard_evidence(%WorkItem{lifecycle_assessment: assessment}),
-    do: assessment.satisfied_guards
+  defp ephemeral_prior_authority_disposition(previous), do: prior_authority_disposition(previous)
 
-  defp prior_guard_evidence(_previous), do: []
-
-  defp evidence_for_observation(%Issue{} = issue, %WorkItem{} = previous, %ProviderProjectContract{} = contract) do
+  defp ephemeral_evidence_for_observation(%Issue{} = issue, %WorkItem{} = previous, %ProviderProjectContract{} = contract) do
     with true <- stable_provider_state_identity?(issue, previous.provider_observation),
          {:ok, mapped_state} <-
            ProviderProjectContract.resolve_provider_state(
@@ -2386,32 +3363,29 @@ defmodule SymphonyElixir.Orchestrator do
              issue.provider_state_group
            ),
          true <- mapped_state == previous.validated_lifecycle_state do
-      prior_guard_evidence(previous)
+      previous.lifecycle_assessment.satisfied_guards
     else
-      _ -> []
+      _changed_or_invalid -> []
     end
   end
 
-  defp evidence_for_observation(%Issue{state: state}, %WorkItem{} = previous, _contract) do
+  defp ephemeral_evidence_for_observation(%Issue{state: state}, %WorkItem{} = previous, _contract) do
     case WorkflowLifecycle.parse(state) do
       {:ok, canonical_state} when canonical_state == previous.validated_lifecycle_state ->
-        prior_guard_evidence(previous)
+        previous.lifecycle_assessment.satisfied_guards
 
-      _different_state ->
+      _changed_or_invalid ->
         []
     end
   end
 
-  defp evidence_for_observation(_issue, _previous, _contract), do: []
+  defp ephemeral_evidence_for_observation(_issue, _previous, _contract), do: []
 
   defp stable_provider_state_identity?(%Issue{} = issue, %ProviderObservation{} = prior_observation) do
     present_string?(prior_observation.provider_state_id) and
       present_string?(issue.provider_state_id) and
       issue.provider_state_id == prior_observation.provider_state_id and
-      provider_state_groups_equivalent?(
-        issue.provider_state_group,
-        prior_observation.provider_state_group
-      )
+      provider_state_groups_equivalent?(issue.provider_state_group, prior_observation.provider_state_group)
   end
 
   defp stable_provider_state_identity?(_issue, _prior_observation), do: false
@@ -2420,9 +3394,7 @@ defmodule SymphonyElixir.Orchestrator do
     normalize_provider_state_group(left) == normalize_provider_state_group(right)
   end
 
-  defp normalize_provider_state_group(group)
-       when group in [:backlog, :unstarted, :started, :completed, :cancelled],
-       do: group
+  defp normalize_provider_state_group(group) when group in [:backlog, :unstarted, :started, :completed, :cancelled], do: group
 
   defp normalize_provider_state_group(group) when is_binary(group) do
     case String.downcase(String.trim(group)) do
@@ -2432,28 +3404,29 @@ defmodule SymphonyElixir.Orchestrator do
       "completed" -> :completed
       "cancelled" -> :cancelled
       "canceled" -> :cancelled
-      _ -> nil
+      _unknown -> nil
     end
   end
 
   defp normalize_provider_state_group(_group), do: nil
 
-  defp attach_suspension_context(%WorkItem{} = work_item, %WorkItem{} = previous, _opts) do
-    assessment = work_item.lifecycle_assessment
+  defp attach_ephemeral_suspension_context(%WorkItem{} = work_item, %WorkItem{} = previous, opts) do
+    prior_state = Map.get(opts, :prior_validated_lifecycle_state)
 
-    if assessment.status in [:authority_reducing, :validation_required, :invalid] and
-         WorkflowLifecycle.canonical?(prior_validated_state(previous)) do
+    if work_item.lifecycle_assessment.status in [:authority_reducing, :validation_required, :invalid] and
+         WorkflowLifecycle.canonical?(prior_state) do
       observation = work_item.provider_observation
 
       case SuspensionContext.new(%{
              work_item_id: work_item.id,
-             last_validated_lifecycle_state: prior_validated_state(previous),
+             last_validated_lifecycle_state: prior_state,
              provider_observation: observation,
-             reason: assessment.reason || :unsafe_lifecycle_observation,
+             reason: work_item.lifecycle_assessment.reason || :unsafe_lifecycle_observation,
+             lineage_generation: ephemeral_lineage_generation(previous),
              created_at: observation.observed_at,
              recovery_policy: :fresh_reconciliation,
-             required_evidence: assessment.missing_guards,
-             resume_target: prior_validated_state(previous)
+             required_evidence: work_item.lifecycle_assessment.missing_guards,
+             resume_target: prior_state
            }) do
         {:ok, context} -> %{work_item | suspension_context: context}
         {:error, _reason} -> work_item
@@ -2463,7 +3436,577 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp attach_suspension_context(%WorkItem{} = work_item, _previous, _opts), do: work_item
+  defp attach_ephemeral_suspension_context(%WorkItem{} = work_item, _previous, _opts), do: work_item
+
+  defp ephemeral_lineage_generation(%WorkItem{suspension_context: %SuspensionContext{lineage_generation: generation}}),
+    do: generation
+
+  defp ephemeral_lineage_generation(_previous), do: nil
+
+  defp suspend_ephemeral_exhausted_lineage(%WorkItem{} = work_item, %State{} = state) do
+    if Map.has_key?(state.durable_exhausted, work_item.id) do
+      case WorkItem.suspend(work_item, :retry_exhausted) do
+        {:ok, suspended} -> suspended
+        {:error, _reason} -> work_item
+      end
+    else
+      work_item
+    end
+  end
+
+  defp recovery_checkpoint_for_refresh(state, issue_id, _previous),
+    do: Map.get(state.recovery_checkpoints, issue_id)
+
+  defp persist_refreshed_work_item(state, issue, original_checkpoint, work_item) do
+    work_item =
+      work_item
+      |> apply_project_contract_guard(state)
+      |> attach_checkpoint_suspension(original_checkpoint, state)
+
+    {state, work_item} = maybe_reconcile_suspension(state, issue, original_checkpoint, work_item)
+    {state, work_item} = maybe_suspend_exhausted_lineage(state, issue, original_checkpoint, work_item)
+    checkpoint = Map.get(state.recovery_checkpoints, issue.id, original_checkpoint)
+
+    case persist_refreshed_work_item_checkpoint(state, checkpoint, work_item) do
+      {:ok, next_state, next_checkpoint} ->
+        %{
+          next_state
+          | work_control: Map.put(next_state.work_control, issue.id, work_item),
+            recovery_checkpoints: put_checkpoint(next_state.recovery_checkpoints, issue.id, next_checkpoint)
+        }
+
+      {:error, blocked_state, reason} ->
+        Logger.error("Unable to persist work-control recovery checkpoint for #{issue_context(issue)}: #{inspect(reason)}")
+        blocked_state
+    end
+  end
+
+  defp prior_authority_disposition(%WorkItem{authority_disposition: disposition}), do: disposition
+  defp prior_authority_disposition(_previous), do: nil
+
+  defp checkpoint_suspension_context(%{active_suspension_context: %SuspensionContext{} = context}), do: context
+
+  defp checkpoint_suspension_context(%{last_terminal_suspension_context: %SuspensionContext{status: :escalated} = context}),
+    do: context
+
+  defp checkpoint_suspension_context(_checkpoint), do: nil
+
+  defp recovery_evidence(_issue, nil, _contract), do: []
+
+  defp recovery_evidence(%Issue{} = issue, checkpoint, contract) do
+    with {:ok, observation} <- ProviderObservation.from_issue(issue, %{provider: Config.settings!().tracker.kind}),
+         {:ok, mapped_state} <- map_observation_state(observation, contract),
+         true <- mapped_state == checkpoint.last_validated_lifecycle_state do
+      checkpoint.durable_guard_evidence
+    else
+      _changed_or_invalid -> []
+    end
+  end
+
+  defp map_observation_state(observation, %ProviderProjectContract{} = contract),
+    do: ProviderObservation.map_state(observation, contract)
+
+  defp map_observation_state(observation, _contract), do: ProviderObservation.map_state(observation)
+
+  defp attach_checkpoint_suspension(%WorkItem{} = work_item, checkpoint, %State{} = state) do
+    existing = checkpoint_suspension_context(checkpoint)
+
+    cond do
+      match?(%SuspensionContext{}, existing) ->
+        %{work_item | suspension_context: existing}
+
+      Map.has_key?(state.durable_exhausted, work_item.id) ->
+        suspend_work_item_with_checkpoint_context(work_item, checkpoint, state, :retry_exhausted)
+
+      match?(%AuthorityDisposition{status: :suspended}, work_item.authority_disposition) ->
+        reason = work_item.authority_disposition.reason || work_item.lifecycle_assessment.reason || :unsafe_lifecycle_observation
+        suspend_work_item_with_checkpoint_context(work_item, checkpoint, state, reason)
+
+      true ->
+        %{work_item | suspension_context: nil}
+    end
+  end
+
+  defp suspend_work_item_with_checkpoint_context(%WorkItem{} = work_item, checkpoint, state, reason) do
+    with %{last_validated_lifecycle_state: last_state} when is_atom(last_state) <- checkpoint,
+         {:ok, suspended} <- WorkItem.suspend(work_item, reason),
+         {:ok, context} <- checkpoint_suspension_context(work_item, last_state, state, reason) do
+      %{suspended | suspension_context: context}
+    else
+      _invalid_or_missing ->
+        work_item
+    end
+  end
+
+  defp checkpoint_suspension_context(%WorkItem{} = work_item, last_state, state, reason) do
+    observation = work_item.provider_observation
+
+    SuspensionContext.new(%{
+      work_item_id: work_item.id,
+      last_validated_lifecycle_state: last_state,
+      provider_observation: observation,
+      reason: reason,
+      lineage_generation: Map.get(state.attempt_lineages, work_item.id),
+      created_at: observation.observed_at,
+      recovery_policy: :fresh_reconciliation,
+      required_evidence: work_item.lifecycle_assessment.missing_guards,
+      resume_target: last_state
+    })
+  end
+
+  defp maybe_suspend_exhausted_lineage(%State{} = state, issue, checkpoint, %WorkItem{} = work_item) do
+    if Map.has_key?(state.durable_exhausted, issue.id) and is_nil(work_item.suspension_context) do
+      {state, suspend_work_item_with_checkpoint_context(work_item, checkpoint, state, :retry_exhausted)}
+    else
+      {state, work_item}
+    end
+  end
+
+  defp maybe_reconcile_suspension(%State{} = state, %Issue{} = issue, checkpoint, %WorkItem{} = work_item) do
+    case work_item.suspension_context do
+      %SuspensionContext{status: status} = context when status in [:open, :resolving] and not is_nil(checkpoint) ->
+        resolve_durable_suspension(state, issue, checkpoint, context, work_item)
+
+      _no_recovery_context ->
+        {state, work_item}
+    end
+  end
+
+  defp resolve_durable_suspension(state, issue, checkpoint, context, work_item) do
+    resolving = begin_suspension_resolution(context)
+
+    first_checkpoint =
+      checkpoint_record(
+        state,
+        issue.id,
+        checkpoint.last_validated_lifecycle_state,
+        checkpoint.durable_guard_evidence,
+        resolving,
+        checkpoint.last_terminal_suspension_context
+      )
+
+    with {:ok, state, stored_checkpoint} <- persist_recovery_checkpoint(state, first_checkpoint),
+         resolving <- resolving_context_with_fresh_target(resolving, work_item),
+         next_checkpoint <-
+           checkpoint_record(
+             state,
+             issue.id,
+             stored_checkpoint.last_validated_lifecycle_state,
+             stored_checkpoint.durable_guard_evidence,
+             resolving,
+             stored_checkpoint.last_terminal_suspension_context
+           ),
+         {:ok, state, next_checkpoint} <- persist_recovery_checkpoint(state, next_checkpoint) do
+      reconcile_suspension_recovery(state, issue, context, next_checkpoint, resolving, work_item)
+    else
+      {:error, blocked_state, _reason} ->
+        {blocked_state, %{work_item | suspension_context: resolving}}
+    end
+  end
+
+  defp begin_suspension_resolution(%SuspensionContext{status: :open} = context) do
+    case SuspensionContext.begin_resolution(context) do
+      {:ok, resolving} -> resolving
+      {:error, _reason} -> context
+    end
+  end
+
+  defp begin_suspension_resolution(%SuspensionContext{} = context), do: context
+
+  defp reconcile_suspension_recovery(state, issue, original_context, checkpoint, resolving, work_item) do
+    facts = suspension_recovery_facts(state, issue, original_context, work_item)
+    decision = SuspensionRecovery.evaluate(resolving, facts)
+
+    if decision.status == :resolved and
+         decision.resume_target == work_item.validated_lifecycle_state and
+         LifecycleAssessment.validated?(work_item.lifecycle_assessment) do
+      resolve_suspension_checkpoint(state, checkpoint, resolving, work_item, facts)
+    else
+      {state, %{work_item | suspension_context: resolving}}
+    end
+  end
+
+  defp resolving_context_with_fresh_target(%SuspensionContext{status: :resolving} = context, %WorkItem{} = work_item) do
+    if LifecycleAssessment.validated?(work_item.lifecycle_assessment) and
+         WorkflowLifecycle.canonical?(work_item.validated_lifecycle_state) do
+      %{context | resume_target: work_item.validated_lifecycle_state}
+    else
+      context
+    end
+  end
+
+  defp resolve_suspension_checkpoint(state, _checkpoint, context, work_item, facts) do
+    supplied_evidence = work_item.lifecycle_assessment.satisfied_guards
+
+    with {:ok, resolved} <-
+           SuspensionContext.resolve(context, %{
+             fresh_reconciliation: true,
+             resume_target: Map.get(facts, :resume_target),
+             required_evidence: supplied_evidence
+           }),
+         resolved_checkpoint <-
+           checkpoint_record(
+             state,
+             work_item.id,
+             work_item.validated_lifecycle_state,
+             durable_mechanical_evidence(supplied_evidence),
+             nil,
+             resolved
+           ),
+         {:ok, state, resolved_checkpoint} <- persist_recovery_checkpoint(state, resolved_checkpoint) do
+      disposition = AuthorityDisposition.derive(work_item.lifecycle_assessment)
+
+      {%{state | recovery_checkpoints: put_checkpoint(state.recovery_checkpoints, work_item.id, resolved_checkpoint)}, %{work_item | authority_disposition: disposition, suspension_context: nil}}
+    else
+      {:error, blocked_state, _reason} -> {blocked_state, %{work_item | suspension_context: context}}
+      {:error, _reason} -> {state, %{work_item | suspension_context: context}}
+    end
+  end
+
+  defp suspension_recovery_facts(state, issue, context, work_item) do
+    dependency = dependency_diagnostic_for_issue(issue, state.dependency_graph, state)
+    graph_complete? = match?(%Graph{completeness: :complete}, state.dependency_graph)
+    contract_valid? = project_contract_valid?(state.project_contract_evidence)
+    observation = work_item.provider_observation
+    stable_identity? = stable_provider_identity?(observation)
+
+    facts = %{
+      fresh_reconciliation: true,
+      resume_target: work_item.validated_lifecycle_state,
+      trusted_resume_target?: LifecycleAssessment.validated?(work_item.lifecycle_assessment),
+      lifecycle_assessment_validated?: LifecycleAssessment.validated?(work_item.lifecycle_assessment),
+      dependency_graph_complete?: graph_complete?,
+      dependency_satisfied?: Map.get(dependency, :allowed?, false),
+      dependency_cycle?: Map.get(dependency, :reason) == :dependency_cycle,
+      contract_revalidated?: contract_valid?,
+      stable_provider_ids?: stable_identity?,
+      authoritative_observation?: graph_complete? and match?(%ProviderObservation{}, observation),
+      evidence_identity_stable?: stable_identity?,
+      provider_observation_complete?: graph_complete?,
+      provider_observation: observation,
+      evidence_identity: observation && observation.snapshot_identity,
+      resubmit?: false,
+      candidate_evidence_revalidated?: false,
+      candidate_identity_stable?: false,
+      runtime_available?: false,
+      old_runtime_discarded?: map_size(state.running) == 0
+    }
+
+    case SuspensionRecovery.classify_reason(context.reason) do
+      :retry_exhaustion -> Map.put(facts, :h030_rearm, h030_rearm_proof(state, issue.id, context.lineage_generation))
+      :h040_reconciliation -> Map.put(facts, :transition_reconciliation_durable?, transition_reconciliation_durable?(state, issue.id))
+      _other -> facts
+    end
+  end
+
+  defp project_contract_valid?(%ProjectContractEvidence{validation: %{status: :valid}}), do: true
+  defp project_contract_valid?(%ProjectContractEvidence{contract: nil}), do: Config.settings!().tracker.kind != "plane"
+  defp project_contract_valid?(_evidence), do: false
+
+  defp stable_provider_identity?(%ProviderObservation{} = observation) do
+    present_string?(observation.provider_state_id) and present_string?(observation.project_id) and
+      (observation.provider not in [:plane, "plane"] or present_string?(observation.workspace_id))
+  end
+
+  defp stable_provider_identity?(_observation), do: false
+
+  defp h030_rearm_proof(%State{attempt_ledger: %AttemptLedger{} = ledger} = state, issue_id, old_lineage) do
+    current_lineage = Map.get(state.attempt_lineages, issue_id)
+
+    with true <- is_binary(old_lineage) and is_binary(current_lineage) and old_lineage != current_lineage,
+         {:ok, history} <- AttemptLedger.history(ledger),
+         old when is_map(old) <- Enum.find(history, &(Map.get(&1, :issue_id) == issue_id and Map.get(&1, :lineage_id) == old_lineage)),
+         true <- Map.get(old, :status) == :closed and Map.get(old, :closed_reason) == :rearmed,
+         rearm_reason when is_binary(rearm_reason) <- Map.get(old, :rearm_reason),
+         true <- String.trim(rearm_reason) != "",
+         rearmed_by when is_binary(rearmed_by) <- Map.get(old, :rearmed_by),
+         true <- String.trim(rearmed_by) != "",
+         rearmed_at when is_integer(rearmed_at) and rearmed_at >= 0 <- Map.get(old, :rearmed_at) do
+      %{
+        explicitly_rearmed?: true,
+        old_lineage: old_lineage,
+        replacement_lineage: current_lineage,
+        rearm_reason: rearm_reason,
+        rearmed_by: rearmed_by,
+        rearmed_at: rearmed_at,
+        old_history_retained?: true
+      }
+    else
+      _missing_proof -> nil
+    end
+  end
+
+  defp h030_rearm_proof(_state, _issue_id, _old_lineage), do: nil
+
+  defp transition_reconciliation_durable?(%State{} = state, work_item_id) when is_binary(work_item_id) do
+    case TransitionCoordinator.reconciliation_marker_for_work_item(state.transition_coordinator, work_item_id) do
+      {:ok, %{work_item_id: ^work_item_id}} -> true
+      _unreconciled -> false
+    end
+  end
+
+  defp transition_reconciliation_durable?(_state, _work_item_id), do: false
+
+  defp persist_refreshed_work_item_checkpoint(%State{recovery_ledger_status: :disabled} = state, _previous, work_item),
+    do: {:ok, state, checkpoint_from_work_item(state, nil, work_item)}
+
+  defp persist_refreshed_work_item_checkpoint(%State{} = state, previous, %WorkItem{} = work_item) do
+    checkpoint = refreshed_checkpoint(state, previous, work_item)
+
+    cond do
+      is_nil(checkpoint) ->
+        {:ok, state, nil}
+
+      checkpoint_equivalent?(checkpoint, previous) ->
+        {:ok, state, previous}
+
+      state.recovery_ledger_status != :ready or not match?(%RecoveryLedger{}, state.recovery_ledger) ->
+        {:error, fence_recovery_ledger(state, :missing_recovery_ledger), :missing_recovery_ledger}
+
+      true ->
+        persist_recovery_checkpoint(state, checkpoint)
+    end
+  end
+
+  defp refreshed_checkpoint(%State{} = state, previous, %WorkItem{} = work_item) do
+    case work_item.suspension_context do
+      %SuspensionContext{status: :escalated} = context ->
+        checkpoint_record(state, work_item.id, previous_lifecycle_state(previous), previous_evidence(previous), nil, context)
+
+      %SuspensionContext{status: status} = context when status in [:open, :resolving] ->
+        checkpoint_record(
+          state,
+          work_item.id,
+          previous_lifecycle_state(previous),
+          previous_evidence(previous),
+          context,
+          previous_terminal_context(previous)
+        )
+
+      _no_active_context ->
+        validated_or_previous_checkpoint(state, previous, work_item)
+    end
+  end
+
+  defp validated_or_previous_checkpoint(state, previous, work_item) do
+    if LifecycleAssessment.validated?(work_item.lifecycle_assessment) and
+         WorkflowLifecycle.canonical?(work_item.validated_lifecycle_state) do
+      checkpoint_record(
+        state,
+        work_item.id,
+        work_item.validated_lifecycle_state,
+        durable_mechanical_evidence(work_item.lifecycle_assessment.satisfied_guards),
+        nil,
+        previous_terminal_context(previous)
+      )
+    else
+      previous_lifecycle_checkpoint(state, previous, work_item)
+    end
+  end
+
+  defp previous_lifecycle_checkpoint(state, previous, work_item) do
+    lifecycle_state = previous_lifecycle_state(previous)
+
+    if WorkflowLifecycle.canonical?(lifecycle_state) do
+      checkpoint_record(
+        state,
+        work_item.id,
+        lifecycle_state,
+        previous_evidence(previous),
+        nil,
+        previous_terminal_context(previous)
+      )
+    else
+      nil
+    end
+  end
+
+  defp previous_lifecycle_state(%{last_validated_lifecycle_state: state}), do: state
+  defp previous_lifecycle_state(_previous), do: nil
+
+  defp previous_evidence(%{durable_guard_evidence: evidence}), do: evidence
+  defp previous_evidence(_previous), do: []
+
+  defp previous_terminal_context(%{last_terminal_suspension_context: context}), do: context
+  defp previous_terminal_context(_previous), do: nil
+
+  defp checkpoint_from_work_item(state, previous, %WorkItem{} = work_item),
+    do: refreshed_checkpoint(state, previous, work_item)
+
+  defp checkpoint_record(_state, _work_item_id, nil, _evidence, _active, _terminal), do: nil
+
+  defp checkpoint_record(_state, work_item_id, lifecycle_state, evidence, active_context, terminal_context) do
+    %{
+      schema_version: RecoveryLedger.schema_version(),
+      project_namespace: Config.settings!().symphony.project_id,
+      work_item_id: work_item_id,
+      last_validated_lifecycle_state: lifecycle_state,
+      durable_guard_evidence: evidence,
+      active_suspension_context: active_context,
+      last_terminal_suspension_context: terminal_context,
+      updated_at: DateTime.utc_now()
+    }
+  end
+
+  defp durable_mechanical_evidence(evidence) when is_list(evidence) do
+    evidence
+    |> Enum.filter(fn
+      %{class: :mechanical_guard} = item -> GuardClass.valid_evidence?(item)
+      _other -> false
+    end)
+    |> Enum.map(&Map.take(&1, [:class, :name, :outcome]))
+  end
+
+  defp durable_mechanical_evidence(_evidence), do: []
+
+  defp persist_recovery_checkpoint(%State{recovery_ledger: %RecoveryLedger{} = ledger} = state, checkpoint) do
+    existing = Map.get(state.recovery_checkpoints, checkpoint.work_item_id)
+
+    if checkpoint_equivalent?(checkpoint, existing) do
+      {:ok, state, existing}
+    else
+      case RecoveryLedger.put_sync(ledger, checkpoint) do
+        :ok ->
+          {:ok,
+           %{
+             state
+             | recovery_ledger_status: :ready,
+               recovery_checkpoints: put_checkpoint(state.recovery_checkpoints, checkpoint.work_item_id, checkpoint)
+           }, checkpoint}
+
+        {:error, reason} ->
+          {:error, fence_recovery_ledger(state, reason), reason}
+      end
+    end
+  end
+
+  defp persist_recovery_checkpoint(%State{} = state, _checkpoint),
+    do: {:error, fence_recovery_ledger(state, :missing_recovery_ledger), :missing_recovery_ledger}
+
+  defp put_checkpoint(checkpoints, work_item_id, nil), do: Map.delete(checkpoints, work_item_id)
+  defp put_checkpoint(checkpoints, work_item_id, checkpoint), do: Map.put(checkpoints, work_item_id, checkpoint)
+
+  defp checkpoint_equivalent?(_checkpoint, nil), do: false
+
+  defp checkpoint_equivalent?(checkpoint, previous) do
+    Map.drop(checkpoint, [:updated_at]) == Map.drop(previous, [:updated_at])
+  end
+
+  defp persist_authoritative_work_item(%State{} = state, work_item_id, %WorkItem{id: work_item_id} = work_item) do
+    cond do
+      not LifecycleAssessment.validated?(work_item.lifecycle_assessment) or
+          not WorkflowLifecycle.canonical?(work_item.validated_lifecycle_state) ->
+        {:error, state, :unvalidated_work_item_lifecycle}
+
+      state.recovery_ledger_status == :disabled ->
+        {:ok, state}
+
+      state.recovery_ledger_status != :ready or not match?(%RecoveryLedger{}, state.recovery_ledger) ->
+        {:error, fence_recovery_ledger(state, :missing_recovery_ledger), :missing_recovery_ledger}
+
+      true ->
+        persist_validated_work_item(state, work_item_id, work_item)
+    end
+  end
+
+  defp persist_authoritative_work_item(%State{} = state, _work_item_id, _work_item),
+    do: {:error, state, :work_item_id_mismatch}
+
+  defp persist_validated_work_item(state, work_item_id, work_item) do
+    previous = Map.get(state.recovery_checkpoints, work_item_id)
+
+    if active_checkpoint_suspension?(previous) or active_work_item_suspension?(work_item) do
+      {:error, state, :active_suspension_context}
+    else
+      checkpoint =
+        checkpoint_record(
+          state,
+          work_item_id,
+          work_item.validated_lifecycle_state,
+          durable_mechanical_evidence(work_item.lifecycle_assessment.satisfied_guards),
+          nil,
+          previous && previous.last_terminal_suspension_context
+        )
+
+      case persist_recovery_checkpoint(state, checkpoint) do
+        {:ok, next_state, _checkpoint} -> {:ok, next_state}
+        {:error, blocked_state, reason} -> {:error, blocked_state, reason}
+      end
+    end
+  end
+
+  defp active_checkpoint_suspension?(%{active_suspension_context: %SuspensionContext{status: status}})
+       when status in [:open, :resolving],
+       do: true
+
+  defp active_checkpoint_suspension?(_checkpoint), do: false
+
+  defp active_work_item_suspension?(%WorkItem{suspension_context: %SuspensionContext{status: status}})
+       when status in [:open, :resolving, :escalated],
+       do: true
+
+  defp active_work_item_suspension?(_work_item), do: false
+
+  defp persist_suspended_work_item(%State{} = state, work_item_id, %WorkItem{} = work_item) do
+    checkpoint = Map.get(state.recovery_checkpoints, work_item_id)
+
+    cond do
+      state.recovery_ledger_status == :disabled ->
+        {:ok, state, work_item}
+
+      is_nil(checkpoint) ->
+        {:ok, state, work_item}
+
+      state.recovery_ledger_status != :ready or not match?(%RecoveryLedger{}, state.recovery_ledger) ->
+        {:error, fence_recovery_ledger(state, :missing_recovery_ledger), :missing_recovery_ledger}
+
+      true ->
+        persist_open_suspension(state, checkpoint, work_item_id, work_item)
+    end
+  end
+
+  defp persist_open_suspension(state, checkpoint, work_item_id, work_item) do
+    context = work_item.suspension_context
+
+    cond do
+      not match?(%SuspensionContext{status: :open}, context) ->
+        fail_suspended_work_item(state, :missing_active_suspension_context)
+
+      context.work_item_id != work_item_id or
+          context.last_validated_lifecycle_state != checkpoint.last_validated_lifecycle_state ->
+        fail_suspended_work_item(state, :suspension_checkpoint_mismatch)
+
+      true ->
+        checkpoint =
+          checkpoint_record(
+            state,
+            work_item_id,
+            checkpoint.last_validated_lifecycle_state,
+            checkpoint.durable_guard_evidence,
+            context,
+            checkpoint.last_terminal_suspension_context
+          )
+
+        case persist_recovery_checkpoint(state, checkpoint) do
+          {:ok, next_state, _checkpoint} -> {:ok, next_state, work_item}
+          {:error, blocked_state, reason} -> {:error, blocked_state, reason}
+        end
+    end
+  end
+
+  defp fail_suspended_work_item(state, reason) do
+    {:error, fence_recovery_ledger(state, reason), reason}
+  end
+
+  defp fence_recovery_ledger(%State{} = state, reason) do
+    blocked_reason = {:recovery_ledger_unavailable, reason}
+
+    %{
+      state
+      | recovery_ledger_status: {:blocked, blocked_reason},
+        startup_reconciliation: {:blocked, blocked_reason}
+    }
+  end
 
   defp apply_project_contract_guard(%WorkItem{} = work_item, %State{} = state) do
     evidence = state.project_contract_evidence
@@ -2584,16 +4127,6 @@ defmodule SymphonyElixir.Orchestrator do
     end)
   end
 
-  defp clear_visible_durable_blocks(%State{} = state, issues) when is_list(issues) do
-    Enum.reduce(issues, state, fn
-      %Issue{id: issue_id}, state_acc when is_binary(issue_id) ->
-        %{state_acc | durable_blocked: Map.delete(state_acc.durable_blocked, issue_id)}
-
-      _issue, state_acc ->
-        state_acc
-    end)
-  end
-
   defp sort_issues_for_dispatch(issues) when is_list(issues) do
     Enum.sort_by(issues, fn
       %Issue{} = issue ->
@@ -2636,6 +4169,7 @@ defmodule SymphonyElixir.Orchestrator do
       !MapSet.member?(state.attempt_ledger_pending_closes, issue_id) and
       !MapSet.member?(state.durable_in_flight, issue_id) and
       !Map.has_key?(state.durable_blocked, issue_id) and
+      !Enum.any?(state.transition_reconciliation_candidates, &(Map.get(&1, :work_item_id) == issue_id)) and
       !Map.has_key?(Map.get(state, :durable_exhausted, %{}), issue_id)
   end
 
@@ -3988,19 +5522,41 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp reset_ready_attempt_counters(%State{attempt_ledger: %AttemptLedger{} = ledger} = state, issue_id) do
-    case AttemptLedger.close_lineage(ledger, issue_id, reason: :terminal) do
-      :ok ->
-        reset_durable_lineage(state, issue_id)
+    case AttemptLedger.current(ledger, issue_id) do
+      {:ok, %{status: :exhausted} = record} ->
+        preserve_exhausted_lineage(state, issue_id, record)
 
       {:error, reason} ->
-        state
-        |> mark_pending_lineage_close(issue_id)
-        |> block_ledger(reason)
+        block_ledger(state, reason)
+
+      _open_or_closed ->
+        case AttemptLedger.close_lineage(ledger, issue_id, reason: :terminal) do
+          :ok ->
+            reset_durable_lineage(state, issue_id)
+
+          {:error, reason} ->
+            state
+            |> mark_pending_lineage_close(issue_id)
+            |> block_ledger(reason)
+        end
     end
   end
 
   defp reset_ready_attempt_counters(%State{} = state, _issue_id),
     do: block_ledger(state, :missing_ledger_handle)
+
+  defp preserve_exhausted_lineage(%State{} = state, issue_id, record) do
+    counters = Map.merge(AttemptPolicy.new(), Map.get(record, :safety_counters, %{}))
+
+    %{
+      state
+      | attempt_counters: Map.put(state.attempt_counters, issue_id, counters),
+        attempt_lineages: Map.put(state.attempt_lineages, issue_id, record.lineage_id),
+        durable_exhausted: Map.put(state.durable_exhausted, issue_id, record),
+        attempt_ledger_pending_closes: MapSet.delete(state.attempt_ledger_pending_closes, issue_id),
+        durable_in_flight: MapSet.delete(state.durable_in_flight, issue_id)
+    }
+  end
 
   defp retry_delay(attempt, metadata) when is_integer(attempt) and attempt > 0 and is_map(metadata) do
     if metadata[:delay_type] in [:continuation, :route_change, :capacity_wait] do
@@ -4589,12 +6145,24 @@ defmodule SymphonyElixir.Orchestrator do
     do: ProjectContractEvidence.observability(nil)
 
   defp transition_context_available?(%State{} = state, work_item_id, %WorkItem{} = work_item) do
-    with :ok <- validate_transition_work_item(work_item),
+    with :ok <- startup_item_authority_available(state, work_item_id),
+         :ok <- validate_transition_work_item(work_item),
          :ok <- validate_transition_dependency_context(state, work_item_id),
          :ok <- validate_transition_work_item_context(work_item) do
       validate_transition_contract_context(state.project_contract_evidence)
     end
   end
+
+  defp startup_item_authority_available(%State{startup_reconciliation: :ready} = state, work_item_id) do
+    if Enum.any?(state.transition_reconciliation_candidates, &(Map.get(&1, :work_item_id) == work_item_id)) do
+      {:error, :transition_reconciliation_pending}
+    else
+      :ok
+    end
+  end
+
+  defp startup_item_authority_available(%State{}, _work_item_id),
+    do: {:error, :startup_reconciliation_pending}
 
   defp validate_transition_work_item(%WorkItem{} = work_item) do
     if WorkItem.suspended?(work_item), do: {:error, :work_item_suspended}, else: :ok
@@ -4855,6 +6423,11 @@ defmodule SymphonyElixir.Orchestrator do
   def autonomous_dispatch_allowed_for_test?(%State{} = state), do: autonomous_dispatch_allowed?(state)
 
   @doc false
+  @spec h030_rearm_proof_for_test(State.t(), String.t(), String.t() | nil) :: map() | nil
+  def h030_rearm_proof_for_test(%State{} = state, issue_id, old_lineage),
+    do: h030_rearm_proof(state, issue_id, old_lineage)
+
+  @doc false
   @spec observability_error(term()) :: String.t() | nil
   def observability_error(value), do: snapshot_safe_error(value)
 
@@ -5047,9 +6620,13 @@ defmodule SymphonyElixir.Orchestrator do
 
   def handle_call({:semantic_tool_context, work_item_id}, _from, %State{} = state)
       when is_binary(work_item_id) do
-    case semantic_tool_context_for_state(state, work_item_id) do
-      {:ok, context} -> {:reply, {:ok, context}, state}
-      {:error, _reason} = error -> {:reply, error, state}
+    if state.startup_reconciliation == :ready do
+      case semantic_tool_context_for_state(state, work_item_id) do
+        {:ok, context} -> {:reply, {:ok, context}, state}
+        {:error, _reason} = error -> {:reply, error, state}
+      end
+    else
+      {:reply, {:error, :startup_reconciliation_pending}, state}
     end
   end
 
@@ -5063,8 +6640,20 @@ defmodule SymphonyElixir.Orchestrator do
       work_item.id != work_item_id ->
         {:reply, {:error, :work_item_id_mismatch}, state}
 
+      state.startup_reconciliation != :ready ->
+        {:reply, {:error, :startup_reconciliation_pending}, state}
+
+      Enum.any?(state.transition_reconciliation_candidates, &(Map.get(&1, :work_item_id) == work_item_id)) ->
+        {:reply, {:error, :transition_reconciliation_pending}, state}
+
       transition_context_token_matches?(state, work_item_id, Keyword.get(opts, :expected_context_token)) ->
-        {:reply, :ok, %{state | work_control: Map.put(state.work_control, work_item_id, work_item)}}
+        case persist_authoritative_work_item(state, work_item_id, work_item) do
+          {:ok, next_state} ->
+            {:reply, :ok, %{next_state | work_control: Map.put(next_state.work_control, work_item_id, work_item)}}
+
+          {:error, next_state, reason} ->
+            {:reply, {:error, {:recovery_ledger_unavailable, reason}}, next_state}
+        end
 
       true ->
         {:reply, {:error, :context_token_mismatch}, state}
@@ -5077,7 +6666,7 @@ defmodule SymphonyElixir.Orchestrator do
       %WorkItem{} = work_item ->
         case WorkItem.suspend(work_item, reason) do
           {:ok, suspended} ->
-            {:reply, {:ok, suspended}, %{state | work_control: Map.put(state.work_control, work_item_id, suspended)}}
+            handle_suspension_persistence(state, work_item_id, reason, suspended)
 
           {:error, _reason} = error ->
             {:reply, error, state}
@@ -5085,6 +6674,25 @@ defmodule SymphonyElixir.Orchestrator do
 
       _missing ->
         {:reply, {:error, :work_item_not_found}, state}
+    end
+  end
+
+  defp handle_suspension_persistence(state, work_item_id, reason, suspended) do
+    suspended =
+      suspend_work_item_with_checkpoint_context(
+        suspended,
+        Map.get(state.recovery_checkpoints, work_item_id),
+        state,
+        reason
+      )
+
+    case persist_suspended_work_item(state, work_item_id, suspended) do
+      {:ok, next_state, suspended} ->
+        next_state = %{next_state | work_control: Map.put(next_state.work_control, work_item_id, suspended)}
+        {:reply, {:ok, suspended}, next_state}
+
+      {:error, next_state, persistence_reason} ->
+        {:reply, {:error, {:recovery_ledger_unavailable, persistence_reason}}, next_state}
     end
   end
 
@@ -5794,6 +7402,7 @@ defmodule SymphonyElixir.Orchestrator do
       reason = evidence.reason || :provider_configuration_changed
 
       state
+      |> Map.put(:startup_reconciliation, :pending)
       |> suspend_work_control_for_project_contract(reason)
       |> suspend_running_for_project_contract(reason)
     else

@@ -989,12 +989,14 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       end
     end)
 
-    worker_pid =
-      spawn(fn ->
+    {:ok, worker_pid} =
+      Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
         receive do
           :done -> :ok
         end
       end)
+
+    worker_monitor = Process.monitor(worker_pid)
 
     stale_activity_at = DateTime.add(DateTime.utc_now(), -5, :second)
     initial_state = :sys.get_state(pid)
@@ -1018,15 +1020,15 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [running_entry.issue])
 
-    :sys.replace_state(pid, fn _ ->
+    state =
       initial_state
       |> Map.put(:running, %{issue_id => running_entry})
       |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
-    end)
+      |> Orchestrator.reconcile_stalled_running_issues_for_test()
 
-    send(pid, :tick)
-    Process.sleep(100)
-    state = :sys.get_state(pid)
+    :sys.replace_state(pid, fn _ -> state end)
+
+    assert_receive {:DOWN, ^worker_monitor, :process, ^worker_pid, _reason}, 5_000
 
     refute Process.alive?(worker_pid)
     refute Map.has_key?(state.running, issue_id)
@@ -1061,12 +1063,14 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       end
     end)
 
-    worker_pid =
-      spawn(fn ->
+    {:ok, worker_pid} =
+      Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
         receive do
           :done -> :ok
         end
       end)
+
+    worker_monitor = Process.monitor(worker_pid)
 
     stale_activity_at = DateTime.add(DateTime.utc_now(), -5, :second)
     initial_state = :sys.get_state(pid)
@@ -1097,15 +1101,15 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [running_entry.issue])
 
-    :sys.replace_state(pid, fn _ ->
+    state =
       initial_state
       |> Map.put(:running, %{issue_id => running_entry})
       |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
-    end)
+      |> Orchestrator.reconcile_stalled_running_issues_for_test()
 
-    send(pid, :tick)
-    Process.sleep(100)
-    state = :sys.get_state(pid)
+    :sys.replace_state(pid, fn _ -> state end)
+
+    assert_receive {:DOWN, ^worker_monitor, :process, ^worker_pid, _reason}, 5_000
 
     refute Process.alive?(worker_pid)
     refute Map.has_key?(state.running, issue_id)

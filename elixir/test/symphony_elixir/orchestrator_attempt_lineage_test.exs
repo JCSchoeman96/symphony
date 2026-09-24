@@ -14,6 +14,9 @@ defmodule SymphonyElixir.OrchestratorAttemptLineageTest do
 
   alias SymphonyElixir.AgentRuntime.AttemptLedger
   alias SymphonyElixir.AgentRuntime.{Route, Router}
+  alias SymphonyElixir.AgentRuntime.RuntimeAttempt.Identity, as: RuntimeAttemptIdentity
+  alias SymphonyElixir.WorkControl.RecoveryLedger
+  alias SymphonyElixir.WorkControl.SuspensionRecovery
   alias SymphonyElixir.WorkControl.WorkItem
 
   test "restores consumed ordinary retry budget across orchestrator restart" do
@@ -115,6 +118,146 @@ defmodule SymphonyElixir.OrchestratorAttemptLineageTest do
     assert Map.has_key?(Map.get(state, :durable_exhausted, %{}), issue.id)
   end
 
+  test "a zero timestamp proves a valid H-030 operator rearm" do
+    project_id = "rearm-zero-#{System.unique_integer([:positive])}"
+    issue_id = "rearm-zero-issue"
+    ledger_root = temporary_ledger_root()
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      symphony_project_id: project_id,
+      tracker_active_states: ["In Progress"],
+      poll_interval_ms: 60_000
+    )
+
+    {:ok, ledger} = AttemptLedger.open(project_id, Tracker.identity(Config.settings!().tracker), root: ledger_root)
+    on_exit(fn -> AttemptLedger.close(ledger) end)
+
+    assert {:ok, exhausted} =
+             AttemptLedger.persist_safety(
+               ledger,
+               issue_id,
+               %{ordinary_failures: 4, ordinary_retries: 3, review_cycles: 0},
+               status: :exhausted,
+               stop_reason: :ordinary_retry_limit,
+               updated_at: 1
+             )
+
+    assert {:ok, rearmed} = AttemptLedger.rearm(ledger, issue_id, "operator verified", "operator", 0)
+
+    state = %Orchestrator.State{attempt_ledger: ledger, attempt_lineages: %{issue_id => rearmed.lineage_id}}
+    proof = Orchestrator.h030_rearm_proof_for_test(state, issue_id, exhausted.lineage_id)
+
+    assert proof.explicitly_rearmed?
+    assert proof.old_lineage == exhausted.lineage_id
+    assert proof.replacement_lineage == rearmed.lineage_id
+    assert proof.rearmed_at == 0
+    assert proof.old_history_retained?
+
+    assert SuspensionRecovery.evaluate(:retry_exhausted, %{
+             fresh_reconciliation: true,
+             resume_target: :ready,
+             h030_rearm: proof
+           }).status == :resolved
+  end
+
+  test "a complete retained-history H-030 rearm proves a replacement lineage" do
+    project_id = "rearm-proof-#{System.unique_integer([:positive])}"
+    issue_id = "rearm-proof-issue"
+    ledger_root = temporary_ledger_root()
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      symphony_project_id: project_id,
+      tracker_active_states: ["In Progress"],
+      poll_interval_ms: 60_000
+    )
+
+    {:ok, ledger} = AttemptLedger.open(project_id, Tracker.identity(Config.settings!().tracker), root: ledger_root)
+    on_exit(fn -> AttemptLedger.close(ledger) end)
+
+    assert {:ok, exhausted} =
+             AttemptLedger.persist_safety(
+               ledger,
+               issue_id,
+               %{ordinary_failures: 4, ordinary_retries: 3, review_cycles: 0},
+               status: :exhausted,
+               stop_reason: :ordinary_retry_limit,
+               updated_at: 1
+             )
+
+    assert {:ok, rearmed} =
+             AttemptLedger.rearm(ledger, issue_id, "operator verified recovery", "host-operator", 1_700_000_000_000)
+
+    state = %Orchestrator.State{attempt_ledger: ledger, attempt_lineages: %{issue_id => rearmed.lineage_id}}
+    proof = Orchestrator.h030_rearm_proof_for_test(state, issue_id, exhausted.lineage_id)
+
+    assert proof.explicitly_rearmed?
+    assert proof.old_lineage == exhausted.lineage_id
+    assert proof.replacement_lineage == rearmed.lineage_id
+    assert proof.rearm_reason == "operator verified recovery"
+    assert proof.rearmed_by == "host-operator"
+    assert proof.rearmed_at == 1_700_000_000_000
+    assert proof.old_history_retained?
+  end
+
+  test "terminal Plane state does not close an exhausted lineage or replace H-030 rearm" do
+    project_id = "exhausted-terminal-#{System.unique_integer([:positive])}"
+    issue = %{active_issue("exhausted-terminal-issue") | state: "Done"}
+    ledger_root = temporary_ledger_root()
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      symphony_project_id: project_id,
+      tracker_active_states: ["In Progress"],
+      poll_interval_ms: 60_000
+    )
+
+    Application.put_env(:symphony_elixir, :attempt_ledger_root, ledger_root)
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+    Application.put_env(:symphony_elixir, :attempt_ledger_test_pid, self())
+
+    path = AttemptLedger.path_for(project_id, root: ledger_root)
+    seed_snapshot(path, project_id, issue.id, %{ordinary_failures: 4, ordinary_retries: 3}, :exhausted)
+
+    name = Module.concat(__MODULE__, "ExhaustedTerminal#{System.unique_integer([:positive])}")
+    {:ok, pid} = start_orchestrator(name)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: GenServer.stop(pid)
+      Application.delete_env(:symphony_elixir, :attempt_ledger_root)
+      Application.delete_env(:symphony_elixir, :attempt_ledger_test_pid)
+    end)
+
+    assert {:ok, exhausted} = read_snapshot(path, project_id, issue.id)
+    assert exhausted.status == :exhausted
+    old_lineage_id = exhausted.lineage_id
+
+    terminal_state = Orchestrator.handle_retry_issue_lookup_for_test(issue, :sys.get_state(pid), issue.id, 0, %{})
+
+    assert Map.has_key?(terminal_state.durable_exhausted, issue.id)
+    assert {:ok, after_manual_terminal} = read_snapshot(path, project_id, issue.id)
+    assert after_manual_terminal.status == :exhausted
+    assert after_manual_terminal.lineage_id == old_lineage_id
+
+    active_issue = %{issue | state: "In Progress"}
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [active_issue])
+    :ok = GenServer.stop(pid)
+
+    second_name = Module.concat(__MODULE__, "ExhaustedTerminalRestart#{System.unique_integer([:positive])}")
+    {:ok, second_pid} = start_orchestrator(second_name)
+
+    on_exit(fn ->
+      if Process.alive?(second_pid), do: GenServer.stop(second_pid)
+    end)
+
+    issue_id = issue.id
+    refute_receive {:attempt_ledger_runner_started, ^issue_id, _opts}, 300
+    assert {:ok, still_exhausted} = read_snapshot(path, project_id, issue.id)
+    assert still_exhausted.status == :exhausted
+    assert still_exhausted.lineage_id == old_lineage_id
+  end
+
   test "blocks autonomous recovery when a reopened record is missing in_flight" do
     assert_corrupt_record_blocks_autonomy(:in_flight)
   end
@@ -159,6 +302,20 @@ defmodule SymphonyElixir.OrchestratorAttemptLineageTest do
     assert {:ok, snapshot} = read_snapshot(path, project_id, issue_id)
     assert snapshot.safety_counters.ordinary_failures == 2
     refute_receive {:attempt_ledger_runner_started, ^issue_id, _opts}, 300
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [active_issue(issue_id)])
+    send(pid, :run_poll_cycle)
+
+    assert eventually(fn ->
+             state = :sys.get_state(pid)
+
+             not Map.has_key?(state.durable_blocked, issue_id) and
+               state.attempt_lineages[issue_id] == snapshot.lineage_id
+           end)
+
+    assert {:ok, visible_snapshot} = read_snapshot(path, project_id, issue_id)
+    assert visible_snapshot.lineage_id == snapshot.lineage_id
+    assert visible_snapshot.safety_counters.ordinary_failures == snapshot.safety_counters.ordinary_failures
   end
 
   test "a missing durable issue does not fence unrelated autonomous work" do
@@ -193,6 +350,56 @@ defmodule SymphonyElixir.OrchestratorAttemptLineageTest do
     state = :sys.get_state(pid)
     assert state.attempt_ledger_status == :ready
     assert state.durable_blocked[missing_issue_id] == {:attempt_ledger_issue_missing, missing_issue_id}
+  end
+
+  test "tracker visibility alone does not clear a missing durable-lineage block" do
+    project_id = "missing-lineage-visible-#{System.unique_integer([:positive])}"
+    issue = active_issue("missing-lineage-visible-issue")
+    issue_id = issue.id
+    ledger_root = temporary_ledger_root()
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      symphony_project_id: project_id,
+      tracker_active_states: ["In Progress"],
+      poll_interval_ms: 60_000
+    )
+
+    Application.put_env(:symphony_elixir, :attempt_ledger_root, ledger_root)
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
+    Application.put_env(:symphony_elixir, :attempt_ledger_test_pid, self())
+
+    {:ok, work_item} =
+      WorkItem.from_issue(issue, %{
+        provider: :memory,
+        observed_at: DateTime.utc_now(),
+        prior_validated_lifecycle_state: issue.state
+      })
+
+    name = Module.concat(__MODULE__, "MissingLineageVisible#{System.unique_integer([:positive])}")
+    {:ok, pid} = start_orchestrator(name, work_control: %{issue_id => work_item})
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: GenServer.stop(pid)
+      Application.delete_env(:symphony_elixir, :attempt_ledger_root)
+      Application.delete_env(:symphony_elixir, :attempt_ledger_test_pid)
+    end)
+
+    assert eventually(fn -> :sys.get_state(pid).startup_reconciliation == :ready end)
+
+    :sys.replace_state(pid, fn state ->
+      %{state | durable_blocked: Map.put(state.durable_blocked, issue_id, {:attempt_ledger_issue_missing, issue_id})}
+    end)
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+    send(pid, :run_poll_cycle)
+
+    assert eventually(fn ->
+             state = :sys.get_state(pid)
+             state.durable_blocked[issue_id] == {:attempt_ledger_issue_missing, issue_id}
+           end)
+
+    refute_receive {:attempt_ledger_runner_started, ^issue_id, _opts}, 300
   end
 
   test "blocks startup when a terminal lineage cannot be durably closed" do
@@ -726,53 +933,47 @@ defmodule SymphonyElixir.OrchestratorAttemptLineageTest do
 
   test "route refresh persistence errors fail closed instead of crashing the orchestrator" do
     project_id = "route-sync-error-#{System.unique_integer([:positive])}"
-    issue = %{active_issue("route-sync-error-issue") | state: "In Review"}
-    next_issue = %{issue | state: "Changes Requested"}
+    issue = %{active_issue("route-sync-error-issue") | state: "Ready"}
+    next_issue = %{issue | state: "Canceled"}
     ledger_root = temporary_ledger_root()
-    path = AttemptLedger.path_for(project_id, root: ledger_root)
+    recovery_path = RecoveryLedger.path_for(project_id, root: ledger_root)
 
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "memory",
       symphony_project_id: project_id,
-      tracker_active_states: ["In Review", "Changes Requested"],
+      tracker_active_states: ["Ready", "Canceled"],
       poll_interval_ms: 60_000
     )
 
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [next_issue])
-    {:ok, initial_ledger} = AttemptLedger.open(project_id, Tracker.identity(Config.settings!().tracker), path: path)
-    :ok = AttemptLedger.close(initial_ledger)
+    tracker_identity = Tracker.identity(Config.settings!().tracker)
+    {:ok, seed_ledger} = RecoveryLedger.open(project_id, tracker_identity, path: recovery_path)
+    checkpoint = recovery_checkpoint(issue.id, :ready)
+    assert :ok = RecoveryLedger.put_sync(seed_ledger, checkpoint)
+    assert :ok = RecoveryLedger.close(seed_ledger)
 
-    {:ok, ledger} =
-      AttemptLedger.open(project_id, Tracker.identity(Config.settings!().tracker),
-        path: path,
+    {:ok, recovery_ledger} =
+      RecoveryLedger.open(project_id, tracker_identity,
+        path: recovery_path,
         sync_fun: fn _table -> {:error, :injected_sync_failure} end
       )
 
-    {:ok, previous_route} = Router.resolve(trusted_work_item(issue), Config.settings!().agent.profiles)
+    work_item = trusted_work_item(issue)
 
     state = %Orchestrator.State{
-      attempt_ledger: ledger,
-      attempt_ledger_status: :ready,
-      attempt_ledger_opts: [path: path],
-      running: %{
-        issue.id => %{
-          pid: nil,
-          ref: nil,
-          identifier: issue.identifier,
-          issue: issue,
-          route: previous_route,
-          started_at: DateTime.utc_now()
-        }
-      },
-      claimed: MapSet.new([issue.id]),
-      work_control: %{issue.id => trusted_work_item(next_issue)},
-      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+      recovery_ledger: recovery_ledger,
+      recovery_ledger_status: :ready,
+      recovery_ledger_opts: [path: recovery_path],
+      recovery_checkpoints: %{issue.id => checkpoint},
+      work_control: %{issue.id => work_item}
     }
 
-    updated = Orchestrator.reconcile_issue_states_for_test([next_issue], state)
+    updated = Orchestrator.refresh_work_control_for_test(state, [next_issue])
 
-    assert match?({:blocked, _reason}, updated.attempt_ledger_status)
-    assert updated.blocked[issue.id].error =~ "attempt ledger unavailable"
+    assert match?({:blocked, {:recovery_ledger_unavailable, _reason}}, updated.recovery_ledger_status)
+    assert match?({:blocked, {:recovery_ledger_unavailable, _reason}}, updated.startup_reconciliation)
+    assert updated.work_control[issue.id] == work_item
+    assert :ok = RecoveryLedger.close(recovery_ledger)
   end
 
   test "rechecks the ledger fence after terminal reconciliation blocks it" do
@@ -900,8 +1101,8 @@ defmodule SymphonyElixir.OrchestratorAttemptLineageTest do
       Application.delete_env(:symphony_elixir, :attempt_ledger_test_pid)
     end)
 
-    refute_receive {:attempt_ledger_runner_started, ^issue_id, _opts}, 300
-    assert MapSet.member?(:sys.get_state(second_pid).durable_in_flight, issue_id)
+    assert_receive {:attempt_ledger_runner_started, ^issue_id, second_opts}, 1_000
+    assert %RuntimeAttemptIdentity{} = second_opts[:runtime_attempt_identity]
   end
 
   test "does not reuse an old ledger identity while reconciliation is blocked" do
@@ -970,7 +1171,9 @@ defmodule SymphonyElixir.OrchestratorAttemptLineageTest do
     {:ok, first_pid} = start_orchestrator(first_name, attempt_ledger_opts: [write_fun: write_fun])
     issue_id = issue.id
 
-    assert_receive {:attempt_ledger_runner_started, ^issue_id, _opts}, 1_000
+    assert_receive {:attempt_ledger_runner_started, ^issue_id, first_opts}, 1_000
+    assert %RuntimeAttemptIdentity{} = first_opts[:runtime_attempt_identity]
+    first_runtime_attempt_id = first_opts[:runtime_attempt_identity].runtime_attempt_id
     assert eventually(fn -> :sys.get_state(first_pid).blocked[issue_id] != nil end)
     :ok = GenServer.stop(first_pid)
 
@@ -989,8 +1192,9 @@ defmodule SymphonyElixir.OrchestratorAttemptLineageTest do
       Application.delete_env(:symphony_elixir, :attempt_ledger_test_pid)
     end)
 
-    refute_receive {:attempt_ledger_runner_started, ^issue_id, _opts}, 300
-    assert MapSet.member?(:sys.get_state(second_pid).durable_in_flight, issue_id)
+    assert_receive {:attempt_ledger_runner_started, ^issue_id, second_opts}, 1_000
+    assert %RuntimeAttemptIdentity{} = second_opts[:runtime_attempt_identity]
+    refute second_opts[:runtime_attempt_identity].runtime_attempt_id == first_runtime_attempt_id
   end
 
   test "retries a pending terminal close before reopening autonomous dispatch" do
@@ -1109,6 +1313,7 @@ defmodule SymphonyElixir.OrchestratorAttemptLineageTest do
         }
       },
       claimed: MapSet.new([issue.id]),
+      recovery_checkpoints: %{issue.id => recovery_checkpoint(issue.id, :changes_requested)},
       work_control: %{issue.id => trusted_work_item(next_issue)},
       codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
     }
@@ -1372,6 +1577,8 @@ defmodule SymphonyElixir.OrchestratorAttemptLineageTest do
   end
 
   defp start_orchestrator(name, extra_opts \\ []) do
+    extra_opts = seed_recovery_checkpoints(extra_opts)
+
     Orchestrator.start_link(
       Keyword.merge(
         [
@@ -1382,6 +1589,68 @@ defmodule SymphonyElixir.OrchestratorAttemptLineageTest do
         extra_opts
       )
     )
+  end
+
+  defp seed_recovery_checkpoints(extra_opts) do
+    config = Config.settings!()
+
+    if config.agent.routing == "routed" and not Keyword.has_key?(extra_opts, :recovery_ledger_opts) do
+      project_id = config.symphony.project_id
+      recovery_root = Path.join(System.tmp_dir!(), "symphony-attempt-lineage-recovery-#{project_id}")
+      recovery_path = Path.join(recovery_root, project_id <> ".dets")
+      recovery_opts = [path: recovery_path]
+      {:ok, ledger} = RecoveryLedger.open(project_id, Tracker.identity(config.tracker), recovery_opts)
+
+      Application.get_env(:symphony_elixir, :memory_tracker_issues, [])
+      |> Enum.each(&seed_recovery_checkpoint(ledger, &1))
+
+      assert :ok = RecoveryLedger.close(ledger)
+      on_exit(fn -> File.rm_rf(recovery_root) end)
+      Keyword.put(extra_opts, :recovery_ledger_opts, recovery_opts)
+    else
+      extra_opts
+    end
+  end
+
+  defp seed_recovery_checkpoint(ledger, %Issue{id: issue_id} = issue) when is_binary(issue_id) do
+    {:ok, work_item} =
+      WorkItem.from_issue(issue, %{
+        provider: :memory,
+        observed_at: DateTime.utc_now(),
+        prior_validated_lifecycle_state: issue.state
+      })
+
+    if work_item.lifecycle_assessment.status == :validated do
+      checkpoint = %{
+        schema_version: RecoveryLedger.schema_version(),
+        project_namespace: Config.settings!().symphony.project_id,
+        work_item_id: issue_id,
+        last_validated_lifecycle_state: work_item.validated_lifecycle_state,
+        durable_guard_evidence:
+          Enum.filter(work_item.lifecycle_assessment.satisfied_guards, &match?(%{class: :mechanical_guard}, &1))
+          |> Enum.map(&Map.take(&1, [:class, :name, :outcome])),
+        active_suspension_context: nil,
+        last_terminal_suspension_context: nil,
+        updated_at: DateTime.utc_now()
+      }
+
+      assert :ok = RecoveryLedger.put_sync(ledger, checkpoint)
+    end
+  end
+
+  defp seed_recovery_checkpoint(_ledger, _issue), do: :ok
+
+  defp recovery_checkpoint(issue_id, lifecycle_state) do
+    %{
+      schema_version: RecoveryLedger.schema_version(),
+      project_namespace: Config.settings!().symphony.project_id,
+      work_item_id: issue_id,
+      last_validated_lifecycle_state: lifecycle_state,
+      durable_guard_evidence: [],
+      active_suspension_context: nil,
+      last_terminal_suspension_context: nil,
+      updated_at: DateTime.utc_now()
+    }
   end
 
   defp trusted_work_control do

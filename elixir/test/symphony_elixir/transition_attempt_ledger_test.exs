@@ -50,6 +50,43 @@ defmodule SymphonyElixir.TransitionAttemptLedgerTest do
     assert :ok = TransitionAttemptLedger.close(ledger)
   end
 
+  test "public reconciliation APIs reject invalid terms and support default marker time", %{path: path} do
+    assert {:error, {:corrupt_transition_attempt, :invalid_record}} =
+             TransitionAttemptLedger.list_reconciliation_candidates(nil)
+
+    assert {:error, {:ledger_sync_failed, :invalid_record}} = TransitionAttemptLedger.sync(nil)
+
+    assert {:error, {:reconciliation_marker, :invalid_marker_attributes}} =
+             TransitionAttemptLedger.reconcile_candidate(nil, nil, %{})
+
+    assert {:error, {:corrupt_transition_attempt, :invalid_record}} =
+             TransitionAttemptLedger.reconciliation_marker_for_work_item(nil, "work-a")
+
+    {:ok, ledger} = TransitionAttemptLedger.open("project-a", @identity, path: path)
+    candidate = attempt("attempt-default-time", "work-default-time", :indeterminate)
+    assert :ok = TransitionAttemptLedger.put_sync(ledger, candidate)
+    assert :not_found = TransitionAttemptLedger.latest_for_work_item(ledger, "missing")
+
+    assert {:error, {:reconciliation_marker, :invalid_candidate}} =
+             TransitionAttemptLedger.reconcile_candidate(ledger, :invalid, :verified, "evidence", 1)
+
+    missing_candidate = attempt("missing-attempt", "missing-work", :prepared)
+
+    assert {:error, {:reconciliation_marker, :candidate_not_found}} =
+             TransitionAttemptLedger.reconcile_candidate(ledger, missing_candidate, :verified, "evidence", 1)
+
+    assert {:error, {:reconciliation_marker, :invalid_marker}} =
+             TransitionAttemptLedger.reconcile_candidate(ledger, candidate, :unexpected, nil, 1)
+
+    assert {:ok, %{reconciled_at: %DateTime{}}} =
+             TransitionAttemptLedger.reconcile_candidate(ledger, candidate, :verified, 12)
+
+    assert {:error, {:reconciliation_marker, :invalid_marker_attributes}} =
+             TransitionAttemptLedger.reconcile_candidate(ledger, candidate, %{outcome: :verified})
+
+    assert :ok = TransitionAttemptLedger.close(ledger)
+  end
+
   test "covers ledger defaults, unreadable tables, and malformed table entries", %{path: path} do
     assert TransitionAttemptLedger.schema_version() == 1
     assert String.ends_with?(TransitionAttemptLedger.path_for("project-a"), "project-a-transition-ledger.dets")
@@ -222,6 +259,259 @@ defmodule SymphonyElixir.TransitionAttemptLedgerTest do
     end
 
     refute TransitionAttemptLedger.resubmit_allowed?(attempt("new", "new", :prepared))
+    assert :ok = TransitionAttemptLedger.close(ledger)
+  end
+
+  test "writes an exact reconciliation marker without changing the original attempt", %{path: path} do
+    {:ok, ledger} = TransitionAttemptLedger.open("project-a", @identity, path: path)
+    candidate = attempt("attempt-a", "work-a", :indeterminate)
+    assert :ok = TransitionAttemptLedger.put_sync(ledger, candidate)
+    at = ~U[2026-09-23 10:00:00Z]
+    assert :not_found = TransitionAttemptLedger.reconciliation_marker_for_work_item(ledger, "work-a")
+
+    assert {:ok, marker} =
+             TransitionAttemptLedger.reconcile_candidate(
+               ledger,
+               candidate,
+               :verified,
+               "evidence-a",
+               at
+             )
+
+    assert marker.attempt_id == "attempt-a"
+    assert marker.work_item_id == "work-a"
+    assert marker.outcome == :verified
+    assert marker.evidence_identity == "evidence-a"
+    assert marker.reconciled_at == at
+    assert {:ok, ^marker} = TransitionAttemptLedger.reconciliation_marker_for_work_item(ledger, "work-a")
+    assert {:ok, ^candidate} = TransitionAttemptLedger.get(ledger, "attempt-a")
+    assert {:ok, []} = TransitionAttemptLedger.list_reconciliation_candidates(ledger)
+    assert :ok = TransitionAttemptLedger.close(ledger)
+
+    {:ok, reopened} = TransitionAttemptLedger.open("project-a", @identity, path: path)
+    assert {:ok, ^candidate} = TransitionAttemptLedger.get(reopened, "attempt-a")
+    assert {:ok, []} = TransitionAttemptLedger.list_reconciliation_candidates(reopened)
+    assert {:ok, ^marker} = TransitionAttemptLedger.reconciliation_marker_for_work_item(reopened, "work-a")
+    assert :ok = TransitionAttemptLedger.close(reopened)
+  end
+
+  test "a marker for the latest attempt cannot clear an older unresolved candidate", %{path: path} do
+    {:ok, ledger} = TransitionAttemptLedger.open("project-a", @identity, path: path)
+    older = attempt("attempt-old", "work-a", :indeterminate)
+    latest = attempt("attempt-latest", "work-a", :prepared)
+
+    assert :ok = TransitionAttemptLedger.put_sync(ledger, older)
+    assert :ok = TransitionAttemptLedger.put_sync(ledger, latest)
+
+    assert {:ok, _marker} =
+             TransitionAttemptLedger.reconcile_candidate(
+               ledger,
+               latest,
+               :provider_failed,
+               "evidence-latest",
+               ~U[2026-09-23 10:00:00Z]
+             )
+
+    assert {:error, {:reconciliation_candidate_unresolved, "work-a"}} =
+             TransitionAttemptLedger.reconciliation_marker_for_work_item(ledger, "work-a")
+
+    assert {:ok, _marker} =
+             TransitionAttemptLedger.reconcile_candidate(
+               ledger,
+               older,
+               :verified,
+               "evidence-old",
+               ~U[2026-09-23 10:01:00Z]
+             )
+
+    assert {:ok, %{attempt_id: "attempt-latest"}} =
+             TransitionAttemptLedger.reconciliation_marker_for_work_item(ledger, "work-a")
+
+    assert :ok = TransitionAttemptLedger.close(ledger)
+  end
+
+  test "rejects reconciliation markers with omitted required fields", %{path: path} do
+    {:ok, ledger} = TransitionAttemptLedger.open("project-a", @identity, path: path)
+    candidate = attempt("attempt-a", "work-a", :indeterminate)
+    assert :ok = TransitionAttemptLedger.put_sync(ledger, candidate)
+
+    assert {:ok, _marker} =
+             TransitionAttemptLedger.reconcile_candidate(
+               ledger,
+               candidate,
+               :verified,
+               "evidence-a",
+               ~U[2026-09-23 10:00:00Z]
+             )
+
+    [{{:reconciliation, "attempt-a"}, marker}] = :dets.lookup(ledger.table, {:reconciliation, "attempt-a"})
+    assert :ok = :dets.insert(ledger.table, {{:reconciliation, "attempt-a"}, Map.delete(marker, :schema_version)})
+    assert :ok = :dets.sync(ledger.table)
+
+    assert {:error, {:corrupt_transition_attempt, :invalid_reconciliation_marker}} =
+             TransitionAttemptLedger.list_reconciliation_candidates(ledger)
+
+    assert :ok = TransitionAttemptLedger.close(ledger)
+  end
+
+  test "validates reconciliation outcome evidence and unresolved status before marking", %{path: path} do
+    {:ok, ledger} = TransitionAttemptLedger.open("project-a", @identity, path: path)
+    terminal = attempt("terminal", "work-terminal", :verified)
+    candidate = attempt("candidate", "work-candidate", :indeterminate)
+
+    assert :ok = TransitionAttemptLedger.put_sync(ledger, terminal)
+    assert :ok = TransitionAttemptLedger.put_sync(ledger, candidate)
+
+    assert {:error, {:reconciliation_marker, :candidate_not_unresolved}} =
+             TransitionAttemptLedger.reconcile_candidate(ledger, terminal, :verified, :provider_snapshot, 0)
+
+    for {identity, reconciled_at} <- [
+          {nil, 0},
+          {"", 0},
+          {-1, 0},
+          {%{}, 0},
+          {:provider_snapshot, -1},
+          {:provider_snapshot, :invalid}
+        ] do
+      assert {:error, {:reconciliation_marker, :invalid_marker}} =
+               TransitionAttemptLedger.reconcile_candidate(
+                 ledger,
+                 candidate,
+                 :verified,
+                 identity,
+                 reconciled_at
+               )
+    end
+
+    assert {:ok, marker} =
+             TransitionAttemptLedger.reconcile_candidate(
+               ledger,
+               candidate,
+               :verified,
+               :provider_snapshot,
+               0
+             )
+
+    assert marker.evidence_identity == :provider_snapshot
+    assert marker.reconciled_at == 0
+
+    assert {:error, {:reconciliation_marker, :already_reconciled}} =
+             TransitionAttemptLedger.reconcile_candidate(
+               ledger,
+               candidate,
+               :verified,
+               :provider_snapshot,
+               1
+             )
+
+    assert :ok = TransitionAttemptLedger.close(ledger)
+  end
+
+  test "fails closed on reconciliation markers without an attempt and typed-key corruption", %{path: path} do
+    {:ok, ledger} = TransitionAttemptLedger.open("project-a", @identity, path: path)
+    assert :ok = :dets.insert(ledger.table, {{:reconciliation, "missing-attempt"}, %{outcome: :verified}})
+    assert :ok = :dets.sync(ledger.table)
+
+    assert {:error, {:corrupt_transition_attempt, :invalid_reconciliation_marker}} =
+             TransitionAttemptLedger.list_reconciliation_candidates(ledger)
+
+    assert :ok = TransitionAttemptLedger.close(ledger)
+
+    malformed_path = path <> "-typed-key"
+    {:ok, malformed} = TransitionAttemptLedger.open("project-a", @identity, path: malformed_path)
+    assert :ok = :dets.insert(malformed.table, {{:latest, 10}, "attempt-a"})
+    assert :ok = :dets.sync(malformed.table)
+
+    assert {:error, {:corrupt_transition_attempt, :invalid_record}} =
+             TransitionAttemptLedger.list_reconciliation_candidates(malformed)
+
+    assert :ok = TransitionAttemptLedger.close(malformed)
+  end
+
+  test "accepts marker attributes through the narrow reconciliation API", %{path: path} do
+    {:ok, ledger} = TransitionAttemptLedger.open("project-a", @identity, path: path)
+    candidate = attempt("attempt-a", "work-a", :indeterminate)
+    assert :ok = TransitionAttemptLedger.put_sync(ledger, candidate)
+
+    assert {:ok, %{attempt_id: "attempt-a", work_item_id: "work-a"}} =
+             TransitionAttemptLedger.reconcile_candidate(ledger, candidate, %{
+               outcome: :provider_failed,
+               evidence_identity: %{observation_id: "observation-a"},
+               reconciled_at: ~U[2026-09-23 10:00:00Z]
+             })
+
+    assert :ok = TransitionAttemptLedger.close(ledger)
+  end
+
+  test "syncs a reconciliation marker and rejects mismatched candidate identity", %{path: path} do
+    parent = self()
+    {:ok, initialized} = TransitionAttemptLedger.open("project-a", @identity, path: path)
+    assert :ok = TransitionAttemptLedger.close(initialized)
+
+    {:ok, ledger} =
+      TransitionAttemptLedger.open("project-a", @identity,
+        path: path,
+        write_fun: fn table, records ->
+          send(parent, {:marker_write, records})
+          :dets.insert(table, records)
+        end,
+        sync_fun: fn table ->
+          send(parent, :marker_sync)
+          :dets.sync(table)
+        end
+      )
+
+    candidate = attempt("attempt-a", "work-a", :prepared)
+    assert :ok = TransitionAttemptLedger.put_sync(ledger, candidate)
+    assert_receive {:marker_write, _attempt_records}
+    assert_receive :marker_sync
+
+    assert {:error, {:reconciliation_marker, :candidate_mismatch}} =
+             TransitionAttemptLedger.reconcile_candidate(
+               ledger,
+               %{candidate | work_item_id: "other-work"},
+               :verified,
+               "evidence-a",
+               ~U[2026-09-23 10:00:00Z]
+             )
+
+    assert {:ok, _marker} =
+             TransitionAttemptLedger.reconcile_candidate(
+               ledger,
+               candidate,
+               :conflict,
+               "evidence-a",
+               ~U[2026-09-23 10:00:00Z]
+             )
+
+    assert_receive {:marker_write, records}
+    assert Enum.any?(records, &match?({{:reconciliation, "attempt-a"}, %{attempt_id: "attempt-a"}}, &1))
+    assert_receive :marker_sync
+    assert :ok = TransitionAttemptLedger.close(ledger)
+  end
+
+  test "fails closed on malformed reconciliation markers", %{path: path} do
+    {:ok, ledger} = TransitionAttemptLedger.open("project-a", @identity, path: path)
+    candidate = attempt("attempt-a", "work-a", :indeterminate)
+    assert :ok = TransitionAttemptLedger.put_sync(ledger, candidate)
+
+    malformed = %{
+      schema_version: 1,
+      marker_type: :transition_reconciliation,
+      project_namespace: "project-a",
+      attempt_id: "attempt-a",
+      work_item_id: "other-work",
+      outcome: :verified,
+      evidence_identity: "evidence-a",
+      reconciled_at: ~U[2026-09-23 10:00:00Z]
+    }
+
+    assert :ok = :dets.insert(ledger.table, {{:reconciliation, "attempt-a"}, malformed})
+    assert :ok = :dets.sync(ledger.table)
+
+    assert {:error, {:corrupt_transition_attempt, :invalid_reconciliation_marker}} =
+             TransitionAttemptLedger.list_reconciliation_candidates(ledger)
+
     assert :ok = TransitionAttemptLedger.close(ledger)
   end
 

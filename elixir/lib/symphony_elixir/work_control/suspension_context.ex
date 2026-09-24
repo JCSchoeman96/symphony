@@ -27,7 +27,7 @@ defmodule SymphonyElixir.WorkControl.SuspensionContext do
           last_validated_lifecycle_state: WorkflowLifecycle.state(),
           provider_observation: ProviderObservation.t(),
           reason: atom() | term(),
-          lineage_generation: non_neg_integer() | nil,
+          lineage_generation: String.t() | nil,
           created_at: DateTime.t(),
           recovery_policy: atom() | term(),
           required_evidence: [term()],
@@ -41,7 +41,13 @@ defmodule SymphonyElixir.WorkControl.SuspensionContext do
          :ok <- validate_last_state(Map.get(attrs, :last_validated_lifecycle_state)),
          :ok <- validate_observation(Map.get(attrs, :provider_observation)),
          :ok <- validate_reason(Map.get(attrs, :reason)),
-         :ok <- validate_required_evidence(Map.get(attrs, :required_evidence, [])) do
+         :ok <- validate_lineage_generation(Map.get(attrs, :lineage_generation)),
+         :ok <- validate_created_at(Map.get(attrs, :created_at, DateTime.utc_now())),
+         :ok <- validate_recovery_policy(Map.get(attrs, :recovery_policy, :fresh_reconciliation)),
+         :ok <- validate_required_evidence(Map.get(attrs, :required_evidence, [])),
+         :ok <- validate_resume_target(Map.get(attrs, :resume_target)),
+         :ok <- validate_status(Map.get(attrs, :status, :open)),
+         :ok <- validate_observation_identity(Map.get(attrs, :provider_observation), Map.get(attrs, :work_item_id)) do
       {:ok,
        %__MODULE__{
          work_item_id: Map.get(attrs, :work_item_id),
@@ -121,11 +127,48 @@ defmodule SymphonyElixir.WorkControl.SuspensionContext do
   defp validate_observation(%ProviderObservation{}), do: :ok
   defp validate_observation(_value), do: {:error, :invalid_provider_observation}
 
+  defp validate_observation_identity(%ProviderObservation{work_item_id: work_item_id}, work_item_id), do: :ok
+  defp validate_observation_identity(_observation, _work_item_id), do: {:error, :work_item_id_mismatch}
+
   defp validate_reason(nil), do: {:error, :missing_reason}
   defp validate_reason(_reason), do: :ok
 
-  defp validate_required_evidence(value) when is_list(value), do: :ok
+  defp validate_lineage_generation(nil), do: :ok
+
+  defp validate_lineage_generation(value) when is_binary(value) do
+    if String.trim(value) == "", do: {:error, :invalid_lineage_generation}, else: :ok
+  end
+
+  defp validate_lineage_generation(_value), do: {:error, :invalid_lineage_generation}
+
+  defp validate_created_at(%DateTime{}), do: :ok
+  defp validate_created_at(_value), do: {:error, :invalid_created_at}
+
+  defp validate_recovery_policy(value) when is_atom(value) and not is_nil(value), do: :ok
+  defp validate_recovery_policy(_value), do: {:error, :invalid_recovery_policy}
+
+  defp validate_required_evidence(value) when is_list(value) do
+    if Enum.all?(value, &valid_required_evidence?/1), do: :ok, else: {:error, :invalid_required_evidence}
+  end
+
   defp validate_required_evidence(_value), do: {:error, :invalid_required_evidence}
+
+  defp valid_required_evidence?(value) when is_atom(value) and not is_nil(value), do: true
+
+  defp valid_required_evidence?(%{class: class, name: name})
+       when class in [:mechanical_guard, :semantic_attestation, :human_decision] and is_atom(name),
+       do: true
+
+  defp valid_required_evidence?(_value), do: false
+
+  defp validate_resume_target(nil), do: :ok
+
+  defp validate_resume_target(value) do
+    if WorkflowLifecycle.canonical?(value), do: :ok, else: {:error, :invalid_resume_target}
+  end
+
+  defp validate_status(value) when value in [:open, :resolving, :resolved, :escalated], do: :ok
+  defp validate_status(_value), do: {:error, :invalid_suspension_status}
 
   defp require_fresh_reconciliation(opts) do
     if Map.get(opts, :fresh_reconciliation, false), do: :ok, else: {:error, :fresh_reconciliation_required}

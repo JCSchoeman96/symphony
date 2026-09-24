@@ -10,6 +10,7 @@ defmodule SymphonyElixir.WorkControl.TransitionAttemptLedger do
 
   @schema_version 1
   @reconciliation_statuses [:submitted, :mutation_submitted, :verifying, :conflict, :indeterminate]
+  @reconciliation_outcomes [:verified, :conflict, :provider_failed]
   @allowed_statuses [:requested, :intent_authorized, :fresh_context_loaded, :prepared] ++
                       @reconciliation_statuses ++ [:verified, :rejected, :provider_failed]
 
@@ -116,11 +117,127 @@ defmodule SymphonyElixir.WorkControl.TransitionAttemptLedger do
 
   def latest_for_work_item(_ledger, _work_item_id), do: {:error, {:corrupt_transition_attempt, :invalid_record}}
 
+  @spec reconcile_candidate(t(), term(), atom(), term()) :: {:ok, map()} | {:error, term()}
+  def reconcile_candidate(ledger, candidate, outcome, evidence_identity) do
+    reconcile_candidate(ledger, candidate, outcome, evidence_identity, DateTime.utc_now())
+  end
+
+  @spec reconcile_candidate(t(), term(), map()) :: {:ok, map()} | {:error, term()}
+  def reconcile_candidate(ledger, candidate, attrs) when is_map(attrs) do
+    if Enum.sort(Map.keys(attrs)) == Enum.sort([:outcome, :evidence_identity, :reconciled_at]) do
+      reconcile_candidate(
+        ledger,
+        candidate,
+        Map.fetch!(attrs, :outcome),
+        Map.fetch!(attrs, :evidence_identity),
+        Map.fetch!(attrs, :reconciled_at)
+      )
+    else
+      {:error, {:reconciliation_marker, :invalid_marker_attributes}}
+    end
+  end
+
+  def reconcile_candidate(_ledger, _candidate, _attrs),
+    do: {:error, {:reconciliation_marker, :invalid_marker_attributes}}
+
+  @spec reconcile_candidate(t(), term(), atom(), term(), DateTime.t() | non_neg_integer()) ::
+          {:ok, map()} | {:error, term()}
+  def reconcile_candidate(%__MODULE__{} = ledger, candidate, outcome, evidence_identity, reconciled_at) do
+    with {:ok, candidate_record, attempt_id, work_item_id} <- candidate_record(ledger, candidate),
+         {:ok, stored_attempt} <- stored_attempt(ledger, attempt_id),
+         :ok <- same_candidate?(candidate_record, stored_attempt, work_item_id),
+         :ok <- ensure_unresolved_candidate(stored_attempt),
+         :ok <- ensure_no_marker(ledger, attempt_id),
+         {:ok, marker} <- new_marker(ledger, attempt_id, work_item_id, outcome, evidence_identity, reconciled_at),
+         :ok <- persist(ledger, [{{:reconciliation, attempt_id}, marker}]),
+         :ok <- sync(ledger) do
+      {:ok, marker}
+    end
+  rescue
+    _error -> {:error, {:reconciliation_marker, :ledger_unavailable}}
+  end
+
+  def reconcile_candidate(_ledger, _candidate, _outcome, _evidence_identity, _reconciled_at),
+    do: {:error, {:reconciliation_marker, :invalid_candidate}}
+
+  @spec sync(t()) :: :ok | {:error, term()}
+  def sync(%__MODULE__{} = ledger), do: sync_ledger(ledger)
+
+  def sync(_ledger), do: {:error, {:ledger_sync_failed, :invalid_record}}
+
   @spec list_reconciliation_candidates(t()) :: {:ok, [term()]} | {:error, term()}
   def list_reconciliation_candidates(%__MODULE__{} = ledger) do
+    list_reconciliation_candidates_from_durable_table(ledger)
+  end
+
+  def list_reconciliation_candidates(_ledger), do: {:error, {:corrupt_transition_attempt, :invalid_record}}
+
+  @spec reconciliation_marker_for_work_item(t(), String.t()) :: {:ok, map()} | :not_found | {:error, term()}
+  def reconciliation_marker_for_work_item(%__MODULE__{} = ledger, work_item_id) when is_binary(work_item_id) do
+    with :ok <- sync(ledger),
+         {:ok, attempt} <- latest_for_work_item(ledger, work_item_id) do
+      marker_for_latest_attempt(ledger, attempt, work_item_id)
+    else
+      :not_found -> :not_found
+      {:error, _reason} = error -> error
+    end
+  rescue
+    _error -> {:error, {:corrupt_transition_attempt, :ledger_unavailable}}
+  end
+
+  def reconciliation_marker_for_work_item(_ledger, _work_item_id),
+    do: {:error, {:corrupt_transition_attempt, :invalid_record}}
+
+  defp marker_for_latest_attempt(ledger, attempt, work_item_id) do
+    case marker_for_attempt(ledger, attempt) do
+      {:ok, marker} -> ensure_no_unresolved_candidates(ledger, work_item_id, marker)
+      result -> result
+    end
+  end
+
+  defp ensure_no_unresolved_candidates(ledger, work_item_id, marker) do
+    case list_reconciliation_candidates_from_durable_table(ledger) do
+      {:ok, candidates} ->
+        if Enum.any?(candidates, &(Map.get(&1, :work_item_id) == work_item_id)) do
+          {:error, {:reconciliation_candidate_unresolved, work_item_id}}
+        else
+          {:ok, marker}
+        end
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp marker_for_attempt(ledger, attempt) do
+    attempt_id = attempt_identifier(attempt)
+
+    case :dets.lookup(ledger.table, {:reconciliation, attempt_id}) do
+      [{{:reconciliation, ^attempt_id}, marker}] ->
+        validate_reconciliation_marker(ledger, marker, attempt_id, attempt)
+
+      [] ->
+        :not_found
+
+      _other ->
+        {:error, {:corrupt_transition_attempt, :invalid_reconciliation_marker}}
+    end
+  end
+
+  defp validate_reconciliation_marker(ledger, marker, attempt_id, attempt) do
+    case validate_marker_map(ledger, marker, attempt_id, attempt) do
+      :ok -> {:ok, marker}
+      {:error, _reason} -> {:error, {:corrupt_transition_attempt, :invalid_reconciliation_marker}}
+    end
+  end
+
+  defp list_reconciliation_candidates_from_durable_table(%__MODULE__{} = ledger) do
     result =
       :dets.foldl(
         fn
+          _record, {:error, _reason} = error ->
+            error
+
           {{:attempt, _attempt_id}, attempt}, {:ok, %{attempts: attempts} = result} ->
             case validate_attempt(ledger, attempt) do
               {:ok, record, _attempt_id, _work_item_id} ->
@@ -137,6 +254,17 @@ defmodule SymphonyElixir.WorkControl.TransitionAttemptLedger do
           {{:latest, _work_item_id}, _attempt_id}, _result ->
             {:error, {:corrupt_transition_attempt, :invalid_record}}
 
+          {{:reconciliation, marker_id}, marker}, {:ok, %{markers: markers} = result}
+          when is_binary(marker_id) ->
+            if Map.has_key?(markers, marker_id) do
+              {:error, {:corrupt_transition_attempt, :invalid_reconciliation_marker}}
+            else
+              {:ok, Map.put(result, :markers, Map.put(markers, marker_id, marker))}
+            end
+
+          {{:reconciliation, _marker_id}, _marker}, {:ok, _result} ->
+            {:error, {:corrupt_transition_attempt, :invalid_reconciliation_marker}}
+
           {{:meta, _stored_project}, metadata}, {:ok, %{metadata_seen: false} = result} ->
             case validate_metadata(metadata, ledger) do
               :ok -> {:ok, Map.put(result, :metadata_seen, true)}
@@ -149,13 +277,18 @@ defmodule SymphonyElixir.WorkControl.TransitionAttemptLedger do
           _other, _result ->
             {:error, {:corrupt_transition_attempt, :invalid_record}}
         end,
-        {:ok, %{attempts: [], pointers: [], metadata_seen: false}},
+        {:ok, %{attempts: [], pointers: [], markers: %{}, metadata_seen: false}},
         ledger.table
       )
 
-    with {:ok, %{attempts: attempts, pointers: pointers, metadata_seen: true}} <- result,
-         :ok <- validate_latest_pointers(attempts, pointers) do
-      candidates = Enum.filter(attempts, &reconciliation_candidate?/1)
+    with {:ok, %{attempts: attempts, pointers: pointers, markers: markers, metadata_seen: true}} <- result,
+         :ok <- validate_latest_pointers(attempts, pointers),
+         :ok <- validate_markers(ledger, attempts, markers) do
+      candidates =
+        Enum.filter(attempts, fn attempt ->
+          reconciliation_candidate?(attempt) and
+            not Map.has_key?(markers, attempt_identifier(attempt))
+        end)
 
       rank = %{
         prepared: 0,
@@ -186,6 +319,79 @@ defmodule SymphonyElixir.WorkControl.TransitionAttemptLedger do
   def resubmit_allowed?(%{status: :prepared}), do: false
   def resubmit_allowed?(%{state: :prepared}), do: false
   def resubmit_allowed?(_attempt), do: false
+
+  defp candidate_record(ledger, %TransitionAttempt{} = candidate) do
+    case validate_attempt(ledger, candidate) do
+      {:ok, record, attempt_id, work_item_id} -> {:ok, record, attempt_id, work_item_id}
+      {:error, _reason} -> {:error, {:reconciliation_marker, :invalid_candidate}}
+    end
+  end
+
+  defp candidate_record(ledger, candidate) when is_map(candidate) do
+    case validate_attempt(ledger, candidate) do
+      {:ok, record, attempt_id, work_item_id} -> {:ok, record, attempt_id, work_item_id}
+      {:error, _reason} -> {:error, {:reconciliation_marker, :invalid_candidate}}
+    end
+  end
+
+  defp candidate_record(_ledger, _candidate), do: {:error, {:reconciliation_marker, :invalid_candidate}}
+
+  defp stored_attempt(%__MODULE__{} = ledger, attempt_id) do
+    case get(ledger, attempt_id) do
+      {:ok, attempt} -> {:ok, attempt}
+      :not_found -> {:error, {:reconciliation_marker, :candidate_not_found}}
+      {:error, _reason} -> {:error, {:reconciliation_marker, :invalid_candidate}}
+    end
+  end
+
+  defp same_candidate?(candidate, stored, work_item_id) do
+    stored_attempt_id = attempt_identifier(stored)
+    stored_work_item_id = Map.get(stored, :work_item_id)
+
+    if attempt_identifier(candidate) == stored_attempt_id and work_item_id == stored_work_item_id do
+      :ok
+    else
+      {:error, {:reconciliation_marker, :candidate_mismatch}}
+    end
+  end
+
+  defp ensure_unresolved_candidate(candidate) do
+    if reconciliation_candidate?(candidate),
+      do: :ok,
+      else: {:error, {:reconciliation_marker, :candidate_not_unresolved}}
+  end
+
+  defp ensure_no_marker(%__MODULE__{table: table}, attempt_id) do
+    case :dets.lookup(table, {:reconciliation, attempt_id}) do
+      [] -> :ok
+      [_marker] -> {:error, {:reconciliation_marker, :already_reconciled}}
+      _entries -> {:error, {:corrupt_transition_attempt, :invalid_reconciliation_marker}}
+    end
+  rescue
+    _error -> {:error, {:reconciliation_marker, :ledger_unavailable}}
+  end
+
+  defp new_marker(ledger, attempt_id, work_item_id, outcome, evidence_identity, reconciled_at) do
+    marker = %{
+      schema_version: @schema_version,
+      marker_type: :transition_reconciliation,
+      project_namespace: ledger.project_id,
+      attempt_id: attempt_id,
+      work_item_id: work_item_id,
+      outcome: outcome,
+      evidence_identity: evidence_identity,
+      reconciled_at: reconciled_at
+    }
+
+    case validate_marker_map(ledger, marker, attempt_id, %{
+           status: :indeterminate,
+           state: :indeterminate,
+           work_item_id: work_item_id
+         }) do
+      :ok -> {:ok, marker}
+      {:error, _reason} -> {:error, {:reconciliation_marker, :invalid_marker}}
+    end
+  end
 
   defp initialize_or_validate(%__MODULE__{} = ledger) do
     metadata_records = :dets.match_object(ledger.table, {{:meta, :_}, :_})
@@ -310,6 +516,71 @@ defmodule SymphonyElixir.WorkControl.TransitionAttemptLedger do
     status in @reconciliation_statuses or status == :prepared
   end
 
+  defp validate_markers(ledger, attempts, markers) do
+    attempts_by_id = Map.new(attempts, &{attempt_identifier(&1), &1})
+
+    Enum.reduce_while(markers, :ok, fn {marker_id, marker}, :ok ->
+      case validate_marker_entry(ledger, attempts_by_id, marker_id, marker) do
+        :ok -> {:cont, :ok}
+        {:error, _reason} -> {:halt, {:error, {:corrupt_transition_attempt, :invalid_reconciliation_marker}}}
+      end
+    end)
+  end
+
+  defp validate_marker_entry(ledger, attempts_by_id, marker_id, marker) do
+    case Map.fetch(attempts_by_id, marker_id) do
+      {:ok, attempt} -> validate_marker_map(ledger, marker, marker_id, attempt)
+      :error -> {:error, :missing_attempt}
+    end
+  end
+
+  defp validate_marker_map(ledger, marker, marker_id, attempt) when is_map(marker) do
+    marker_attempt_id = Map.get(marker, :attempt_id)
+    marker_work_item_id = Map.get(marker, :work_item_id)
+    attempt_work_item_id = Map.get(attempt, :work_item_id)
+
+    with true <- Map.get(marker, :schema_version) == @schema_version,
+         true <- Map.get(marker, :marker_type) == :transition_reconciliation,
+         true <- Map.get(marker, :project_namespace) == ledger.project_id,
+         true <- marker_attempt_id == marker_id,
+         true <- valid_id?(marker_attempt_id),
+         true <- marker_work_item_id == attempt_work_item_id and valid_id?(marker_work_item_id),
+         true <- reconciliation_outcome?(Map.get(marker, :outcome)),
+         true <- valid_evidence_identity?(Map.get(marker, :evidence_identity)),
+         true <- valid_timestamp?(Map.get(marker, :reconciled_at)),
+         true <- marker_keys_valid?(marker) do
+      if reconciliation_candidate?(attempt), do: :ok, else: {:error, :candidate_not_unresolved}
+    else
+      _ -> {:error, :invalid_reconciliation_marker}
+    end
+  end
+
+  defp validate_marker_map(_ledger, _marker, _marker_id, _attempt),
+    do: {:error, :invalid_reconciliation_marker}
+
+  defp marker_keys_valid?(marker) do
+    marker_keys = [
+      :schema_version,
+      :marker_type,
+      :project_namespace,
+      :attempt_id,
+      :work_item_id,
+      :outcome,
+      :evidence_identity,
+      :reconciled_at
+    ]
+
+    Enum.sort(Map.keys(marker)) == Enum.sort(marker_keys)
+  end
+
+  defp reconciliation_outcome?(outcome), do: outcome in @reconciliation_outcomes
+
+  defp valid_evidence_identity?(value) when is_binary(value), do: String.trim(value) != ""
+  defp valid_evidence_identity?(value) when is_atom(value), do: not is_nil(value)
+  defp valid_evidence_identity?(value) when is_integer(value), do: value >= 0
+  defp valid_evidence_identity?(value) when is_map(value), do: map_size(value) > 0
+  defp valid_evidence_identity?(_value), do: false
+
   defp validate_latest_pointers(attempts, pointers) do
     attempt_ids = MapSet.new(attempts, &attempt_identifier/1)
 
@@ -361,7 +632,7 @@ defmodule SymphonyElixir.WorkControl.TransitionAttemptLedger do
     _error -> {:error, {:ledger_write_failed, :write_failed}}
   end
 
-  defp sync(%__MODULE__{table: table, sync_fun: sync_fun}) do
+  defp sync_ledger(%__MODULE__{table: table, sync_fun: sync_fun}) do
     case sync_fun.(table) do
       :ok -> :ok
       {:error, reason} -> {:error, {:ledger_sync_failed, reason}}

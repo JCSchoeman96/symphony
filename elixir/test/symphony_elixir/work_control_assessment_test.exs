@@ -638,7 +638,7 @@ defmodule SymphonyElixir.WorkControlAssessmentTest do
                last_validated_lifecycle_state: :in_progress,
                provider_observation: observation("Blocked"),
                reason: :provider_blocked,
-               lineage_generation: 2,
+               lineage_generation: "lineage-2",
                created_at: @now,
                recovery_policy: :fresh_reconciliation,
                required_evidence: [:trusted_resume_target],

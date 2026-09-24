@@ -123,6 +123,7 @@ defmodule SymphonyElixir.RuntimeAttemptProductionPathTest do
     )
 
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+    seed_recovery_checkpoint!(issue)
     Application.put_env(:symphony_elixir, :attempt_ledger_test_pid, self())
 
     name = Module.concat(__MODULE__, "Retry#{System.unique_integer([:positive])}")
@@ -204,6 +205,7 @@ defmodule SymphonyElixir.RuntimeAttemptProductionPathTest do
     )
 
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+    seed_recovery_checkpoint!(issue)
     Application.put_env(:symphony_elixir, :attempt_ledger_test_pid, self())
 
     name = Module.concat(__MODULE__, "Down#{System.unique_integer([:positive])}")
@@ -314,6 +316,7 @@ defmodule SymphonyElixir.RuntimeAttemptProductionPathTest do
     :ok = AttemptLedger.close(ledger)
 
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+    seed_recovery_checkpoint!(issue)
     Application.put_env(:symphony_elixir, :attempt_ledger_test_pid, self())
 
     name = Module.concat(__MODULE__, "Rearm#{System.unique_integer([:positive])}")
