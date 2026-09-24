@@ -10,6 +10,7 @@ defmodule SymphonyElixir.AgentRunner do
   alias SymphonyElixir.Dependency.Guard
   alias SymphonyElixir.Tracker.Issue
   alias SymphonyElixir.WorkControl.{LifecycleAssessment, WorkflowLifecycle, WorkItem}
+  alias SymphonyElixir.Workspace.OwnershipLedger
 
   @type worker_host :: String.t() | nil
 
@@ -79,8 +80,9 @@ defmodule SymphonyElixir.AgentRunner do
   defp run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
     Logger.info("Starting worker attempt for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
     runtime_identity = runtime_attempt_identity(opts)
+    ownership_ledger = Keyword.get(opts, :ownership_ledger)
 
-    case Workspace.create_for_issue(issue, worker_host) do
+    case create_workspace(issue, worker_host, ownership_ledger) do
       {:ok, workspace} ->
         send_worker_runtime_info(codex_update_recipient, issue, runtime_identity, worker_host, workspace)
 
@@ -95,6 +97,15 @@ defmodule SymphonyElixir.AgentRunner do
       {:error, reason} ->
         {:error, reason}
     end
+  end
+
+  defp create_workspace(issue, worker_host, %OwnershipLedger{} = ownership_ledger) do
+    Workspace.create_for_issue(issue, worker_host, ownership_ledger)
+  end
+
+  defp create_workspace(issue, _worker_host, _ownership_ledger) do
+    Logger.error("Workspace ownership ledger is unavailable for #{issue_context(issue)}")
+    {:error, :workspace_ownership_ledger_unavailable}
   end
 
   defp codex_message_handler(recipient, issue, runtime_identity) do

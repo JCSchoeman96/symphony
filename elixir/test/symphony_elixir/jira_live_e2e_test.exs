@@ -77,7 +77,11 @@ defmodule SymphonyElixir.Jira.LiveE2ETest do
       assert refreshed_id == issue.id
       assert refreshed_identifier == issue.identifier
 
-      assert :ok = AgentRunner.run(issue, self(), max_turns: 3)
+      assert :ok =
+               AgentRunner.run(issue, self(),
+                 max_turns: 3,
+                 ownership_ledger: workspace_ownership_ledger()
+               )
 
       runtime_info = receive_runtime_info!(issue.id)
       tool_calls = completed_jira_tool_calls(issue.id)

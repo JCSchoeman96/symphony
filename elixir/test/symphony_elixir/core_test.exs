@@ -409,7 +409,8 @@ defmodule SymphonyElixir.CoreTest do
              SymphonyElixir.AgentRuntimeSupervisor.start_link(
                name: runtime_supervisor_name,
                task_supervisor_name: task_supervisor_name,
-               orchestrator_name: orchestrator_name
+               orchestrator_name: orchestrator_name,
+               transition_coordinator_name: SymphonyElixir.TransitionCoordinator
              )
 
     Process.unlink(runtime_supervisor_pid)
@@ -571,7 +572,12 @@ defmodule SymphonyElixir.CoreTest do
         hook_before_remove: "if [ -f \"#{worker_alive_marker}\" ]; then printf alive > \"#{cleanup_marker}\"; else printf stopped > \"#{cleanup_marker}\"; fi"
       )
 
-      File.mkdir_p!(workspace)
+      running_issue = %Issue{id: issue_id, state: "In Progress", identifier: issue_identifier}
+      ownership_state = workspace_ownership_state()
+
+      assert {:ok, ^workspace} =
+               Workspace.create_for_issue(running_issue, nil, ownership_state.workspace_ownership_ledger)
+
       {:ok, task_supervisor} = Task.Supervisor.start_link()
 
       {:ok, agent_pid} =
@@ -590,31 +596,33 @@ defmodule SymphonyElixir.CoreTest do
 
       assert eventually_value(fn -> if File.exists?(worker_alive_marker), do: true end)
 
-      state = %Orchestrator.State{
-        task_supervisor: task_supervisor,
-        running: %{
-          issue_id => %{
-            pid: agent_pid,
-            ref: nil,
-            identifier: issue_identifier,
-            issue: %Issue{id: issue_id, state: "In Progress", identifier: issue_identifier},
-            started_at: DateTime.utc_now()
-          }
-        },
-        claimed: MapSet.new([issue_id]),
-        codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
-        retry_attempts: %{},
-        attempt_counters: %{
-          issue_id => %{
-            ordinary_failures: 2,
-            ordinary_retries: 2,
-            review_cycles: 1,
-            capacity_waits: 0,
-            continuations: 0,
-            route_changes: 1
+      state =
+        %Orchestrator.State{
+          task_supervisor: task_supervisor,
+          running: %{
+            issue_id => %{
+              pid: agent_pid,
+              ref: nil,
+              identifier: issue_identifier,
+              issue: %Issue{id: issue_id, state: "In Progress", identifier: issue_identifier},
+              started_at: DateTime.utc_now()
+            }
+          },
+          claimed: MapSet.new([issue_id]),
+          codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+          retry_attempts: %{},
+          attempt_counters: %{
+            issue_id => %{
+              ordinary_failures: 2,
+              ordinary_retries: 2,
+              review_cycles: 1,
+              capacity_waits: 0,
+              continuations: 0,
+              route_changes: 1
+            }
           }
         }
-      }
+        |> Map.merge(ownership_state)
 
       issue = %Issue{
         id: issue_id,
@@ -659,7 +667,12 @@ defmodule SymphonyElixir.CoreTest do
         tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate"]
       )
 
-      File.mkdir_p!(old_workspace)
+      ownership_state = workspace_ownership_state()
+      running_issue = %Issue{id: issue_id, state: "In Progress", identifier: issue_identifier}
+
+      assert {:ok, ^old_workspace} =
+               Workspace.create_for_issue(running_issue, nil, ownership_state.workspace_ownership_ledger)
+
       File.mkdir_p!(new_workspace)
 
       agent_pid =
@@ -669,23 +682,23 @@ defmodule SymphonyElixir.CoreTest do
           end
         end)
 
-      state = %Orchestrator.State{
-        running: %{
-          issue_id => %{
-            pid: agent_pid,
-            ref: nil,
-            identifier: issue_identifier,
-            issue: %Issue{id: issue_id, state: "In Progress", identifier: issue_identifier},
-            workspace_path: old_workspace,
-            started_at: DateTime.utc_now()
-          }
-        },
-        claimed: MapSet.new([issue_id]),
-        codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
-        retry_attempts: %{}
-      }
-
-      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: new_root)
+      state =
+        %Orchestrator.State{
+          running: %{
+            issue_id => %{
+              pid: agent_pid,
+              ref: nil,
+              identifier: issue_identifier,
+              issue: %Issue{id: issue_id, state: "In Progress", identifier: issue_identifier},
+              workspace_path: old_workspace,
+              started_at: DateTime.utc_now()
+            }
+          },
+          claimed: MapSet.new([issue_id]),
+          codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+          retry_attempts: %{}
+        }
+        |> Map.merge(ownership_state)
 
       issue = %Issue{
         id: issue_id,
@@ -697,6 +710,8 @@ defmodule SymphonyElixir.CoreTest do
       }
 
       _updated_state = Orchestrator.reconcile_issue_states_for_test([issue], state)
+
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: new_root)
 
       refute File.exists?(old_workspace)
       assert File.exists?(new_workspace)
@@ -1129,7 +1144,7 @@ defmodule SymphonyElixir.CoreTest do
     issue_id = "issue-crash-initial"
     ref = make_ref()
     orchestrator_name = Module.concat(__MODULE__, :InitialCrashRetryOrchestrator)
-    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name, start_quiesced: true)
 
     on_exit(fn ->
       if Process.alive?(pid) do
@@ -1293,7 +1308,7 @@ defmodule SymphonyElixir.CoreTest do
   test "stale retry timer messages do not consume newer retry entries" do
     issue_id = "issue-stale-retry"
     orchestrator_name = Module.concat(__MODULE__, :StaleRetryOrchestrator)
-    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name, start_quiesced: true)
 
     on_exit(fn ->
       if Process.alive?(pid) do
@@ -1307,6 +1322,7 @@ defmodule SymphonyElixir.CoreTest do
 
     :sys.replace_state(pid, fn _ ->
       initial_state
+      |> Map.put(:startup_reconciliation, :ready)
       |> Map.put(:retry_attempts, %{
         issue_id => %{
           attempt: 2,
@@ -1797,6 +1813,7 @@ defmodule SymphonyElixir.CoreTest do
       )
 
       issue = %Issue{
+        id: "issue-agent-runner-retain-workspace",
         identifier: "S-99",
         title: "Smoke test",
         description: "Run and keep workspace",
@@ -1806,7 +1823,13 @@ defmodule SymphonyElixir.CoreTest do
       }
 
       before = MapSet.new(File.ls!(workspace_root))
-      assert :ok = AgentRunner.run(issue)
+
+      assert :ok =
+               AgentRunner.run(issue, nil,
+                 ownership_ledger: workspace_ownership_ledger(),
+                 issue_state_fetcher: fn [_issue_id] -> {:ok, []} end
+               )
+
       entries_after = MapSet.new(File.ls!(workspace_root))
 
       created =
@@ -1897,6 +1920,7 @@ defmodule SymphonyElixir.CoreTest do
                AgentRunner.run(
                  issue,
                  test_pid,
+                 ownership_ledger: workspace_ownership_ledger(),
                  issue_state_fetcher: fn [_issue_id] -> {:ok, [%{issue | state: "Done"}]} end
                )
 
@@ -1973,7 +1997,10 @@ defmodule SymphonyElixir.CoreTest do
       }
 
       assert_raise RuntimeError, ~r/workspace_prepare_failed/, fn ->
-        AgentRunner.run(issue, nil, worker_host: "worker-a")
+        AgentRunner.run(issue, nil,
+          worker_host: "worker-a",
+          ownership_ledger: workspace_ownership_ledger()
+        )
       end
 
       trace = File.read!(trace_file)
@@ -2085,7 +2112,12 @@ defmodule SymphonyElixir.CoreTest do
         labels: []
       }
 
-      assert :ok = AgentRunner.run(issue, nil, issue_state_fetcher: state_fetcher)
+      assert :ok =
+               AgentRunner.run(issue, nil,
+                 ownership_ledger: workspace_ownership_ledger(),
+                 issue_state_fetcher: state_fetcher
+               )
+
       assert_receive {:issue_state_fetch, 1}
       assert_receive {:issue_state_fetch, 2}
 
@@ -2203,7 +2235,11 @@ defmodule SymphonyElixir.CoreTest do
         labels: []
       }
 
-      assert :ok = AgentRunner.run(issue, nil, issue_state_fetcher: state_fetcher)
+      assert :ok =
+               AgentRunner.run(issue, nil,
+                 ownership_ledger: workspace_ownership_ledger(),
+                 issue_state_fetcher: state_fetcher
+               )
 
       trace = File.read!(trace_file)
       assert length(String.split(trace, "RUN", trim: true)) == 1

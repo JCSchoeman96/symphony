@@ -4,32 +4,51 @@ defmodule SymphonyElixir.Workspace do
   """
 
   require Logger
-  alias SymphonyElixir.{Config, CredentialBoundary, PathSafety, SSH}
+  alias SymphonyElixir.{Config, CredentialBoundary, PathSafety, SSH, Tracker}
+  alias SymphonyElixir.Workspace.OwnershipLedger
 
-  @remote_workspace_marker "__SYMPHONY_WORKSPACE__"
+  @remote_workspace_marker "__SYMPHONY_WORKSPACE_PREPARE__"
+  @default_remote_host_identity "~/.local/state/symphony/workspace-ownership/host.identity"
 
   @type worker_host :: String.t() | nil
+  @type workspace_options :: keyword()
+  @type ownership_record :: map()
 
-  @spec create_for_issue(map() | String.t() | nil, worker_host()) ::
+  @spec create_for_issue(map() | String.t() | nil) :: {:ok, Path.t()} | {:error, term()}
+  def create_for_issue(issue_or_identifier), do: create_for_issue(issue_or_identifier, nil)
+
+  @spec create_for_issue(map() | String.t() | nil, worker_host() | OwnershipLedger.t()) ::
           {:ok, Path.t()} | {:error, term()}
-  def create_for_issue(issue_or_identifier, worker_host \\ nil) do
+  def create_for_issue(issue_or_identifier, %OwnershipLedger{} = ledger) do
+    create_for_issue(issue_or_identifier, nil, ledger)
+  end
+
+  def create_for_issue(issue_or_identifier, worker_host)
+      when is_binary(worker_host) or is_nil(worker_host) do
+    create_for_issue(issue_or_identifier, worker_host, [])
+  end
+
+  @spec create_for_issue(map() | String.t() | nil, worker_host(), OwnershipLedger.t()) ::
+          {:ok, Path.t()} | {:error, term()}
+  def create_for_issue(issue_or_identifier, worker_host, %OwnershipLedger{} = ledger) do
+    create_for_issue(issue_or_identifier, worker_host, ledger: ledger)
+  end
+
+  @spec create_for_issue(map() | String.t() | nil, worker_host(), workspace_options()) ::
+          {:ok, Path.t()} | {:error, term()}
+  def create_for_issue(issue_or_identifier, worker_host, opts)
+      when (is_binary(worker_host) or is_nil(worker_host)) and is_list(opts) do
     issue_context = issue_context(issue_or_identifier)
 
     try do
-      safe_id = workspace_key(issue_or_identifier)
-
-      with {:ok, workspace} <- workspace_path_for_issue(safe_id, worker_host),
-           :ok <- validate_workspace_path(workspace, worker_host),
-           {:ok, workspace, created?} <- ensure_workspace(workspace, worker_host) do
-        case maybe_run_after_create_hook(workspace, issue_context, created?, worker_host) do
-          :ok ->
-            {:ok, workspace}
-
-          {:error, _reason} = error ->
-            cleanup_failed_new_workspace(workspace, created?, worker_host)
-            error
+      with_ledger(opts, fn ledger ->
+        with {:ok, identity} <- issue_identity(issue_or_identifier),
+             safe_id <- workspace_key(identity.identifier),
+             {:ok, workspace} <- workspace_path_for_issue(safe_id, worker_host),
+             :ok <- validate_workspace_path(workspace, worker_host) do
+          prepare_workspace(ledger, identity, workspace, worker_host, opts)
         end
-      end
+      end)
     rescue
       error in [ArgumentError, ErlangError, File.Error] ->
         Logger.error("Workspace creation failed #{issue_log_context(issue_context)} worker_host=#{worker_host_for_log(worker_host)} error=#{Exception.message(error)}")
@@ -37,184 +56,1185 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  defp ensure_workspace(workspace, nil) do
-    cond do
-      File.dir?(workspace) ->
-        {:ok, workspace, false}
+  defp prepare_workspace(ledger, identity, workspace, nil, opts),
+    do: prepare_local_workspace(ledger, identity, workspace, opts)
 
-      File.exists?(workspace) ->
-        File.rm_rf!(workspace)
-        create_workspace(workspace)
+  defp prepare_workspace(ledger, identity, workspace, worker_host, opts),
+    do: prepare_remote_workspace(ledger, identity, workspace, worker_host, opts)
 
-      true ->
-        create_workspace(workspace)
+  @spec remove(Path.t()) :: {:ok, [String.t()]} | {:error, term(), String.t()}
+  def remove(workspace), do: remove(workspace, nil, [])
+
+  @spec remove(Path.t(), worker_host()) :: {:ok, [String.t()]} | {:error, term(), String.t()}
+  def remove(workspace, worker_host), do: remove(workspace, worker_host, [])
+
+  @spec remove(Path.t(), worker_host(), OwnershipLedger.t() | workspace_options()) ::
+          {:ok, [String.t()]} | {:error, term(), String.t()}
+  def remove(workspace, worker_host, %OwnershipLedger{} = ledger),
+    do: remove(workspace, worker_host, ledger: ledger)
+
+  def remove(workspace, worker_host, opts) when is_list(opts) do
+    remove_recorded(workspace, worker_host, opts)
+  end
+
+  @spec remove(Path.t(), worker_host(), OwnershipLedger.t(), workspace_options()) ::
+          {:ok, [String.t()]} | {:error, term(), String.t()}
+  def remove(workspace, worker_host, %OwnershipLedger{} = ledger, opts) when is_list(opts),
+    do: remove(workspace, worker_host, Keyword.put(opts, :ledger, ledger))
+
+  @doc false
+  @spec remove_recorded(Path.t(), worker_host()) ::
+          {:ok, [String.t()]} | {:error, term(), String.t()}
+  def remove_recorded(workspace, worker_host), do: remove_recorded(workspace, worker_host, [])
+
+  @doc false
+  @spec remove_recorded(Path.t(), worker_host(), OwnershipLedger.t() | workspace_options()) ::
+          {:ok, [String.t()]} | {:error, term(), String.t()}
+  def remove_recorded(workspace, worker_host, %OwnershipLedger{} = ledger),
+    do: remove_recorded(workspace, worker_host, ledger: ledger)
+
+  def remove_recorded(workspace, worker_host, opts)
+      when is_binary(workspace) and (is_binary(worker_host) or is_nil(worker_host)) and is_list(opts) do
+    if cleanup_authorized?(opts) do
+      try do
+        with_ledger(opts, fn ledger ->
+          remove_recorded_with_ledger(workspace, worker_host, ledger, opts)
+        end)
+        |> normalize_removal_result()
+      rescue
+        error in [ArgumentError, ErlangError, File.Error] ->
+          {:error, error, ""}
+      end
+    else
+      {:error, :workspace_cleanup_authorization_required, ""}
     end
   end
 
-  defp ensure_workspace(workspace, worker_host) when is_binary(worker_host) do
-    script =
-      [
-        "set -eu",
-        remote_shell_assign("workspace", workspace),
-        "if [ -d \"$workspace\" ]; then",
-        "  created=0",
-        "elif [ -e \"$workspace\" ]; then",
-        "  rm -rf \"$workspace\"",
-        "  mkdir -p \"$workspace\"",
-        "  created=1",
-        "else",
-        "  mkdir -p \"$workspace\"",
-        "  created=1",
-        "fi",
-        "cd \"$workspace\"",
-        "printf '%s\\t%s\\t%s\\n' '#{@remote_workspace_marker}' \"$created\" \"$(pwd -P)\""
-      ]
-      |> Enum.reject(&(&1 == ""))
-      |> Enum.join("\n")
+  def remove_recorded(workspace, _worker_host, _opts),
+    do: {:error, {:workspace_path_unreadable, workspace, :invalid}, ""}
 
-    case run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms) do
-      {:ok, {output, 0}} ->
-        parse_remote_workspace_output(output)
+  @spec remove_recorded(Path.t(), worker_host(), OwnershipLedger.t(), workspace_options()) ::
+          {:ok, [String.t()]} | {:error, term(), String.t()}
+  def remove_recorded(workspace, worker_host, %OwnershipLedger{} = ledger, opts) when is_list(opts),
+    do: remove_recorded(workspace, worker_host, Keyword.put(opts, :ledger, ledger))
 
-      {:ok, {output, status}} ->
-        {:error, {:workspace_prepare_failed, worker_host, status, output}}
+  @doc """
+  Cancels a durable pending release after revalidating the current workspace binding.
+  """
+  @spec cancel_pending_release_if_current(map(), OwnershipLedger.t()) :: :ok | {:error, term()}
+  def cancel_pending_release_if_current(record, %OwnershipLedger{} = ledger) when is_map(record) do
+    with ownership_id when is_binary(ownership_id) <- Map.get(record, :workspace_ownership_id),
+         {:ok, current} <- OwnershipLedger.get(ledger, ownership_id),
+         true <- current == record,
+         :release_pending <- current.state,
+         :authorized_cleanup <- current.release_origin,
+         :ok <- validate_pending_release_current(current, ledger),
+         {:ok, _owned} <-
+           OwnershipLedger.transition_sync(ledger, ownership_id, :owned,
+             configured_root_identity: current.configured_root_identity,
+             top_level_filesystem_identity: current.top_level_filesystem_identity
+           ) do
+      :ok
+    else
+      nil -> {:error, :workspace_ownership_not_found}
+      false -> {:error, :workspace_ownership_changed}
+      {:error, reason} -> {:error, reason}
+      :not_found -> {:error, :workspace_ownership_not_found}
+      :failed_provisioning -> {:error, :failed_provisioning_release_cannot_be_cancelled}
+      state when is_atom(state) -> {:error, {:invalid_pending_release_state, state}}
+    end
+  end
+
+  def cancel_pending_release_if_current(_record, _ledger),
+    do: {:error, :workspace_ownership_not_found}
+
+  @spec remove_issue_workspaces(term()) :: :ok | {:error, term()}
+  def remove_issue_workspaces(identifier), do: remove_issue_workspaces(identifier, nil, [])
+
+  @spec remove_issue_workspaces(term(), worker_host()) :: :ok | {:error, term()}
+  def remove_issue_workspaces(identifier, worker_host),
+    do: remove_issue_workspaces(identifier, worker_host, [])
+
+  @spec remove_issue_workspaces(term(), worker_host(), OwnershipLedger.t() | workspace_options()) ::
+          :ok | {:error, term()}
+  def remove_issue_workspaces(identifier, worker_host, %OwnershipLedger{} = ledger),
+    do: remove_issue_workspaces(identifier, worker_host, ledger: ledger)
+
+  def remove_issue_workspaces(identifier, worker_host, opts)
+      when (is_binary(worker_host) or is_nil(worker_host)) and is_list(opts) do
+    case cleanup_authorized?(opts) do
+      true -> remove_authorized_issue_workspaces(identifier, worker_host, opts)
+      false -> {:error, :workspace_cleanup_authorization_required}
+    end
+  end
+
+  def remove_issue_workspaces(_identifier, _worker_host, _opts), do: {:error, :invalid_worker_host}
+
+  defp remove_authorized_issue_workspaces(identifier, worker_host, opts) do
+    with {:ok, identity} <- issue_identity(identifier) do
+      with_ledger(opts, &remove_issue_records(&1, identity, worker_host, opts))
+      |> normalize_issue_removal_result()
+    end
+  rescue
+    error in [ArgumentError, ErlangError, File.Error] -> {:error, error}
+  end
+
+  defp remove_issue_records(ledger, identity, worker_host, opts) do
+    with {:ok, records} <- OwnershipLedger.list_for_work_item(ledger, identity.id) do
+      remove_matching_issue_records(records, identity, worker_host, ledger, opts)
+    end
+  end
+
+  defp remove_matching_issue_records(records, identity, worker_host, ledger, opts) do
+    matching_records = Enum.filter(records, &issue_workspace_record?(&1, identity, worker_host))
+
+    if matching_records == [] do
+      {:error, :workspace_ownership_not_found}
+    else
+      releasable_records = Enum.filter(matching_records, &(&1.state in [:owned, :release_pending]))
+      unresolved_records = Enum.reject(matching_records, &(&1.state in [:owned, :release_pending, :released]))
+
+      case remove_records(releasable_records, ledger, opts) do
+        {:ok, _removed} when unresolved_records == [] -> {:ok, []}
+        {:ok, _removed} -> {:error, {:workspace_ownership_not_releasable, unresolved_records}}
+        {:error, _reason} = error -> error
+      end
+    end
+  end
+
+  defp issue_workspace_record?(record, identity, worker_host) do
+    record.work_item_id == identity.id and record.issue_identifier == identity.identifier and
+      (is_nil(worker_host) or record.worker_host == worker_host)
+  end
+
+  defp normalize_issue_removal_result({:ok, _removed}), do: :ok
+  defp normalize_issue_removal_result({:error, reason}), do: {:error, reason}
+
+  @spec remove_issue_workspaces(term(), worker_host(), OwnershipLedger.t(), workspace_options()) ::
+          :ok | {:error, term()}
+  def remove_issue_workspaces(identifier, worker_host, %OwnershipLedger{} = ledger, opts)
+      when is_list(opts) do
+    remove_issue_workspaces(identifier, worker_host, Keyword.put(opts, :ledger, ledger))
+  end
+
+  defp with_ledger(opts, fun) when is_list(opts) and is_function(fun, 1) do
+    case Keyword.get(opts, :ledger) do
+      %OwnershipLedger{} = ledger ->
+        fun.(ledger)
+
+      _ ->
+        settings = Config.settings!()
+        project_id = Keyword.get(opts, :project_id) || settings.symphony.project_id || "legacy-default"
+        tracker_identity = Keyword.get(opts, :tracker_identity, Tracker.identity(settings.tracker))
+        ledger_opts = ledger_options(opts)
+
+        with {:ok, ledger} <- OwnershipLedger.open(project_id, tracker_identity, ledger_opts) do
+          try do
+            fun.(ledger)
+          after
+            _ = OwnershipLedger.close(ledger)
+          end
+        end
+    end
+  end
+
+  defp ledger_options(opts) do
+    opts
+    |> Keyword.get(:ledger_opts, [])
+    |> Keyword.merge(Keyword.take(opts, [:root, :path, :ledger_path, :host_identity_path]))
+    |> Keyword.put(:workspace_root, Config.local_workspace_root())
+  end
+
+  defp issue_identity(%{id: id, identifier: identifier})
+       when is_binary(id) and is_binary(identifier) and id != "" and identifier != "" do
+    {:ok, %{id: id, identifier: identifier}}
+  end
+
+  defp issue_identity(identifier) when is_binary(identifier) and identifier != "" do
+    {:ok, %{id: identifier, identifier: identifier}}
+  end
+
+  defp issue_identity(_issue), do: {:error, :invalid_issue_identity}
+
+  defp normalize_removal_result({:ok, removed}), do: {:ok, removed}
+  defp normalize_removal_result({:error, reason}), do: {:error, reason, ""}
+
+  defp remove_records([], _ledger, _opts), do: {:ok, []}
+
+  defp remove_records(records, ledger, opts) do
+    Enum.reduce_while(records, {:ok, []}, fn record, {:ok, removed} ->
+      case remove_recorded_with_ledger(
+             record.canonical_workspace_path,
+             record.worker_host,
+             ledger,
+             opts,
+             ownership_id: record.workspace_ownership_id
+           ) do
+        {:ok, paths} -> {:cont, {:ok, removed ++ paths}}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
+
+  defp prepare_local_workspace(ledger, identity, workspace, _opts) do
+    root = Config.local_workspace_root()
+
+    with :ok <- File.mkdir_p(root),
+         {:ok, canonical_root} <- PathSafety.canonicalize(root),
+         {:ok, root_identity} <- OwnershipLedger.root_identity(canonical_root),
+         :ok <- validate_local_root(canonical_root, root_identity),
+         {:ok, records} <- OwnershipLedger.list_for_work_item(ledger, identity.id) do
+      local_workspace_result(
+        ledger,
+        identity,
+        workspace,
+        configured_root_binding(nil),
+        canonical_root,
+        root_identity,
+        records
+      )
+    end
+  end
+
+  defp validate_local_root(root, _identity) do
+    case File.lstat(root) do
+      {:ok, %File.Stat{type: :directory}} -> :ok
+      {:ok, %File.Stat{type: type}} -> {:error, {:workspace_root_not_directory, root, type}}
+      {:error, reason} -> {:error, {:workspace_root_unreadable, root, reason}}
+    end
+  end
+
+  defp local_workspace_result(
+         ledger,
+         identity,
+         workspace,
+         configured_root,
+         canonical_root,
+         root_identity,
+         records
+       ) do
+    case File.lstat(workspace) do
+      {:ok, %File.Stat{type: :symlink}} ->
+        {:error, {:workspace_symlink, workspace}}
+
+      {:ok, %File.Stat{type: :directory}} ->
+        local_reuse_or_reject(
+          ledger,
+          identity,
+          workspace,
+          configured_root,
+          canonical_root,
+          root_identity,
+          records
+        )
+
+      {:ok, %File.Stat{type: type}} ->
+        {:error, {:workspace_path_exists, workspace, type}}
+
+      {:error, :enoent} ->
+        create_local_workspace(
+          ledger,
+          identity,
+          workspace,
+          configured_root,
+          canonical_root,
+          root_identity,
+          records
+        )
+
+      {:error, reason} ->
+        {:error, {:workspace_path_unreadable, workspace, reason}}
+    end
+  end
+
+  defp local_reuse_or_reject(
+         ledger,
+         identity,
+         workspace,
+         configured_root,
+         canonical_root,
+         root_identity,
+         records
+       ) do
+    with {:ok, filesystem_identity} <- OwnershipLedger.filesystem_identity(workspace),
+         {:ok, record} <-
+           exact_owned_record(
+             records,
+             identity,
+             workspace,
+             configured_root,
+             canonical_root,
+             root_identity,
+             nil,
+             ledger.host_identity
+           ),
+         true <- record.top_level_filesystem_identity == filesystem_identity do
+      {:ok, workspace}
+    else
+      {:error, :workspace_ownership_not_found} ->
+        {:error, {:workspace_ownership_required, workspace}}
+
+      {:error, reason} ->
+        {:error, reason}
+
+      false ->
+        {:error, {:workspace_identity_mismatch, workspace}}
+    end
+  end
+
+  defp exact_owned_record(
+         records,
+         identity,
+         workspace,
+         configured_root,
+         canonical_root,
+         root_identity,
+         worker_host,
+         trusted_host_identity
+       ) do
+    case Enum.find(records, fn record ->
+           record.state == :owned and
+             exact_record_binding?(
+               record,
+               identity,
+               workspace,
+               configured_root,
+               canonical_root,
+               root_identity,
+               worker_host,
+               trusted_host_identity
+             )
+         end) do
+      nil -> {:error, :workspace_ownership_not_found}
+      record -> {:ok, record}
+    end
+  end
+
+  defp exact_record_binding?(
+         record,
+         identity,
+         workspace,
+         configured_root,
+         canonical_root,
+         root_identity,
+         worker_host,
+         trusted_host_identity
+       ) do
+    expected_binding =
+      {identity.identifier, identity.id, workspace_key(identity.identifier), workspace_location(worker_host), worker_host, configured_root, canonical_root, workspace, root_identity,
+       trusted_host_identity}
+
+    record_binding(record) == expected_binding
+  end
+
+  defp workspace_location(nil), do: :local
+  defp workspace_location(_worker_host), do: :remote
+
+  defp record_binding(record) do
+    {
+      record.issue_identifier,
+      record.work_item_id,
+      record.workspace_key,
+      record.location,
+      record.worker_host,
+      record.configured_root,
+      record.canonical_root,
+      record.canonical_workspace_path,
+      record.configured_root_identity,
+      record.trusted_host_identity
+    }
+  end
+
+  defp reserved_record(
+         ledger,
+         identity,
+         workspace,
+         root_binding,
+         location,
+         worker_host,
+         host_identity
+       ) do
+    now = System.system_time(:millisecond)
+    configured_root = root_binding.configured_root
+    canonical_root = root_binding.canonical_root
+    root_identity = root_binding.configured_root_identity
+
+    %{
+      schema_version: OwnershipLedger.schema_version(),
+      project_namespace: ledger.project_id,
+      tracker_identity: ledger.tracker_identity,
+      issue_identifier: identity.identifier,
+      work_item_id: identity.id,
+      workspace_key: workspace_key(identity.identifier),
+      workspace_ownership_id: new_workspace_ownership_id(),
+      location: location,
+      worker_host: worker_host,
+      trusted_host_identity: host_identity,
+      configured_root: configured_root,
+      configured_root_identity: root_identity,
+      canonical_root: canonical_root,
+      canonical_workspace_path: workspace,
+      top_level_filesystem_identity: nil,
+      state: :reserved,
+      created_at: now,
+      updated_at: now
+    }
+  end
+
+  defp new_workspace_ownership_id do
+    "workspace-" <> Base.encode16(:crypto.strong_rand_bytes(24), case: :lower)
+  end
+
+  defp create_local_workspace(
+         ledger,
+         identity,
+         workspace,
+         configured_root,
+         canonical_root,
+         root_identity,
+         records
+       ) do
+    attrs =
+      reserved_record(
+        ledger,
+        identity,
+        workspace,
+        %{
+          configured_root: configured_root,
+          canonical_root: canonical_root,
+          configured_root_identity: root_identity
+        },
+        :local,
+        nil,
+        ledger.host_identity
+      )
+
+    with {:ok, reserved} <- reserve_or_reuse_local(ledger, attrs, records),
+         :ok <- atomic_mkdir(workspace),
+         {:ok, filesystem_identity} <- OwnershipLedger.filesystem_identity(workspace),
+         :ok <- after_create_and_own(ledger, reserved, identity, workspace, root_identity, filesystem_identity) do
+      {:ok, workspace}
+    else
+      {:error, {:after_create_failed, ownership_id, hook_reason}} ->
+        {:error, cleanup_failed_create(ledger, ownership_id, workspace, hook_reason)}
 
       {:error, reason} ->
         {:error, reason}
     end
   end
 
-  defp create_workspace(workspace) do
-    File.rm_rf!(workspace)
-    File.mkdir_p!(workspace)
-    {:ok, workspace, true}
+  defp reserve_or_reuse_local(ledger, attrs, records) do
+    records
+    |> Enum.filter(&reservation_record?(&1, attrs, :local, nil))
+    |> reserve_or_reuse_record(ledger, attrs)
   end
 
-  @spec remove(Path.t()) :: {:ok, [String.t()]} | {:error, term(), String.t()}
-  def remove(workspace), do: remove(workspace, nil)
+  defp reservation_record?(record, attrs, location, worker_host) do
+    expected_binding = %{attrs | location: location, worker_host: worker_host}
 
-  @spec remove(Path.t(), worker_host()) :: {:ok, [String.t()]} | {:error, term(), String.t()}
-  def remove(workspace, nil) do
-    case File.exists?(workspace) do
-      true ->
-        case validate_workspace_path(workspace, nil) do
-          :ok ->
-            remove_local_workspace(workspace)
+    record_binding(record) == record_binding(expected_binding) and
+      record.state in [:reserved, :provisioning, :release_pending, :owned]
+  end
 
-          {:error, reason} ->
-            {:error, reason, ""}
-        end
-
-      false ->
-        File.rm_rf(workspace)
+  defp reserve_or_reuse_record(active, ledger, attrs) do
+    case Enum.find(active, &(&1.state == :reserved)) do
+      %{} = reserved -> {:ok, reserved}
+      nil when active == [] -> OwnershipLedger.reserve_sync(ledger, attrs)
+      nil -> {:error, {:workspace_ownership_inconsistent, attrs.canonical_workspace_path}}
     end
   end
 
-  def remove(workspace, worker_host) when is_binary(worker_host) do
-    maybe_run_before_remove_hook(workspace, worker_host)
+  defp after_create_and_own(ledger, reserved, identity, workspace, root_identity, filesystem_identity) do
+    case persist_local_provisioning(ledger, reserved, root_identity, filesystem_identity) do
+      {:error, reason} ->
+        {:error, {:provisioning_sync_failed, reason}}
 
+      {:ok, _provisioning} ->
+        run_local_after_create(ledger, reserved, identity, workspace, root_identity, filesystem_identity)
+    end
+  end
+
+  defp persist_local_provisioning(ledger, reserved, root_identity, filesystem_identity) do
+    OwnershipLedger.transition_sync(
+      ledger,
+      reserved.workspace_ownership_id,
+      :provisioning,
+      configured_root_identity: root_identity,
+      top_level_filesystem_identity: filesystem_identity
+    )
+  end
+
+  defp run_local_after_create(ledger, reserved, identity, workspace, root_identity, filesystem_identity) do
+    case maybe_run_after_create_hook(workspace, issue_context(identity), nil) do
+      {:error, reason} -> {:error, {:after_create_failed, reserved.workspace_ownership_id, reason}}
+      :ok -> validate_and_own_local_workspace(ledger, reserved, workspace, root_identity, filesystem_identity)
+    end
+  end
+
+  defp validate_and_own_local_workspace(ledger, reserved, workspace, root_identity, filesystem_identity) do
+    case validate_local_cleanup_identity(
+           workspace,
+           root_identity,
+           filesystem_identity,
+           reserved.canonical_root,
+           reserved.configured_root
+         ) do
+      :ok ->
+        case OwnershipLedger.transition_sync(
+               ledger,
+               reserved.workspace_ownership_id,
+               :owned,
+               top_level_filesystem_identity: filesystem_identity
+             ) do
+          {:ok, _owned} -> :ok
+          {:error, reason} -> {:error, {:owned_sync_failed, reason}}
+        end
+
+      {:error, reason} ->
+        {:error, {:owned_identity_mismatch, reason}}
+    end
+  end
+
+  defp atomic_mkdir(workspace) do
+    case File.mkdir(workspace) do
+      :ok -> :ok
+      {:error, :eexist} -> {:error, {:workspace_path_exists, workspace}}
+      {:error, reason} -> {:error, {:workspace_create_failed, workspace, reason}}
+    end
+  end
+
+  defp cleanup_failed_create(_ledger, nil, _workspace, reason), do: reason
+
+  defp cleanup_failed_create(ledger, ownership_id, _workspace, reason) do
+    with {:ok, pending} <-
+           OwnershipLedger.transition_sync(
+             ledger,
+             ownership_id,
+             :release_pending,
+             release_origin: :failed_provisioning
+           ),
+         {:ok, _removed} <- remove_local_owned_path(pending, ledger, []) do
+      reason
+    else
+      {:error, cleanup_reason} -> {:after_create_cleanup_failed, reason, cleanup_reason}
+    end
+  end
+
+  defp validate_local_cleanup_identity(
+         workspace,
+         root_identity,
+         expected_filesystem_identity,
+         expected_root,
+         expected_configured_root
+       ) do
+    with {:ok, %File.Stat{type: :directory}} <- File.lstat(workspace),
+         {:ok, filesystem_identity} <- OwnershipLedger.filesystem_identity(workspace),
+         true <- filesystem_identity == expected_filesystem_identity do
+      with :ok <- validate_current_configured_root(expected_configured_root),
+           {:ok, canonical_root} <- PathSafety.canonicalize(Config.local_workspace_root()),
+           true <- is_nil(expected_root) or canonical_root == expected_root,
+           {:ok, ^root_identity} <- OwnershipLedger.root_identity(canonical_root) do
+        :ok
+      else
+        false -> {:error, {:workspace_root_path_mismatch, expected_root}}
+        {:ok, actual} -> {:error, {:workspace_root_identity_mismatch, root_identity, actual}}
+        {:error, reason} -> {:error, reason}
+      end
+    else
+      {:ok, %File.Stat{type: type}} -> {:error, {:workspace_identity_mismatch, workspace, type}}
+      {:error, reason} -> {:error, {:workspace_identity_mismatch, workspace, reason}}
+      false -> {:error, {:workspace_identity_mismatch, workspace}}
+    end
+  end
+
+  defp validate_current_configured_root(expected) do
+    current = configured_root_binding(nil)
+
+    if current == expected do
+      :ok
+    else
+      {:error, {:workspace_configured_root_mismatch, expected, current}}
+    end
+  end
+
+  defp configured_root_binding(nil), do: Config.local_workspace_root() |> Path.expand()
+
+  defp configured_root_binding(_worker_host) do
+    Config.settings!().workspace.root
+    |> String.trim_trailing("/")
+    |> normalize_root_slash()
+  end
+
+  defp normalize_root_slash(""), do: "/"
+  defp normalize_root_slash(root), do: root
+
+  defp cleanup_authorized?(opts) when is_list(opts) do
+    Keyword.get(opts, :cleanup_authorized) == true or
+      Keyword.get(opts, :cleanup_authorized?) == true or
+      Keyword.get(opts, :cleanup_authorization) == true or
+      match?(%{authorized: true}, Keyword.get(opts, :cleanup_authorization))
+  end
+
+  defp cleanup_authorized?(_opts), do: false
+
+  defp remove_recorded_with_ledger(workspace, worker_host, ledger, opts, extra \\ []) do
+    with {:ok, requested_path} <- requested_workspace_path(workspace, worker_host),
+         {:ok, records} <- OwnershipLedger.list_for_host(ledger, worker_host),
+         {:ok, record} <- find_record_for_path(records, requested_path, extra),
+         :ok <- validate_cleanup_authorization(record, opts),
+         {:ok, pending} <- ensure_release_pending(ledger, record) do
+      remove_owned_path(pending, worker_host, ledger, opts)
+    end
+  end
+
+  defp requested_workspace_path(workspace, nil) do
+    with :ok <- validate_workspace_path(workspace, nil),
+         {:ok, canonical_workspace} <- PathSafety.canonicalize(workspace) do
+      case File.lstat(workspace) do
+        {:ok, %File.Stat{type: :symlink}} ->
+          {:error, {:workspace_symlink_escape, Path.expand(workspace), Path.expand(Config.local_workspace_root())}}
+
+        _ ->
+          {:ok, canonical_workspace}
+      end
+    end
+  end
+
+  defp requested_workspace_path(workspace, worker_host) when is_binary(worker_host) do
+    if String.trim(workspace) == "" or String.contains?(workspace, ["\n", "\r", <<0>>]) do
+      {:error, {:workspace_path_unreadable, workspace, :invalid}}
+    else
+      {:ok, Path.expand(workspace)}
+    end
+  end
+
+  defp find_record_for_path(records, requested_path, extra) do
+    requested_ownership_id = Keyword.get(extra, :ownership_id)
+
+    case Enum.find(records, fn record ->
+           record.canonical_workspace_path == requested_path and
+             (is_nil(requested_ownership_id) or record.workspace_ownership_id == requested_ownership_id) and
+             record.state in [:owned, :release_pending]
+         end) do
+      nil -> {:error, :workspace_ownership_not_found}
+      record -> {:ok, record}
+    end
+  end
+
+  defp validate_cleanup_authorization(record, opts) do
+    case Keyword.get(opts, :cleanup_authorization) do
+      authorization when is_map(authorization) ->
+        if cleanup_authorization_matches?(authorization, record) do
+          :ok
+        else
+          {:error, :workspace_cleanup_authorization_mismatch}
+        end
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp cleanup_authorization_matches?(authorization, record) do
+    fields = [:workspace_ownership_id, :canonical_workspace_path, :worker_host]
+
+    Enum.all?(fields, fn field ->
+      not Map.has_key?(authorization, field) or Map.get(authorization, field) == Map.get(record, field)
+    end)
+  end
+
+  defp ensure_release_pending(_ledger, %{state: :release_pending} = record), do: {:ok, record}
+
+  defp ensure_release_pending(ledger, %{state: :owned} = record) do
+    OwnershipLedger.transition_sync(ledger, record.workspace_ownership_id, :release_pending)
+  end
+
+  defp remove_owned_path(%{location: :local} = record, nil, ledger, opts),
+    do: remove_local_owned_path(record, ledger, opts)
+
+  defp remove_owned_path(%{location: :remote} = record, worker_host, ledger, opts)
+       when is_binary(worker_host),
+       do: remove_remote_owned_path(record, worker_host, ledger, opts)
+
+  defp remove_owned_path(_record, _worker_host, _ledger, _opts),
+    do: {:error, :workspace_ownership_not_found}
+
+  defp remove_remote_owned_path(record, worker_host, ledger, _opts) do
+    with :ok <- validate_remote_configured_root(worker_host, record.configured_root) do
+      remove_configured_remote_workspace(record, worker_host, ledger)
+    end
+  end
+
+  defp remove_configured_remote_workspace(record, worker_host, ledger) do
+    script = remote_remove_guard_script(record, true)
+
+    case run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms) do
+      {:ok, {_output, 0}} ->
+        case OwnershipLedger.transition_sync(ledger, record.workspace_ownership_id, :released) do
+          {:ok, _released} -> {:ok, [record.canonical_workspace_path]}
+          {:error, reason} -> {:error, reason}
+        end
+
+      {:ok, {output, status}} ->
+        {:error, {:workspace_remove_failed, worker_host, status, output}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp remote_remove_guard_script(record, include_before_remove?) do
+    root = Config.settings!().workspace.root
+    expected_root = record.canonical_root
+    workspace = record.canonical_workspace_path
+    host_identity_path = @default_remote_host_identity
+    hook = Config.settings!().hooks.before_remove
+
+    hook_commands =
+      cond do
+        not include_before_remove? -> []
+        is_nil(hook) -> []
+        CredentialBoundary.routed_workspace_shell_hook_skipped?("before_remove") -> []
+        true -> [hook]
+      end
+
+    [
+      "set -eu",
+      remote_shell_assign("workspace", workspace),
+      remote_shell_assign("root", root),
+      remote_shell_assign("host_identity_path", host_identity_path),
+      "case \"$workspace\" in \"$root\"/*) ;; *) exit 91 ;; esac",
+      "if [ -L \"$root\" ] || [ ! -d \"$root\" ]; then exit 92; fi",
+      "if [ \"$(cd \"$root\" && pwd -P)\" != #{shell_escape(expected_root)} ]; then exit 93; fi",
+      "if [ \"$(stat -c '%d:%i' -- \"$root\")\" != #{shell_escape(record.configured_root_identity)} ]; then exit 94; fi",
+      "host_identity_dir=$(dirname \"$host_identity_path\")",
+      "check_dir=\"$host_identity_dir\"",
+      "while [ \"$check_dir\" != \"/\" ] && [ \"$check_dir\" != \".\" ]; do if [ -L \"$check_dir\" ] || [ ! -d \"$check_dir\" ]; then exit 95; fi; check_dir=$(dirname \"$check_dir\"); done",
+      "if [ \"$(stat -c '%a' -- \"$host_identity_dir\")\" != 700 ]; then exit 95; fi",
+      "if [ -L \"$host_identity_path\" ] || [ ! -f \"$host_identity_path\" ] || [ \"$(stat -c '%a' -- \"$host_identity_path\")\" != 600 ]; then exit 95; fi",
+      "if [ \"$(cat \"$host_identity_path\")\" != #{shell_escape(record.trusted_host_identity)} ]; then exit 96; fi",
+      "if [ ! -e \"$workspace\" ] && [ ! -L \"$workspace\" ]; then printf '%s\\n' '#{@remote_workspace_marker}\\tabsent'; exit 0; fi",
+      "if [ -L \"$workspace\" ] || [ ! -d \"$workspace\" ]; then exit 97; fi",
+      "if [ \"$(cd \"$workspace\" && pwd -P)\" != #{shell_escape(workspace)} ]; then exit 98; fi",
+      "if [ \"$(stat -c '%d:%i' -- \"$workspace\")\" != #{shell_escape(record.top_level_filesystem_identity)} ]; then exit 99; fi",
+      "cd \"$workspace\"",
+      CredentialBoundary.unset_shell_command(CredentialBoundary.configured_secret_environment_names()),
+      "#{Enum.join(hook_commands, "\n")}",
+      "if [ \"$(cd \"$root\" && pwd -P)\" != #{shell_escape(expected_root)} ] || [ \"$(stat -c '%d:%i' -- \"$root\")\" != #{shell_escape(record.configured_root_identity)} ]; then exit 100; fi",
+      "if [ -L \"$workspace\" ] || [ \"$(cd \"$workspace\" && pwd -P)\" != #{shell_escape(workspace)} ]; then exit 101; fi",
+      "if [ \"$(stat -c '%d:%i' -- \"$workspace\")\" != #{shell_escape(record.top_level_filesystem_identity)} ]; then exit 102; fi",
+      "rm -rf -- \"$workspace\""
+    ]
+    |> Enum.reject(&(&1 in [nil, ""]))
+    |> Enum.join("\n")
+  end
+
+  defp remove_local_owned_path(%{state: :release_pending} = record, ledger, _opts) do
+    case File.lstat(record.canonical_workspace_path) do
+      {:error, :enoent} -> release_missing_local_workspace(record, ledger)
+      _ -> remove_local_existing_workspace(record, ledger)
+    end
+  end
+
+  defp remove_local_owned_path(record, ledger, _opts) do
+    remove_local_existing_workspace(record, ledger)
+  end
+
+  defp release_missing_local_workspace(record, ledger) do
+    with :ok <- validate_local_root_binding(record),
+         {:ok, _released} <-
+           OwnershipLedger.transition_sync(ledger, record.workspace_ownership_id, :released) do
+      {:ok, [record.canonical_workspace_path]}
+    end
+  end
+
+  defp remove_local_existing_workspace(record, ledger) do
+    with :ok <-
+           validate_local_cleanup_identity(
+             record.canonical_workspace_path,
+             record.configured_root_identity,
+             record.top_level_filesystem_identity,
+             record.canonical_root,
+             record.configured_root
+           ),
+         :ok <- run_before_remove_hook(record.canonical_workspace_path, record, nil),
+         :ok <-
+           validate_local_cleanup_identity(
+             record.canonical_workspace_path,
+             record.configured_root_identity,
+             record.top_level_filesystem_identity,
+             record.canonical_root,
+             record.configured_root
+           ),
+         {:ok, _removed} <- File.rm_rf(record.canonical_workspace_path),
+         {:ok, _released} <-
+           OwnershipLedger.transition_sync(ledger, record.workspace_ownership_id, :released) do
+      {:ok, [record.canonical_workspace_path]}
+    else
+      {:error, reason} -> {:error, reason}
+      {:error, reason, path} -> {:error, {reason, path}}
+    end
+  end
+
+  defp validate_local_root_binding(record) do
+    expected_root_identity = record.configured_root_identity
+
+    with :ok <- validate_current_configured_root(record.configured_root),
+         {:ok, canonical_root} <- PathSafety.canonicalize(Config.local_workspace_root()),
+         true <- canonical_root == record.canonical_root,
+         {:ok, ^expected_root_identity} <- OwnershipLedger.root_identity(canonical_root) do
+      :ok
+    else
+      false ->
+        {:error, {:workspace_root_path_mismatch, record.canonical_root}}
+
+      {:ok, actual} ->
+        {:error, {:workspace_root_identity_mismatch, record.configured_root_identity, actual}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp validate_pending_release_current(
+         %{location: :local, worker_host: nil, trusted_host_identity: trusted} = record,
+         ledger
+       ) do
+    if trusted == ledger.host_identity do
+      validate_local_cleanup_identity(
+        record.canonical_workspace_path,
+        record.configured_root_identity,
+        record.top_level_filesystem_identity,
+        record.canonical_root,
+        record.configured_root
+      )
+    else
+      {:error, :workspace_host_identity_mismatch}
+    end
+  end
+
+  defp validate_pending_release_current(
+         %{location: :remote, worker_host: worker_host} = record,
+         _ledger
+       )
+       when is_binary(worker_host) do
+    validate_remote_pending_release(record, worker_host)
+  end
+
+  defp validate_pending_release_current(_record, _ledger),
+    do: {:error, :workspace_ownership_not_found}
+
+  defp validate_remote_pending_release(record, worker_host) do
+    with :ok <- validate_remote_configured_root(worker_host, record.configured_root),
+         {:ok, fresh} <- remote_prepare(worker_host, record.canonical_workspace_path),
+         true <- remote_binding_matches?(fresh, record) do
+      :ok
+    else
+      false -> {:error, {:workspace_identity_mismatch, record.canonical_workspace_path}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp remote_binding_matches?(fresh, record) do
+    fresh.present? and fresh.host_identity == record.trusted_host_identity and
+      fresh.root == record.canonical_root and
+      fresh.root_identity == record.configured_root_identity and
+      fresh.workspace == record.canonical_workspace_path and
+      fresh.workspace_identity == record.top_level_filesystem_identity
+  end
+
+  defp validate_remote_configured_root(worker_host, expected) do
+    current_root = configured_root_binding(worker_host)
+
+    cond do
+      worker_host in Config.settings!().worker.ssh_hosts and current_root == expected ->
+        :ok
+
+      worker_host in Config.settings!().worker.ssh_hosts ->
+        {:error, {:workspace_configured_root_mismatch, expected, current_root}}
+
+      true ->
+        {:error, {:workspace_worker_host_not_configured, worker_host}}
+    end
+  end
+
+  defp run_before_remove_hook(workspace, record, worker_host) do
+    hooks = Config.settings!().hooks
+    issue = %{id: record.work_item_id, identifier: record.issue_identifier}
+
+    case hooks.before_remove do
+      nil -> :ok
+      command -> run_hook(command, workspace, issue_context(issue), "before_remove", worker_host)
+    end
+  end
+
+  defp prepare_remote_workspace(ledger, identity, workspace, worker_host, _opts) do
+    with :ok <- validate_remote_configured_root(worker_host, configured_root_binding(worker_host)),
+         {:ok, remote} <- remote_prepare(worker_host, workspace),
+         {:ok, records} <- OwnershipLedger.list_for_work_item(ledger, identity.id) do
+      remote_workspace_result(ledger, identity, remote, records, worker_host)
+    end
+  end
+
+  defp remote_workspace_result(ledger, identity, remote, records, worker_host) do
+    case remote.present? do
+      true ->
+        exact_remote_workspace_record(ledger, identity, remote, records, worker_host)
+
+      false ->
+        create_remote_workspace(ledger, identity, remote, worker_host)
+    end
+  end
+
+  defp exact_remote_workspace_record(_ledger, identity, remote, records, worker_host) do
+    configured_root = configured_root_binding(worker_host)
+
+    case Enum.find(records, fn record ->
+           record.state == :owned and
+             exact_record_binding?(
+               record,
+               identity,
+               remote.workspace,
+               configured_root,
+               remote.root,
+               remote.root_identity,
+               worker_host,
+               remote.host_identity
+             ) and
+             record.top_level_filesystem_identity == remote.workspace_identity
+         end) do
+      nil -> {:error, {:workspace_ownership_required, remote.workspace}}
+      _record -> {:ok, remote.workspace}
+    end
+  end
+
+  defp create_remote_workspace(ledger, identity, remote, worker_host) do
+    configured_root = configured_root_binding(worker_host)
+
+    attrs =
+      reserved_record(
+        ledger,
+        identity,
+        remote.workspace,
+        %{
+          configured_root: configured_root,
+          canonical_root: remote.root,
+          configured_root_identity: remote.root_identity
+        },
+        :remote,
+        worker_host,
+        remote.host_identity
+      )
+
+    with {:ok, reserved} <- reserve_or_reuse_remote(ledger, attrs),
+         {:ok, created} <- remote_mkdir(worker_host, remote) do
+      created
+      |> Map.put(:configured_root, configured_root)
+      |> provision_and_own_remote_workspace(ledger, reserved, identity, worker_host)
+    end
+  end
+
+  defp provision_and_own_remote_workspace(created, ledger, reserved, identity, worker_host) do
+    case OwnershipLedger.transition_sync(
+           ledger,
+           reserved.workspace_ownership_id,
+           :provisioning,
+           configured_root_identity: created.root_identity,
+           top_level_filesystem_identity: created.workspace_identity
+         ) do
+      {:ok, _provisioning} ->
+        run_remote_after_create(ledger, reserved, identity, worker_host, created)
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp run_remote_after_create(ledger, reserved, identity, worker_host, created) do
+    case maybe_run_after_create_hook(
+           created.workspace,
+           issue_context(identity),
+           worker_host
+         ) do
+      :ok ->
+        own_remote_workspace(ledger, reserved, worker_host, created)
+
+      {:error, reason} ->
+        case remote_after_create_failure(ledger, reserved, worker_host) do
+          :ok -> {:error, reason}
+          {:error, cleanup_reason} -> {:error, {:after_create_cleanup_failed, reason, cleanup_reason}}
+        end
+    end
+  end
+
+  defp own_remote_workspace(ledger, reserved, worker_host, created) do
+    case validate_remote_after_create(worker_host, created) do
+      :ok ->
+        case OwnershipLedger.transition_sync(
+               ledger,
+               reserved.workspace_ownership_id,
+               :owned,
+               top_level_filesystem_identity: created.workspace_identity
+             ) do
+          {:ok, _owned} -> {:ok, created.workspace}
+          {:error, reason} -> {:error, reason}
+        end
+
+      {:error, reason} ->
+        {:error, {:owned_identity_mismatch, reason}}
+    end
+  end
+
+  defp validate_remote_after_create(worker_host, created) do
+    with :ok <- validate_remote_configured_root(worker_host, created.configured_root),
+         {:ok, fresh} <- remote_prepare(worker_host, created.workspace),
+         true <- remote_created_binding_matches?(fresh, created) do
+      :ok
+    else
+      false -> {:error, {:workspace_identity_mismatch, created.workspace}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp remote_created_binding_matches?(fresh, created) do
+    fresh.present? and fresh.host_identity == created.host_identity and
+      fresh.root == created.root and fresh.root_identity == created.root_identity and
+      fresh.workspace == created.workspace and fresh.workspace_identity == created.workspace_identity
+  end
+
+  defp reserve_or_reuse_remote(ledger, attrs) do
+    case OwnershipLedger.list_for_work_item(ledger, attrs.work_item_id) do
+      {:ok, records} ->
+        records
+        |> Enum.filter(&reservation_record?(&1, attrs, :remote, attrs.worker_host))
+        |> reserve_or_reuse_record(ledger, attrs)
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp remote_after_create_failure(ledger, reserved, worker_host) do
+    with {:ok, pending} <-
+           OwnershipLedger.transition_sync(
+             ledger,
+             reserved.workspace_ownership_id,
+             :release_pending,
+             release_origin: :failed_provisioning
+           ),
+         :ok <- validate_remote_configured_root(worker_host, pending.configured_root),
+         {:ok, {output, 0}} <-
+           run_remote_command(
+             worker_host,
+             remote_remove_guard_script(pending, true),
+             Config.settings!().hooks.timeout_ms
+           ),
+         {:ok, _released} <-
+           OwnershipLedger.transition_sync(ledger, reserved.workspace_ownership_id, :released) do
+      _ = output
+      :ok
+    else
+      {:ok, {output, status}} -> {:error, {:workspace_remove_failed, worker_host, status, output}}
+      {:error, reason} -> {:error, reason}
+      :not_found -> {:error, :workspace_ownership_not_found}
+    end
+  end
+
+  defp remote_prepare(worker_host, workspace) do
+    script = remote_prepare_script(workspace)
+
+    case run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms) do
+      {:ok, {output, 0}} -> parse_remote_workspace_output(output)
+      {:ok, {output, status}} -> {:error, {:workspace_prepare_failed, worker_host, status, output}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp remote_prepare_script(workspace) do
+    root = Config.settings!().workspace.root
+    host_identity_path = @default_remote_host_identity
+
+    [
+      "set -eu",
+      remote_shell_assign("workspace", workspace),
+      remote_shell_assign("root", root),
+      remote_shell_assign("host_identity_path", host_identity_path),
+      "case \"$root\" in \"$workspace\"|\"$workspace\"/*) exit 71 ;; esac",
+      "case \"$host_identity_path\" in \"$root\"|\"$root\"/*|\"$workspace\"|\"$workspace\"/*) exit 71 ;; esac",
+      "if [ -L \"$root\" ] || [ ! -d \"$root\" ]; then exit 72; fi",
+      "host_identity_dir=$(dirname \"$host_identity_path\")",
+      "umask 077",
+      "mkdir -p \"$host_identity_dir\"",
+      "check_dir=\"$host_identity_dir\"",
+      "while [ \"$check_dir\" != \"/\" ] && [ \"$check_dir\" != \".\" ]; do if [ -L \"$check_dir\" ] || [ ! -d \"$check_dir\" ]; then exit 73; fi; check_dir=$(dirname \"$check_dir\"); done",
+      "if [ \"$(stat -c '%a' -- \"$host_identity_dir\")\" != 700 ]; then exit 73; fi",
+      "if [ -L \"$host_identity_path\" ]; then exit 73; fi",
+      "if [ ! -e \"$host_identity_path\" ]; then identity_tmp=\"$host_identity_path.$$.$RANDOM\"; (umask 077; printf 'host-%s\\n' \"$(od -An -N16 -tx1 /dev/urandom | tr -d ' \\n')\" > \"$identity_tmp\"); chmod 600 \"$identity_tmp\"; if ln \"$identity_tmp\" \"$host_identity_path\" 2>/dev/null; then :; fi; rm -f \"$identity_tmp\"; fi",
+      "if [ ! -f \"$host_identity_path\" ] || [ \"$(stat -c '%a' -- \"$host_identity_path\")\" != 600 ]; then exit 74; fi",
+      "host_identity=$(cat \"$host_identity_path\")",
+      "root_identity=$(stat -c '%d:%i' -- \"$root\")",
+      "present=0",
+      "workspace_identity=-",
+      "if [ -L \"$workspace\" ]; then exit 75; fi",
+      "if [ -e \"$workspace\" ]; then",
+      "  if [ ! -d \"$workspace\" ]; then exit 76; fi",
+      "  present=1",
+      "  workspace_identity=$(stat -c '%d:%i' -- \"$workspace\")",
+      "fi",
+      "workspace=$(if [ -e \"$workspace\" ]; then cd \"$workspace\" && pwd -P; else printf '%s' \"$workspace\"; fi)",
+      "root=$(cd \"$root\" && pwd -P)",
+      "printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' '#{@remote_workspace_marker}' \"$present\" \"$workspace\" \"$root\" \"$host_identity\" \"$root_identity\" \"$workspace_identity\" \"$host_identity_path\""
+    ]
+    |> Enum.join("\n")
+  end
+
+  defp remote_mkdir(worker_host, remote) do
     script =
       [
-        remote_shell_assign("workspace", workspace),
-        "rm -rf \"$workspace\""
+        "set -eu",
+        remote_shell_assign("workspace", remote.workspace),
+        remote_shell_assign("root", remote.root),
+        remote_shell_assign("host_identity_path", remote.host_identity_path),
+        "if [ -L \"$root\" ] || [ ! -d \"$root\" ]; then exit 81; fi",
+        "if [ \"$(stat -c '%d:%i' -- \"$root\")\" != #{shell_escape(remote.root_identity)} ]; then exit 82; fi",
+        "host_identity_dir=$(dirname \"$host_identity_path\")",
+        "check_dir=\"$host_identity_dir\"",
+        "while [ \"$check_dir\" != \"/\" ] && [ \"$check_dir\" != \".\" ]; do if [ -L \"$check_dir\" ] || [ ! -d \"$check_dir\" ]; then exit 83; fi; check_dir=$(dirname \"$check_dir\"); done",
+        "if [ \"$(stat -c '%a' -- \"$host_identity_dir\")\" != 700 ]; then exit 83; fi",
+        "if [ -L \"$host_identity_path\" ] || [ ! -f \"$host_identity_path\" ] || [ \"$(stat -c '%a' -- \"$host_identity_path\")\" != 600 ]; then exit 83; fi",
+        "if [ \"$(cat \"$host_identity_path\")\" != #{shell_escape(remote.host_identity)} ]; then exit 83; fi",
+        "if [ -e \"$workspace\" ]; then exit 84; fi",
+        "mkdir \"$workspace\"",
+        "workspace=$(cd \"$workspace\" && pwd -P)",
+        "printf '%s\\t%s\\t%s\\t%s\\n' '#{@remote_workspace_marker}' \"$workspace\" \"$(stat -c '%d:%i' -- \"$workspace\")\" \"$(stat -c '%d:%i' -- \"$root\")\""
       ]
       |> Enum.join("\n")
 
     case run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms) do
-      {:ok, {_output, 0}} ->
-        {:ok, []}
-
-      {:ok, {output, status}} ->
-        {:error, {:workspace_remove_failed, worker_host, status, output}, ""}
-
-      {:error, reason} ->
-        {:error, reason, ""}
+      {:ok, {output, 0}} -> parse_remote_mkdir_output(output, remote)
+      {:ok, {output, status}} -> {:error, {:workspace_prepare_failed, worker_host, status, output}}
+      {:error, reason} -> {:error, reason}
     end
   end
 
-  @doc false
-  @spec remove_recorded(Path.t(), worker_host()) :: {:ok, [String.t()]} | {:error, term(), String.t()}
-  def remove_recorded(workspace, nil) when is_binary(workspace) do
-    if Path.type(workspace) == :absolute do
-      case validate_recorded_workspace_path(workspace) do
-        :ok ->
-          remove_local_workspace(workspace)
+  defp parse_remote_mkdir_output(output, remote) do
+    line =
+      output
+      |> IO.iodata_to_binary()
+      |> String.split("\n", trim: true)
+      |> Enum.find_value(fn value ->
+        case String.split(value, "\t", parts: 4) do
+          [@remote_workspace_marker, workspace, workspace_identity, root_identity]
+          when workspace != "" and workspace_identity != "" and root_identity != "" ->
+            %{remote | workspace: workspace, workspace_identity: workspace_identity, root_identity: root_identity}
 
-        {:error, reason} ->
-          {:error, reason, ""}
-      end
-    else
-      {:error, {:workspace_path_unreadable, workspace, :not_absolute}, ""}
-    end
-  end
-
-  def remove_recorded(workspace, worker_host) when is_binary(workspace) and is_binary(worker_host) do
-    remove(workspace, worker_host)
-  end
-
-  def remove_recorded(workspace, _worker_host) do
-    {:error, {:workspace_path_unreadable, workspace, :invalid}, ""}
-  end
-
-  defp remove_local_workspace(workspace) do
-    maybe_run_before_remove_hook(workspace, nil)
-    File.rm_rf(workspace)
-  end
-
-  @spec remove_issue_workspaces(term()) :: :ok
-  def remove_issue_workspaces(identifier), do: remove_issue_workspaces(identifier, nil)
-
-  @spec remove_issue_workspaces(term(), worker_host()) :: :ok
-  def remove_issue_workspaces(%{id: _issue_id, identifier: _identifier} = issue, worker_host)
-      when is_binary(worker_host) do
-    case workspace_path_for_issue(workspace_key(issue), worker_host) do
-      {:ok, workspace} -> remove(workspace, worker_host)
-      {:error, _reason} -> :ok
-    end
-
-    :ok
-  end
-
-  def remove_issue_workspaces(%{id: _issue_id, identifier: _identifier} = issue, nil) do
-    case Config.settings!().worker.ssh_hosts do
-      [] ->
-        case workspace_path_for_issue(workspace_key(issue), nil) do
-          {:ok, workspace} -> remove(workspace, nil)
-          {:error, _reason} -> :ok
+          _ ->
+            nil
         end
+      end)
 
-      worker_hosts ->
-        Enum.each(worker_hosts, &remove_issue_workspaces(issue, &1))
-    end
-
-    :ok
+    if is_map(line), do: {:ok, line}, else: {:error, {:workspace_prepare_failed, :invalid_output, output}}
   end
-
-  def remove_issue_workspaces(identifier, worker_host) when is_binary(identifier) and is_binary(worker_host) do
-    case workspace_path_for_issue(workspace_key(identifier), worker_host) do
-      {:ok, workspace} -> remove(workspace, worker_host)
-      {:error, _reason} -> :ok
-    end
-
-    :ok
-  end
-
-  def remove_issue_workspaces(identifier, nil) when is_binary(identifier) do
-    case Config.settings!().worker.ssh_hosts do
-      [] ->
-        case workspace_path_for_issue(workspace_key(identifier), nil) do
-          {:ok, workspace} -> remove(workspace, nil)
-          {:error, _reason} -> :ok
-        end
-
-      worker_hosts ->
-        Enum.each(worker_hosts, &remove_issue_workspaces(identifier, &1))
-    end
-
-    :ok
-  end
-
-  def remove_issue_workspaces(_identifier, _worker_host), do: :ok
 
   @spec run_before_run_hook(Path.t(), map() | String.t() | nil, worker_host()) ::
           :ok | {:error, term()}
@@ -286,89 +1306,13 @@ defmodule SymphonyElixir.Workspace do
     |> binary_part(0, 16)
   end
 
-  defp maybe_run_after_create_hook(workspace, issue_context, created?, worker_host) do
-    hooks = Config.settings!().hooks
-
-    case created? do
-      true ->
-        case hooks.after_create do
-          nil ->
-            :ok
-
-          command ->
-            run_hook(command, workspace, issue_context, "after_create", worker_host)
-        end
-
-      false ->
-        :ok
-    end
-  end
-
-  defp cleanup_failed_new_workspace(_workspace, false, _worker_host), do: :ok
-
-  defp cleanup_failed_new_workspace(workspace, true, nil) do
-    case File.rm_rf(workspace) do
-      {:ok, _removed} ->
-        :ok
-
-      {:error, reason, path} ->
-        Logger.warning("Failed to remove partial workspace path=#{path} reason=#{inspect(reason)}")
-    end
-  end
-
-  defp cleanup_failed_new_workspace(workspace, true, worker_host) when is_binary(worker_host) do
-    script = [remote_shell_assign("workspace", workspace), "rm -rf \"$workspace\""] |> Enum.join("\n")
-
-    case run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms) do
-      {:ok, {_output, 0}} ->
-        :ok
-
-      result ->
-        Logger.warning("Failed to remove partial workspace worker_host=#{worker_host_for_log(worker_host)} result=#{inspect(result)}")
-    end
-  end
-
-  defp maybe_run_before_remove_hook(workspace, nil) do
-    hooks = Config.settings!().hooks
-
-    case File.dir?(workspace) do
-      true ->
-        case hooks.before_remove do
-          nil ->
-            :ok
-
-          command ->
-            run_hook(
-              command,
-              workspace,
-              %{issue_id: nil, issue_identifier: Path.basename(workspace)},
-              "before_remove",
-              nil
-            )
-            |> ignore_hook_failure()
-        end
-
-      false ->
-        :ok
-    end
-  end
-
-  defp maybe_run_before_remove_hook(workspace, worker_host) when is_binary(worker_host) do
-    hooks = Config.settings!().hooks
-
-    case hooks.before_remove do
+  defp maybe_run_after_create_hook(workspace, issue_context, worker_host) do
+    case Config.settings!().hooks.after_create do
       nil ->
         :ok
 
       command ->
-        run_hook(
-          command,
-          workspace,
-          %{issue_id: nil, issue_identifier: Path.basename(workspace)},
-          "before_remove",
-          worker_host
-        )
-        |> ignore_hook_failure()
+        run_hook(command, workspace, issue_context, "after_create", worker_host)
     end
   end
 
@@ -442,8 +1386,8 @@ defmodule SymphonyElixir.Workspace do
       {:ok, cmd_result} ->
         handle_hook_command_result(cmd_result, workspace, issue_context, hook_name)
 
-      {:error, {:workspace_hook_timeout, ^hook_name, _timeout_ms} = reason} ->
-        {:error, reason}
+      {:error, {:workspace_hook_timeout, _command, timeout_ms}} ->
+        {:error, {:workspace_hook_timeout, hook_name, timeout_ms}}
 
       {:error, reason} ->
         {:error, reason}
@@ -501,10 +1445,6 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  defp validate_recorded_workspace_path(workspace) when is_binary(workspace) do
-    validate_local_workspace_path(workspace, Path.dirname(workspace))
-  end
-
   defp validate_local_workspace_path(workspace, workspace_root)
        when is_binary(workspace) and is_binary(workspace_root) do
     expanded_workspace = Path.expand(workspace)
@@ -547,27 +1487,88 @@ defmodule SymphonyElixir.Workspace do
   end
 
   defp parse_remote_workspace_output(output) do
-    lines = String.split(IO.iodata_to_binary(output), "\n", trim: true)
-
     payload =
-      Enum.find_value(lines, fn line ->
-        case String.split(line, "\t", parts: 3) do
-          [@remote_workspace_marker, created, path] when created in ["0", "1"] and path != "" ->
-            {created == "1", path}
-
-          _ ->
-            nil
-        end
-      end)
+      output
+      |> IO.iodata_to_binary()
+      |> String.split("\n", trim: true)
+      |> Enum.find_value(&parse_remote_workspace_line/1)
 
     case payload do
-      {created?, workspace} when is_boolean(created?) and is_binary(workspace) ->
-        {:ok, workspace, created?}
+      %{present?: present?} = remote when is_boolean(present?) ->
+        {:ok, remote}
 
       _ ->
         {:error, {:workspace_prepare_failed, :invalid_output, output}}
     end
   end
+
+  defp parse_remote_workspace_line(line) do
+    case String.split(line, "\t", parts: 8) do
+      [
+        @remote_workspace_marker,
+        present,
+        workspace,
+        root,
+        host_identity,
+        root_identity,
+        workspace_identity,
+        host_identity_path
+      ] ->
+        remote_workspace_payload(
+          present,
+          workspace,
+          root,
+          host_identity,
+          root_identity,
+          workspace_identity,
+          host_identity_path
+        )
+
+      _ ->
+        nil
+    end
+  end
+
+  defp remote_workspace_payload(
+         present,
+         workspace,
+         root,
+         host_identity,
+         root_identity,
+         workspace_identity,
+         host_identity_path
+       ) do
+    valid_fields = [
+      present in ["0", "1"],
+      workspace != "",
+      root != "",
+      host_identity != "",
+      root_identity not in ["", "-"],
+      host_identity_path != "",
+      Path.type(workspace) == :absolute,
+      Path.type(root) == :absolute,
+      Path.type(host_identity_path) == :absolute,
+      workspace != root,
+      String.starts_with?(workspace, root <> "/"),
+      remote_workspace_presence_valid?(present, workspace_identity)
+    ]
+
+    if Enum.all?(valid_fields) do
+      %{
+        present?: present == "1",
+        workspace: workspace,
+        root: root,
+        host_identity: host_identity,
+        root_identity: root_identity,
+        workspace_identity: workspace_identity,
+        host_identity_path: host_identity_path
+      }
+    end
+  end
+
+  defp remote_workspace_presence_valid?("1", identity), do: identity not in ["", "-"]
+  defp remote_workspace_presence_valid?("0", "-"), do: true
+  defp remote_workspace_presence_valid?(_present, _identity), do: false
 
   defp run_remote_command(worker_host, script, timeout_ms)
        when is_binary(worker_host) and is_binary(script) and is_integer(timeout_ms) and timeout_ms > 0 do

@@ -202,6 +202,7 @@ defmodule SymphonyElixir.AgentRuntimeTest do
       AgentRunner.run(issue, test_pid,
         runtime: SymphonyElixir.AgentRuntimeStopFailureTestRuntime,
         max_turns: 1,
+        ownership_ledger: workspace_ownership_ledger(),
         issue_state_fetcher: fn [_issue_id] -> {:ok, [%{issue | state: "Done"}]} end
       )
     end
@@ -216,6 +217,7 @@ defmodule SymphonyElixir.AgentRuntimeTest do
                runtime: SymphonyElixir.AgentRuntimeTestFake,
                test_pid: test_pid,
                max_turns: 1,
+               ownership_ledger: workspace_ownership_ledger(),
                issue_state_fetcher: fn [_issue_id] -> {:ok, [%{issue | state: "Done"}]} end
              )
 
@@ -253,6 +255,7 @@ defmodule SymphonyElixir.AgentRuntimeTest do
                test_pid: test_pid,
                route: initial_route,
                work_item: work_item,
+               ownership_ledger: workspace_ownership_ledger(),
                issue_state_fetcher: fn [_issue_id] -> {:ok, [%{issue | state: "Ready"}]} end
              )
 
@@ -280,7 +283,11 @@ defmodule SymphonyElixir.AgentRuntimeTest do
     assert {:ok, route} = Router.resolve_legacy(issue, Config.settings!().agent.profiles)
 
     assert_raise RuntimeError, ~r/canonical_work_item_required/, fn ->
-      AgentRunner.run(issue, self(), route: route, runtime: SymphonyElixir.AgentRuntimeTestFake)
+      AgentRunner.run(issue, self(),
+        route: route,
+        runtime: SymphonyElixir.AgentRuntimeTestFake,
+        ownership_ledger: workspace_ownership_ledger()
+      )
     end
   end
 
@@ -300,7 +307,10 @@ defmodule SymphonyElixir.AgentRuntimeTest do
     }
 
     assert_raise RuntimeError, ~r/route authority validation failed.*canonical_work_item_required/, fn ->
-      AgentRunner.run(issue, self(), runtime: SymphonyElixir.AgentRuntimeTestFake)
+      AgentRunner.run(issue, self(),
+        runtime: SymphonyElixir.AgentRuntimeTestFake,
+        ownership_ledger: workspace_ownership_ledger()
+      )
     end
   end
 
@@ -331,6 +341,7 @@ defmodule SymphonyElixir.AgentRuntimeTest do
                test_pid: test_pid,
                route: initial_route,
                work_item: work_item,
+               ownership_ledger: workspace_ownership_ledger(),
                issue_state_fetcher: fn [_issue_id] -> {:ok, [issue]} end
              )
 
@@ -369,6 +380,7 @@ defmodule SymphonyElixir.AgentRuntimeTest do
                test_pid: test_pid,
                route: route,
                work_item: work_item,
+               ownership_ledger: workspace_ownership_ledger(),
                guard_evidence: [GuardClass.requirement(:mechanical_guard, :dispatch_guard)],
                issue_state_fetcher: fn [_issue_id] -> {:ok, [refreshed_issue]} end
              )
@@ -430,6 +442,7 @@ defmodule SymphonyElixir.AgentRuntimeTest do
                  test_pid: test_pid,
                  route: route,
                  work_item: work_item,
+                 ownership_ledger: workspace_ownership_ledger(),
                  runtime_attempt_identity: runtime_identity,
                  guard_evidence: [GuardClass.requirement(:mechanical_guard, :dispatch_guard)],
                  issue_state_fetcher: fn [_issue_id] -> {:ok, [refreshed_issue]} end
@@ -494,6 +507,7 @@ defmodule SymphonyElixir.AgentRuntimeTest do
                test_pid: test_pid,
                route: route,
                work_item: work_item,
+               ownership_ledger: workspace_ownership_ledger(),
                issue_state_fetcher: fn [_issue_id] -> {:ok, [issue]} end
              )
 
@@ -559,6 +573,7 @@ defmodule SymphonyElixir.AgentRuntimeTest do
                test_pid: test_pid,
                route: route,
                work_item: work_item,
+               ownership_ledger: workspace_ownership_ledger(),
                issue_state_fetcher: fn [_issue_id] ->
                  {:ok,
                   [
@@ -606,6 +621,7 @@ defmodule SymphonyElixir.AgentRuntimeTest do
                test_pid: test_pid,
                route: route,
                work_item: work_item,
+               ownership_ledger: workspace_ownership_ledger(),
                issue_state_fetcher: fn [_issue_id] -> {:ok, [%{issue | state: "In Review"}]} end
              )
 
@@ -644,6 +660,7 @@ defmodule SymphonyElixir.AgentRuntimeTest do
                test_pid: test_pid,
                route: route,
                work_item: work_item,
+               ownership_ledger: workspace_ownership_ledger(),
                issue_state_fetcher: fn [_issue_id] ->
                  {:ok, [%{issue | state: "Blocked", dispatchable: false}]}
                end

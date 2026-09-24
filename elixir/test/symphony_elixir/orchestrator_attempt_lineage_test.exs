@@ -503,13 +503,15 @@ defmodule SymphonyElixir.OrchestratorAttemptLineageTest do
 
     {:ok, ledger} = AttemptLedger.open(project_id, Tracker.identity(Config.settings!().tracker), path: path)
 
-    state = %Orchestrator.State{
-      attempt_ledger: ledger,
-      attempt_ledger_status: {:blocked, {:attempt_ledger_close_failed, [{issue_id, :sync_failed}]}},
-      attempt_ledger_opts: [path: path],
-      attempt_ledger_pending_closes: MapSet.new([issue_id]),
-      poll_interval_ms: 60_000
-    }
+    state =
+      %Orchestrator.State{
+        attempt_ledger: ledger,
+        attempt_ledger_status: {:blocked, {:attempt_ledger_close_failed, [{issue_id, :sync_failed}]}},
+        attempt_ledger_opts: [path: path],
+        attempt_ledger_pending_closes: MapSet.new([issue_id]),
+        poll_interval_ms: 60_000
+      }
+      |> Map.merge(workspace_ownership_state())
 
     {:noreply, updated} = Orchestrator.handle_info(:run_poll_cycle, state)
 
@@ -538,13 +540,15 @@ defmodule SymphonyElixir.OrchestratorAttemptLineageTest do
     {:ok, ledger} = AttemptLedger.open(project_id, Tracker.identity(Config.settings!().tracker), path: path)
     :ok = AttemptLedger.close(ledger)
 
-    state = %Orchestrator.State{
-      attempt_ledger: ledger,
-      attempt_ledger_status: {:blocked, {:attempt_ledger_close_failed, [{issue_id, :read_failed}]}},
-      attempt_ledger_opts: [path: path],
-      attempt_ledger_pending_closes: MapSet.new([issue_id]),
-      poll_interval_ms: 60_000
-    }
+    state =
+      %Orchestrator.State{
+        attempt_ledger: ledger,
+        attempt_ledger_status: {:blocked, {:attempt_ledger_close_failed, [{issue_id, :read_failed}]}},
+        attempt_ledger_opts: [path: path],
+        attempt_ledger_pending_closes: MapSet.new([issue_id]),
+        poll_interval_ms: 60_000
+      }
+      |> Map.merge(workspace_ownership_state())
 
     {:noreply, updated} = Orchestrator.handle_info(:run_poll_cycle, state)
 
@@ -578,13 +582,15 @@ defmodule SymphonyElixir.OrchestratorAttemptLineageTest do
     assert {:error, {:ledger_sync_failed, :injected_sync_failure}} =
              AttemptLedger.close_lineage(ledger, issue_id)
 
-    state = %Orchestrator.State{
-      attempt_ledger: ledger,
-      attempt_ledger_status: {:blocked, {:attempt_ledger_close_failed, [{issue_id, :sync_failed}]}},
-      attempt_ledger_opts: [path: path],
-      attempt_ledger_pending_closes: MapSet.new([issue_id]),
-      poll_interval_ms: 60_000
-    }
+    state =
+      %Orchestrator.State{
+        attempt_ledger: ledger,
+        attempt_ledger_status: {:blocked, {:attempt_ledger_close_failed, [{issue_id, :sync_failed}]}},
+        attempt_ledger_opts: [path: path],
+        attempt_ledger_pending_closes: MapSet.new([issue_id]),
+        poll_interval_ms: 60_000
+      }
+      |> Map.merge(workspace_ownership_state())
 
     {:noreply, updated} = Orchestrator.handle_info(:run_poll_cycle, state)
 
@@ -618,13 +624,15 @@ defmodule SymphonyElixir.OrchestratorAttemptLineageTest do
         sync_fun: fn _table -> {:error, :injected_sync_failure} end
       )
 
-    state = %Orchestrator.State{
-      attempt_ledger: ledger,
-      attempt_ledger_status: {:blocked, {:attempt_ledger_close_failed, [{issue_id, :sync_failed}]}},
-      attempt_ledger_opts: [path: path],
-      attempt_ledger_pending_closes: MapSet.new([issue_id]),
-      poll_interval_ms: 60_000
-    }
+    state =
+      %Orchestrator.State{
+        attempt_ledger: ledger,
+        attempt_ledger_status: {:blocked, {:attempt_ledger_close_failed, [{issue_id, :sync_failed}]}},
+        attempt_ledger_opts: [path: path],
+        attempt_ledger_pending_closes: MapSet.new([issue_id]),
+        poll_interval_ms: 60_000
+      }
+      |> Map.merge(workspace_ownership_state())
 
     {:noreply, updated} = Orchestrator.handle_info(:run_poll_cycle, state)
 
@@ -661,12 +669,14 @@ defmodule SymphonyElixir.OrchestratorAttemptLineageTest do
     ]
 
     for reason <- reasons do
-      state = %Orchestrator.State{
-        attempt_ledger: ledger,
-        attempt_ledger_status: {:blocked, reason},
-        attempt_ledger_opts: [path: path],
-        poll_interval_ms: 60_000
-      }
+      state =
+        %Orchestrator.State{
+          attempt_ledger: ledger,
+          attempt_ledger_status: {:blocked, reason},
+          attempt_ledger_opts: [path: path],
+          poll_interval_ms: 60_000
+        }
+        |> Map.merge(workspace_ownership_state())
 
       {:noreply, updated} = Orchestrator.handle_info(:run_poll_cycle, state)
       assert updated.attempt_ledger_status == :ready
@@ -1010,35 +1020,37 @@ defmodule SymphonyElixir.OrchestratorAttemptLineageTest do
     queued_retry_token = make_ref()
     queued_retry_timer = Process.send_after(self(), :stale_retry_timer, 60_000)
 
-    state = %Orchestrator.State{
-      attempt_ledger: ledger,
-      attempt_ledger_status: :ready,
-      attempt_ledger_opts: [path: path],
-      poll_interval_ms: 60_000,
-      max_concurrent_agents: 1,
-      running: %{
-        terminal_issue.id => %{
-          pid: nil,
-          ref: nil,
-          identifier: terminal_issue.identifier,
-          issue: terminal_issue,
-          started_at: DateTime.utc_now()
-        }
-      },
-      claimed: MapSet.new([terminal_issue.id]),
-      retry_attempts: %{
-        "queued-after-terminal-fence" => %{
-          attempt: 1,
-          retry_token: queued_retry_token,
-          timer_ref: queued_retry_timer,
-          due_at_ms: System.monotonic_time(:millisecond),
-          identifier: "QUEUED-TERMINAL-FENCE",
-          issue_url: "https://example.org/issues/QUEUED-TERMINAL-FENCE"
-        }
-      },
-      agent_runner: SymphonyElixir.AttemptLedgerFailingRunner,
-      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
-    }
+    state =
+      %Orchestrator.State{
+        attempt_ledger: ledger,
+        attempt_ledger_status: :ready,
+        attempt_ledger_opts: [path: path],
+        poll_interval_ms: 60_000,
+        max_concurrent_agents: 1,
+        running: %{
+          terminal_issue.id => %{
+            pid: nil,
+            ref: nil,
+            identifier: terminal_issue.identifier,
+            issue: terminal_issue,
+            started_at: DateTime.utc_now()
+          }
+        },
+        claimed: MapSet.new([terminal_issue.id]),
+        retry_attempts: %{
+          "queued-after-terminal-fence" => %{
+            attempt: 1,
+            retry_token: queued_retry_token,
+            timer_ref: queued_retry_timer,
+            due_at_ms: System.monotonic_time(:millisecond),
+            identifier: "QUEUED-TERMINAL-FENCE",
+            issue_url: "https://example.org/issues/QUEUED-TERMINAL-FENCE"
+          }
+        },
+        agent_runner: SymphonyElixir.AttemptLedgerFailingRunner,
+        codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+      }
+      |> Map.merge(workspace_ownership_state())
 
     {:noreply, updated} = Orchestrator.handle_info(:run_poll_cycle, state)
 
@@ -1119,20 +1131,24 @@ defmodule SymphonyElixir.OrchestratorAttemptLineageTest do
 
     {:ok, ledger} = AttemptLedger.open(old_project_id, Tracker.identity(Config.settings!().tracker), path: path)
 
-    state = %Orchestrator.State{
-      attempt_ledger: ledger,
-      attempt_ledger_status: {:blocked, {:attempt_ledger_issue_missing, ["old-issue"]}},
-      attempt_ledger_opts: [path: path],
-      poll_interval_ms: 60_000,
-      max_concurrent_agents: 1,
-      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
-    }
+    state =
+      %Orchestrator.State{
+        attempt_ledger: ledger,
+        attempt_ledger_status: {:blocked, {:attempt_ledger_issue_missing, ["old-issue"]}},
+        attempt_ledger_opts: [path: path],
+        poll_interval_ms: 60_000,
+        max_concurrent_agents: 1,
+        codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+      }
+      |> Map.merge(workspace_ownership_state())
 
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "memory",
       symphony_project_id: new_project_id,
       poll_interval_ms: 60_000
     )
+
+    assert Config.settings!().symphony.project_id == new_project_id
 
     {:noreply, updated} = Orchestrator.handle_info(:run_poll_cycle, state)
 
@@ -1214,15 +1230,17 @@ defmodule SymphonyElixir.OrchestratorAttemptLineageTest do
     seed_snapshot(path, project_id, issue.id, %{ordinary_failures: 2, ordinary_retries: 2})
     {:ok, ledger} = AttemptLedger.open(project_id, Tracker.identity(Config.settings!().tracker), path: path)
 
-    state = %Orchestrator.State{
-      attempt_ledger: ledger,
-      attempt_ledger_status: {:blocked, {:attempt_ledger_close_failed, [{issue.id, :sync_failed}]}},
-      attempt_ledger_opts: [path: path],
-      attempt_ledger_pending_closes: MapSet.new([issue.id]),
-      attempt_counters: %{issue.id => %{ordinary_failures: 2, ordinary_retries: 2, review_cycles: 0}},
-      poll_interval_ms: 60_000,
-      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
-    }
+    state =
+      %Orchestrator.State{
+        attempt_ledger: ledger,
+        attempt_ledger_status: {:blocked, {:attempt_ledger_close_failed, [{issue.id, :sync_failed}]}},
+        attempt_ledger_opts: [path: path],
+        attempt_ledger_pending_closes: MapSet.new([issue.id]),
+        attempt_counters: %{issue.id => %{ordinary_failures: 2, ordinary_retries: 2, review_cycles: 0}},
+        poll_interval_ms: 60_000,
+        codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+      }
+      |> Map.merge(workspace_ownership_state())
 
     {:noreply, updated} = Orchestrator.handle_info(:run_poll_cycle, state)
 
@@ -1543,6 +1561,7 @@ defmodule SymphonyElixir.OrchestratorAttemptLineageTest do
       poll_interval_ms: 60_000,
       codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
     }
+    |> Map.merge(workspace_ownership_state())
   end
 
   defp cancel_tick(%{tick_timer_ref: timer_ref}) when is_reference(timer_ref) do

@@ -54,6 +54,14 @@ defmodule SymphonyElixir.StartupOrderingCoordinator do
   end
 end
 
+defmodule SymphonyElixir.StartupReconciliationRunnerFake do
+  @spec run(map(), pid() | nil, keyword()) :: :ok
+  def run(issue, _recipient, opts) do
+    send(Process.whereis(:symphony_agent_router_capture), {:fake_agent_run, issue, opts})
+    :ok
+  end
+end
+
 defmodule SymphonyElixir.OrchestratorStartupReconciliationTest do
   use SymphonyElixir.TestSupport
 
@@ -63,6 +71,7 @@ defmodule SymphonyElixir.OrchestratorStartupReconciliationTest do
 
   alias SymphonyElixir.WorkControl.{
     AuthorityDisposition,
+    GuardClass,
     LifecycleAssessment,
     ProviderObservation,
     RecoveryLedger,
@@ -70,35 +79,76 @@ defmodule SymphonyElixir.OrchestratorStartupReconciliationTest do
     WorkItem
   }
 
+  alias SymphonyElixir.Workspace.OwnershipLedger
+
+  defp suspended_work_item(%Issue{} = issue) do
+    {:ok, work_item} =
+      WorkItem.from_issue(issue, %{
+        provider: :memory,
+        observed_at: DateTime.utc_now(),
+        prior_validated_lifecycle_state: :in_progress
+      })
+
+    {:ok, suspended} = WorkItem.suspend(work_item, :provider_failed)
+    suspended
+  end
+
+  defp test_ownership_ledger_root(workspace_root) do
+    Path.join(Path.dirname(workspace_root), "#{Path.basename(workspace_root)}-ownership-ledger")
+  end
+
   test "startup stays pending and preserves terminal workspaces until reconciliation" do
     workspace_root =
       Path.join(System.tmp_dir!(), "symphony-h060b-startup-#{System.unique_integer([:positive])}")
+
+    ledger_root = test_ownership_ledger_root(workspace_root)
 
     issue = %Issue{
       id: "startup-terminal-issue",
       identifier: "SYM-H060B-STARTUP",
       title: "Terminal issue with a retained workspace",
-      state: "Done"
+      state: "Canceled"
     }
 
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "memory",
       agent_routing: "routed",
       tracker_active_states: ["In Progress"],
-      tracker_terminal_states: ["Done"],
+      tracker_terminal_states: ["Canceled"],
       workspace_root: workspace_root,
       poll_interval_ms: 60_000
     )
 
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
-    {:ok, workspace} = Workspace.create_for_issue(issue)
+
+    {:ok, ownership_ledger} =
+      OwnershipLedger.open(
+        Config.settings!().symphony.project_id,
+        Tracker.identity(Config.settings!().tracker),
+        root: ledger_root
+      )
+
+    {:ok, workspace} = Workspace.create_for_issue(issue, nil, ownership_ledger)
+    {:ok, [owned_record]} = OwnershipLedger.list_for_work_item(ownership_ledger, issue.id)
+
+    assert {:ok, %{state: :release_pending}} =
+             OwnershipLedger.transition_sync(ownership_ledger, owned_record.workspace_ownership_id, :release_pending)
+
+    assert :ok = OwnershipLedger.close(ownership_ledger)
 
     name = Module.concat(__MODULE__, "Pending#{System.unique_integer([:positive])}")
-    {:ok, pid} = Orchestrator.start_link(name: name, start_quiesced: true)
+
+    {:ok, pid} =
+      Orchestrator.start_link(
+        name: name,
+        start_quiesced: true,
+        workspace_ownership_ledger_opts: [root: ledger_root]
+      )
 
     on_exit(fn ->
       if Process.alive?(pid), do: GenServer.stop(pid)
       File.rm_rf(workspace_root)
+      File.rm_rf(ledger_root)
     end)
 
     state = :sys.get_state(pid)
@@ -110,7 +160,8 @@ defmodule SymphonyElixir.OrchestratorStartupReconciliationTest do
       WorkItem.from_issue(issue, %{
         provider: :memory,
         observed_at: DateTime.utc_now(),
-        prior_validated_lifecycle_state: :done
+        prior_validated_lifecycle_state: :done,
+        evidence: [GuardClass.requirement(:mechanical_guard, :completion_proof_verified)]
       })
 
     :sys.replace_state(pid, fn current ->
@@ -132,9 +183,1075 @@ defmodule SymphonyElixir.OrchestratorStartupReconciliationTest do
     refute File.dir?(workspace)
   end
 
+  test "terminal cleanup uses the current issue identity and ignores a stale workspace path" do
+    workspace_root =
+      Path.join(System.tmp_dir!(), "symphony-h060c-terminal-cleanup-#{System.unique_integer([:positive])}")
+
+    ledger_root = test_ownership_ledger_root(workspace_root)
+
+    issue = %Issue{
+      id: "terminal-owned-workspace",
+      identifier: "SYM-H060C-OWNED",
+      title: "Release the owned workspace",
+      state: "In Progress"
+    }
+
+    terminal_issue = %{issue | state: "Done"}
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      agent_routing: "legacy",
+      tracker_active_states: ["In Progress"],
+      tracker_terminal_states: ["Done"],
+      workspace_root: workspace_root,
+      poll_interval_ms: 60_000
+    )
+
+    {:ok, ownership_ledger} =
+      OwnershipLedger.open(
+        Config.settings!().symphony.project_id,
+        Tracker.identity(Config.settings!().tracker),
+        root: ledger_root
+      )
+
+    {:ok, workspace} = Workspace.create_for_issue(issue, nil, ownership_ledger)
+
+    assert {:error, :workspace_cleanup_authorization_required} =
+             Workspace.remove_issue_workspaces(issue, nil, ownership_ledger)
+
+    assert File.dir?(workspace)
+
+    state = %State{
+      startup_reconciliation: :ready,
+      workspace_ownership_ledger: ownership_ledger,
+      workspace_ownership_ledger_status: :ready,
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      running: %{
+        issue.id => %{
+          pid: nil,
+          ref: nil,
+          identifier: issue.identifier,
+          issue: issue,
+          worker_host: nil,
+          started_at: DateTime.utc_now(),
+          workspace_path: Path.join(workspace_root, "foreign-path")
+        }
+      },
+      claimed: MapSet.new([issue.id])
+    }
+
+    updated_state =
+      Orchestrator.reconcile_issue_states_for_test([terminal_issue], state)
+
+    refute File.dir?(workspace)
+    refute Map.has_key?(updated_state.running, issue.id)
+
+    assert :ok = OwnershipLedger.close(ownership_ledger)
+    File.rm_rf(workspace_root)
+    File.rm_rf(ledger_root)
+  end
+
+  test "startup preserves an unowned terminal workspace and still completes reconciliation" do
+    workspace_root =
+      Path.join(System.tmp_dir!(), "symphony-h060c-unowned-terminal-#{System.unique_integer([:positive])}")
+
+    ledger_root = test_ownership_ledger_root(workspace_root)
+
+    issue = %Issue{
+      id: "unowned-terminal-workspace",
+      identifier: "SYM-H060C-UNOWNED",
+      title: "Preserve an unowned terminal directory",
+      state: "Done"
+    }
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      agent_routing: "legacy",
+      tracker_active_states: ["In Progress"],
+      tracker_terminal_states: ["Done"],
+      workspace_root: workspace_root,
+      poll_interval_ms: 60_000
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+    unowned_workspace = Path.join(workspace_root, Workspace.workspace_key(issue.identifier))
+    File.mkdir_p!(unowned_workspace)
+
+    name = Module.concat(__MODULE__, "UnownedTerminal#{System.unique_integer([:positive])}")
+
+    {:ok, pid} =
+      Orchestrator.start_link(
+        name: name,
+        start_quiesced: true,
+        workspace_ownership_ledger_opts: [root: ledger_root]
+      )
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: GenServer.stop(pid)
+      File.rm_rf(workspace_root)
+      File.rm_rf(ledger_root)
+    end)
+
+    send(pid, :tick)
+
+    assert eventually(fn -> :sys.get_state(pid).startup_reconciliation == :ready end)
+
+    state = :sys.get_state(pid)
+    assert state.startup_cleanup_ran?
+    assert File.dir?(unowned_workspace)
+  end
+
+  test "terminal cleanup preserves a workspace with an active suspension context" do
+    workspace_root =
+      Path.join(System.tmp_dir!(), "symphony-h060c-terminal-suspension-#{System.unique_integer([:positive])}")
+
+    ledger_root = test_ownership_ledger_root(workspace_root)
+
+    active_issue = %Issue{
+      id: "terminal-suspended-workspace",
+      identifier: "SYM-H060C-SUSPENDED",
+      title: "Preserve the suspended workspace",
+      state: "In Progress"
+    }
+
+    terminal_issue = %{active_issue | state: "Done"}
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      agent_routing: "routed",
+      tracker_active_states: ["In Progress"],
+      tracker_terminal_states: ["Done"],
+      workspace_root: workspace_root,
+      poll_interval_ms: 60_000
+    )
+
+    {:ok, ownership_ledger} =
+      OwnershipLedger.open(
+        Config.settings!().symphony.project_id,
+        Tracker.identity(Config.settings!().tracker),
+        root: ledger_root
+      )
+
+    {:ok, workspace} = Workspace.create_for_issue(active_issue, nil, ownership_ledger)
+    suspended_work_item = suspended_work_item(active_issue)
+
+    state = %State{
+      startup_reconciliation: :ready,
+      workspace_ownership_ledger: ownership_ledger,
+      workspace_ownership_ledger_status: :ready,
+      blocked: %{active_issue.id => %{issue: active_issue, worker_host: nil}},
+      claimed: MapSet.new([active_issue.id]),
+      work_control: %{active_issue.id => suspended_work_item}
+    }
+
+    updated_state =
+      Orchestrator.reconcile_blocked_issue_states_for_test([terminal_issue], state)
+
+    assert File.dir?(workspace)
+    refute Map.has_key?(updated_state.blocked, active_issue.id)
+
+    assert :ok = OwnershipLedger.close(ownership_ledger)
+    File.rm_rf(workspace_root)
+    File.rm_rf(ledger_root)
+  end
+
+  test "routed terminal cleanup preserves a workspace without a current canonical work item" do
+    workspace_root =
+      Path.join(System.tmp_dir!(), "symphony-h060c-missing-terminal-work-item-#{System.unique_integer([:positive])}")
+
+    ledger_root = test_ownership_ledger_root(workspace_root)
+    active_issue = %Issue{id: "missing-terminal-work-item", identifier: "SYM-H060C-MISSING-WORK-ITEM", state: "In Progress"}
+    terminal_issue = %{active_issue | state: "Done"}
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      agent_routing: "routed",
+      tracker_active_states: ["In Progress"],
+      tracker_terminal_states: ["Done"],
+      workspace_root: workspace_root
+    )
+
+    {:ok, ownership_ledger} =
+      OwnershipLedger.open(
+        Config.settings!().symphony.project_id,
+        Tracker.identity(Config.settings!().tracker),
+        root: ledger_root
+      )
+
+    on_exit(fn ->
+      _ = OwnershipLedger.close(ownership_ledger)
+      File.rm_rf(workspace_root)
+      File.rm_rf(ledger_root)
+    end)
+
+    {:ok, workspace} = Workspace.create_for_issue(active_issue, nil, ownership_ledger)
+
+    state = %State{
+      startup_reconciliation: :ready,
+      workspace_ownership_ledger: ownership_ledger,
+      workspace_ownership_ledger_status: :ready,
+      blocked: %{active_issue.id => %{issue: active_issue, worker_host: nil}},
+      claimed: MapSet.new([active_issue.id])
+    }
+
+    _updated = Orchestrator.reconcile_blocked_issue_states_for_test([terminal_issue], state)
+
+    assert File.dir?(workspace)
+    assert {:ok, [owned]} = OwnershipLedger.list_for_work_item(ownership_ledger, active_issue.id)
+    assert owned.state == :owned
+  end
+
+  test "terminal workspace cleanup failure remains blocked and can be retried" do
+    workspace_root =
+      Path.join(System.tmp_dir!(), "symphony-h060c-terminal-cleanup-retry-#{System.unique_integer([:positive])}")
+
+    ledger_root = test_ownership_ledger_root(workspace_root)
+    active_issue = %Issue{id: "terminal-cleanup-retry", identifier: "SYM-H060C-CLEANUP-RETRY", state: "In Progress"}
+    terminal_issue = %{active_issue | state: "Done"}
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      agent_routing: "legacy",
+      tracker_active_states: ["In Progress"],
+      tracker_terminal_states: ["Done"],
+      workspace_root: workspace_root,
+      hook_before_remove: "printf cleanup-blocked; exit 17"
+    )
+
+    {:ok, ownership_ledger} =
+      OwnershipLedger.open(
+        Config.settings!().symphony.project_id,
+        Tracker.identity(Config.settings!().tracker),
+        root: ledger_root
+      )
+
+    on_exit(fn ->
+      _ = OwnershipLedger.close(ownership_ledger)
+      File.rm_rf(workspace_root)
+      File.rm_rf(ledger_root)
+    end)
+
+    {:ok, workspace} = Workspace.create_for_issue(active_issue, nil, ownership_ledger)
+
+    blocked_state = %State{
+      startup_reconciliation: :ready,
+      workspace_ownership_ledger: ownership_ledger,
+      workspace_ownership_ledger_status: :ready,
+      blocked: %{active_issue.id => %{issue: active_issue, worker_host: nil}},
+      claimed: MapSet.new([active_issue.id])
+    }
+
+    failed_state = Orchestrator.reconcile_blocked_issue_states_for_test([terminal_issue], blocked_state)
+
+    assert Map.has_key?(failed_state.blocked, active_issue.id)
+    assert File.dir?(workspace)
+    assert {:ok, [pending]} = OwnershipLedger.list_for_work_item(ownership_ledger, active_issue.id)
+    assert pending.state == :release_pending
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      agent_routing: "legacy",
+      tracker_active_states: ["In Progress"],
+      tracker_terminal_states: ["Done"],
+      workspace_root: workspace_root
+    )
+
+    retried_state = Orchestrator.reconcile_blocked_issue_states_for_test([terminal_issue], failed_state)
+
+    refute Map.has_key?(retried_state.blocked, active_issue.id)
+    refute File.exists?(workspace)
+    assert {:ok, [released]} = OwnershipLedger.list_for_work_item(ownership_ledger, active_issue.id)
+    assert released.state == :released
+  end
+
+  test "startup terminal cleanup stays pending after a hook failure and retries safely" do
+    workspace_root =
+      Path.join(System.tmp_dir!(), "symphony-h060c-startup-cleanup-retry-#{System.unique_integer([:positive])}")
+
+    ledger_root = test_ownership_ledger_root(workspace_root)
+    issue = %Issue{id: "startup-cleanup-retry", identifier: "SYM-H060C-STARTUP-CLEANUP", state: "Done"}
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      agent_routing: "legacy",
+      tracker_active_states: ["In Progress"],
+      tracker_terminal_states: ["Done"],
+      workspace_root: workspace_root,
+      hook_before_remove: "printf cleanup-blocked; exit 17",
+      poll_interval_ms: 60_000
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+    {:ok, ownership_ledger} =
+      OwnershipLedger.open(
+        Config.settings!().symphony.project_id,
+        Tracker.identity(Config.settings!().tracker),
+        root: ledger_root
+      )
+
+    {:ok, workspace} = Workspace.create_for_issue(issue, nil, ownership_ledger)
+    assert :ok = OwnershipLedger.close(ownership_ledger)
+
+    name = Module.concat(__MODULE__, "StartupCleanupRetry#{System.unique_integer([:positive])}")
+
+    {:ok, pid} =
+      Orchestrator.start_link(
+        name: name,
+        start_quiesced: true,
+        workspace_ownership_ledger_opts: [root: ledger_root]
+      )
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: GenServer.stop(pid)
+      File.rm_rf(workspace_root)
+      File.rm_rf(ledger_root)
+    end)
+
+    send(pid, :tick)
+
+    assert eventually(fn ->
+             state = :sys.get_state(pid)
+
+             with true <- state.startup_reconciliation == :pending,
+                  true <- not state.startup_cleanup_ran?,
+                  {:ok, [pending]} <- OwnershipLedger.list_for_work_item(state.workspace_ownership_ledger, issue.id) do
+               pending.state == :release_pending
+             else
+               _ -> false
+             end
+           end)
+
+    pending_state = :sys.get_state(pid)
+    assert {:ok, [pending]} = OwnershipLedger.list_for_work_item(pending_state.workspace_ownership_ledger, issue.id)
+    assert pending.state == :release_pending
+    assert File.dir?(workspace)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      agent_routing: "legacy",
+      tracker_active_states: ["In Progress"],
+      tracker_terminal_states: ["Done"],
+      workspace_root: workspace_root,
+      poll_interval_ms: 60_000
+    )
+
+    send(pid, :tick)
+    assert eventually(fn -> :sys.get_state(pid).startup_reconciliation == :ready end)
+
+    state = :sys.get_state(pid)
+    assert state.startup_cleanup_ran?
+    assert {:ok, [released]} = OwnershipLedger.list_for_work_item(state.workspace_ownership_ledger, issue.id)
+    assert released.state == :released
+    refute File.exists?(workspace)
+  end
+
+  test "terminal workspace cleanup preserves open, resolving, and escalated suspension contexts" do
+    workspace_root =
+      Path.join(System.tmp_dir!(), "symphony-h060c-suspension-status-#{System.unique_integer([:positive])}")
+
+    ledger_root = test_ownership_ledger_root(workspace_root)
+    active_issue = %Issue{id: "terminal-suspension-status", identifier: "SYM-H060C-SUSPENSION-STATUS", state: "In Progress"}
+    terminal_issue = %{active_issue | state: "Done"}
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      agent_routing: "legacy",
+      tracker_active_states: ["In Progress"],
+      tracker_terminal_states: ["Done"],
+      workspace_root: workspace_root
+    )
+
+    {:ok, ownership_ledger} =
+      OwnershipLedger.open(
+        Config.settings!().symphony.project_id,
+        Tracker.identity(Config.settings!().tracker),
+        root: ledger_root
+      )
+
+    on_exit(fn ->
+      _ = OwnershipLedger.close(ownership_ledger)
+      File.rm_rf(workspace_root)
+      File.rm_rf(ledger_root)
+    end)
+
+    {:ok, workspace} = Workspace.create_for_issue(active_issue, nil, ownership_ledger)
+    suspended = suspended_work_item(active_issue)
+    context = suspended.suspension_context
+
+    for status <- [:open, :resolving, :escalated] do
+      status_item = %{suspended | suspension_context: %{context | status: status}}
+
+      state = %State{
+        startup_reconciliation: :ready,
+        workspace_ownership_ledger: ownership_ledger,
+        workspace_ownership_ledger_status: :ready,
+        blocked: %{active_issue.id => %{issue: active_issue, worker_host: nil}},
+        claimed: MapSet.new([active_issue.id]),
+        work_control: %{active_issue.id => status_item}
+      }
+
+      _updated = Orchestrator.reconcile_blocked_issue_states_for_test([terminal_issue], state)
+      assert File.dir?(workspace)
+      assert {:ok, [owned]} = OwnershipLedger.list_for_work_item(ownership_ledger, active_issue.id)
+      assert owned.state == :owned
+    end
+
+    assert :ok =
+             Workspace.remove_issue_workspaces(active_issue, nil, ownership_ledger, cleanup_authorized?: true)
+  end
+
+  test "terminal cleanup follows authority escalation and cancellation dispositions" do
+    workspace_root =
+      Path.join(System.tmp_dir!(), "symphony-h060c-authority-disposition-#{System.unique_integer([:positive])}")
+
+    ledger_root = test_ownership_ledger_root(workspace_root)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      agent_routing: "legacy",
+      tracker_active_states: ["In Progress"],
+      tracker_terminal_states: ["Done"],
+      workspace_root: workspace_root
+    )
+
+    {:ok, ownership_ledger} =
+      OwnershipLedger.open(
+        Config.settings!().symphony.project_id,
+        Tracker.identity(Config.settings!().tracker),
+        root: ledger_root
+      )
+
+    on_exit(fn ->
+      _ = OwnershipLedger.close(ownership_ledger)
+      File.rm_rf(workspace_root)
+      File.rm_rf(ledger_root)
+    end)
+
+    for {status, lifecycle_state, preserved?} <- [
+          {:escalated, :in_progress, true},
+          {:suspended, :in_progress, true},
+          {:suspended, :canceled, false}
+        ] do
+      issue = %Issue{
+        id: "authority-disposition-#{status}-#{lifecycle_state}",
+        identifier: "SYM-H060C-#{status}-#{lifecycle_state}",
+        state: "In Progress"
+      }
+
+      terminal_issue = %{issue | state: "Done"}
+      {:ok, workspace} = Workspace.create_for_issue(issue, nil, ownership_ledger)
+
+      work_item =
+        suspended_work_item(issue)
+        |> Map.put(:suspension_context, nil)
+        |> Map.put(
+          :authority_disposition,
+          AuthorityDisposition.new(%{status: status, lifecycle_state: lifecycle_state})
+        )
+
+      state = %State{
+        startup_reconciliation: :ready,
+        workspace_ownership_ledger: ownership_ledger,
+        workspace_ownership_ledger_status: :ready,
+        blocked: %{issue.id => %{issue: issue, worker_host: nil}},
+        claimed: MapSet.new([issue.id]),
+        work_control: %{issue.id => work_item}
+      }
+
+      _updated = Orchestrator.reconcile_blocked_issue_states_for_test([terminal_issue], state)
+
+      if preserved? do
+        assert File.dir?(workspace)
+        assert {:ok, [owned]} = OwnershipLedger.list_for_work_item(ownership_ledger, issue.id)
+        assert owned.state == :owned
+      else
+        refute File.exists?(workspace)
+        assert {:ok, [released]} = OwnershipLedger.list_for_work_item(ownership_ledger, issue.id)
+        assert released.state == :released
+      end
+    end
+  end
+
+  test "shutdown termination never authorizes workspace deletion" do
+    workspace_root =
+      Path.join(System.tmp_dir!(), "symphony-h060c-shutdown-#{System.unique_integer([:positive])}")
+
+    ledger_root = test_ownership_ledger_root(workspace_root)
+
+    issue = %Issue{
+      id: "shutdown-owned-workspace",
+      identifier: "SYM-H060C-SHUTDOWN",
+      title: "Keep the workspace on shutdown",
+      state: "In Progress"
+    }
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      agent_routing: "legacy",
+      tracker_active_states: ["In Progress"],
+      workspace_root: workspace_root,
+      poll_interval_ms: 60_000
+    )
+
+    {:ok, ownership_ledger} =
+      OwnershipLedger.open(
+        Config.settings!().symphony.project_id,
+        Tracker.identity(Config.settings!().tracker),
+        root: ledger_root
+      )
+
+    {:ok, workspace} = Workspace.create_for_issue(issue, nil, ownership_ledger)
+
+    state = %State{
+      startup_reconciliation: :ready,
+      workspace_ownership_ledger: ownership_ledger,
+      workspace_ownership_ledger_status: :ready,
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      running: %{
+        issue.id => %{
+          pid: nil,
+          ref: nil,
+          identifier: issue.identifier,
+          issue: issue,
+          worker_host: nil,
+          started_at: DateTime.utc_now(),
+          workspace_path: workspace
+        }
+      },
+      claimed: MapSet.new([issue.id])
+    }
+
+    _updated_state =
+      Orchestrator.terminate_running_issue_for_test(state, issue.id, true, :shutdown)
+
+    assert File.dir?(workspace)
+
+    assert :ok = OwnershipLedger.close(ownership_ledger)
+    File.rm_rf(workspace_root)
+    File.rm_rf(ledger_root)
+  end
+
+  test "startup cancels a pending workspace release only after matching fresh tracker state" do
+    workspace_root =
+      Path.join(System.tmp_dir!(), "symphony-h060c-pending-release-#{System.unique_integer([:positive])}")
+
+    ledger_root = test_ownership_ledger_root(workspace_root)
+
+    issue = %Issue{
+      id: "pending-release-issue",
+      identifier: "SYM-H060C-PENDING",
+      title: "Keep the active workspace",
+      state: "In Progress"
+    }
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      agent_routing: "legacy",
+      tracker_active_states: ["In Progress"],
+      tracker_terminal_states: ["Done"],
+      workspace_root: workspace_root,
+      poll_interval_ms: 60_000
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+    {:ok, ownership_ledger} =
+      OwnershipLedger.open(
+        Config.settings!().symphony.project_id,
+        Tracker.identity(Config.settings!().tracker),
+        root: ledger_root
+      )
+
+    {:ok, workspace} = Workspace.create_for_issue(issue, nil, ownership_ledger)
+    {:ok, [record]} = OwnershipLedger.list_for_work_item(ownership_ledger, issue.id)
+
+    assert {:ok, %{state: :release_pending}} =
+             OwnershipLedger.transition_sync(ownership_ledger, record.workspace_ownership_id, :release_pending)
+
+    assert :ok = OwnershipLedger.close(ownership_ledger)
+
+    name = Module.concat(__MODULE__, "PendingRelease#{System.unique_integer([:positive])}")
+
+    {:ok, pid} =
+      Orchestrator.start_link(
+        name: name,
+        start_quiesced: true,
+        workspace_ownership_ledger_opts: [root: ledger_root]
+      )
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: GenServer.stop(pid)
+      File.rm_rf(workspace_root)
+      File.rm_rf(ledger_root)
+    end)
+
+    send(pid, :tick)
+
+    assert eventually(fn -> :sys.get_state(pid).startup_reconciliation == :ready end)
+
+    state = :sys.get_state(pid)
+    assert {:ok, [owned]} = OwnershipLedger.list_for_work_item(state.workspace_ownership_ledger, issue.id)
+    assert owned.state == :owned
+    assert File.dir?(workspace)
+  end
+
+  test "startup preserves a pending workspace release when the work item is missing" do
+    workspace_root =
+      Path.join(System.tmp_dir!(), "symphony-h060c-missing-pending-#{System.unique_integer([:positive])}")
+
+    ledger_root = test_ownership_ledger_root(workspace_root)
+    issue = %Issue{id: "missing-pending-issue", identifier: "SYM-H060C-MISSING", state: "In Progress"}
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      agent_routing: "legacy",
+      tracker_active_states: ["In Progress"],
+      tracker_terminal_states: ["Done"],
+      workspace_root: workspace_root,
+      poll_interval_ms: 60_000
+    )
+
+    {:ok, ownership_ledger} =
+      OwnershipLedger.open(
+        Config.settings!().symphony.project_id,
+        Tracker.identity(Config.settings!().tracker),
+        root: ledger_root
+      )
+
+    {:ok, workspace} = Workspace.create_for_issue(issue, nil, ownership_ledger)
+    {:ok, [record]} = OwnershipLedger.list_for_work_item(ownership_ledger, issue.id)
+
+    assert {:ok, %{state: :release_pending}} =
+             OwnershipLedger.transition_sync(ownership_ledger, record.workspace_ownership_id, :release_pending)
+
+    assert :ok = OwnershipLedger.close(ownership_ledger)
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
+
+    name = Module.concat(__MODULE__, "MissingPendingRelease#{System.unique_integer([:positive])}")
+
+    {:ok, pid} =
+      Orchestrator.start_link(
+        name: name,
+        start_quiesced: true,
+        workspace_ownership_ledger_opts: [root: ledger_root]
+      )
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: GenServer.stop(pid)
+      File.rm_rf(workspace_root)
+      File.rm_rf(ledger_root)
+    end)
+
+    send(pid, :tick)
+
+    assert eventually(fn -> :sys.get_state(pid).startup_reconciliation == :ready end)
+
+    state = :sys.get_state(pid)
+    assert {:ok, [pending]} = OwnershipLedger.list_for_work_item(state.workspace_ownership_ledger, issue.id)
+    assert pending.state == :release_pending
+    assert File.dir?(workspace)
+  end
+
+  test "startup preserves a pending release when the tracker identifier is unavailable" do
+    workspace_root =
+      Path.join(System.tmp_dir!(), "symphony-h060c-ambiguous-pending-#{System.unique_integer([:positive])}")
+
+    ledger_root = test_ownership_ledger_root(workspace_root)
+    recorded_issue = %Issue{id: "ambiguous-pending-issue", identifier: "SYM-H060C-RECORDED", state: "In Progress"}
+    current_issue = %{recorded_issue | identifier: nil}
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      agent_routing: "legacy",
+      tracker_active_states: ["In Progress"],
+      tracker_terminal_states: ["Done"],
+      workspace_root: workspace_root,
+      poll_interval_ms: 60_000
+    )
+
+    {:ok, ownership_ledger} =
+      OwnershipLedger.open(
+        Config.settings!().symphony.project_id,
+        Tracker.identity(Config.settings!().tracker),
+        root: ledger_root
+      )
+
+    {:ok, workspace} = Workspace.create_for_issue(recorded_issue, nil, ownership_ledger)
+    {:ok, [record]} = OwnershipLedger.list_for_work_item(ownership_ledger, recorded_issue.id)
+
+    assert {:ok, %{state: :release_pending}} =
+             OwnershipLedger.transition_sync(ownership_ledger, record.workspace_ownership_id, :release_pending)
+
+    assert :ok = OwnershipLedger.close(ownership_ledger)
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [current_issue])
+
+    name = Module.concat(__MODULE__, "AmbiguousPendingRelease#{System.unique_integer([:positive])}")
+
+    {:ok, pid} =
+      Orchestrator.start_link(
+        name: name,
+        start_quiesced: true,
+        workspace_ownership_ledger_opts: [root: ledger_root]
+      )
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: GenServer.stop(pid)
+      File.rm_rf(workspace_root)
+      File.rm_rf(ledger_root)
+    end)
+
+    send(pid, :tick)
+
+    assert eventually(fn -> :sys.get_state(pid).startup_reconciliation == :ready end)
+
+    state = :sys.get_state(pid)
+    assert {:ok, [pending]} = OwnershipLedger.list_for_work_item(state.workspace_ownership_ledger, recorded_issue.id)
+    assert pending.state == :release_pending
+    assert pending.issue_identifier == recorded_issue.identifier
+    assert File.dir?(workspace)
+  end
+
+  test "corrupt ownership records fence pending-release reconciliation" do
+    workspace_root =
+      Path.join(System.tmp_dir!(), "symphony-h060c-corrupt-ownership-#{System.unique_integer([:positive])}")
+
+    ledger_root = test_ownership_ledger_root(workspace_root)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      agent_routing: "legacy",
+      tracker_active_states: ["In Progress"],
+      tracker_terminal_states: ["Done"],
+      workspace_root: workspace_root,
+      poll_interval_ms: 60_000
+    )
+
+    name = Module.concat(__MODULE__, "CorruptOwnership#{System.unique_integer([:positive])}")
+
+    {:ok, pid} =
+      Orchestrator.start_link(
+        name: name,
+        start_quiesced: true,
+        workspace_ownership_ledger_opts: [root: ledger_root]
+      )
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: GenServer.stop(pid)
+      File.rm_rf(workspace_root)
+      File.rm_rf(ledger_root)
+    end)
+
+    state = :sys.get_state(pid)
+    ledger = state.workspace_ownership_ledger
+    corrupt_key = {:ownership, "corrupt-record"}
+    assert :ok = :dets.insert(ledger.table, {corrupt_key, %{unexpected: true}})
+
+    send(pid, :tick)
+
+    assert eventually(fn -> :sys.get_state(pid).workspace_ownership_ledger_status != :ready end)
+
+    blocked_state = :sys.get_state(pid)
+
+    assert {:blocked, {:workspace_ownership_ledger_unavailable, ownership_error}} =
+             blocked_state.workspace_ownership_ledger_status
+
+    assert {:corrupt_ownership_record, ^corrupt_key, :invalid_record} = ownership_error
+
+    assert match?({:blocked, {:workspace_pending_reconciliation_unavailable, _}}, blocked_state.startup_reconciliation)
+  end
+
+  test "startup resumes a failed provisioning release instead of converting it to owned" do
+    workspace_root =
+      Path.join(System.tmp_dir!(), "symphony-h060c-failed-provisioning-#{System.unique_integer([:positive])}")
+
+    ledger_root = test_ownership_ledger_root(workspace_root)
+    cleanup_attempt_marker = workspace_root <> "-retry-marker"
+    issue = %Issue{id: "failed-provisioning", identifier: "SYM-H060C-BOOTSTRAP", state: "In Progress"}
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      agent_routing: "legacy",
+      tracker_active_states: ["In Progress"],
+      tracker_terminal_states: ["Done"],
+      workspace_root: workspace_root,
+      hook_after_create: "exit 17",
+      hook_before_remove: "exit 18",
+      poll_interval_ms: 60_000
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+    {:ok, ownership_ledger} =
+      OwnershipLedger.open(
+        Config.settings!().symphony.project_id,
+        Tracker.identity(Config.settings!().tracker),
+        root: ledger_root,
+        workspace_root: Config.local_workspace_root()
+      )
+
+    on_exit(fn ->
+      _ = OwnershipLedger.close(ownership_ledger)
+      File.rm_rf(workspace_root)
+      File.rm_rf(ledger_root)
+      File.rm(cleanup_attempt_marker)
+    end)
+
+    workspace = Path.join(workspace_root, Workspace.workspace_key(issue.identifier))
+
+    assert {:error, {:after_create_cleanup_failed, _, {:workspace_hook_failed, "before_remove", 18, _}}} =
+             Workspace.create_for_issue(issue, nil, ownership_ledger)
+
+    assert File.dir?(workspace)
+    assert {:ok, [pending]} = OwnershipLedger.list_for_work_item(ownership_ledger, issue.id)
+    assert pending.state == :release_pending
+    assert pending.release_origin == :failed_provisioning
+    assert :ok = OwnershipLedger.close(ownership_ledger)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      agent_routing: "legacy",
+      tracker_active_states: ["In Progress"],
+      tracker_terminal_states: ["Done"],
+      workspace_root: workspace_root,
+      hook_before_remove: "printf attempt >> #{cleanup_attempt_marker}; exit 18",
+      poll_interval_ms: 60_000
+    )
+
+    name = Module.concat(__MODULE__, "FailedProvisioningRelease#{System.unique_integer([:positive])}")
+
+    {:ok, pid} =
+      Orchestrator.start_link(
+        name: name,
+        start_quiesced: true,
+        workspace_ownership_ledger_opts: [root: ledger_root]
+      )
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: GenServer.stop(pid)
+    end)
+
+    send(pid, :tick)
+    assert eventually(fn -> File.exists?(cleanup_attempt_marker) end)
+    assert eventually(fn -> :sys.get_state(pid).startup_reconciliation == :pending end)
+
+    state = :sys.get_state(pid)
+    assert {:ok, [still_pending]} = OwnershipLedger.list_for_work_item(state.workspace_ownership_ledger, issue.id)
+    assert still_pending.state == :release_pending
+    assert still_pending.release_origin == :failed_provisioning
+    assert File.dir?(workspace)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      agent_routing: "legacy",
+      tracker_active_states: ["In Progress"],
+      tracker_terminal_states: ["Done"],
+      workspace_root: workspace_root,
+      poll_interval_ms: 60_000
+    )
+
+    send(pid, :tick)
+    assert eventually(fn -> :sys.get_state(pid).startup_reconciliation == :ready end)
+
+    state = :sys.get_state(pid)
+    assert {:ok, [released]} = OwnershipLedger.list_for_work_item(state.workspace_ownership_ledger, issue.id)
+    assert released.state == :released
+    assert released.release_origin == :failed_provisioning
+    refute File.exists?(workspace)
+  end
+
+  test "runtime config reload fences dispatch when tracker ownership identity changes" do
+    workspace_root =
+      Path.join(System.tmp_dir!(), "symphony-h060c-reload-root-#{System.unique_integer([:positive])}")
+
+    ledger_root = test_ownership_ledger_root(workspace_root)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      agent_routing: "legacy",
+      symphony_project_id: "h060c-reload-project",
+      workspace_root: workspace_root,
+      poll_interval_ms: 60_000
+    )
+
+    name = Module.concat(__MODULE__, "OwnershipReload#{System.unique_integer([:positive])}")
+
+    {:ok, pid} =
+      Orchestrator.start_link(
+        name: name,
+        start_quiesced: true,
+        workspace_ownership_ledger_opts: [root: ledger_root]
+      )
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: GenServer.stop(pid)
+      File.rm_rf(workspace_root)
+      File.rm_rf(ledger_root)
+    end)
+
+    assert :sys.get_state(pid).workspace_ownership_ledger_status == :ready
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "linear",
+      tracker_project_slug: "a-different-project",
+      agent_routing: "legacy",
+      symphony_project_id: "h060c-reload-project",
+      workspace_root: workspace_root,
+      poll_interval_ms: 60_000
+    )
+
+    send(pid, :tick)
+
+    assert eventually(fn -> :sys.get_state(pid).workspace_ownership_ledger_status != :ready end)
+
+    state = :sys.get_state(pid)
+
+    assert {:blocked, {:workspace_ownership_ledger_unavailable, {:ledger_tracker_identity_mismatch, _, _}}} =
+             state.workspace_ownership_ledger_status
+
+    refute Orchestrator.autonomous_dispatch_allowed_for_test?(state)
+  end
+
+  test "runtime config reload fences dispatch when workspace root changes" do
+    workspace_root =
+      Path.join(System.tmp_dir!(), "symphony-h060c-reload-root-#{System.unique_integer([:positive])}")
+
+    next_workspace_root = workspace_root <> "-next"
+    ledger_root = test_ownership_ledger_root(workspace_root)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      agent_routing: "legacy",
+      symphony_project_id: "h060c-root-reload-project",
+      workspace_root: workspace_root,
+      poll_interval_ms: 60_000
+    )
+
+    name = Module.concat(__MODULE__, "WorkspaceRootReload#{System.unique_integer([:positive])}")
+
+    {:ok, pid} =
+      Orchestrator.start_link(
+        name: name,
+        start_quiesced: true,
+        workspace_ownership_ledger_opts: [root: ledger_root]
+      )
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: GenServer.stop(pid)
+      File.rm_rf(workspace_root)
+      File.rm_rf(next_workspace_root)
+      File.rm_rf(ledger_root)
+    end)
+
+    assert :sys.get_state(pid).workspace_ownership_ledger_status == :ready
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      agent_routing: "legacy",
+      symphony_project_id: "h060c-root-reload-project",
+      workspace_root: next_workspace_root,
+      poll_interval_ms: 60_000
+    )
+
+    send(pid, :tick)
+
+    assert eventually(fn -> :sys.get_state(pid).workspace_ownership_ledger_status != :ready end)
+
+    state = :sys.get_state(pid)
+
+    assert {:blocked, {:workspace_ownership_ledger_unavailable, {:workspace_root_changed, _, _}}} =
+             state.workspace_ownership_ledger_status
+
+    refute Orchestrator.autonomous_dispatch_allowed_for_test?(state)
+  end
+
+  test "live terminal workspace cleanup retries a durable pending release on the next poll" do
+    workspace_root =
+      Path.join(System.tmp_dir!(), "symphony-h060c-live-cleanup-#{System.unique_integer([:positive])}")
+
+    ledger_root = test_ownership_ledger_root(workspace_root)
+    first_remove_attempt = Path.join(System.tmp_dir!(), "symphony-h060c-remove-once-#{System.unique_integer([:positive])}")
+
+    issue = %Issue{
+      id: "live-pending-cleanup",
+      identifier: "SYM-H060C-LIVE-CLEANUP",
+      title: "Retry a pending terminal cleanup",
+      state: "In Progress"
+    }
+
+    terminal_issue = %{issue | state: "Done"}
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      agent_routing: "legacy",
+      tracker_active_states: ["In Progress"],
+      tracker_terminal_states: ["Done"],
+      workspace_root: workspace_root,
+      hook_before_remove: "if [ -e '#{first_remove_attempt}' ]; then exit 0; else touch '#{first_remove_attempt}'; exit 17; fi",
+      poll_interval_ms: 60_000
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [terminal_issue])
+
+    {:ok, ledger} =
+      OwnershipLedger.open(
+        Config.settings!().symphony.project_id,
+        Tracker.identity(Config.settings!().tracker),
+        root: ledger_root,
+        workspace_root: Config.local_workspace_root()
+      )
+
+    on_exit(fn ->
+      _ = OwnershipLedger.close(ledger)
+      File.rm_rf(workspace_root)
+      File.rm_rf(ledger_root)
+      File.rm(first_remove_attempt)
+    end)
+
+    {:ok, workspace} = Workspace.create_for_issue(issue, nil, ledger)
+
+    state = %State{
+      startup_reconciliation: :ready,
+      workspace_ownership_ledger: ledger,
+      workspace_ownership_ledger_status: :ready,
+      workspace_ownership_ledger_opts: [root: ledger_root, workspace_root: Config.local_workspace_root()],
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      running: %{
+        issue.id => %{
+          pid: nil,
+          ref: nil,
+          identifier: issue.identifier,
+          issue: terminal_issue,
+          worker_host: nil,
+          started_at: DateTime.utc_now(),
+          workspace_path: workspace
+        }
+      },
+      claimed: MapSet.new([issue.id])
+    }
+
+    pending_state =
+      Orchestrator.terminate_running_issue_for_test(state, issue.id, true, :terminal_cancelled)
+
+    assert File.dir?(workspace)
+    assert {:ok, [pending_record]} = OwnershipLedger.list_for_work_item(ledger, issue.id)
+    assert pending_record.state == :release_pending
+
+    {:noreply, retried_state} = Orchestrator.handle_info(:run_poll_cycle, pending_state)
+
+    refute File.dir?(workspace)
+    assert {:ok, [released_record]} = OwnershipLedger.list_for_work_item(ledger, issue.id)
+    assert released_record.state == :released
+
+    if retried_state.tick_timer_ref, do: Process.cancel_timer(retried_state.tick_timer_ref)
+  end
+
   test "an open security suspension stays fenced after a clean restart" do
     test_pid = self()
     Process.register(test_pid, :symphony_agent_router_capture)
+    workspace_root = Path.join(System.tmp_dir!(), "symphony-h060c-suspended-workspace-#{System.unique_integer([:positive])}")
+    ownership_ledger_root = test_ownership_ledger_root(workspace_root)
 
     issue = %Issue{
       id: "startup-security-suspension",
@@ -147,11 +1264,27 @@ defmodule SymphonyElixir.OrchestratorStartupReconciliationTest do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "memory",
       tracker_active_states: ["Planning"],
+      workspace_root: workspace_root,
       poll_interval_ms: 60_000
     )
 
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
     seed_recovery_checkpoint!(issue)
+
+    {:ok, ownership_ledger} =
+      OwnershipLedger.open(
+        Config.settings!().symphony.project_id,
+        Tracker.identity(Config.settings!().tracker),
+        root: ownership_ledger_root
+      )
+
+    {:ok, workspace} = Workspace.create_for_issue(issue, nil, ownership_ledger)
+    {:ok, [owned]} = OwnershipLedger.list_for_work_item(ownership_ledger, issue.id)
+
+    assert {:ok, %{state: :release_pending}} =
+             OwnershipLedger.transition_sync(ownership_ledger, owned.workspace_ownership_id, :release_pending)
+
+    assert :ok = OwnershipLedger.close(ownership_ledger)
 
     {:ok, initial_work_item} =
       WorkItem.from_issue(issue, %{
@@ -174,7 +1307,8 @@ defmodule SymphonyElixir.OrchestratorStartupReconciliationTest do
         name: first_name,
         start_quiesced: true,
         transition_coordinator: coordinator,
-        work_control: %{issue.id => initial_work_item}
+        work_control: %{issue.id => initial_work_item},
+        workspace_ownership_ledger_opts: [root: ownership_ledger_root]
       )
 
     second_name = Module.concat(__MODULE__, "SecurityRestart#{System.unique_integer([:positive])}")
@@ -185,6 +1319,9 @@ defmodule SymphonyElixir.OrchestratorStartupReconciliationTest do
 
       if Process.whereis(:symphony_agent_router_capture) == test_pid,
         do: Process.unregister(:symphony_agent_router_capture)
+
+      File.rm_rf(workspace_root)
+      File.rm_rf(ownership_ledger_root)
     end)
 
     assert {:ok, suspended_item} =
@@ -202,7 +1339,8 @@ defmodule SymphonyElixir.OrchestratorStartupReconciliationTest do
         name: second_name,
         start_quiesced: true,
         transition_coordinator: coordinator,
-        agent_runner: SymphonyElixir.AgentRouterOrchestratorRunnerFake
+        agent_runner: SymphonyElixir.StartupReconciliationRunnerFake,
+        workspace_ownership_ledger_opts: [root: ownership_ledger_root]
       )
 
     on_exit(fn -> if Process.alive?(restarted_pid), do: GenServer.stop(restarted_pid) end)
@@ -224,6 +1362,12 @@ defmodule SymphonyElixir.OrchestratorStartupReconciliationTest do
     assert recovered_item.authority_disposition.status == :suspended
     assert recovered_item.lifecycle_assessment.status == :validated
     assert Graph.complete?(reconciled_state.dependency_graph)
+
+    assert {:ok, [pending_workspace]} =
+             OwnershipLedger.list_for_work_item(reconciled_state.workspace_ownership_ledger, issue.id)
+
+    assert pending_workspace.state == :release_pending
+    assert File.dir?(workspace)
     refute_receive {:fake_agent_run, ^issue, _opts}, 50
   end
 
@@ -642,7 +1786,7 @@ defmodule SymphonyElixir.OrchestratorStartupReconciliationTest do
         name: name,
         start_quiesced: true,
         transition_coordinator: coordinator,
-        agent_runner: SymphonyElixir.AgentRouterOrchestratorRunnerFake
+        agent_runner: SymphonyElixir.StartupReconciliationRunnerFake
       )
 
     on_exit(fn ->

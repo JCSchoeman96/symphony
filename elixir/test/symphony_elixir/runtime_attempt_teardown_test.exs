@@ -1,5 +1,5 @@
 defmodule SymphonyElixir.RuntimeAttemptTeardownTest do
-  use SymphonyElixir.TestSupport, async: true
+  use SymphonyElixir.TestSupport
 
   alias SymphonyElixir.AgentRuntime.AttemptLedger
   alias SymphonyElixir.AgentRuntime.Route
@@ -57,7 +57,7 @@ defmodule SymphonyElixir.RuntimeAttemptTeardownTest do
   defp temporary_ledger_root do
     Path.join(
       System.tmp_dir!(),
-      "symphony-attempt-ledger-#{System.unique_integer([:positive])}"
+      "symphony-attempt-ledger-#{System.unique_integer([:positive])}-#{Base.encode16(:crypto.strong_rand_bytes(8), case: :lower)}"
     )
   end
 
@@ -69,6 +69,11 @@ defmodule SymphonyElixir.RuntimeAttemptTeardownTest do
 
     {:ok, ledger} =
       AttemptLedger.open(project_id, Tracker.identity(Config.settings!().tracker), path: path)
+
+    on_exit(fn ->
+      _ = AttemptLedger.close(ledger)
+      File.rm_rf(root)
+    end)
 
     assert {:ok, %{in_flight: true}} =
              AttemptLedger.begin_attempt(ledger, @issue_id, route_fingerprint: "fp-teardown")

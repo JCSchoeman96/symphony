@@ -58,11 +58,15 @@ defmodule SymphonyElixir.LegacyGraphTest do
 
   defp poll do
     {:noreply, result} =
-      Orchestrator.handle_info(:run_poll_cycle, %Orchestrator.State{
-        poll_interval_ms: 60_000,
-        max_concurrent_agents: 10,
-        agent_runner: SymphonyElixir.LegacyGraphRunner
-      })
+      Orchestrator.handle_info(
+        :run_poll_cycle,
+        %Orchestrator.State{
+          poll_interval_ms: 60_000,
+          max_concurrent_agents: 10,
+          agent_runner: SymphonyElixir.LegacyGraphRunner
+        }
+        |> Map.merge(workspace_ownership_state())
+      )
 
     if result.tick_timer_ref, do: Process.cancel_timer(result.tick_timer_ref)
     result

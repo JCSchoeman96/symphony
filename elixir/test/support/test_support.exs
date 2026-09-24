@@ -4,6 +4,7 @@ defmodule SymphonyElixir.TestSupport do
   alias SymphonyElixir.Tracker.Issue
   alias SymphonyElixir.WorkControl.RecoveryLedger
   alias SymphonyElixir.WorkControl.WorkflowLifecycle
+  alias SymphonyElixir.Workspace.OwnershipLedger
 
   @workflow_prompt "You are an agent for this repository."
 
@@ -36,6 +37,9 @@ defmodule SymphonyElixir.TestSupport do
           seed_recovery_checkpoint!: 2,
           seed_orchestrator_recovery_checkpoint!: 2,
           seed_orchestrator_recovery_checkpoint!: 3,
+          workspace_ownership_ledger: 0,
+          workspace_ownership_ledger_opts: 0,
+          workspace_ownership_state: 0,
           stop_default_http_server: 0
         ]
 
@@ -49,14 +53,37 @@ defmodule SymphonyElixir.TestSupport do
         File.mkdir_p!(workflow_root)
         workflow_file = Path.join(workflow_root, "WORKFLOW.md")
         attempt_ledger_root = Path.join(workflow_root, "attempt-ledger")
+        workspace_ownership_root = Path.join(workflow_root, "workspace-ownership")
+        workspace_root = Path.join(workflow_root, "workspaces")
         File.mkdir_p!(attempt_ledger_root)
-        write_workflow_file!(workflow_file)
+        write_workflow_file!(workflow_file, workspace_root: workspace_root)
         Workflow.set_workflow_file_path(workflow_file)
         Application.put_env(:symphony_elixir, :attempt_ledger_root, attempt_ledger_root)
         if Process.whereis(SymphonyElixir.WorkflowStore), do: SymphonyElixir.WorkflowStore.force_reload()
         stop_default_http_server()
 
+        {:ok, workspace_ownership_ledger} =
+          OwnershipLedger.open(
+            "test-workspace-ownership",
+            Tracker.identity(Config.settings!().tracker),
+            root: workspace_ownership_root,
+            workspace_root: Config.local_workspace_root()
+          )
+
+        Process.put(:symphony_test_workspace_ownership_ledger, workspace_ownership_ledger)
+        Process.put(:symphony_test_workspace_ownership_root, workspace_ownership_root)
+        Process.put(:symphony_test_workspace_root, workspace_root)
+        Process.put(:symphony_test_workspace_ownership_ledgers, [workspace_ownership_ledger])
+
         on_exit(fn ->
+          Process.get(:symphony_test_workspace_ownership_ledgers, [])
+          |> Enum.uniq_by(& &1.path)
+          |> Enum.each(&OwnershipLedger.close/1)
+
+          Process.delete(:symphony_test_workspace_ownership_ledger)
+          Process.delete(:symphony_test_workspace_ownership_root)
+          Process.delete(:symphony_test_workspace_root)
+          Process.delete(:symphony_test_workspace_ownership_ledgers)
           Application.delete_env(:symphony_elixir, :workflow_file_path)
           Application.delete_env(:symphony_elixir, :server_port_override)
           Application.delete_env(:symphony_elixir, :memory_tracker_issues)
@@ -70,6 +97,7 @@ defmodule SymphonyElixir.TestSupport do
   end
 
   def write_workflow_file!(path, overrides \\ []) do
+    overrides = default_test_workspace_root(overrides)
     workflow = workflow_content(default_identity_override(path, overrides))
     File.write!(path, workflow)
 
@@ -86,6 +114,88 @@ defmodule SymphonyElixir.TestSupport do
 
   def restore_env(key, nil), do: System.delete_env(key)
   def restore_env(key, value), do: System.put_env(key, value)
+
+  def workspace_ownership_ledger do
+    case Process.get(:symphony_test_workspace_ownership_ledger) do
+      %OwnershipLedger{} = ledger -> ledger
+      nil -> raise "workspace ownership ledger is not available in this test"
+    end
+  end
+
+  def workspace_ownership_ledger_opts do
+    [ownership_ledger: workspace_ownership_ledger()]
+  end
+
+  def workspace_ownership_state do
+    config = Config.settings!()
+    project_id = config.symphony.project_id || "legacy-default"
+
+    ledger_root =
+      case Process.get(:symphony_test_workspace_ownership_root) do
+        root when is_binary(root) -> root
+        _missing -> raise "workspace ownership ledger root is not available in this test"
+      end
+
+    ledger_opts = [root: ledger_root, workspace_root: Config.local_workspace_root()]
+    tracker_identity = Tracker.identity(config.tracker)
+    ledger = workspace_ownership_ledger_for(project_id, tracker_identity, ledger_opts)
+
+    %{
+      workspace_ownership_ledger: ledger,
+      workspace_ownership_ledger_status: :ready,
+      workspace_ownership_ledger_opts: ledger_opts
+    }
+  end
+
+  defp workspace_ownership_ledger_for(project_id, tracker_identity, ledger_opts) do
+    case Process.get(:symphony_test_workspace_ownership_ledger) do
+      %OwnershipLedger{} = ledger ->
+        if workspace_ownership_ledger_matches?(ledger, project_id, tracker_identity, ledger_opts) do
+          ledger
+        else
+          _ = OwnershipLedger.close(ledger)
+          open_workspace_ownership_ledger!(project_id, tracker_identity, ledger_opts)
+        end
+
+      _missing ->
+        open_workspace_ownership_ledger!(project_id, tracker_identity, ledger_opts)
+    end
+  end
+
+  defp workspace_ownership_ledger_matches?(
+         %OwnershipLedger{} = ledger,
+         project_id,
+         tracker_identity,
+         ledger_opts
+       ) do
+    ledger.project_id == project_id and
+      ledger.tracker_identity == tracker_identity and
+      ledger.path == OwnershipLedger.path_for(project_id, ledger_opts) and
+      ledger.host_identity_path == OwnershipLedger.host_identity_path(ledger_opts)
+  end
+
+  defp open_workspace_ownership_ledger!(project_id, tracker_identity, ledger_opts) do
+    {:ok, ledger} = OwnershipLedger.open(project_id, tracker_identity, ledger_opts)
+    Process.put(:symphony_test_workspace_ownership_ledger, ledger)
+
+    Process.put(
+      :symphony_test_workspace_ownership_ledgers,
+      [ledger | Process.get(:symphony_test_workspace_ownership_ledgers, [])]
+    )
+
+    ledger
+  end
+
+  defp default_test_workspace_root(overrides) do
+    if Keyword.has_key?(overrides, :workspace_root) do
+      overrides
+    else
+      case Process.get(:symphony_test_workspace_root) do
+        root when is_binary(root) -> Keyword.put(overrides, :workspace_root, root)
+        _missing -> overrides
+      end
+    end
+  end
 
   def seed_recovery_checkpoint!(%Issue{} = issue, opts \\ []) when is_list(opts) do
     config = Config.settings!()

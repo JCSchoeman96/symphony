@@ -6,6 +6,392 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
   alias SymphonyElixir.Dependency.Graph
   alias SymphonyElixir.Linear.Client
   alias SymphonyElixir.WorkControl.{GuardClass, WorkItem}
+  alias SymphonyElixir.Workspace.OwnershipLedger
+
+  test "workspace creation records the exact durable ownership binding" do
+    workspace_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-workspace-ledger-binding-#{System.unique_integer([:positive])}"
+      )
+
+    ledger_root = Path.join(workspace_root, "ledger")
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        symphony_project_id: "workspace-test"
+      )
+
+      config = Config.settings!()
+
+      {:ok, ledger} =
+        OwnershipLedger.open(config.symphony.project_id, Tracker.identity(config.tracker), root: ledger_root)
+
+      assert {:ok, workspace} = Workspace.create_for_issue(%Issue{id: "issue-1", identifier: "MT-1"}, nil, ledger)
+      assert {:ok, [record]} = OwnershipLedger.list_for_work_item(ledger, "issue-1")
+      assert record.state == :owned
+      assert record.work_item_id == "issue-1"
+      assert record.workspace_key == Workspace.workspace_key("MT-1")
+      assert record.canonical_workspace_path == workspace
+      assert record.configured_root_identity
+      assert record.top_level_filesystem_identity
+      refute Map.has_key?(record, :ownership_generation)
+
+      assert :ok = OwnershipLedger.close(ledger)
+    after
+      File.rm_rf(workspace_root)
+    end
+  end
+
+  test "workspace refuses a pre-existing directory without durable ownership" do
+    workspace_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-workspace-unowned-#{System.unique_integer([:positive])}"
+      )
+
+    workspace = Path.join(workspace_root, "MT-UNOWNED")
+
+    try do
+      File.mkdir_p!(workspace)
+      File.write!(Path.join(workspace, ".symphony-workspace.json"), "forged marker")
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+      assert {:error, _reason} = Workspace.create_for_issue("MT-UNOWNED")
+      assert File.dir?(workspace)
+      assert File.exists?(Path.join(workspace, ".symphony-workspace.json"))
+    after
+      File.rm_rf(workspace_root)
+    end
+  end
+
+  test "workspace creation preserves a pre-existing non-directory target" do
+    workspace_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-workspace-file-target-#{System.unique_integer([:positive])}"
+      )
+
+    workspace = Path.join(workspace_root, "MT-FILE-TARGET")
+
+    try do
+      File.mkdir_p!(workspace_root)
+      File.write!(workspace, "operator-owned file")
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+      assert {:error, {:workspace_path_exists, ^workspace, :regular}} =
+               Workspace.create_for_issue("MT-FILE-TARGET", nil, workspace_ownership_ledger())
+
+      assert File.read!(workspace) == "operator-owned file"
+
+      assert {:ok, []} =
+               OwnershipLedger.list_for_work_item(workspace_ownership_ledger(), "MT-FILE-TARGET")
+    after
+      File.rm_rf(workspace_root)
+    end
+  end
+
+  test "recorded workspace removal requires explicit durable authorization" do
+    workspace_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-workspace-removal-auth-#{System.unique_integer([:positive])}"
+      )
+
+    workspace = Path.join(workspace_root, "MT-AUTH")
+
+    try do
+      File.mkdir_p!(workspace)
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+      assert {:error, _reason, ""} = Workspace.remove_recorded(workspace, nil)
+      assert File.dir?(workspace)
+    after
+      File.rm_rf(workspace_root)
+    end
+  end
+
+  test "authorized recorded removal releases the exact local ownership record" do
+    workspace_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-workspace-removal-owned-#{System.unique_integer([:positive])}"
+      )
+
+    ledger_root = Path.join(workspace_root, "ledger")
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        symphony_project_id: "workspace-removal-owned"
+      )
+
+      config = Config.settings!()
+
+      {:ok, ledger} =
+        OwnershipLedger.open(config.symphony.project_id, Tracker.identity(config.tracker), root: ledger_root)
+
+      issue = %Issue{id: "issue-removal-owned", identifier: "MT-REMOVE"}
+      assert {:ok, workspace} = Workspace.create_for_issue(issue, nil, ledger)
+
+      assert {:ok, [^workspace]} =
+               Workspace.remove_recorded(workspace, nil, ledger, cleanup_authorized?: true)
+
+      refute File.exists?(workspace)
+      assert {:ok, [record]} = OwnershipLedger.list_for_work_item(ledger, issue.id)
+      assert record.state == :released
+      assert :ok = OwnershipLedger.close(ledger)
+    after
+      File.rm_rf(workspace_root)
+    end
+  end
+
+  test "cleanup completes an owned release when the recorded workspace is already missing" do
+    workspace_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-workspace-missing-release-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+      issue = %Issue{id: "missing-release", identifier: "MT-MISSING-RELEASE"}
+      ledger = workspace_ownership_ledger()
+      assert {:ok, workspace} = Workspace.create_for_issue(issue, nil, ledger)
+      assert {:ok, [owned]} = OwnershipLedger.list_for_work_item(ledger, issue.id)
+      assert owned.state == :owned
+
+      assert {:ok, _removed_paths} = File.rm_rf(workspace)
+      refute File.exists?(workspace)
+
+      assert :ok = Workspace.remove_issue_workspaces(issue, nil, ledger, cleanup_authorized?: true)
+      assert {:ok, [released]} = OwnershipLedger.list_for_work_item(ledger, issue.id)
+      assert released.state == :released
+    after
+      File.rm_rf(workspace_root)
+    end
+  end
+
+  test "a failed before_remove hook preserves a retryable pending release" do
+    workspace_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-workspace-pending-hook-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+      issue = %Issue{id: "pending-hook", identifier: "MT-PENDING-HOOK"}
+      ledger = workspace_ownership_ledger()
+      assert {:ok, workspace} = Workspace.create_for_issue(issue, nil, ledger)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_before_remove: "printf removal-blocked; exit 17"
+      )
+
+      assert {:error, {:workspace_hook_failed, "before_remove", 17, output}} =
+               Workspace.remove_issue_workspaces(issue, nil, ledger, cleanup_authorized?: true)
+
+      assert output =~ "removal-blocked"
+      assert File.dir?(workspace)
+      assert {:ok, [pending]} = OwnershipLedger.list_for_work_item(ledger, issue.id)
+      assert pending.state == :release_pending
+
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+      assert :ok = Workspace.remove_issue_workspaces(issue, nil, ledger, cleanup_authorized?: true)
+      refute File.exists?(workspace)
+      assert {:ok, [released]} = OwnershipLedger.list_for_work_item(ledger, issue.id)
+      assert released.state == :released
+    after
+      File.rm_rf(workspace_root)
+    end
+  end
+
+  test "authorized removal preserves a workspace after the recorded identity changes" do
+    workspace_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-workspace-removal-mismatch-#{System.unique_integer([:positive])}"
+      )
+
+    ledger_root = Path.join(workspace_root, "ledger")
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        symphony_project_id: "workspace-removal-mismatch"
+      )
+
+      config = Config.settings!()
+
+      {:ok, ledger} =
+        OwnershipLedger.open(config.symphony.project_id, Tracker.identity(config.tracker), root: ledger_root)
+
+      issue = %Issue{id: "issue-removal-mismatch", identifier: "MT-REMOVE-MISMATCH"}
+      assert {:ok, workspace} = Workspace.create_for_issue(issue, nil, ledger)
+      replacement = workspace <> ".replacement"
+      File.mkdir!(replacement)
+      File.rm_rf!(workspace)
+      File.rename!(replacement, workspace)
+
+      assert {:error, _reason, ""} =
+               Workspace.remove_recorded(workspace, nil, ledger, cleanup_authorized?: true)
+
+      assert File.dir?(workspace)
+      assert {:ok, [record]} = OwnershipLedger.list_for_work_item(ledger, issue.id)
+      assert record.state == :release_pending
+      assert :ok = OwnershipLedger.close(ledger)
+    after
+      File.rm_rf(workspace_root)
+    end
+  end
+
+  test "workspace removal overloads enforce record-bound authorization" do
+    ownership_state = workspace_ownership_state()
+    issue = %Issue{id: "workspace-overloads", identifier: "MT-OVERLOADS", state: "In Progress"}
+    ledger = ownership_state.workspace_ownership_ledger
+
+    assert {:ok, workspace} = Workspace.create_for_issue(issue, ledger)
+    assert {:ok, [record]} = OwnershipLedger.list_for_work_item(ledger, issue.id)
+
+    assert {:error, :workspace_cleanup_authorization_required, ""} = Workspace.remove(workspace, nil, ledger)
+    assert {:error, :workspace_cleanup_authorization_required, ""} = Workspace.remove_recorded(workspace, nil, ledger)
+    assert {:error, :workspace_cleanup_authorization_required} = Workspace.remove_issue_workspaces(issue, nil, ledger)
+    assert {:error, {:workspace_path_unreadable, nil, :invalid}, ""} = Workspace.remove_recorded(nil, nil, [])
+    assert {:error, :invalid_worker_host} = Workspace.remove_issue_workspaces(issue, 123, [])
+
+    assert {:error, :workspace_cleanup_authorization_mismatch, ""} =
+             Workspace.remove_recorded(workspace, nil, ledger,
+               cleanup_authorized?: true,
+               cleanup_authorization: %{workspace_ownership_id: "another-owner"}
+             )
+
+    assert {:error, :workspace_cleanup_authorization_mismatch, ""} =
+             Workspace.remove_recorded(workspace, nil, ledger,
+               cleanup_authorized?: true,
+               cleanup_authorization: %{
+                 workspace_ownership_id: record.workspace_ownership_id,
+                 canonical_workspace_path: workspace <> ".different"
+               }
+             )
+
+    assert {:error, :workspace_cleanup_authorization_mismatch, ""} =
+             Workspace.remove_recorded(workspace, nil, ledger,
+               cleanup_authorized?: true,
+               cleanup_authorization: %{
+                 workspace_ownership_id: record.workspace_ownership_id,
+                 canonical_workspace_path: workspace,
+                 worker_host: "worker-other"
+               }
+             )
+
+    authorization = %{
+      workspace_ownership_id: record.workspace_ownership_id,
+      canonical_workspace_path: workspace,
+      worker_host: nil
+    }
+
+    assert {:ok, [^workspace]} =
+             Workspace.remove(workspace, nil, ledger,
+               cleanup_authorized?: true,
+               cleanup_authorization: authorization
+             )
+
+    refute File.exists?(workspace)
+    assert {:ok, [released]} = OwnershipLedger.list_for_work_item(ledger, issue.id)
+    assert released.state == :released
+  end
+
+  test "cancels a pending release only while the recorded local workspace remains current" do
+    ownership_state = workspace_ownership_state()
+    issue = %Issue{id: "workspace-cancel-release", identifier: "MT-CANCEL-RELEASE", state: "In Progress"}
+    ledger = ownership_state.workspace_ownership_ledger
+
+    assert {:ok, workspace} = Workspace.create_for_issue(issue, ledger)
+    assert {:ok, [owned]} = OwnershipLedger.list_for_work_item(ledger, issue.id)
+
+    assert {:error, {:invalid_pending_release_state, :owned}} =
+             Workspace.cancel_pending_release_if_current(owned, ledger)
+
+    assert {:ok, pending} = OwnershipLedger.transition_sync(ledger, owned.workspace_ownership_id, :release_pending)
+    assert {:error, :workspace_ownership_changed} = Workspace.cancel_pending_release_if_current(owned, ledger)
+
+    configured_root = Config.settings!().workspace.root
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: configured_root <> "-changed")
+
+    assert {:error, {:workspace_configured_root_mismatch, _, _}} =
+             Workspace.cancel_pending_release_if_current(pending, ledger)
+
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: configured_root)
+    assert :ok = Workspace.cancel_pending_release_if_current(pending, ledger)
+    assert {:ok, [restored]} = OwnershipLedger.list_for_work_item(ledger, issue.id)
+    assert restored.state == :owned
+    assert File.dir?(workspace)
+
+    assert {:error, :workspace_ownership_not_found} = Workspace.cancel_pending_release_if_current(%{}, ledger)
+
+    assert {:error, :workspace_ownership_not_found} =
+             Workspace.cancel_pending_release_if_current(%{workspace_ownership_id: "missing"}, ledger)
+
+    assert {:error, :workspace_ownership_not_found} = Workspace.cancel_pending_release_if_current(nil, ledger)
+
+    assert :ok = Workspace.remove_issue_workspaces(issue, nil, ledger, cleanup_authorized?: true)
+  end
+
+  test "releases a missing local workspace without treating it as a cleanup failure" do
+    ownership_state = workspace_ownership_state()
+    issue = %Issue{id: "workspace-missing-release", identifier: "MT-MISSING-RELEASE", state: "In Progress"}
+    ledger = ownership_state.workspace_ownership_ledger
+
+    assert {:ok, workspace} = Workspace.create_for_issue(issue, ledger)
+    assert {:ok, [record]} = OwnershipLedger.list_for_work_item(ledger, issue.id)
+    assert {:ok, _pending} = OwnershipLedger.transition_sync(ledger, record.workspace_ownership_id, :release_pending)
+    File.rm_rf!(workspace)
+
+    assert :ok = Workspace.remove_issue_workspaces(issue, nil, ledger, cleanup_authorized?: true)
+    assert {:ok, [released]} = OwnershipLedger.list_for_work_item(ledger, issue.id)
+    assert released.state == :released
+    assert :ok = Workspace.remove_issue_workspaces(issue, nil, ledger, cleanup_authorized?: true)
+  end
+
+  test "after_create replacement leaves the durable record provisioning" do
+    workspace_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-workspace-post-hook-replacement-#{System.unique_integer([:positive])}"
+      )
+
+    ledger_root = Path.join(workspace_root, "ledger")
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        symphony_project_id: "workspace-post-hook-replacement",
+        hook_after_create: "cd .. && rm -rf MT-POST-HOOK && mkdir MT-POST-HOOK"
+      )
+
+      config = Config.settings!()
+
+      {:ok, ledger} =
+        OwnershipLedger.open(config.symphony.project_id, Tracker.identity(config.tracker), root: ledger_root)
+
+      issue = %Issue{id: "issue-post-hook-replacement", identifier: "MT-POST-HOOK"}
+
+      assert {:error, {:owned_identity_mismatch, _reason}} =
+               Workspace.create_for_issue(issue, nil, ledger)
+
+      workspace = Path.join(workspace_root, "MT-POST-HOOK")
+      assert File.dir?(workspace)
+      assert {:ok, [record]} = OwnershipLedger.list_for_work_item(ledger, issue.id)
+      assert record.state == :provisioning
+      assert :ok = OwnershipLedger.close(ledger)
+    after
+      File.rm_rf(workspace_root)
+    end
+  end
 
   test "workspace bootstrap can be implemented in after_create hook" do
     test_root =
@@ -46,17 +432,32 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     workspace_root =
       Path.join(
         System.tmp_dir!(),
-        "symphony-elixir-workspace-deterministic-#{System.unique_integer([:positive])}"
+        "symphony-elixir-workspace-deterministic-#{System.unique_integer([:positive])}-#{Base.encode16(:crypto.strong_rand_bytes(8), case: :lower)}"
       )
 
-    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+    ledger_root = Path.join(workspace_root, "ledger")
 
-    assert {:ok, first_workspace} = Workspace.create_for_issue("MT/Det")
-    assert {:ok, second_workspace} = Workspace.create_for_issue("MT/Det")
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        symphony_project_id: "workspace-deterministic-test"
+      )
 
-    assert first_workspace == second_workspace
-    assert Path.basename(first_workspace) == Workspace.workspace_key("MT/Det")
-    assert String.starts_with?(Path.basename(first_workspace), "MT_Det--")
+      config = Config.settings!()
+
+      {:ok, ledger} =
+        OwnershipLedger.open(config.symphony.project_id, Tracker.identity(config.tracker), root: ledger_root)
+
+      assert {:ok, first_workspace} = Workspace.create_for_issue("MT/Det", nil, ledger)
+      assert {:ok, second_workspace} = Workspace.create_for_issue("MT/Det", nil, ledger)
+
+      assert first_workspace == second_workspace
+      assert Path.basename(first_workspace) == Workspace.workspace_key("MT/Det")
+      assert String.starts_with?(Path.basename(first_workspace), "MT_Det--")
+      assert :ok = OwnershipLedger.close(ledger)
+    after
+      File.rm_rf(workspace_root)
+    end
   end
 
   test "relative local workspace roots resolve from the workflow directory" do
@@ -96,16 +497,25 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       underscore_issue = %Issue{id: "dispatch-underscore", identifier: "team_a-1"}
 
       assert {:ok, slash_workspace} = Workspace.create_for_issue(slash_issue)
-      assert {:ok, ^slash_workspace} = Workspace.create_for_issue("team/a-1")
+      assert {:ok, ^slash_workspace} = Workspace.create_for_issue(slash_issue)
       assert {:ok, underscore_workspace} = Workspace.create_for_issue(underscore_issue)
 
       refute slash_workspace == underscore_workspace
       assert Path.basename(underscore_workspace) == "team_a-1"
       assert String.starts_with?(Path.basename(slash_workspace), "team_a-1--")
+      assert Workspace.workspace_key(slash_issue) == Workspace.workspace_key(slash_issue.identifier)
+      assert Workspace.workspace_key(nil) == "issue"
 
-      assert :ok = Workspace.remove_issue_workspaces("team/a-1")
+      assert :ok = Workspace.remove_issue_workspaces(slash_issue, nil, cleanup_authorized?: true)
       refute File.exists?(slash_workspace)
       assert File.exists?(underscore_workspace)
+
+      assert :ok = Workspace.remove_issue_workspaces(slash_issue, nil, cleanup_authorized?: true)
+
+      assert {:ok, recreated_workspace} = Workspace.create_for_issue(slash_issue)
+      assert recreated_workspace == slash_workspace
+      assert :ok = Workspace.remove_issue_workspaces(slash_issue, nil, cleanup_authorized?: true)
+      refute File.exists?(recreated_workspace)
     after
       File.rm_rf(workspace_root)
     end
@@ -147,7 +557,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
-  test "workspace replaces stale non-directory paths" do
+  test "workspace preserves stale non-directory paths" do
     workspace_root =
       Path.join(
         System.tmp_dir!(),
@@ -162,9 +572,9 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
 
       assert {:ok, canonical_workspace} = SymphonyElixir.PathSafety.canonicalize(stale_workspace)
-      assert {:ok, workspace} = Workspace.create_for_issue("MT-STALE")
-      assert workspace == canonical_workspace
-      assert File.dir?(workspace)
+      assert {:error, _reason} = Workspace.create_for_issue("MT-STALE")
+      assert canonical_workspace == Path.expand(stale_workspace)
+      assert File.regular?(stale_workspace)
     after
       File.rm_rf(workspace_root)
     end
@@ -221,11 +631,8 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
         hook_before_remove: "touch \"#{hook_marker}\""
       )
 
-      assert {:ok, canonical_recorded_root} =
-               SymphonyElixir.PathSafety.canonicalize(recorded_root)
-
-      assert {:error, {:workspace_symlink_escape, ^recorded_workspace, ^canonical_recorded_root}, ""} =
-               Workspace.remove_recorded(recorded_workspace, nil)
+      assert {:error, {:workspace_outside_root, _, _}, ""} =
+               Workspace.remove_recorded(recorded_workspace, nil, cleanup_authorized?: true)
 
       refute File.exists?(hook_marker)
       assert File.exists?(outside_root)
@@ -256,6 +663,16 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert {:ok, workspace} = Workspace.create_for_issue("MT-LINK")
       assert workspace == canonical_workspace
       assert File.dir?(workspace)
+
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: actual_root)
+
+      assert {:error, {:workspace_ownership_required, ^workspace}} =
+               Workspace.create_for_issue("MT-LINK")
+
+      assert {:error, {:workspace_configured_root_mismatch, _, _}, ""} =
+               Workspace.remove_recorded(workspace, nil, cleanup_authorized?: true)
+
+      assert File.dir?(workspace)
     after
       File.rm_rf(test_root)
     end
@@ -276,7 +693,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
                SymphonyElixir.PathSafety.canonicalize(workspace_root)
 
       assert {:error, {:workspace_equals_root, ^canonical_workspace_root, ^canonical_workspace_root}, ""} =
-               Workspace.remove(workspace_root)
+               Workspace.remove(workspace_root, nil, cleanup_authorized?: true)
     after
       File.rm_rf(workspace_root)
     end
@@ -286,17 +703,23 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     workspace_root =
       Path.join(
         System.tmp_dir!(),
-        "symphony-elixir-workspace-hook-failure-#{System.unique_integer([:positive])}"
+        "symphony-elixir-workspace-hook-failure-#{System.unique_integer([:positive])}-#{Base.encode16(:crypto.strong_rand_bytes(8), case: :lower)}"
       )
+
+    before_remove_marker = Path.join(workspace_root, "before-remove")
 
     try do
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
-        hook_after_create: "echo nope && exit 17"
+        hook_after_create: "echo nope && exit 17",
+        hook_before_remove: "touch #{before_remove_marker}"
       )
 
       assert {:error, {:workspace_hook_failed, "after_create", 17, _output}} =
                Workspace.create_for_issue("MT-FAIL")
+
+      refute File.exists?(Path.join(workspace_root, "MT-FAIL"))
+      assert File.exists?(before_remove_marker)
     after
       File.rm_rf(workspace_root)
     end
@@ -376,7 +799,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
-  test "workspace removes all workspaces for a closed issue identifier" do
+  test "workspace cleanup preserves unowned paths for a closed issue identifier" do
     workspace_root =
       Path.join(
         System.tmp_dir!(),
@@ -394,8 +817,10 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
 
-      assert :ok = Workspace.remove_issue_workspaces("S_1")
-      refute File.exists?(target_workspace)
+      assert {:error, _reason} =
+               Workspace.remove_issue_workspaces("S_1", nil, cleanup_authorized?: true)
+
+      assert File.exists?(target_workspace)
       assert File.exists?(untouched_workspace)
     after
       File.rm_rf(workspace_root)
@@ -411,11 +836,12 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     write_workflow_file!(Workflow.workflow_file_path(), workspace_root: missing_root)
 
-    assert :ok = Workspace.remove_issue_workspaces("S-2")
+    assert {:error, _reason} =
+             Workspace.remove_issue_workspaces("S-2", nil, cleanup_authorized?: true)
   end
 
   test "workspace cleanup ignores non-binary identifier" do
-    assert :ok = Workspace.remove_issue_workspaces(nil)
+    assert {:error, :workspace_cleanup_authorization_required} = Workspace.remove_issue_workspaces(nil)
   end
 
   test "tracker issue helpers" do
@@ -961,7 +1387,202 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
         "symphony-elixir-missing-#{System.unique_integer([:positive])}"
       )
 
-    assert {:ok, []} = Workspace.remove(random_path)
+    assert {:error, :workspace_cleanup_authorization_required, ""} = Workspace.remove(random_path)
+  end
+
+  test "workspace operations reject invalid work items, roots, and worker hosts" do
+    assert {:error, :invalid_issue_identity} = Workspace.create_for_issue(%{identifier: "MT-NO-ID"})
+
+    workspace_root = Path.join(System.tmp_dir!(), "symphony-workspace-root-file-#{System.unique_integer([:positive])}")
+    File.write!(workspace_root, "not a directory")
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+      assert {:error, {:path_canonicalize_failed, _workspace_path, :enotdir}} =
+               Workspace.create_for_issue(%Issue{id: "root-file", identifier: "MT-ROOT-FILE"})
+    after
+      File.rm(workspace_root)
+    end
+
+    assert {:error, :invalid_worker_host} =
+             Workspace.remove_issue_workspaces("MT-INVALID-HOST", :invalid, cleanup_authorized?: true)
+
+    assert {:error, {:workspace_path_unreadable, "", :invalid}, ""} =
+             Workspace.remove_recorded("", "worker-invalid-path", workspace_ownership_ledger(), cleanup_authorized?: true)
+  end
+
+  test "after_run hook failures are ignored while before_run failures are returned" do
+    workspace =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-workspace-hook-semantics-#{System.unique_integer([:positive])}"
+      )
+
+    File.mkdir_p!(workspace)
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        hook_before_run: "printf before-failed; exit 17",
+        hook_after_run: "printf after-failed; exit 18"
+      )
+
+      assert {:error, {:workspace_hook_failed, "before_run", 17, output}} =
+               Workspace.run_before_run_hook(workspace, "MT-HOOK-FAILURE")
+
+      assert output =~ "before-failed"
+      assert :ok = Workspace.run_after_run_hook(workspace, "MT-HOOK-FAILURE")
+    after
+      File.rm_rf(workspace)
+    end
+  end
+
+  test "workspace cleanup reports unresolved ownership records" do
+    issue = %Issue{id: "workspace-unresolved", identifier: "MT-UNRESOLVED"}
+    ledger = workspace_ownership_ledger()
+    configured_root = Path.join(System.tmp_dir!(), "symphony-remote-workspaces")
+    workspace_key = Workspace.workspace_key(issue.identifier)
+
+    remote_reservation = %{
+      work_item_id: issue.id,
+      issue_identifier: issue.identifier,
+      workspace_key: workspace_key,
+      workspace_ownership_id: "workspace-unresolved-remote",
+      location: :remote,
+      worker_host: "worker-unresolved",
+      trusted_host_identity: "remote-host-unresolved",
+      configured_root: configured_root,
+      configured_root_identity: "1:2",
+      canonical_root: configured_root,
+      canonical_workspace_path: Path.join(configured_root, workspace_key),
+      top_level_filesystem_identity: nil
+    }
+
+    assert {:ok, reserved} = OwnershipLedger.reserve_sync(ledger, remote_reservation)
+
+    assert {:error, {:workspace_ownership_not_releasable, [^reserved]}} =
+             Workspace.remove_issue_workspaces(issue, nil, ledger, cleanup_authorized?: true)
+
+    assert {:ok, current} = OwnershipLedger.get(ledger, reserved.workspace_ownership_id)
+    assert current.state == :reserved
+  end
+
+  test "local creation safely resumes an absent reservation and rejects ambiguous records" do
+    ledger = workspace_ownership_ledger()
+    canonical_root = Config.local_workspace_root()
+    File.mkdir_p!(canonical_root)
+    configured_root = Path.expand(canonical_root)
+    {:ok, canonical_root} = SymphonyElixir.PathSafety.canonicalize(canonical_root)
+    {:ok, root_identity} = OwnershipLedger.root_identity(canonical_root)
+    issue = %Issue{id: "workspace-reservation-recovery", identifier: "MT-RESERVATION-RECOVERY"}
+    workspace_key = Workspace.workspace_key(issue.identifier)
+
+    reservation = %{
+      work_item_id: issue.id,
+      issue_identifier: issue.identifier,
+      workspace_key: workspace_key,
+      workspace_ownership_id: "workspace-reservation-recovery-owned",
+      location: :local,
+      worker_host: nil,
+      trusted_host_identity: ledger.host_identity,
+      configured_root: configured_root,
+      configured_root_identity: root_identity,
+      canonical_root: canonical_root,
+      canonical_workspace_path: Path.join(canonical_root, workspace_key),
+      top_level_filesystem_identity: nil
+    }
+
+    assert {:ok, reserved} = OwnershipLedger.reserve_sync(ledger, reservation)
+    assert {:ok, workspace} = Workspace.create_for_issue(issue, nil, ledger)
+    assert workspace == reservation.canonical_workspace_path
+    assert {:ok, owned} = OwnershipLedger.get(ledger, reserved.workspace_ownership_id)
+    assert owned.state == :owned
+
+    ambiguous_issue = %Issue{id: "workspace-reservation-ambiguous", identifier: "MT-RESERVATION-AMBIGUOUS"}
+    ambiguous_key = Workspace.workspace_key(ambiguous_issue.identifier)
+
+    ambiguous_reservation = %{
+      reservation
+      | work_item_id: ambiguous_issue.id,
+        issue_identifier: ambiguous_issue.identifier,
+        workspace_key: ambiguous_key,
+        workspace_ownership_id: "workspace-reservation-ambiguous",
+        canonical_workspace_path: Path.join(canonical_root, ambiguous_key)
+    }
+
+    assert {:ok, provisioning} = OwnershipLedger.reserve_sync(ledger, ambiguous_reservation)
+
+    assert {:ok, _provisioning} =
+             OwnershipLedger.transition_sync(
+               ledger,
+               provisioning.workspace_ownership_id,
+               :provisioning,
+               top_level_filesystem_identity: %{major_device: 1, minor_device: 0, inode: 99}
+             )
+
+    assert {:error, {:workspace_ownership_inconsistent, _path}} =
+             Workspace.create_for_issue(ambiguous_issue, nil, ledger)
+
+    refute File.exists?(ambiguous_reservation.canonical_workspace_path)
+  end
+
+  test "authorized path-only removal still requires a trusted ownership record" do
+    workspace = Path.join(Config.local_workspace_root(), "MT-UNOWNED-REMOVE")
+
+    assert {:error, :workspace_ownership_not_found, ""} =
+             Workspace.remove_recorded(workspace, nil, workspace_ownership_ledger(), cleanup_authorized?: true)
+  end
+
+  test "reservation, provisioning, and ownership write failures never expose a workspace" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-local-ledger-write-failure-#{System.unique_integer([:positive])}")
+    workspace_root = Path.join(test_root, "workspaces")
+    ledger = workspace_ownership_ledger()
+    File.mkdir_p!(workspace_root)
+
+    on_exit(fn -> File.rm_rf(test_root) end)
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+    cases = [
+      {"reservation-write-failure", 1, :missing, false},
+      {"provisioning-write-failure", 2, :reserved, false},
+      {"owned-write-failure", 3, :provisioning, true}
+    ]
+
+    for {suffix, fail_on_write, expected_state, after_create_ran?} <- cases do
+      issue = %Issue{id: "workspace-#{suffix}", identifier: "MT-#{suffix}"}
+      counter = :counters.new(1, [:atomics])
+      workspace = Path.join(workspace_root, issue.identifier)
+      after_create_marker = Path.join(workspace, "after-create-ran")
+
+      failing_ledger = %{
+        ledger
+        | write_fun: fn table, records ->
+            :counters.add(counter, 1, 1)
+            write_number = :counters.get(counter, 1)
+
+            if write_number == fail_on_write do
+              {:error, :disk_full}
+            else
+              :dets.insert(table, records)
+            end
+          end
+      }
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_after_create: "touch after-create-ran"
+      )
+
+      assert {:error, _reason} = Workspace.create_for_issue(issue, nil, failing_ledger)
+      assert File.exists?(workspace) == (expected_state != :missing)
+      assert File.exists?(after_create_marker) == after_create_ran?
+
+      case {expected_state, OwnershipLedger.list_for_work_item(ledger, issue.id)} do
+        {:missing, {:ok, []}} -> :ok
+        {state, {:ok, [record]}} when state in [:reserved, :provisioning] -> assert record.state == state
+        unexpected -> flunk("unexpected ownership result: #{inspect(unexpected)}")
+      end
+    end
   end
 
   test "workspace hooks support multiline YAML scripts and run at lifecycle boundaries" do
@@ -994,7 +1615,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert {:ok, _workspace} = Workspace.create_for_issue("MT-HOOKS")
       assert length(String.split(String.trim(File.read!(after_create_counter)), "\n")) == 1
 
-      assert :ok = Workspace.remove_issue_workspaces("MT-HOOKS")
+      assert :ok = Workspace.remove_issue_workspaces("MT-HOOKS", nil, cleanup_authorized?: true)
       assert File.read!(before_remove_marker) == "before_remove\n"
       refute File.exists?(workspace)
     after
@@ -1002,7 +1623,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
-  test "workspace remove continues when before_remove hook fails" do
+  test "workspace cleanup preserves workspace when before_remove hook fails" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -1020,14 +1641,17 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       )
 
       assert {:ok, workspace} = Workspace.create_for_issue("MT-HOOKS-FAIL")
-      assert :ok = Workspace.remove_issue_workspaces("MT-HOOKS-FAIL")
-      refute File.exists?(workspace)
+
+      assert {:error, _reason} =
+               Workspace.remove_issue_workspaces("MT-HOOKS-FAIL", nil, cleanup_authorized?: true)
+
+      assert File.exists?(workspace)
     after
       File.rm_rf(test_root)
     end
   end
 
-  test "workspace remove continues when before_remove hook fails with large output" do
+  test "workspace cleanup preserves workspace when before_remove hook has large failure output" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -1045,26 +1669,17 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       )
 
       assert {:ok, workspace} = Workspace.create_for_issue("MT-HOOKS-LARGE-FAIL")
-      assert :ok = Workspace.remove_issue_workspaces("MT-HOOKS-LARGE-FAIL")
-      refute File.exists?(workspace)
+
+      assert {:error, _reason} =
+               Workspace.remove_issue_workspaces("MT-HOOKS-LARGE-FAIL", nil, cleanup_authorized?: true)
+
+      assert File.exists?(workspace)
     after
       File.rm_rf(test_root)
     end
   end
 
-  test "workspace remove continues when before_remove hook times out" do
-    previous_timeout = Application.get_env(:symphony_elixir, :workspace_hook_timeout_ms)
-
-    on_exit(fn ->
-      if is_nil(previous_timeout) do
-        Application.delete_env(:symphony_elixir, :workspace_hook_timeout_ms)
-      else
-        Application.put_env(:symphony_elixir, :workspace_hook_timeout_ms, previous_timeout)
-      end
-    end)
-
-    Application.put_env(:symphony_elixir, :workspace_hook_timeout_ms, 10)
-
+  test "workspace cleanup preserves workspace when before_remove hook times out" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -1078,15 +1693,258 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
+        hook_timeout_ms: 10,
         hook_before_remove: "sleep 1"
       )
 
       assert {:ok, workspace} = Workspace.create_for_issue("MT-HOOKS-TIMEOUT")
-      assert :ok = Workspace.remove_issue_workspaces("MT-HOOKS-TIMEOUT")
-      refute File.exists?(workspace)
+
+      assert {:error, _reason} =
+               Workspace.remove_issue_workspaces("MT-HOOKS-TIMEOUT", nil, cleanup_authorized?: true)
+
+      assert File.exists?(workspace)
     after
       File.rm_rf(test_root)
     end
+  end
+
+  test "after_create workspace replacement remains provisioning and is never adopted" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-workspace-replacement-#{System.unique_integer([:positive])}")
+    workspace_root = Path.join(test_root, "workspaces")
+    issue = %Issue{id: "workspace-replaced", identifier: "MT-REPLACED"}
+    workspace = Path.join(workspace_root, issue.identifier)
+    moved_workspace = workspace <> ".moved"
+    File.mkdir_p!(workspace_root)
+
+    on_exit(fn -> File.rm_rf(test_root) end)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      hook_after_create: "echo original > marker; mv \"$PWD\" \"#{moved_workspace}\"; mkdir \"$PWD\""
+    )
+
+    assert {:error, {:owned_identity_mismatch, {:workspace_identity_mismatch, ^workspace}}} =
+             Workspace.create_for_issue(issue, nil, workspace_ownership_ledger())
+
+    assert {:ok, [provisioning]} = OwnershipLedger.list_for_work_item(workspace_ownership_ledger(), issue.id)
+    assert provisioning.state == :provisioning
+    assert File.read!(Path.join(moved_workspace, "marker")) == "original\n"
+    assert File.dir?(workspace)
+    assert File.ls!(workspace) == []
+  end
+
+  test "before_remove replacement fails the second filesystem identity check" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-workspace-remove-replacement-#{System.unique_integer([:positive])}")
+    workspace_root = Path.join(test_root, "workspaces")
+    issue = %Issue{id: "workspace-remove-replaced", identifier: "MT-REMOVE-REPLACED"}
+    workspace = Path.join(workspace_root, issue.identifier)
+    moved_workspace = workspace <> ".moved"
+    File.mkdir_p!(workspace_root)
+
+    on_exit(fn -> File.rm_rf(test_root) end)
+
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+    ledger = workspace_ownership_ledger()
+    assert {:ok, ^workspace} = Workspace.create_for_issue(issue, nil, ledger)
+    File.write!(Path.join(workspace, "marker"), "owned")
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      hook_before_remove: "mv \"$PWD\" \"#{moved_workspace}\"; mkdir \"$PWD\""
+    )
+
+    assert {:error, {:workspace_identity_mismatch, ^workspace}} =
+             Workspace.remove_issue_workspaces(issue, nil, ledger, cleanup_authorized?: true)
+
+    assert {:ok, [pending]} = OwnershipLedger.list_for_work_item(ledger, issue.id)
+    assert pending.state == :release_pending
+    assert File.read!(Path.join(moved_workspace, "marker")) == "owned"
+    assert File.dir?(workspace)
+    assert File.ls!(workspace) == []
+  end
+
+  test "failed after_create cleanup preserves the workspace when the configured root changes identity" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-workspace-root-replaced-#{System.unique_integer([:positive])}")
+    workspace_root = Path.join(test_root, "workspaces")
+    moved_root = workspace_root <> ".moved"
+    issue = %Issue{id: "workspace-root-replaced", identifier: "MT-ROOT-REPLACED"}
+    moved_workspace = Path.join(moved_root, issue.identifier)
+    File.mkdir_p!(workspace_root)
+
+    on_exit(fn -> File.rm_rf(test_root) end)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      hook_after_create: "mv \"#{workspace_root}\" \"#{moved_root}\"; mkdir \"#{workspace_root}\"; exit 17"
+    )
+
+    assert {:error, {:after_create_cleanup_failed, hook_error, cleanup_error}} =
+             Workspace.create_for_issue(issue, nil, workspace_ownership_ledger())
+
+    assert {:workspace_hook_failed, "after_create", 17, _output} = hook_error
+    assert {:workspace_root_identity_mismatch, _, _} = cleanup_error
+
+    assert {:ok, [pending]} = OwnershipLedger.list_for_work_item(workspace_ownership_ledger(), issue.id)
+    assert pending.state == :release_pending
+    assert pending.release_origin == :failed_provisioning
+
+    assert {:error, :failed_provisioning_release_cannot_be_cancelled} =
+             Workspace.cancel_pending_release_if_current(pending, workspace_ownership_ledger())
+
+    assert File.dir?(moved_workspace)
+  end
+
+  test "workspace symlink replacement is rejected before the removal hook" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-workspace-symlink-replacement-#{System.unique_integer([:positive])}")
+    workspace_root = Path.join(test_root, "workspaces")
+    issue = %Issue{id: "workspace-symlink-replaced", identifier: "MT-SYMLINK-REPLACED"}
+    workspace = Path.join(workspace_root, issue.identifier)
+    protected_target = Path.join(workspace_root, "operator-data")
+    hook_marker = Path.join(test_root, "before-remove-ran")
+    File.mkdir_p!(workspace_root)
+    File.mkdir!(protected_target)
+
+    on_exit(fn -> File.rm_rf(test_root) end)
+
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+    ledger = workspace_ownership_ledger()
+    assert {:ok, ^workspace} = Workspace.create_for_issue(issue, nil, ledger)
+    File.rm_rf!(workspace)
+    File.ln_s!(protected_target, workspace)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      hook_before_remove: "touch #{hook_marker}"
+    )
+
+    assert {:error, {:workspace_symlink_escape, ^workspace, ^workspace_root}} =
+             Workspace.remove_issue_workspaces(issue, nil, ledger, cleanup_authorized?: true)
+
+    assert File.lstat!(workspace).type == :symlink
+    assert File.dir?(protected_target)
+    refute File.exists?(hook_marker)
+    assert {:ok, [owned]} = OwnershipLedger.list_for_work_item(ledger, issue.id)
+    assert owned.state == :owned
+  end
+
+  test "local workspace provisioning detects a replaced configured-root object" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-workspace-root-identity-#{System.unique_integer([:positive])}")
+    workspace_root = Path.join(test_root, "workspaces")
+    moved_root = workspace_root <> ".moved"
+    issue = %Issue{id: "workspace-root-identity", identifier: "MT-ROOT-IDENTITY"}
+    workspace = Path.join(workspace_root, issue.identifier)
+    File.mkdir_p!(workspace_root)
+
+    on_exit(fn -> File.rm_rf(test_root) end)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      hook_after_create: "mv '#{workspace_root}' '#{moved_root}'; mkdir '#{workspace_root}'; mv '#{moved_root}/#{issue.identifier}' '#{workspace}'"
+    )
+
+    ledger = workspace_ownership_ledger()
+
+    assert {:error, {:owned_identity_mismatch, {:workspace_root_identity_mismatch, _, _}}} =
+             Workspace.create_for_issue(issue, nil, ledger)
+
+    assert File.dir?(workspace)
+    assert {:ok, [provisioning]} = OwnershipLedger.list_for_work_item(ledger, issue.id)
+    assert provisioning.state == :provisioning
+  end
+
+  test "atomic workspace creation preserves a path that appears after reservation sync" do
+    workspace_root = Path.join(System.tmp_dir!(), "symphony-workspace-create-race-#{System.unique_integer([:positive])}")
+    issue = %Issue{id: "workspace-create-race", identifier: "MT-CREATE-RACE"}
+    workspace = Path.join(workspace_root, Workspace.workspace_key(issue.identifier))
+    File.mkdir_p!(workspace_root)
+
+    on_exit(fn -> File.rm_rf(workspace_root) end)
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+    ledger = workspace_ownership_ledger()
+
+    racing_ledger = %{
+      ledger
+      | sync_fun: fn table ->
+          case :dets.sync(table) do
+            :ok ->
+              File.mkdir!(workspace)
+              File.write!(Path.join(workspace, "foreign"), "created after durable reservation")
+              :ok
+
+            error ->
+              error
+          end
+        end
+    }
+
+    assert {:error, {:workspace_path_exists, ^workspace}} =
+             Workspace.create_for_issue(issue, nil, racing_ledger)
+
+    assert File.read!(Path.join(workspace, "foreign")) == "created after durable reservation"
+    assert {:ok, [reserved]} = OwnershipLedger.list_for_work_item(ledger, issue.id)
+    assert reserved.state == :reserved
+  end
+
+  test "atomic workspace creation preserves its reservation when the root disappears" do
+    workspace_root = Path.join(System.tmp_dir!(), "symphony-workspace-parent-race-#{System.unique_integer([:positive])}")
+    issue = %Issue{id: "workspace-parent-race", identifier: "MT-PARENT-RACE"}
+    workspace = Path.join(workspace_root, Workspace.workspace_key(issue.identifier))
+    File.mkdir_p!(workspace_root)
+
+    on_exit(fn -> File.rm_rf(workspace_root) end)
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+    ledger = workspace_ownership_ledger()
+
+    racing_ledger = %{
+      ledger
+      | sync_fun: fn table ->
+          case :dets.sync(table) do
+            :ok ->
+              File.rm_rf!(workspace_root)
+              :ok
+
+            error ->
+              error
+          end
+        end
+    }
+
+    assert {:error, {:workspace_create_failed, ^workspace, :enoent}} =
+             Workspace.create_for_issue(issue, nil, racing_ledger)
+
+    refute File.exists?(workspace)
+    assert {:ok, [reserved]} = OwnershipLedger.list_for_work_item(ledger, issue.id)
+    assert reserved.state == :reserved
+  end
+
+  test "before_remove hook replacing a workspace with a file fails the identity recheck" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-workspace-file-replacement-#{System.unique_integer([:positive])}")
+    workspace_root = Path.join(test_root, "workspaces")
+    issue = %Issue{id: "workspace-file-replaced", identifier: "MT-FILE-REPLACED"}
+    workspace = Path.join(workspace_root, issue.identifier)
+    moved_workspace = workspace <> ".moved"
+
+    File.mkdir_p!(workspace_root)
+    on_exit(fn -> File.rm_rf(test_root) end)
+
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+    ledger = workspace_ownership_ledger()
+    assert {:ok, ^workspace} = Workspace.create_for_issue(issue, nil, ledger)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      hook_before_remove: "mv '#{workspace}' '#{moved_workspace}'; touch '#{workspace}'"
+    )
+
+    assert {:error, {:workspace_identity_mismatch, ^workspace, :regular}} =
+             Workspace.remove_issue_workspaces(issue, nil, ledger, cleanup_authorized?: true)
+
+    assert File.regular?(workspace)
+    assert File.dir?(moved_workspace)
+    assert {:ok, [pending]} = OwnershipLedger.list_for_work_item(ledger, issue.id)
+    assert pending.state == :release_pending
   end
 
   test "config reads defaults for optional settings" do
@@ -1714,6 +2572,9 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       fake_ssh = Path.join(test_root, "ssh")
       workspace_root = "~/.symphony-remote-workspaces"
       workspace_path = "/remote/home/.symphony-remote-workspaces/MT-SSH-WS"
+      canonical_root = "/remote/home/.symphony-remote-workspaces"
+      host_identity = "host-remote-test"
+      host_identity_path = "/remote/home/.local/state/symphony/workspace-ownership/host.identity"
 
       File.mkdir_p!(test_root)
       System.put_env("SYMP_TEST_SSH_TRACE", trace_file)
@@ -1722,13 +2583,27 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       File.write!(fake_ssh, """
       #!/bin/sh
       trace_file="${SYMP_TEST_SSH_TRACE:-/tmp/symphony-fake-ssh.trace}"
+      response_count_file="$trace_file.prepare-count"
       printf 'ARGV:%s\\n' "$*" >> "$trace_file"
 
-      case "$*" in
-        *"__SYMPHONY_WORKSPACE__"*)
-          printf '%s\\t%s\\t%s\\n' '__SYMPHONY_WORKSPACE__' '1' '#{workspace_path}'
-          ;;
-      esac
+      if printf '%s' "$*" | grep -q 'workspace_identity=-'; then
+        response_count=0
+        if [ -f "$response_count_file" ]; then
+          response_count=$(cat "$response_count_file")
+        fi
+        response_count=$((response_count + 1))
+        printf '%s\\n' "$response_count" > "$response_count_file"
+
+        if [ "$response_count" -eq 1 ]; then
+          printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' '__SYMPHONY_WORKSPACE_PREPARE__' '0' '#{workspace_path}' '#{canonical_root}' '#{host_identity}' '1:2' '-' '#{host_identity_path}'
+        elif [ "$response_count" -eq 4 ]; then
+          printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' '__SYMPHONY_WORKSPACE_PREPARE__' '1' '#{workspace_path}' '#{canonical_root}' 'host-changed' '1:2' '2:3' '#{host_identity_path}'
+        else
+          printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' '__SYMPHONY_WORKSPACE_PREPARE__' '1' '#{workspace_path}' '#{canonical_root}' '#{host_identity}' '1:2' '2:3' '#{host_identity_path}'
+        fi
+      elif printf '%s' "$*" | grep -q '__SYMPHONY_WORKSPACE_PREPARE__'; then
+        printf '%s\\t%s\\t%s\\t%s\\n' '__SYMPHONY_WORKSPACE_PREPARE__' '#{workspace_path}' '2:3' '1:2'
+      fi
 
       exit 0
       """)
@@ -1745,23 +2620,522 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       assert Config.settings!().worker.ssh_hosts == ["worker-01:2200"]
       assert Config.settings!().workspace.root == workspace_root
-      assert {:ok, ^workspace_path} = Workspace.create_for_issue("MT-SSH-WS", "worker-01:2200")
+      ownership_state = workspace_ownership_state()
+      ledger = ownership_state.workspace_ownership_ledger
+
+      assert {:ok, ^workspace_path} = Workspace.create_for_issue("MT-SSH-WS", "worker-01:2200", ledger)
+      assert {:ok, ^workspace_path} = Workspace.create_for_issue("MT-SSH-WS", "worker-01:2200", ledger)
       assert :ok = Workspace.run_before_run_hook(workspace_path, "MT-SSH-WS", "worker-01:2200")
       assert :ok = Workspace.run_after_run_hook(workspace_path, "MT-SSH-WS", "worker-01:2200")
-      assert :ok = Workspace.remove_issue_workspaces("MT-SSH-WS", "worker-01:2200")
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: "~/.different-remote-workspaces",
+        worker_ssh_hosts: ["worker-01:2200"],
+        hook_before_remove: "echo before-remove"
+      )
+
+      assert {:error, {:workspace_configured_root_mismatch, _, _}} =
+               Workspace.remove_issue_workspaces("MT-SSH-WS", "worker-01:2200", ledger, cleanup_authorized?: true)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        worker_ssh_hosts: ["worker-01:2200"],
+        hook_before_remove: "echo before-remove"
+      )
+
+      assert {:ok, [pending]} = OwnershipLedger.list_for_work_item(ledger, "MT-SSH-WS")
+      assert pending.state == :release_pending
+      assert {:error, {:workspace_identity_mismatch, _}} = Workspace.cancel_pending_release_if_current(pending, ledger)
+      assert :ok = Workspace.cancel_pending_release_if_current(pending, ledger)
+
+      assert :ok =
+               Workspace.remove_issue_workspaces("MT-SSH-WS", "worker-01:2200", ledger, cleanup_authorized?: true)
 
       trace = File.read!(trace_file)
       assert trace =~ "-p 2200 worker-01 bash -lc"
-      assert trace =~ "__SYMPHONY_WORKSPACE__"
+      assert trace =~ "__SYMPHONY_WORKSPACE_PREPARE__"
+      assert trace =~ host_identity
+      assert trace =~ canonical_root
       assert trace =~ "~/.symphony-remote-workspaces/MT-SSH-WS"
       assert trace =~ "${workspace#\\~/}"
       assert trace =~ "echo before-run"
       assert trace =~ "echo after-run"
       assert trace =~ "echo before-remove"
-      assert trace =~ "rm -rf"
+      assert trace =~ "rm -rf --"
+      assert trace =~ "[ ! -e \"$workspace\" ] && [ ! -L \"$workspace\" ]"
       assert trace =~ workspace_path
     after
       File.rm_rf(test_root)
     end
+  end
+
+  test "remote after_create failures release a workspace through the guarded remote removal path" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-remote-hook-failure-#{System.unique_integer([:positive])}")
+    trace_file = Path.join(test_root, "ssh.trace")
+    fake_ssh = Path.join(test_root, "ssh")
+    previous_path = System.get_env("PATH")
+    previous_trace = System.get_env("SYMP_TEST_SSH_TRACE")
+    workspace_root = "~/.symphony-remote-failure-workspaces"
+    workspace_path = "/remote/home/.symphony-remote-failure-workspaces/MT-REMOTE-FAIL"
+    canonical_root = "/remote/home/.symphony-remote-failure-workspaces"
+    host_identity = "host-remote-failure"
+    host_identity_path = "/remote/home/.local/state/symphony/workspace-ownership/host.identity"
+
+    on_exit(fn ->
+      restore_env("PATH", previous_path)
+      restore_env("SYMP_TEST_SSH_TRACE", previous_trace)
+      File.rm_rf(test_root)
+    end)
+
+    File.mkdir_p!(test_root)
+    System.put_env("SYMP_TEST_SSH_TRACE", trace_file)
+    System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
+
+    File.write!(fake_ssh, """
+    #!/bin/sh
+    trace_file="${SYMP_TEST_SSH_TRACE}"
+    response_count_file="$trace_file.prepare-count"
+    printf 'ARGV:%s\\n' "$*" >> "$trace_file"
+
+    if printf '%s' "$*" | grep -q 'workspace_identity=-'; then
+      response_count=0
+      if [ -f "$response_count_file" ]; then response_count=$(cat "$response_count_file"); fi
+      response_count=$((response_count + 1))
+      printf '%s\\n' "$response_count" > "$response_count_file"
+      if [ "$response_count" -eq 1 ]; then
+        printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' '__SYMPHONY_WORKSPACE_PREPARE__' '0' '#{workspace_path}' '#{canonical_root}' '#{host_identity}' '1:2' '-' '#{host_identity_path}'
+      fi
+    elif printf '%s' "$*" | grep -q 'exit 17'; then
+      exit 17
+    elif printf '%s' "$*" | grep -q 'rm -rf --'; then
+      exit 0
+    elif printf '%s' "$*" | grep -q '__SYMPHONY_WORKSPACE_PREPARE__'; then
+      printf '%s\\t%s\\t%s\\t%s\\n' '__SYMPHONY_WORKSPACE_PREPARE__' '#{workspace_path}' '3:4' '1:2'
+    fi
+
+    exit 0
+    """)
+
+    File.chmod!(fake_ssh, 0o755)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      worker_ssh_hosts: ["worker-failure"],
+      hook_after_create: "exit 17"
+    )
+
+    issue = %Issue{id: "remote-hook-failure", identifier: "MT-REMOTE-FAIL", state: "In Progress"}
+    ledger = workspace_ownership_ledger()
+
+    assert {:error, {:workspace_hook_failed, "after_create", 17, _output}} =
+             Workspace.create_for_issue(issue, "worker-failure", ledger)
+
+    assert {:ok, [released]} = OwnershipLedger.list_for_work_item(ledger, issue.id)
+    assert released.state == :released
+  end
+
+  test "remote probe failures never authorize workspace creation or removal" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-remote-probe-failure-#{System.unique_integer([:positive])}")
+    trace_file = Path.join(test_root, "ssh.trace")
+    fake_ssh = Path.join(test_root, "ssh")
+    previous_path = System.get_env("PATH")
+    previous_trace = System.get_env("SYMP_TEST_SSH_TRACE")
+    worker_host = "worker-probe-failure"
+    workspace_root = "~/.symphony-probe-failure-workspaces"
+    canonical_root = "/remote/home/.symphony-probe-failure-workspaces"
+    issue = %Issue{id: "remote-probe-failure", identifier: "MT-REMOTE-PROBE-FAILURE"}
+    workspace_key = Workspace.workspace_key(issue.identifier)
+    workspace_path = Path.join(canonical_root, workspace_key)
+
+    on_exit(fn ->
+      restore_env("PATH", previous_path)
+      restore_env("SYMP_TEST_SSH_TRACE", previous_trace)
+      File.rm_rf(test_root)
+    end)
+
+    File.mkdir_p!(test_root)
+    System.put_env("SYMP_TEST_SSH_TRACE", trace_file)
+    System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
+    File.write!(fake_ssh, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$SYMP_TEST_SSH_TRACE\"\nprintf 'probe failed\\n'\nexit 42\n")
+    File.chmod!(fake_ssh, 0o755)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      worker_ssh_hosts: [worker_host]
+    )
+
+    ledger = workspace_ownership_ledger()
+
+    assert {:error, {:workspace_prepare_failed, ^worker_host, 42, output}} =
+             Workspace.create_for_issue(issue, worker_host, ledger)
+
+    assert output =~ "probe failed"
+    assert {:ok, []} = OwnershipLedger.list_for_work_item(ledger, issue.id)
+
+    malformed_issue = %{issue | id: "remote-malformed-probe", identifier: "MT-REMOTE-MALFORMED-PROBE"}
+    malformed_workspace_path = Path.join(canonical_root, Workspace.workspace_key(malformed_issue.identifier))
+
+    File.write!(fake_ssh, """
+    #!/bin/sh
+    printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' '__SYMPHONY_WORKSPACE_PREPARE__' '1' '#{malformed_workspace_path}' '#{canonical_root}' 'trusted-remote-host' '1:2' '-' '/remote/home/.local/state/symphony/workspace-ownership/host.identity'
+    """)
+
+    assert {:error, {:workspace_prepare_failed, :invalid_output, _output}} =
+             Workspace.create_for_issue(malformed_issue, worker_host, ledger)
+
+    assert {:ok, []} = OwnershipLedger.list_for_work_item(ledger, malformed_issue.id)
+
+    File.write!(fake_ssh, """
+    #!/bin/sh
+    printf '%s\\n' "$*" >> "$SYMP_TEST_SSH_TRACE"
+    printf 'probe failed\\n'
+    exit 42
+    """)
+
+    File.chmod!(fake_ssh, 0o755)
+
+    remote_record = %{
+      work_item_id: issue.id,
+      issue_identifier: issue.identifier,
+      workspace_key: workspace_key,
+      workspace_ownership_id: "remote-probe-failure-owned",
+      location: :remote,
+      worker_host: worker_host,
+      trusted_host_identity: "trusted-remote-host",
+      configured_root: workspace_root,
+      configured_root_identity: "1:2",
+      canonical_root: canonical_root,
+      canonical_workspace_path: workspace_path,
+      top_level_filesystem_identity: nil
+    }
+
+    assert {:ok, reserved} = OwnershipLedger.reserve_sync(ledger, remote_record)
+
+    assert {:ok, _provisioning} =
+             OwnershipLedger.transition_sync(
+               ledger,
+               reserved.workspace_ownership_id,
+               :provisioning,
+               top_level_filesystem_identity: "1:3"
+             )
+
+    assert {:ok, _owned} = OwnershipLedger.transition_sync(ledger, reserved.workspace_ownership_id, :owned)
+
+    assert {:error, {:workspace_remove_failed, ^worker_host, 42, output}} =
+             Workspace.remove_issue_workspaces(issue, worker_host, ledger, cleanup_authorized?: true)
+
+    assert output =~ "probe failed"
+    assert {:ok, [pending]} = OwnershipLedger.list_for_work_item(ledger, issue.id)
+    assert pending.state == :release_pending
+    trace = File.read!(trace_file)
+    assert trace =~ "workspace_identity=-"
+    assert trace =~ "rm -rf --"
+    {identity_guard_offset, _length} = List.last(:binary.matches(trace, "workspace_identity="))
+    {remove_offset, _length} = :binary.match(trace, "rm -rf --")
+    assert identity_guard_offset < remove_offset
+  end
+
+  test "remote failed-provision cleanup stays pending after an ambiguous SSH result" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-remote-cleanup-ambiguous-#{System.unique_integer([:positive])}")
+    trace_file = Path.join(test_root, "ssh.trace")
+    fake_ssh = Path.join(test_root, "ssh")
+    previous_path = System.get_env("PATH")
+    previous_trace = System.get_env("SYMP_TEST_SSH_TRACE")
+    previous_remove_failure = System.get_env("SYMP_TEST_REMOTE_REMOVE_FAIL")
+    worker_host = "worker-cleanup-ambiguous"
+    workspace_root = "~/.symphony-cleanup-ambiguous-workspaces"
+    canonical_root = "/remote/home/.symphony-cleanup-ambiguous-workspaces"
+    workspace_path = Path.join(canonical_root, "MT-REMOTE-CLEANUP-AMBIGUOUS")
+    host_identity = "host-remote-cleanup-ambiguous"
+    host_identity_path = "/remote/home/.local/state/symphony/workspace-ownership/host.identity"
+    issue = %Issue{id: "remote-cleanup-ambiguous", identifier: "MT-REMOTE-CLEANUP-AMBIGUOUS"}
+
+    on_exit(fn ->
+      restore_env("PATH", previous_path)
+      restore_env("SYMP_TEST_SSH_TRACE", previous_trace)
+      restore_env("SYMP_TEST_REMOTE_REMOVE_FAIL", previous_remove_failure)
+      File.rm_rf(test_root)
+    end)
+
+    File.mkdir_p!(test_root)
+    System.put_env("SYMP_TEST_SSH_TRACE", trace_file)
+    System.put_env("SYMP_TEST_REMOTE_REMOVE_FAIL", "1")
+    System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
+
+    File.write!(fake_ssh, """
+    #!/bin/sh
+    printf 'ARGV:%s\\n' "$*" >> "$SYMP_TEST_SSH_TRACE"
+
+    if printf '%s' "$*" | grep -q 'workspace_identity=-'; then
+      printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' '__SYMPHONY_WORKSPACE_PREPARE__' '0' '#{workspace_path}' '#{canonical_root}' '#{host_identity}' '1:2' '-' '#{host_identity_path}'
+    elif printf '%s' "$*" | grep -q 'exit 17'; then
+      printf 'bootstrap failed\\n'
+      exit 17
+    elif printf '%s' "$*" | grep -q 'rm -rf --'; then
+      if [ "${SYMP_TEST_REMOTE_REMOVE_FAIL:-0}" = 1 ]; then
+        printf 'remote result is ambiguous\\n'
+        exit 42
+      fi
+      exit 0
+    else
+      printf '%s\\t%s\\t%s\\t%s\\n' '__SYMPHONY_WORKSPACE_PREPARE__' '#{workspace_path}' '2:3' '1:2'
+    fi
+
+    exit 0
+    """)
+
+    File.chmod!(fake_ssh, 0o755)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      worker_ssh_hosts: [worker_host],
+      hook_after_create: "exit 17"
+    )
+
+    ledger = workspace_ownership_ledger()
+
+    assert {:error, {:after_create_cleanup_failed, hook_error, removal_error}} =
+             Workspace.create_for_issue(issue, worker_host, ledger)
+
+    assert {:workspace_hook_failed, "after_create", 17, _} = hook_error
+    assert {:workspace_remove_failed, ^worker_host, 42, output} = removal_error
+
+    assert output =~ "remote result is ambiguous"
+    assert {:ok, [pending]} = OwnershipLedger.list_for_work_item(ledger, issue.id)
+    assert pending.state == :release_pending
+    assert pending.release_origin == :failed_provisioning
+
+    assert {:error, :failed_provisioning_release_cannot_be_cancelled} =
+             Workspace.cancel_pending_release_if_current(pending, ledger)
+
+    System.put_env("SYMP_TEST_REMOTE_REMOVE_FAIL", "0")
+
+    assert {:ok, [^workspace_path]} =
+             Workspace.remove_recorded(workspace_path, worker_host, ledger, cleanup_authorized?: true)
+
+    assert {:ok, [released]} = OwnershipLedger.list_for_work_item(ledger, issue.id)
+    assert released.state == :released
+  end
+
+  test "remote mkdir ambiguity leaves a reservation that cannot adopt a later path" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-remote-mkdir-ambiguous-#{System.unique_integer([:positive])}")
+    trace_file = Path.join(test_root, "ssh.trace")
+    fake_ssh = Path.join(test_root, "ssh")
+    previous_path = System.get_env("PATH")
+    previous_trace = System.get_env("SYMP_TEST_SSH_TRACE")
+    worker_host = "worker-mkdir-ambiguous"
+    workspace_root = "~/.symphony-mkdir-ambiguous-workspaces"
+    canonical_root = "/remote/home/.symphony-mkdir-ambiguous-workspaces"
+    issue = %Issue{id: "remote-mkdir-ambiguous", identifier: "MT-REMOTE-MKDIR-AMBIGUOUS"}
+    workspace_path = Path.join(canonical_root, Workspace.workspace_key(issue.identifier))
+    host_identity = "host-remote-mkdir-ambiguous"
+    host_identity_path = "/remote/home/.local/state/symphony/workspace-ownership/host.identity"
+
+    on_exit(fn ->
+      restore_env("PATH", previous_path)
+      restore_env("SYMP_TEST_SSH_TRACE", previous_trace)
+      File.rm_rf(test_root)
+    end)
+
+    File.mkdir_p!(test_root)
+    System.put_env("SYMP_TEST_SSH_TRACE", trace_file)
+    System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
+
+    File.write!(fake_ssh, """
+    #!/bin/sh
+    trace_file="$SYMP_TEST_SSH_TRACE"
+    count_file="$trace_file.probes"
+    printf 'ARGV:%s\\n' "$*" >> "$trace_file"
+
+    if printf '%s' "$*" | grep -q 'workspace_identity=-'; then
+      count=0
+      if [ -f "$count_file" ]; then count=$(cat "$count_file"); fi
+      count=$((count + 1))
+      printf '%s\\n' "$count" > "$count_file"
+      if [ "$count" -eq 1 ]; then
+        printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' '__SYMPHONY_WORKSPACE_PREPARE__' '0' '#{workspace_path}' '#{canonical_root}' '#{host_identity}' '1:2' '-' '#{host_identity_path}'
+      else
+        printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' '__SYMPHONY_WORKSPACE_PREPARE__' '1' '#{workspace_path}' '#{canonical_root}' '#{host_identity}' '1:2' '2:3' '#{host_identity_path}'
+      fi
+    elif printf '%s' "$*" | grep -q 'mkdir "\\$workspace"'; then
+      printf 'mkdir outcome unknown\\n'
+      exit 42
+    fi
+
+    exit 0
+    """)
+
+    File.chmod!(fake_ssh, 0o755)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      worker_ssh_hosts: [worker_host]
+    )
+
+    ledger = workspace_ownership_ledger()
+
+    assert {:error, {:workspace_prepare_failed, ^worker_host, 42, output}} =
+             Workspace.create_for_issue(issue, worker_host, ledger)
+
+    assert output =~ "mkdir outcome unknown"
+    assert {:ok, [reserved]} = OwnershipLedger.list_for_work_item(ledger, issue.id)
+    assert reserved.state == :reserved
+
+    assert {:error, {:workspace_ownership_required, ^workspace_path}} =
+             Workspace.create_for_issue(issue, worker_host, ledger)
+
+    assert {:ok, [still_reserved]} = OwnershipLedger.list_for_work_item(ledger, issue.id)
+    assert still_reserved.workspace_ownership_id == reserved.workspace_ownership_id
+    assert still_reserved.state == :reserved
+  end
+
+  test "remote post-create identity drift leaves the workspace provisioning" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-remote-owned-mismatch-#{System.unique_integer([:positive])}")
+    trace_file = Path.join(test_root, "ssh.trace")
+    fake_ssh = Path.join(test_root, "ssh")
+    previous_path = System.get_env("PATH")
+    previous_trace = System.get_env("SYMP_TEST_SSH_TRACE")
+    worker_host = "worker-post-create-mismatch"
+    workspace_root = "~/.symphony-post-create-mismatch-workspaces"
+    canonical_root = "/remote/home/.symphony-post-create-mismatch-workspaces"
+    issue = %Issue{id: "remote-post-create-mismatch", identifier: "MT-REMOTE-POST-CREATE-MISMATCH"}
+    workspace_path = Path.join(canonical_root, Workspace.workspace_key(issue.identifier))
+    host_identity = "host-remote-post-create-mismatch"
+    host_identity_path = "/remote/home/.local/state/symphony/workspace-ownership/host.identity"
+
+    on_exit(fn ->
+      restore_env("PATH", previous_path)
+      restore_env("SYMP_TEST_SSH_TRACE", previous_trace)
+      File.rm_rf(test_root)
+    end)
+
+    File.mkdir_p!(test_root)
+    System.put_env("SYMP_TEST_SSH_TRACE", trace_file)
+    System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
+
+    File.write!(fake_ssh, """
+    #!/bin/sh
+    trace_file="$SYMP_TEST_SSH_TRACE"
+    count_file="$trace_file.probes"
+    printf 'ARGV:%s\\n' "$*" >> "$trace_file"
+
+    if printf '%s' "$*" | grep -q 'workspace_identity=-'; then
+      count=0
+      if [ -f "$count_file" ]; then count=$(cat "$count_file"); fi
+      count=$((count + 1))
+      printf '%s\\n' "$count" > "$count_file"
+      if [ "$count" -eq 1 ]; then
+        printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' '__SYMPHONY_WORKSPACE_PREPARE__' '0' '#{workspace_path}' '#{canonical_root}' '#{host_identity}' '1:2' '-' '#{host_identity_path}'
+      else
+        printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' '__SYMPHONY_WORKSPACE_PREPARE__' '1' '#{workspace_path}' '#{canonical_root}' '#{host_identity}' '1:2' '9:9' '#{host_identity_path}'
+      fi
+    elif printf '%s' "$*" | grep -q 'mkdir "\\$workspace"'; then
+      printf '%s\\t%s\\t%s\\t%s\\n' '__SYMPHONY_WORKSPACE_PREPARE__' '#{workspace_path}' '2:3' '1:2'
+    fi
+
+    exit 0
+    """)
+
+    File.chmod!(fake_ssh, 0o755)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      worker_ssh_hosts: [worker_host]
+    )
+
+    ledger = workspace_ownership_ledger()
+
+    assert {:error, {:owned_identity_mismatch, {:workspace_identity_mismatch, ^workspace_path}}} =
+             Workspace.create_for_issue(issue, worker_host, ledger)
+
+    assert {:ok, [provisioning]} = OwnershipLedger.list_for_work_item(ledger, issue.id)
+    assert provisioning.state == :provisioning
+    assert provisioning.top_level_filesystem_identity == "2:3"
+  end
+
+  test "remote workspace hook timeout is returned to the caller" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-remote-hook-timeout-#{System.unique_integer([:positive])}")
+    fake_ssh = Path.join(test_root, "ssh")
+    previous_path = System.get_env("PATH")
+    worker_host = "worker-hook-timeout"
+
+    on_exit(fn ->
+      restore_env("PATH", previous_path)
+      File.rm_rf(test_root)
+    end)
+
+    File.mkdir_p!(test_root)
+    System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
+    File.write!(fake_ssh, "#!/bin/sh\nsleep 1\nexit 0\n")
+    File.chmod!(fake_ssh, 0o755)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      agent_routing: "legacy",
+      worker_ssh_hosts: [worker_host],
+      hook_before_run: "echo before-run",
+      hook_timeout_ms: 1
+    )
+
+    assert {:error, {:workspace_hook_timeout, "before_run", 1}} =
+             Workspace.run_before_run_hook("/remote/workspace", "MT-TIMEOUT", worker_host)
+  end
+
+  test "routed mode skips workspace shell hooks on local and remote workers" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      agent_routing: "routed",
+      hook_before_run: "exit 41"
+    )
+
+    assert :ok = Workspace.run_before_run_hook("/local/workspace", "MT-ROUTED-HOOK")
+
+    assert capture_log([level: :info], fn ->
+             assert :ok = Workspace.run_before_run_hook("/remote/workspace", "MT-ROUTED-HOOK", "worker-routed")
+           end) =~ "Skipping workspace hook in routed mode"
+  end
+
+  test "local workspace hook timeout is returned to the caller" do
+    workspace = Path.join(System.tmp_dir!(), "symphony-local-hook-timeout-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(workspace)
+
+    on_exit(fn -> File.rm_rf(workspace) end)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      agent_routing: "legacy",
+      hook_before_run: "sleep 1",
+      hook_timeout_ms: 1
+    )
+
+    assert {:error, {:workspace_hook_timeout, "before_run", 1}} =
+             Workspace.run_before_run_hook(workspace, "MT-LOCAL-TIMEOUT")
+  end
+
+  test "remote workspace hook reports SSH setup failures" do
+    previous_path = System.get_env("PATH")
+
+    on_exit(fn -> restore_env("PATH", previous_path) end)
+    System.put_env("PATH", "")
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      agent_routing: "legacy",
+      hook_before_run: "echo before-run",
+      hook_timeout_ms: 1_000
+    )
+
+    assert {:error, :ssh_not_found} =
+             Workspace.run_before_run_hook("/remote/workspace", "MT-SSH-SETUP-FAILURE", "worker-missing-ssh")
+  end
+
+  test "workspace removal defaults to denied and rejects invalid worker hosts" do
+    assert {:error, :workspace_cleanup_authorization_required} =
+             Workspace.remove_issue_workspaces("MT-UNAUTHORIZED-REMOVE")
+
+    assert {:error, :invalid_worker_host} =
+             Workspace.remove_issue_workspaces("MT-INVALID-HOST", 42, [])
+  end
+
+  test "remote workspace removal rejects an empty workspace path before probing the host" do
+    assert {:error, {:workspace_path_unreadable, "", :invalid}, ""} =
+             Workspace.remove_recorded("", "worker-empty-path", workspace_ownership_ledger(), cleanup_authorized?: true)
   end
 end

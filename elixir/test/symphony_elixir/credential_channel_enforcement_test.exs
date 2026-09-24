@@ -348,12 +348,9 @@ defmodule SymphonyElixir.CredentialChannelEnforcementTest do
       hook_before_remove: "echo #{marker}"
     )
 
-    assert {:ok, []} = Workspace.remove(workspace_path, "worker-01:2200")
+    assert {:error, _reason, ""} = Workspace.remove(workspace_path, "worker-01:2200")
 
-    trace = File.read!(trace_file)
-    refute trace =~ marker
-    assert trace =~ "rm -rf"
-    assert trace =~ workspace_path
+    refute File.exists?(trace_file)
   end
 
   test "routed mode skips post-agent workspace shell hooks instead of executing host commands" do

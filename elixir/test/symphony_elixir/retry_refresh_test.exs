@@ -45,24 +45,26 @@ defmodule SymphonyElixir.RetryRefreshTest do
 
     Application.put_env(:symphony_elixir, :memory_tracker_issues, issues)
 
-    state = %Orchestrator.State{
-      poll_interval_ms: 60_000,
-      max_concurrent_agents: 10,
-      agent_runner: RetryRefreshRunner,
-      claimed: MapSet.new(["probe"]),
-      attempt_counters: %{"probe" => counters},
-      retry_attempts: %{
-        "probe" => %{
-          attempt: 1,
-          retry_token: token,
-          responsibility: "review",
-          profile_name: "reviewer",
-          delay_type: :continuation
-        }
-      },
-      dependency_graph: Graph.build(issues),
-      work_control: trusted_work_control(issues)
-    }
+    state =
+      %Orchestrator.State{
+        poll_interval_ms: 60_000,
+        max_concurrent_agents: 10,
+        agent_runner: RetryRefreshRunner,
+        claimed: MapSet.new(["probe"]),
+        attempt_counters: %{"probe" => counters},
+        retry_attempts: %{
+          "probe" => %{
+            attempt: 1,
+            retry_token: token,
+            responsibility: "review",
+            profile_name: "reviewer",
+            delay_type: :continuation
+          }
+        },
+        dependency_graph: Graph.build(issues),
+        work_control: trusted_work_control(issues)
+      }
+      |> Map.merge(workspace_ownership_state())
 
     {state, token}
   end

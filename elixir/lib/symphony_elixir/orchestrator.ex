@@ -8,7 +8,8 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, TransitionCoordinator, Workspace}
+  alias SymphonyElixir.{AgentRunner, Config, PathSafety, StatusDashboard, Tracker, TransitionCoordinator, Workspace}
+  alias SymphonyElixir.Workspace.OwnershipLedger
 
   alias SymphonyElixir.AgentRuntime.{
     AttemptLedger,
@@ -139,6 +140,9 @@ defmodule SymphonyElixir.Orchestrator do
       recovery_ledger_status: :disabled,
       recovery_ledger_opts: [],
       recovery_checkpoints: %{},
+      workspace_ownership_ledger: nil,
+      workspace_ownership_ledger_status: :blocked,
+      workspace_ownership_ledger_opts: [],
       startup_cleanup_ran?: false,
       transition_reconciliation_candidates: [],
       work_control: %{},
@@ -180,7 +184,7 @@ defmodule SymphonyElixir.Orchestrator do
 
         state = initialize_attempt_ledger(state, config, opts)
         state = initialize_recovery_ledger(state, config, opts)
-        state = maybe_cleanup_legacy_startup_workspaces(state, config.agent.routing)
+        state = initialize_workspace_ownership_ledger(state, config, opts)
 
         state =
           if Keyword.get(opts, :start_quiesced, false) do
@@ -196,25 +200,13 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp startup_reconciliation_initial_state("legacy"), do: :ready
   defp startup_reconciliation_initial_state(_routing), do: :pending
-
-  defp maybe_cleanup_legacy_startup_workspaces(%State{} = state, "legacy") do
-    if autonomous_dispatch_allowed?(state) do
-      run_terminal_workspace_cleanup()
-      %{state | startup_cleanup_ran?: true}
-    else
-      Logger.error("Autonomous dispatch is held: #{inspect(ledger_block_reason(state))}")
-      state
-    end
-  end
-
-  defp maybe_cleanup_legacy_startup_workspaces(%State{} = state, _routing), do: state
 
   @impl true
   def terminate(_reason, %State{} = state) do
     close_attempt_ledger(state.attempt_ledger)
     close_recovery_ledger(state.recovery_ledger)
+    close_workspace_ownership_ledger(state.workspace_ownership_ledger)
     :ok
   end
 
@@ -298,6 +290,175 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp initialize_workspace_ownership_ledger(%State{} = state, config, opts) do
+    project_id = workspace_ownership_project_id(config)
+    tracker_identity = Tracker.identity(config.tracker)
+
+    ledger_opts =
+      opts
+      |> workspace_ownership_ledger_options()
+      |> Keyword.put(:workspace_root, Config.local_workspace_root())
+
+    case open_workspace_ownership_ledger(opts, project_id, tracker_identity, ledger_opts) do
+      {:ok, %OwnershipLedger{} = ledger} ->
+        validate_workspace_ownership_ledger(state, ledger, ledger_opts)
+
+      {:error, reason} ->
+        block_workspace_ownership_ledger(state, ledger_opts, reason)
+    end
+  end
+
+  defp synchronize_workspace_ownership_ledger_config(%State{} = state, config) do
+    project_id = workspace_ownership_project_id(config)
+    tracker_identity = Tracker.identity(config.tracker)
+    current_root = Config.local_workspace_root()
+    previous_opts = state.workspace_ownership_ledger_opts
+    previous_root = Keyword.get(previous_opts, :workspace_root)
+
+    cond do
+      is_binary(previous_root) and previous_root != current_root ->
+        block_workspace_ownership_root_change(state, previous_root, current_root)
+
+      workspace_ownership_ledger_binding_matches?(
+        state.workspace_ownership_ledger,
+        project_id,
+        tracker_identity,
+        previous_opts
+      ) ->
+        %{state | workspace_ownership_ledger_opts: previous_opts}
+
+      true ->
+        reopen_workspace_ownership_ledger(state, project_id, tracker_identity, current_root)
+    end
+  end
+
+  defp workspace_ownership_ledger_binding_matches?(
+         %OwnershipLedger{} = ledger,
+         project_id,
+         tracker_identity,
+         ledger_opts
+       ) do
+    ledger.project_id == project_id and
+      ledger.tracker_identity == tracker_identity and
+      ledger.path == OwnershipLedger.path_for(project_id, ledger_opts) and
+      ledger.host_identity_path == OwnershipLedger.host_identity_path(ledger_opts)
+  end
+
+  defp workspace_ownership_ledger_binding_matches?(_ledger, _project_id, _tracker_identity, _ledger_opts),
+    do: false
+
+  defp block_workspace_ownership_root_change(%State{} = state, previous_root, current_root) do
+    close_result = close_workspace_ownership_ledger(state.workspace_ownership_ledger)
+
+    reason =
+      case close_result do
+        :ok -> {:workspace_root_changed, previous_root, current_root}
+        {:error, close_reason} -> {:workspace_root_changed, previous_root, current_root, close_reason}
+      end
+
+    Logger.error("Workspace ownership ledger blocked after workspace root change: #{inspect(reason)}")
+
+    %{
+      state
+      | workspace_ownership_ledger: nil,
+        workspace_ownership_ledger_status: {:blocked, {:workspace_ownership_ledger_unavailable, reason}},
+        startup_reconciliation: :pending
+    }
+  end
+
+  defp reopen_workspace_ownership_ledger(%State{} = state, project_id, tracker_identity, current_root) do
+    ledger_opts = Keyword.put(state.workspace_ownership_ledger_opts, :workspace_root, current_root)
+    close_result = close_workspace_ownership_ledger(state.workspace_ownership_ledger)
+
+    case close_result do
+      :ok ->
+        case OwnershipLedger.open(project_id, tracker_identity, ledger_opts) do
+          {:ok, %OwnershipLedger{} = ledger} ->
+            state
+            |> validate_workspace_ownership_ledger(ledger, ledger_opts)
+            |> Map.put(:startup_reconciliation, :pending)
+
+          {:error, reason} ->
+            state
+            |> block_workspace_ownership_ledger(ledger_opts, reason)
+            |> Map.put(:startup_reconciliation, :pending)
+        end
+
+      {:error, reason} ->
+        state
+        |> block_workspace_ownership_ledger(ledger_opts, {:workspace_ownership_ledger_close_failed, reason})
+        |> Map.put(:startup_reconciliation, :pending)
+    end
+  end
+
+  defp open_workspace_ownership_ledger(opts, project_id, tracker_identity, ledger_opts) do
+    case Keyword.get(opts, :workspace_ownership_ledger) do
+      %OwnershipLedger{} = ledger ->
+        {:ok, ledger}
+
+      nil when is_binary(project_id) and project_id != "" ->
+        OwnershipLedger.open(project_id, tracker_identity, ledger_opts)
+
+      nil ->
+        {:error, :missing_symphony_project_id}
+
+      _invalid ->
+        {:error, :invalid_workspace_ownership_ledger}
+    end
+  end
+
+  defp validate_workspace_ownership_ledger(%State{} = state, %OwnershipLedger{} = ledger, ledger_opts) do
+    case OwnershipLedger.list(ledger) do
+      {:ok, _records} ->
+        %{
+          state
+          | workspace_ownership_ledger: ledger,
+            workspace_ownership_ledger_status: :ready,
+            workspace_ownership_ledger_opts: ledger_opts
+        }
+
+      {:error, reason} ->
+        Logger.error("Workspace ownership ledger validation failed: #{inspect(reason)}")
+        _ = OwnershipLedger.close(ledger)
+        blocked_workspace_ownership_ledger_state(state, ledger_opts, reason)
+    end
+  end
+
+  defp block_workspace_ownership_ledger(%State{} = state, ledger_opts, reason) do
+    Logger.error("Workspace ownership ledger is unavailable: #{inspect(reason)}")
+    blocked_workspace_ownership_ledger_state(state, ledger_opts, reason)
+  end
+
+  defp blocked_workspace_ownership_ledger_state(%State{} = state, ledger_opts, reason) do
+    %{
+      state
+      | workspace_ownership_ledger: nil,
+        workspace_ownership_ledger_status: {:blocked, {:workspace_ownership_ledger_unavailable, reason}},
+        workspace_ownership_ledger_opts: ledger_opts
+    }
+  end
+
+  defp workspace_ownership_project_id(%{agent: %{routing: "legacy"}, symphony: %{project_id: project_id}})
+       when is_binary(project_id) and project_id != "",
+       do: project_id
+
+  defp workspace_ownership_project_id(%{agent: %{routing: "legacy"}}), do: "legacy-default"
+
+  defp workspace_ownership_project_id(%{symphony: %{project_id: project_id}}), do: project_id
+
+  defp workspace_ownership_ledger_options(opts) do
+    ledger_opts = Keyword.get(opts, :workspace_ownership_ledger_opts, [])
+
+    if Keyword.has_key?(ledger_opts, :path) or Keyword.has_key?(ledger_opts, :root) do
+      ledger_opts
+    else
+      case Application.get_env(:symphony_elixir, :attempt_ledger_root) do
+        root when is_binary(root) -> Keyword.put(ledger_opts, :root, Path.join(root, "workspace-ownership"))
+        _unset -> ledger_opts
+      end
+    end
+  end
+
   defp recovery_ledger_options(opts) do
     ledger_opts = Keyword.get(opts, :recovery_ledger_opts, [])
 
@@ -326,6 +487,19 @@ defmodule SymphonyElixir.Orchestrator do
     case RecoveryLedger.close(ledger) do
       :ok -> :ok
       {:error, reason} -> Logger.error("Failed to close work-control recovery ledger: #{inspect(reason)}")
+    end
+  end
+
+  defp close_workspace_ownership_ledger(nil), do: :ok
+
+  defp close_workspace_ownership_ledger(%OwnershipLedger{} = ledger) do
+    case OwnershipLedger.close(ledger) do
+      :ok ->
+        :ok
+
+      {:error, reason} = error ->
+        Logger.error("Failed to close workspace ownership ledger: #{inspect(reason)}")
+        error
     end
   end
 
@@ -636,6 +810,8 @@ defmodule SymphonyElixir.Orchestrator do
        when attempt_status in [:disabled, :ready] do
     state.startup_reconciliation == :ready and
       state.recovery_ledger_status in [:disabled, :ready] and
+      state.workspace_ownership_ledger_status == :ready and
+      match?(%OwnershipLedger{}, state.workspace_ownership_ledger) and
       not ProjectContractEvidence.reconciliation_required?(state.project_contract_evidence)
   end
 
@@ -1180,21 +1356,38 @@ defmodule SymphonyElixir.Orchestrator do
 
     case do_reconcile_startup(state) do
       {:ok, %State{} = ready_state} ->
-        ready_state = %{ready_state | startup_reconciliation: :ready}
-
-        ready_state =
-          if ready_state.startup_cleanup_ran? do
-            ready_state
-          else
-            run_terminal_workspace_cleanup()
-            %{ready_state | startup_cleanup_ran?: true}
-          end
-
-        reschedule_pending_retries(ready_state)
+        finish_startup_reconciliation(ready_state)
 
       {:blocked, %State{} = blocked_state, reason} ->
         Logger.warning("Startup reconciliation is blocked: #{inspect(reason)}")
         %{blocked_state | startup_reconciliation: {:blocked, reason}}
+    end
+  end
+
+  defp finish_startup_reconciliation(%State{} = state) do
+    state
+    |> Map.put(:startup_reconciliation, :ready)
+    |> reconcile_pending_workspace_releases()
+    |> maybe_run_startup_workspace_cleanup()
+    |> reschedule_pending_retries()
+  end
+
+  defp maybe_run_startup_workspace_cleanup(%State{} = state) do
+    if state.startup_reconciliation != :ready or state.startup_cleanup_ran? do
+      state
+    else
+      complete_startup_workspace_cleanup(state)
+    end
+  end
+
+  defp complete_startup_workspace_cleanup(%State{} = state) do
+    case run_terminal_workspace_cleanup(state) do
+      :ok ->
+        %{state | startup_cleanup_ran?: true}
+
+      {:error, reason} ->
+        Logger.error("Startup terminal workspace cleanup remains pending: #{inspect(reason)}")
+        %{state | startup_reconciliation: :pending, startup_cleanup_ran?: false}
     end
   end
 
@@ -1241,28 +1434,57 @@ defmodule SymphonyElixir.Orchestrator do
   defp reload_attempt_ledger_records(%State{attempt_ledger_status: :disabled} = state, %{agent: %{routing: "legacy"}}),
     do: {:ok, state}
 
-  defp reload_attempt_ledger_records(%State{attempt_ledger: %AttemptLedger{} = ledger} = state, _config) do
-    case resync_attempt_ledger_if_needed(state, ledger) do
-      {:ok, state} ->
-        case AttemptLedger.open_lineages(ledger) do
-          {:ok, records} ->
-            restored = restore_durable_lineages(state, records)
-            {:ok, %{restored | attempt_ledger_status: :ready}}
+  defp reload_attempt_ledger_records(%State{attempt_ledger: %AttemptLedger{} = ledger} = state, config) do
+    case attempt_ledger_identity_mismatch(ledger, config) do
+      nil ->
+        reload_matching_attempt_ledger(state, ledger)
 
-          {:error, reason} ->
-            blocked_reason = {:attempt_ledger_unavailable, reason}
-            blocked_state = %{state | attempt_ledger_status: {:blocked, blocked_reason}}
-            {:blocked, blocked_state, blocked_reason}
-        end
-
-      {:error, state, reason} ->
-        {:blocked, state, reason}
+      mismatch ->
+        blocked_reason = {:attempt_ledger_unavailable, mismatch}
+        blocked_state = %{state | attempt_ledger_status: {:blocked, blocked_reason}}
+        {:blocked, blocked_state, blocked_reason}
     end
   end
 
   defp reload_attempt_ledger_records(%State{} = state, _config) do
     reason = ledger_block_reason(state) || :missing_ledger_handle
     {:blocked, state, reason}
+  end
+
+  defp reload_matching_attempt_ledger(%State{} = state, %AttemptLedger{} = ledger) do
+    case resync_attempt_ledger_if_needed(state, ledger) do
+      {:ok, state} -> reload_attempt_ledger_lineages(state, ledger)
+      {:error, state, reason} -> {:blocked, state, reason}
+    end
+  end
+
+  defp reload_attempt_ledger_lineages(%State{} = state, %AttemptLedger{} = ledger) do
+    case AttemptLedger.open_lineages(ledger) do
+      {:ok, records} ->
+        restored = restore_durable_lineages(state, records)
+        {:ok, %{restored | attempt_ledger_status: :ready}}
+
+      {:error, reason} ->
+        blocked_reason = {:attempt_ledger_unavailable, reason}
+        blocked_state = %{state | attempt_ledger_status: {:blocked, blocked_reason}}
+        {:blocked, blocked_state, blocked_reason}
+    end
+  end
+
+  defp attempt_ledger_identity_mismatch(%AttemptLedger{} = ledger, config) do
+    project_id = config.symphony.project_id
+    tracker_identity = Tracker.identity(config.tracker)
+
+    cond do
+      ledger.project_id != project_id ->
+        {:ledger_project_namespace_mismatch, ledger.project_id, project_id}
+
+      ledger.tracker_identity != tracker_identity ->
+        {:ledger_tracker_identity_mismatch, ledger.tracker_identity, tracker_identity}
+
+      true ->
+        nil
+    end
   end
 
   defp resync_attempt_ledger_if_needed(
@@ -1881,7 +2103,8 @@ defmodule SymphonyElixir.Orchestrator do
     routed? = Config.settings!().agent.routing == "routed"
 
     with :ok <- attempt_store_ready(state, routed?),
-         :ok <- recovery_store_ready(state, routed?) do
+         :ok <- recovery_store_ready(state, routed?),
+         :ok <- workspace_ownership_store_ready(state) do
       {:ok, state}
     else
       {:error, reason} ->
@@ -1914,6 +2137,20 @@ defmodule SymphonyElixir.Orchestrator do
         {:error, {:recovery_ledger_unavailable, state.recovery_ledger_status}}
     end
   end
+
+  defp workspace_ownership_store_ready(%State{} = state) do
+    if workspace_dispatchable?(state) do
+      :ok
+    else
+      {:error, workspace_ownership_ledger_block_reason(state)}
+    end
+  end
+
+  defp workspace_ownership_ledger_block_reason(%State{workspace_ownership_ledger_status: {:blocked, reason}}),
+    do: {:workspace_ownership_ledger_unavailable, reason}
+
+  defp workspace_ownership_ledger_block_reason(%State{}),
+    do: {:workspace_ownership_ledger_unavailable, :missing_ledger_handle}
 
   defp maybe_reconcile_blocked_ledger(%State{} = state, reason) do
     with true <- retryable_ledger_reconciliation_reason?(reason),
@@ -1981,6 +2218,7 @@ defmodule SymphonyElixir.Orchestrator do
       |> refresh_dependency_state_for_reconciliation()
       |> reconcile_running_issues()
       |> reconcile_blocked_issues()
+      |> reconcile_pending_workspace_releases()
 
     dispatch_ready_if_allowed(state)
   end
@@ -2377,6 +2615,7 @@ defmodule SymphonyElixir.Orchestrator do
       terminal_issue_state?(issue.state, terminal_states) ->
         Logger.info("Issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; stopping active agent")
 
+        state = refresh_running_issue_entry(state, issue)
         terminate_running_issue(state, issue.id, true, tracker_terminal_teardown_reason(issue, state))
 
       routed_lifecycle_suspended?(issue, state) ->
@@ -2407,6 +2646,16 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp reconcile_issue_state(_issue, state, _active_states, _terminal_states), do: state
 
+  defp refresh_running_issue_entry(%State{} = state, %Issue{} = issue) do
+    case Map.get(state.running, issue.id) do
+      running_entry when is_map(running_entry) ->
+        %{state | running: Map.put(state.running, issue.id, Map.put(running_entry, :issue, issue))}
+
+      _missing_entry ->
+        state
+    end
+  end
+
   defp reconcile_blocked_issue_states([], state, _active_states, _terminal_states), do: state
 
   defp reconcile_blocked_issue_states([issue | rest], state, active_states, terminal_states) do
@@ -2422,15 +2671,34 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp reconcile_blocked_issue_state(%Issue{} = issue, state, active_states, terminal_states) do
-    cond do
-      terminal_issue_state?(issue.state, terminal_states) ->
-        Logger.info("Blocked issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; releasing block")
-        cleanup_issue_workspace(issue, Map.get(state.blocked, issue.id, %{}))
+    if terminal_issue_state?(issue.state, terminal_states) do
+      reconcile_terminal_blocked_issue_state(issue, state)
+    else
+      reconcile_nonterminal_blocked_issue_state(issue, state, active_states)
+    end
+  end
 
+  defp reconcile_blocked_issue_state(_issue, state, _active_states, _terminal_states), do: state
+
+  defp reconcile_terminal_blocked_issue_state(issue, state) do
+    Logger.info("Blocked issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; releasing block")
+
+    blocked_entry = Map.get(state.blocked, issue.id, %{})
+
+    case cleanup_issue_workspace(state, issue, Map.get(blocked_entry, :worker_host)) do
+      :ok ->
         state
         |> release_issue_claim(issue.id)
         |> reset_attempt_counters(issue.id)
 
+      {:error, reason} ->
+        Logger.error("Blocked terminal workspace cleanup remains pending for #{issue_context(issue)}: #{inspect(reason)}")
+        state
+    end
+  end
+
+  defp reconcile_nonterminal_blocked_issue_state(issue, state, active_states) do
+    cond do
       routed_lifecycle_suspended?(issue, state) ->
         Logger.info("Retaining blocked issue after unsafe lifecycle observation for #{issue_context(issue)}")
         retain_blocked_issue(state, issue)
@@ -2454,8 +2722,6 @@ defmodule SymphonyElixir.Orchestrator do
         release_issue_claim(state, issue.id)
     end
   end
-
-  defp reconcile_blocked_issue_state(_issue, state, _active_states, _terminal_states), do: state
 
   defp routed_lifecycle_suspended?(%Issue{id: issue_id}, %State{} = state)
        when is_binary(issue_id) do
@@ -2761,7 +3027,7 @@ defmodule SymphonyElixir.Orchestrator do
          running_entry,
          pid,
          ref,
-         identifier,
+         _identifier,
          cleanup_workspace,
          termination_reason
        ) do
@@ -2769,13 +3035,32 @@ defmodule SymphonyElixir.Orchestrator do
     state = record_recent_attempt(state, issue_id, running_entry, termination_reason)
     stop_running_task(pid, ref, state.task_supervisor)
 
-    if cleanup_workspace do
-      cleanup_issue_workspace(Map.get(running_entry, :issue, identifier), running_entry)
-    end
+    if cleanup_workspace and terminal_cleanup_termination?(termination_reason),
+      do: cleanup_terminalized_running_workspace(state, running_entry, issue_id)
 
     state = pop_running_issue_maps(state, issue_id)
 
     if cleanup_workspace, do: reset_attempt_counters(state, issue_id), else: state
+  end
+
+  defp cleanup_terminalized_running_workspace(state, running_entry, issue_id) do
+    case Map.get(running_entry, :issue) do
+      %Issue{} = issue ->
+        cleanup_terminal_workspace(state, issue, Map.get(running_entry, :worker_host))
+
+      _missing_issue ->
+        Logger.error("Skipping terminal workspace cleanup for issue_id=#{issue_id}: current issue identity is unavailable")
+    end
+  end
+
+  defp cleanup_terminal_workspace(state, issue, worker_host) do
+    case cleanup_issue_workspace(state, issue, worker_host) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.error("Terminal workspace cleanup remains pending for #{issue_context(issue)}: #{inspect(reason)}")
+    end
   end
 
   defp pop_running_issue_maps(%State{} = state, issue_id) do
@@ -2795,6 +3080,9 @@ defmodule SymphonyElixir.Orchestrator do
       :terminal_cancelled
     end
   end
+
+  defp terminal_cleanup_termination?(termination_reason),
+    do: termination_reason in [:terminal_completed, :terminal_cancelled]
 
   defp successful_runtime_completion_observation?(%Issue{} = issue, %State{} = state) do
     case Map.get(state.work_control, issue.id) do
@@ -4425,16 +4713,26 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp do_dispatch_issue(%State{} = state, issue, route, attempt, preferred_worker_host) do
-    recipient = self()
+    if workspace_dispatchable?(state) do
+      recipient = self()
 
-    case select_worker_host(state, preferred_worker_host) do
-      :no_worker_capacity ->
-        Logger.debug("No SSH worker slots available for #{issue_context(issue)} preferred_worker_host=#{inspect(preferred_worker_host)}")
-        state
+      case select_worker_host(state, preferred_worker_host) do
+        :no_worker_capacity ->
+          Logger.debug("No SSH worker slots available for #{issue_context(issue)} preferred_worker_host=#{inspect(preferred_worker_host)}")
+          state
 
-      worker_host ->
-        spawn_issue_on_worker_host(state, issue, route, attempt, recipient, worker_host)
+        worker_host ->
+          spawn_issue_on_worker_host(state, issue, route, attempt, recipient, worker_host)
+      end
+    else
+      Logger.error("Skipping workspace-backed dispatch because workspace ownership ledger is unavailable for #{issue_context(issue)}")
+      state
     end
+  end
+
+  defp workspace_dispatchable?(%State{} = state) do
+    state.workspace_ownership_ledger_status == :ready and
+      match?(%OwnershipLedger{}, state.workspace_ownership_ledger)
   end
 
   defp spawn_issue_on_worker_host(%State{} = state, issue, route, attempt, recipient, worker_host) do
@@ -4548,6 +4846,7 @@ defmodule SymphonyElixir.Orchestrator do
              work_item: work_item,
              work_control: state.work_control,
              dependency_decision: Map.get(state.dependency_diagnostics, issue.id),
+             ownership_ledger: state.workspace_ownership_ledger,
              runtime_attempt_identity: runtime_attempt_identity
            )
          end) do
@@ -5190,9 +5489,7 @@ defmodule SymphonyElixir.Orchestrator do
 
     cond do
       terminal_issue_state?(issue.state, terminal_states) ->
-        Logger.info("Issue state is terminal: issue_id=#{issue_id} issue_identifier=#{issue.identifier} state=#{issue.state}; removing associated workspace")
-
-        cleanup_issue_workspace(issue, metadata)
+        Logger.info("Issue state is terminal: issue_id=#{issue_id} issue_identifier=#{issue.identifier} state=#{issue.state}; preserving workspace during retry teardown")
 
         state =
           state
@@ -5253,44 +5550,367 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp cleanup_issue_workspace(identifier, worker_host \\ nil)
+  defp cleanup_issue_workspace(%State{} = state, %Issue{} = issue, worker_host) do
+    cond do
+      not terminal_cleanup_authorized?(state, issue) ->
+        Logger.info("Preserving workspace for #{issue_context(issue)} because terminal cleanup is not authorized")
+        :ok
 
-  defp cleanup_issue_workspace(issue_or_identifier, metadata) when is_map(metadata) do
-    case Map.get(metadata, :workspace_path) do
-      workspace_path when is_binary(workspace_path) and workspace_path != "" ->
-        Workspace.remove_recorded(workspace_path, Map.get(metadata, :worker_host))
+      not workspace_dispatchable?(state) ->
+        Logger.error("Skipping terminal workspace cleanup for #{issue_context(issue)} because workspace ownership ledger is unavailable")
+        {:error, :workspace_ownership_ledger_unavailable}
 
-      _ ->
-        cleanup_issue_workspace(issue_or_identifier, Map.get(metadata, :worker_host))
+      true ->
+        case Workspace.remove_issue_workspaces(
+               issue,
+               worker_host,
+               state.workspace_ownership_ledger,
+               cleanup_authorized: true
+             ) do
+          :ok ->
+            :ok
+
+          {:error, :workspace_ownership_not_found} ->
+            Logger.info("Preserving unowned workspace for #{issue_context(issue)} because no trusted ownership record exists")
+
+            :ok
+
+          {:error, reason} ->
+            Logger.error("Terminal workspace cleanup failed for #{issue_context(issue)}: #{inspect(reason)}")
+            {:error, reason}
+        end
     end
   end
 
-  defp cleanup_issue_workspace(%Issue{} = issue, worker_host) do
-    Workspace.remove_issue_workspaces(issue, worker_host)
+  defp terminal_cleanup_authorized?(%State{} = state, %Issue{} = issue) do
+    state.startup_reconciliation == :ready and
+      terminal_policy_current?(state, issue) and
+      not transition_candidate_pending?(state, issue.id) and
+      not terminal_workspace_suspension?(state, issue.id)
   end
 
-  defp cleanup_issue_workspace(identifier, worker_host) when is_binary(identifier) do
-    Workspace.remove_issue_workspaces(identifier, worker_host)
+  defp terminal_policy_current?(%State{} = state, %Issue{} = issue) do
+    if Config.settings!().agent.routing == "routed" do
+      case Map.get(state.work_control, issue.id) do
+        %WorkItem{
+          lifecycle_assessment: %LifecycleAssessment{} = assessment,
+          validated_lifecycle_state: lifecycle_state
+        } ->
+          terminal_issue_state?(issue.state, terminal_state_set()) and
+            WorkflowLifecycle.terminal?(lifecycle_state) and
+            lifecycle_state == terminal_lifecycle_state(assessment) and
+            (LifecycleAssessment.validated?(assessment) or
+               LifecycleAssessment.authority_reducing?(assessment))
+
+        _missing_or_invalid_work_item ->
+          false
+      end
+    else
+      terminal_issue_state?(issue.state, terminal_state_set())
+    end
   end
 
-  defp cleanup_issue_workspace(_issue_or_identifier, _worker_host), do: :ok
+  defp terminal_lifecycle_state(%LifecycleAssessment{validated_state: state}), do: state
 
-  defp run_terminal_workspace_cleanup do
+  defp terminal_workspace_suspension?(%State{} = state, issue_id) when is_binary(issue_id) do
+    work_item = Map.get(state.work_control, issue_id)
+    checkpoint = Map.get(state.recovery_checkpoints, issue_id)
+
+    active_context? = fn
+      %SuspensionContext{status: status} when status in [:open, :resolving, :escalated] -> true
+      _context -> false
+    end
+
+    checkpoint_contexts =
+      [
+        Map.get(checkpoint || %{}, :active_suspension_context),
+        Map.get(checkpoint || %{}, :last_terminal_suspension_context)
+      ]
+
+    active_context?.(Map.get(work_item || %{}, :suspension_context)) or
+      Enum.any?(checkpoint_contexts, active_context?) or
+      terminal_authority_suspension?(work_item)
+  end
+
+  defp terminal_workspace_suspension?(_state, _issue_id), do: false
+
+  defp terminal_authority_suspension?(%WorkItem{
+         authority_disposition: %AuthorityDisposition{status: :escalated}
+       }),
+       do: true
+
+  defp terminal_authority_suspension?(%WorkItem{
+         authority_disposition: %AuthorityDisposition{status: :suspended, lifecycle_state: :canceled},
+         suspension_context: nil
+       }),
+       do: false
+
+  defp terminal_authority_suspension?(%WorkItem{
+         authority_disposition: %AuthorityDisposition{status: status}
+       })
+       when status in [:suspended, :escalated],
+       do: true
+
+  defp terminal_authority_suspension?(_work_item), do: false
+
+  defp run_terminal_workspace_cleanup(%State{} = state, issues) when is_list(issues) do
+    errors =
+      Enum.reduce(issues, [], fn
+        %Issue{} = issue, errors ->
+          case cleanup_issue_workspace(state, issue, nil) do
+            {:error, reason} -> [{issue.id, reason} | errors]
+            _ok -> errors
+          end
+
+        _invalid_issue, errors ->
+          errors
+      end)
+
+    case errors do
+      [] -> :ok
+      errors -> {:error, Enum.reverse(errors)}
+    end
+  end
+
+  defp run_terminal_workspace_cleanup(%State{} = state) do
     case Tracker.fetch_issues_by_states(Config.settings!().tracker.terminal_states) do
       {:ok, issues} ->
-        issues
-        |> Enum.each(fn
-          %Issue{} = issue ->
-            cleanup_issue_workspace(issue)
-
-          _ ->
-            :ok
-        end)
+        run_terminal_workspace_cleanup(state, issues)
 
       {:error, reason} ->
         Logger.warning("Skipping startup terminal workspace cleanup; failed to fetch terminal issues: #{inspect(reason)}")
+        {:error, {:terminal_issue_fetch_failed, reason}}
     end
   end
+
+  defp reconcile_pending_workspace_releases(%State{} = state) do
+    if workspace_dispatchable?(state) do
+      case OwnershipLedger.list(state.workspace_ownership_ledger) do
+        {:ok, records} ->
+          reconcile_pending_workspace_records(state, records)
+
+        {:error, reason} ->
+          Logger.error("Unable to validate pending workspace releases: #{inspect(reason)}")
+
+          %{
+            state
+            | workspace_ownership_ledger_status: {:blocked, {:workspace_ownership_ledger_unavailable, reason}},
+              startup_reconciliation: {:blocked, {:workspace_pending_reconciliation_unavailable, reason}}
+          }
+      end
+    else
+      state
+    end
+  end
+
+  defp reconcile_pending_workspace_records(%State{} = state, records) when is_list(records) do
+    pending_records = Enum.filter(records, &(Map.get(&1, :state) == :release_pending))
+
+    reconcile_pending_workspace_record_list(state, pending_records)
+  end
+
+  defp reconcile_pending_workspace_record_list(%State{} = state, []), do: state
+
+  defp reconcile_pending_workspace_record_list(%State{} = state, records) do
+    issue_ids = Enum.map(records, &Map.get(&1, :work_item_id)) |> Enum.filter(&is_binary/1)
+
+    case Tracker.fetch_issues_by_ids(issue_ids) do
+      {:ok, issues} ->
+        reconcile_pending_workspace_records_with_issues(state, records, issues)
+
+      {:error, reason} ->
+        Logger.error("Unable to fetch tracker state for pending workspace releases: #{inspect(reason)}")
+        %{state | startup_reconciliation: {:blocked, {:workspace_pending_reconciliation_unavailable, reason}}}
+    end
+  end
+
+  defp reconcile_pending_workspace_records_with_issues(%State{} = state, records, issues) do
+    issues_by_id = Map.new(issues, fn issue -> {issue.id, issue} end)
+
+    Enum.reduce(records, state, fn record, state_acc ->
+      reconcile_pending_workspace_record_for_issue(state_acc, record, issues_by_id)
+    end)
+  end
+
+  defp reconcile_pending_workspace_record_for_issue(%State{} = state, record, issues_by_id) do
+    case Map.get(issues_by_id, Map.get(record, :work_item_id)) do
+      %Issue{} = issue ->
+        reconcile_pending_workspace_record(state, record, issue)
+
+      _missing_issue ->
+        Logger.warning(
+          "Keeping pending workspace release because tracker identity is unavailable: " <>
+            "work_item_id=#{inspect(Map.get(record, :work_item_id))}"
+        )
+
+        state
+    end
+  end
+
+  defp reconcile_pending_workspace_record(%State{} = state, record, %Issue{} = issue) do
+    cond do
+      Map.get(record, :release_origin) == :failed_provisioning ->
+        reconcile_failed_provisioning_workspace_record(state, record, issue)
+
+      terminal_cleanup_authorized?(state, issue) ->
+        reconcile_authorized_pending_workspace_record(state, record, issue)
+
+      pending_workspace_release_preserved?(state, issue) ->
+        preserve_pending_workspace_record(state, issue)
+
+      pending_workspace_identity_matches?(state, record, issue) ->
+        cancel_stale_pending_workspace_record(state, record, issue)
+
+      true ->
+        preserve_ambiguous_pending_workspace_record(state, issue)
+    end
+  end
+
+  defp reconcile_failed_provisioning_workspace_record(
+         %State{workspace_ownership_ledger: %OwnershipLedger{} = ledger} = state,
+         record,
+         %Issue{} = issue
+       ) do
+    authorization = %{
+      workspace_ownership_id: Map.get(record, :workspace_ownership_id),
+      canonical_workspace_path: Map.get(record, :canonical_workspace_path),
+      worker_host: Map.get(record, :worker_host)
+    }
+
+    case Workspace.remove_recorded(
+           record.canonical_workspace_path,
+           record.worker_host,
+           ledger,
+           cleanup_authorized: true,
+           cleanup_authorization: authorization
+         ) do
+      {:ok, _removed} ->
+        state
+
+      {:error, reason, _output} ->
+        Logger.error("Failed provisioning workspace cleanup remains pending for #{issue_context(issue)}: #{inspect(reason)}")
+        %{state | startup_reconciliation: :pending, startup_cleanup_ran?: false}
+    end
+  end
+
+  defp reconcile_failed_provisioning_workspace_record(%State{} = state, _record, _issue), do: state
+
+  defp reconcile_authorized_pending_workspace_record(%State{} = state, record, %Issue{} = issue) do
+    case cleanup_issue_workspace(state, issue, Map.get(record, :worker_host)) do
+      :ok ->
+        state
+
+      {:error, reason} ->
+        Logger.error("Pending terminal workspace cleanup remains unresolved for #{issue_context(issue)}: #{inspect(reason)}")
+        %{state | startup_reconciliation: :pending, startup_cleanup_ran?: false}
+    end
+  end
+
+  defp pending_workspace_release_preserved?(%State{} = state, %Issue{} = issue) do
+    terminal_issue_state?(issue.state, terminal_state_set()) or
+      terminal_workspace_suspension?(state, issue.id) or
+      transition_candidate_pending?(state, issue.id)
+  end
+
+  defp preserve_pending_workspace_record(%State{} = state, %Issue{} = issue) do
+    Logger.info("Keeping pending workspace release for #{issue_context(issue)} until preservation checks clear")
+    state
+  end
+
+  defp cancel_stale_pending_workspace_record(%State{} = state, record, %Issue{} = issue) do
+    case cancel_pending_workspace_release(state, record) do
+      :ok ->
+        Logger.info("Cancelled stale pending workspace release for #{issue_context(issue)}")
+        state
+
+      {:error, reason} ->
+        Logger.error("Unable to cancel pending workspace release for #{issue_context(issue)}: #{inspect(reason)}")
+        state
+    end
+  end
+
+  defp preserve_ambiguous_pending_workspace_record(%State{} = state, %Issue{} = issue) do
+    Logger.warning("Keeping ambiguous pending workspace release for #{issue_context(issue)}")
+    state
+  end
+
+  defp pending_workspace_identity_matches?(
+         %State{workspace_ownership_ledger: %OwnershipLedger{} = ledger},
+         record,
+         %Issue{id: issue_id, identifier: identifier}
+       )
+       when is_binary(issue_id) and is_binary(identifier) do
+    Map.get(record, :work_item_id) == issue_id and
+      Map.get(record, :issue_identifier) == identifier and
+      Map.get(record, :workspace_key) == Workspace.workspace_key(identifier) and
+      pending_workspace_record_provable?(record, ledger)
+  end
+
+  defp pending_workspace_identity_matches?(_state, _record, _issue), do: false
+
+  defp pending_workspace_record_provable?(%{location: :remote}, _ledger), do: true
+
+  defp pending_workspace_record_provable?(record, ledger),
+    do: pending_workspace_record_current?(record, ledger)
+
+  defp cancel_pending_workspace_release(
+         %State{workspace_ownership_ledger: %OwnershipLedger{} = ledger},
+         %{location: :remote} = record
+       ) do
+    Workspace.cancel_pending_release_if_current(record, ledger)
+  end
+
+  defp cancel_pending_workspace_release(
+         %State{workspace_ownership_ledger: %OwnershipLedger{} = ledger},
+         record
+       ) do
+    case pending_workspace_record_current?(record, ledger) do
+      true ->
+        case OwnershipLedger.transition_sync(
+               ledger,
+               Map.get(record, :workspace_ownership_id),
+               :owned
+             ) do
+          {:ok, _owned} -> :ok
+          {:error, reason} -> {:error, reason}
+        end
+
+      false ->
+        {:error, :workspace_identity_unavailable}
+    end
+  end
+
+  defp cancel_pending_workspace_release(_state, _record),
+    do: {:error, :workspace_ownership_ledger_unavailable}
+
+  defp pending_workspace_record_current?(
+         %{
+           state: :release_pending,
+           location: :local,
+           worker_host: nil,
+           trusted_host_identity: trusted_host_identity,
+           configured_root: configured_root,
+           configured_root_identity: configured_root_identity,
+           canonical_root: canonical_root,
+           canonical_workspace_path: canonical_workspace_path,
+           top_level_filesystem_identity: workspace_identity
+         },
+         %OwnershipLedger{host_identity: host_identity}
+       ) do
+    with true <- trusted_host_identity == host_identity,
+         true <- Path.expand(Config.local_workspace_root()) == configured_root,
+         {:ok, current_root} <- PathSafety.canonicalize(Config.local_workspace_root()),
+         true <- current_root == canonical_root,
+         {:ok, ^configured_root_identity} <- OwnershipLedger.root_identity(canonical_root),
+         {:ok, %File.Stat{type: :directory}} <- File.lstat(canonical_workspace_path),
+         {:ok, ^workspace_identity} <- OwnershipLedger.filesystem_identity(canonical_workspace_path) do
+      true
+    else
+      _ -> false
+    end
+  end
+
+  defp pending_workspace_record_current?(_record, _ledger), do: false
 
   defp notify_dashboard do
     StatusDashboard.notify_update()
@@ -7391,6 +8011,7 @@ defmodule SymphonyElixir.Orchestrator do
     state
     |> synchronize_project_contract_config(config.provider_project_contract)
     |> synchronize_attempt_ledger_config(config)
+    |> synchronize_workspace_ownership_ledger_config(config)
   end
 
   defp synchronize_project_contract_config(%State{} = state, contract) do

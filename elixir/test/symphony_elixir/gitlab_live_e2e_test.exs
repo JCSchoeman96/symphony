@@ -64,7 +64,11 @@ defmodule SymphonyElixir.GitLab.LiveE2ETest do
       assert issue_id == issue.id
       assert identifier == issue.identifier
 
-      assert :ok = AgentRunner.run(issue, self(), max_turns: 3)
+      assert :ok =
+               AgentRunner.run(issue, self(),
+                 max_turns: 3,
+                 ownership_ledger: workspace_ownership_ledger()
+               )
 
       runtime_info = receive_runtime_info!(issue.id)
       tool_calls = completed_gitlab_tool_calls(issue.id)

@@ -121,6 +121,7 @@ defmodule SymphonyElixir.AgentRouterDependencyProofTest do
                    test_pid: test_pid,
                    route: route,
                    work_item: work_item,
+                   ownership_ledger: workspace_ownership_ledger(),
                    guard_evidence: transition_evidence([state | refreshed_states], stage_issue.id),
                    assessment_context: %{
                      runtime_attempt_id: "attempt-#{stage_issue.id}",

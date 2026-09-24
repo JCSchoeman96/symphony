@@ -165,6 +165,7 @@ defmodule SymphonyElixir.RolePromptTest do
              AgentRunner.run(issue, test_pid,
                runtime: SymphonyElixir.RolePromptReloadRuntime,
                test_pid: test_pid,
+               ownership_ledger: workspace_ownership_ledger(),
                prompt_path: prompt_path,
                replacement_prompt: "Role policy: builder attempt version two",
                route: route,
