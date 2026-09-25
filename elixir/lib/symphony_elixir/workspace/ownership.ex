@@ -47,6 +47,16 @@ defmodule SymphonyElixir.Workspace.Ownership do
           | {integer(), integer(), non_neg_integer()}
           | %{required(:device) => integer(), required(:inode) => non_neg_integer()}
           | %{
+              required(:device) => non_neg_integer(),
+              required(:inode) => non_neg_integer(),
+              required(:birth_time_ns) => integer()
+            }
+          | %{
+              required(:device) => non_neg_integer(),
+              required(:inode) => non_neg_integer(),
+              required(:generation) => pos_integer()
+            }
+          | %{
               required(:major_device) => integer(),
               required(:minor_device) => integer(),
               required(:inode) => non_neg_integer()

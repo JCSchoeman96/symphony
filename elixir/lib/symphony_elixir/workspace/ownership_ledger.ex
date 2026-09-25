@@ -161,8 +161,8 @@ defmodule SymphonyElixir.Workspace.OwnershipLedger do
   @spec filesystem_identity(Path.t()) :: {:ok, Ownership.filesystem_identity()} | {:error, term()}
   def filesystem_identity(path) when is_binary(path) do
     case File.lstat(path) do
-      {:ok, %File.Stat{type: :directory, major_device: major, minor_device: minor, inode: inode}} ->
-        {:ok, %{major_device: major, minor_device: minor, inode: inode}}
+      {:ok, %File.Stat{type: :directory}} ->
+        stat_filesystem_identity(path)
 
       {:ok, %File.Stat{type: type}} ->
         {:error, {:filesystem_identity_failed, {:not_directory, type}}}
@@ -175,6 +175,70 @@ defmodule SymphonyElixir.Workspace.OwnershipLedger do
   end
 
   def filesystem_identity(_path), do: {:error, {:filesystem_identity_failed, :invalid_path}}
+
+  defp stat_filesystem_identity(path) do
+    {args, birth_identity_kind} = filesystem_identity_stat_command(path, :os.type())
+
+    case System.cmd("stat", args, stderr_to_stdout: true) do
+      {output, 0} ->
+        parse_stat_filesystem_identity(output, birth_identity_kind)
+
+      {output, status} ->
+        {:error, {:filesystem_identity_failed, {:stat_failed, status, String.trim(output)}}}
+    end
+  end
+
+  @doc false
+  @spec filesystem_identity_stat_command(Path.t(), term()) ::
+          {nonempty_list(String.t()), :birth_time | :generation}
+  def filesystem_identity_stat_command(path, {:unix, :darwin}),
+    do: {["-f", "%Xp|%d|%i|%v", "--", path], :generation}
+
+  def filesystem_identity_stat_command(path, _os_type),
+    do: {["-c", "%f|%d|%i|%w", "--", path], :birth_time}
+
+  @doc false
+  @spec parse_stat_filesystem_identity(binary(), :birth_time | :generation) ::
+          {:ok, Ownership.filesystem_identity()} | {:error, term()}
+  def parse_stat_filesystem_identity(output, birth_identity_kind) do
+    with [mode, device, inode, birth_time] <- String.trim(output) |> String.split("|", parts: 4),
+         {mode, ""} <- Integer.parse(mode, 16),
+         true <- Bitwise.band(mode, 0xF000) == 0x4000,
+         {device, ""} <- Integer.parse(device),
+         {inode, ""} <- Integer.parse(inode),
+         {:ok, birth_identity} <- filesystem_birth_identity(birth_time, birth_identity_kind) do
+      {:ok, Map.merge(%{device: device, inode: inode}, birth_identity)}
+    else
+      false -> {:error, {:filesystem_identity_failed, {:not_directory, :unknown}}}
+      {:error, _reason} = error -> error
+      _other -> {:error, {:filesystem_identity_failed, :invalid_stat_output}}
+    end
+  end
+
+  defp filesystem_birth_identity("-", :birth_time) do
+    {:error, {:filesystem_identity_failed, :birth_time_unavailable}}
+  end
+
+  defp filesystem_birth_identity(generation, :generation) do
+    case Integer.parse(generation) do
+      {value, ""} when value > 0 -> {:ok, %{generation: value}}
+      {0, ""} -> {:error, {:filesystem_identity_failed, :generation_unavailable}}
+      _other -> {:error, {:filesystem_identity_failed, :invalid_generation}}
+    end
+  end
+
+  defp filesystem_birth_identity(birth_time, :birth_time) do
+    case System.cmd("date", ["-d", birth_time, "+%s%N"], stderr_to_stdout: true) do
+      {output, 0} ->
+        case Integer.parse(String.trim(output)) do
+          {value, ""} -> {:ok, %{birth_time_ns: value}}
+          _other -> {:error, {:filesystem_identity_failed, :invalid_birth_time}}
+        end
+
+      {_output, _status} ->
+        {:error, {:filesystem_identity_failed, :invalid_birth_time}}
+    end
+  end
 
   @spec root_identity(Path.t()) :: {:ok, Ownership.filesystem_identity()} | {:error, term()}
   def root_identity(path), do: filesystem_identity(path)
@@ -659,6 +723,14 @@ defmodule SymphonyElixir.Workspace.OwnershipLedger do
 
   defp normalize_transition_attrs(_attrs), do: {:error, :invalid_transition_attributes}
 
+  defp filesystem_identity_map?(%{device: _device, inode: _inode, birth_time_ns: _birth_time_ns} = identity) do
+    Enum.sort(Map.keys(identity)) == [:birth_time_ns, :device, :inode]
+  end
+
+  defp filesystem_identity_map?(%{device: _device, inode: _inode, generation: _generation} = identity) do
+    Enum.sort(Map.keys(identity)) == [:device, :generation, :inode]
+  end
+
   defp filesystem_identity_map?(%{device: _device, inode: _inode} = identity) do
     Enum.sort(Map.keys(identity)) == [:device, :inode]
   end
@@ -972,6 +1044,22 @@ defmodule SymphonyElixir.Workspace.OwnershipLedger do
     do: validate_structured_filesystem_identity(value)
 
   defp validate_filesystem_identity(_value), do: {:error, :invalid_record}
+
+  defp validate_structured_filesystem_identity(%{device: device, inode: inode, birth_time_ns: birth_time_ns} = value)
+       when is_integer(device) and is_integer(inode) and is_integer(birth_time_ns) and device >= 0 and
+              inode >= 0 do
+    if Enum.sort(Map.keys(value)) == [:birth_time_ns, :device, :inode],
+      do: :ok,
+      else: {:error, :invalid_record}
+  end
+
+  defp validate_structured_filesystem_identity(%{device: device, inode: inode, generation: generation} = value)
+       when is_integer(device) and is_integer(inode) and is_integer(generation) and device >= 0 and
+              inode >= 0 and generation > 0 do
+    if Enum.sort(Map.keys(value)) == [:device, :generation, :inode],
+      do: :ok,
+      else: {:error, :invalid_record}
+  end
 
   defp validate_structured_filesystem_identity(%{device: device, inode: inode} = value)
        when is_integer(device) and is_integer(inode) and device >= 0 and inode >= 0 do

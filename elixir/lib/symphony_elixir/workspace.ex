@@ -802,7 +802,7 @@ defmodule SymphonyElixir.Workspace do
     root_binding_checks = [
       "if [ -L \"$root\" ] || [ ! -d \"$root\" ]; then exit 92; fi",
       "if [ \"$(cd \"$root\" && pwd -P)\" != #{shell_escape(expected_root)} ]; then exit 93; fi",
-      "if [ \"$(stat -c '%d:%i' -- \"$root\")\" != #{shell_escape(record.configured_root_identity)} ]; then exit 94; fi"
+      "if [ \"$(symphony_filesystem_identity \"$root\")\" != #{shell_escape(record.configured_root_identity)} ]; then exit 94; fi"
     ]
 
     host_identity_checks = [
@@ -827,16 +827,16 @@ defmodule SymphonyElixir.Workspace do
     source_validation = [
       "if [ -L \"$workspace\" ] || [ ! -d \"$workspace\" ]; then exit 97; fi",
       "if [ \"$(cd \"$workspace\" && pwd -P)\" != #{shell_escape(workspace)} ]; then exit 98; fi",
-      "if [ \"$(stat -c '%d:%i' -- \"$workspace\")\" != #{shell_escape(record.top_level_filesystem_identity)} ]; then exit 99; fi"
+      "if [ \"$(symphony_filesystem_identity \"$workspace\")\" != #{shell_escape(record.top_level_filesystem_identity)} ]; then exit 99; fi"
     ]
 
     source_hook_and_detach = [
       "cd \"$workspace\"",
       CredentialBoundary.unset_shell_command(CredentialBoundary.configured_secret_environment_names()),
       Enum.join(hook_commands, "\n"),
-      "if [ \"$(cd \"$root\" && pwd -P)\" != #{shell_escape(expected_root)} ] || [ \"$(stat -c '%d:%i' -- \"$root\")\" != #{shell_escape(record.configured_root_identity)} ]; then exit 100; fi",
+      "if [ \"$(cd \"$root\" && pwd -P)\" != #{shell_escape(expected_root)} ] || [ \"$(symphony_filesystem_identity \"$root\")\" != #{shell_escape(record.configured_root_identity)} ]; then exit 100; fi",
       "if [ -L \"$workspace\" ] || [ \"$(cd \"$workspace\" && pwd -P)\" != #{shell_escape(workspace)} ]; then exit 101; fi",
-      "if [ \"$(stat -c '%d:%i' -- \"$workspace\")\" != #{shell_escape(record.top_level_filesystem_identity)} ]; then exit 102; fi",
+      "if [ \"$(symphony_filesystem_identity \"$workspace\")\" != #{shell_escape(record.top_level_filesystem_identity)} ]; then exit 102; fi",
       "if [ -e \"$quarantined_workspace\" ] || [ -L \"$quarantined_workspace\" ]; then exit 104; fi",
       "mv -- \"$workspace\" \"$quarantined_workspace\""
     ]
@@ -844,11 +844,12 @@ defmodule SymphonyElixir.Workspace do
     quarantined_workspace_validation = [
       "if [ -L \"$quarantined_workspace\" ] || [ ! -d \"$quarantined_workspace\" ]; then exit 104; fi",
       "if [ \"$(cd \"$quarantined_workspace\" && pwd -P)\" != \"$quarantined_workspace\" ]; then exit 104; fi",
-      "if [ \"$(stat -c '%d:%i' -- \"$quarantined_workspace\")\" != #{shell_escape(record.top_level_filesystem_identity)} ]; then exit 104; fi"
+      "if [ \"$(symphony_filesystem_identity \"$quarantined_workspace\")\" != #{shell_escape(record.top_level_filesystem_identity)} ]; then exit 104; fi"
     ]
 
     [
       "set -eu",
+      remote_filesystem_identity_function(),
       remote_shell_assign("workspace", workspace),
       remote_shell_assign("root", root),
       remote_shell_assign("host_identity_path", host_identity_path),
@@ -1121,12 +1122,8 @@ defmodule SymphonyElixir.Workspace do
     |> binary_part(0, 24)
   end
 
-  defp same_filesystem?(
-         %{major_device: expected_major, minor_device: expected_minor},
-         %{major_device: actual_major, minor_device: actual_minor}
-       ) do
-    expected_major == actual_major and expected_minor == actual_minor
-  end
+  defp same_filesystem?(%{device: expected_device}, %{device: actual_device}),
+    do: expected_device == actual_device
 
   defp validate_local_root_binding(record) do
     expected_root_identity = record.configured_root_identity
@@ -1402,6 +1399,24 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
+  defp remote_filesystem_identity_function do
+    """
+    symphony_filesystem_identity() {
+      local stat_record mode device inode birth_time birth_time_ns mode_value
+      stat_record=$(stat -c '%f|%d|%i|%w' -- "$1") || return 1
+      IFS='|' read -r mode device inode birth_time <<< "$stat_record"
+      [[ "$mode" =~ ^[0-9a-fA-F]+$ ]] || return 1
+      [[ "$device" =~ ^[0-9]+$ && "$inode" =~ ^[0-9]+$ ]] || return 1
+      mode_value=$((16#$mode))
+      [ $((mode_value & 61440)) -eq 16384 ] || return 1
+      [ -n "$birth_time" ] && [ "$birth_time" != "-" ] || return 1
+      birth_time_ns=$(date -d "$birth_time" +%s%N 2>/dev/null) || return 1
+      [[ "$birth_time_ns" =~ ^-?[0-9]+$ ]] || return 1
+      printf '%s:%s:%s' "$device" "$inode" "$birth_time_ns"
+    }
+    """
+  end
+
   defp remote_prepare_script(workspace) do
     root = Config.settings!().workspace.root
     host_identity_path = @default_remote_host_identity
@@ -1414,6 +1429,7 @@ defmodule SymphonyElixir.Workspace do
       "case \"$root\" in \"$workspace\"|\"$workspace\"/*) exit 71 ;; esac",
       "case \"$host_identity_path\" in \"$root\"|\"$root\"/*|\"$workspace\"|\"$workspace\"/*) exit 71 ;; esac",
       "if [ -L \"$root\" ] || [ ! -d \"$root\" ]; then exit 72; fi",
+      remote_filesystem_identity_function(),
       "host_identity_dir=$(dirname \"$host_identity_path\")",
       "umask 077",
       "mkdir -p \"$host_identity_dir\"",
@@ -1424,14 +1440,14 @@ defmodule SymphonyElixir.Workspace do
       "if [ ! -e \"$host_identity_path\" ]; then identity_tmp=\"$host_identity_path.$$.$RANDOM\"; (umask 077; printf 'host-%s\\n' \"$(od -An -N16 -tx1 /dev/urandom | tr -d ' \\n')\" > \"$identity_tmp\"); chmod 600 \"$identity_tmp\"; if ln \"$identity_tmp\" \"$host_identity_path\" 2>/dev/null; then :; fi; rm -f \"$identity_tmp\"; fi",
       "if [ ! -f \"$host_identity_path\" ] || [ \"$(stat -c '%a' -- \"$host_identity_path\")\" != 600 ]; then exit 74; fi",
       "host_identity=$(cat \"$host_identity_path\")",
-      "root_identity=$(stat -c '%d:%i' -- \"$root\")",
+      "root_identity=$(symphony_filesystem_identity \"$root\")",
       "present=0",
       "workspace_identity=-",
       "if [ -L \"$workspace\" ]; then exit 75; fi",
       "if [ -e \"$workspace\" ]; then",
       "  if [ ! -d \"$workspace\" ]; then exit 76; fi",
       "  present=1",
-      "  workspace_identity=$(stat -c '%d:%i' -- \"$workspace\")",
+      "  workspace_identity=$(symphony_filesystem_identity \"$workspace\")",
       "fi",
       "workspace=$(if [ -e \"$workspace\" ]; then cd \"$workspace\" && pwd -P; else printf '%s' \"$workspace\"; fi)",
       "root=$(cd \"$root\" && pwd -P)",
@@ -1447,8 +1463,9 @@ defmodule SymphonyElixir.Workspace do
         remote_shell_assign("workspace", remote.workspace),
         remote_shell_assign("root", remote.root),
         remote_shell_assign("host_identity_path", remote.host_identity_path),
+        remote_filesystem_identity_function(),
         "if [ -L \"$root\" ] || [ ! -d \"$root\" ]; then exit 81; fi",
-        "if [ \"$(stat -c '%d:%i' -- \"$root\")\" != #{shell_escape(remote.root_identity)} ]; then exit 82; fi",
+        "if [ \"$(symphony_filesystem_identity \"$root\")\" != #{shell_escape(remote.root_identity)} ]; then exit 82; fi",
         "host_identity_dir=$(dirname \"$host_identity_path\")",
         "check_dir=\"$host_identity_dir\"",
         "while [ \"$check_dir\" != \"/\" ] && [ \"$check_dir\" != \".\" ]; do if [ -L \"$check_dir\" ] || [ ! -d \"$check_dir\" ]; then exit 83; fi; check_dir=$(dirname \"$check_dir\"); done",
@@ -1458,7 +1475,7 @@ defmodule SymphonyElixir.Workspace do
         "if [ -e \"$workspace\" ]; then exit 84; fi",
         "mkdir \"$workspace\"",
         "workspace=$(cd \"$workspace\" && pwd -P)",
-        "printf '%s\\t%s\\t%s\\t%s\\n' '#{@remote_workspace_marker}' \"$workspace\" \"$(stat -c '%d:%i' -- \"$workspace\")\" \"$(stat -c '%d:%i' -- \"$root\")\""
+        "printf '%s\\t%s\\t%s\\t%s\\n' '#{@remote_workspace_marker}' \"$workspace\" \"$(symphony_filesystem_identity \"$workspace\")\" \"$(symphony_filesystem_identity \"$root\")\""
       ]
       |> Enum.join("\n")
 

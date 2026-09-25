@@ -393,6 +393,185 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
+  test "local workspace identity rejects repeated inode reuse after delete and recreate" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-workspace-inode-reuse-#{System.unique_integer([:positive])}")
+    workspace_root = Path.join(test_root, "workspaces")
+    workspace = Path.join(workspace_root, "MT-INODE-REUSE")
+    stat_wrapper = Path.join(test_root, "stat")
+    birth_time_file = Path.join(test_root, "birth-time")
+    generation_file = Path.join(test_root, "generation")
+    previous_path = System.get_env("PATH")
+    previous_stat_path = System.get_env("SYMP_TEST_STAT_PATH")
+    previous_stat_birth_time_file = System.get_env("SYMP_TEST_STAT_BIRTH_TIME_FILE")
+    previous_stat_generation_file = System.get_env("SYMP_TEST_STAT_GENERATION_FILE")
+
+    on_exit(fn ->
+      restore_env("PATH", previous_path)
+      restore_env("SYMP_TEST_STAT_PATH", previous_stat_path)
+      restore_env("SYMP_TEST_STAT_BIRTH_TIME_FILE", previous_stat_birth_time_file)
+      restore_env("SYMP_TEST_STAT_GENERATION_FILE", previous_stat_generation_file)
+      File.rm_rf(test_root)
+    end)
+
+    File.mkdir_p!(workspace_root)
+    File.write!(birth_time_file, "2024-01-01 00:00:00.000000001 +0000")
+    File.write!(generation_file, "100")
+
+    File.write!(stat_wrapper, """
+    #!/bin/sh
+    if [ "${2:-}" = "%f|%d|%i|%w" ] && [ "${4:-}" = "$SYMP_TEST_STAT_PATH" ]; then
+      printf '41ed|39|999|%s\\n' "$(cat "$SYMP_TEST_STAT_BIRTH_TIME_FILE")"
+    elif [ "${2:-}" = "%Xp|%d|%i|%v" ] && [ "${4:-}" = "$SYMP_TEST_STAT_PATH" ]; then
+      printf '41ED|39|999|%s\\n' "$(cat "$SYMP_TEST_STAT_GENERATION_FILE")"
+    else
+      exec /usr/bin/stat "$@"
+    fi
+    """)
+
+    File.chmod!(stat_wrapper, 0o755)
+    System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
+    System.put_env("SYMP_TEST_STAT_PATH", workspace)
+    System.put_env("SYMP_TEST_STAT_BIRTH_TIME_FILE", birth_time_file)
+    System.put_env("SYMP_TEST_STAT_GENERATION_FILE", generation_file)
+
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+    issue = %Issue{id: "local-inode-reuse", identifier: "MT-INODE-REUSE"}
+    ledger = workspace_ownership_ledger()
+
+    assert {:ok, ^workspace} = Workspace.create_for_issue(issue, nil, ledger)
+    assert {:ok, [owned]} = OwnershipLedger.list_for_work_item(ledger, issue.id)
+
+    case :os.type() do
+      {:unix, :darwin} ->
+        assert owned.top_level_filesystem_identity == %{device: 39, inode: 999, generation: 100}
+
+      _other ->
+        assert owned.top_level_filesystem_identity == %{
+                 device: 39,
+                 inode: 999,
+                 birth_time_ns: 1_704_067_200_000_000_001
+               }
+    end
+
+    for offset <- 1..3 do
+      File.rm_rf!(workspace)
+      File.mkdir!(workspace)
+      File.write!(Path.join(workspace, "foreign"), "replacement-#{offset}")
+
+      File.write!(birth_time_file, "2024-01-01 00:00:00.00000000#{offset + 1} +0000")
+      File.write!(generation_file, Integer.to_string(100 + offset))
+
+      assert {:error, {:workspace_identity_mismatch, ^workspace}} =
+               Workspace.create_for_issue(issue, nil, ledger)
+
+      assert File.read!(Path.join(workspace, "foreign")) == "replacement-#{offset}"
+    end
+
+    assert {:error, {:workspace_identity_mismatch, ^workspace}} =
+             Workspace.remove_issue_workspaces(issue, nil, ledger, cleanup_authorized?: true)
+
+    assert File.read!(Path.join(workspace, "foreign")) == "replacement-3"
+    assert {:ok, [pending]} = OwnershipLedger.list_for_work_item(ledger, issue.id)
+    assert pending.state == :release_pending
+  end
+
+  test "remote workspace identity rejects repeated inode reuse and preserves replacements" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-remote-inode-reuse-#{System.unique_integer([:positive])}")
+    remote_home = Path.join(test_root, "remote-home")
+    workspace_root = "~/.symphony-remote-inode-reuse"
+    workspace = Path.join(remote_home, ".symphony-remote-inode-reuse/MT-REMOTE-INODE-REUSE")
+    stat_wrapper = Path.join(test_root, "stat")
+    fake_ssh = Path.join(test_root, "ssh")
+    birth_time_file = Path.join(test_root, "birth-time")
+    trace_file = Path.join(test_root, "ssh.trace")
+    previous_path = System.get_env("PATH")
+    previous_home = System.get_env("HOME")
+    previous_stat_path = System.get_env("SYMP_TEST_STAT_PATH")
+    previous_stat_birth_time_file = System.get_env("SYMP_TEST_STAT_BIRTH_TIME_FILE")
+    previous_remote_home = System.get_env("SYMP_TEST_REMOTE_HOME")
+    previous_trace = System.get_env("SYMP_TEST_SSH_TRACE")
+    worker_host = "worker-remote-inode-reuse"
+
+    on_exit(fn ->
+      restore_env("PATH", previous_path)
+      restore_env("HOME", previous_home)
+      restore_env("SYMP_TEST_STAT_PATH", previous_stat_path)
+      restore_env("SYMP_TEST_STAT_BIRTH_TIME_FILE", previous_stat_birth_time_file)
+      restore_env("SYMP_TEST_REMOTE_HOME", previous_remote_home)
+      restore_env("SYMP_TEST_SSH_TRACE", previous_trace)
+      File.rm_rf(test_root)
+    end)
+
+    File.mkdir_p!(Path.join(remote_home, ".symphony-remote-inode-reuse"))
+    File.write!(birth_time_file, "2024-01-01 00:00:00.000000001 +0000")
+
+    File.write!(stat_wrapper, """
+    #!/bin/sh
+    if [ "${2:-}" = "%f|%d|%i|%w" ] && [ "${4:-}" = "$SYMP_TEST_STAT_PATH" ]; then
+      printf '41ed|39|999|%s\\n' "$(cat "$SYMP_TEST_STAT_BIRTH_TIME_FILE")"
+    else
+      exec /usr/bin/stat "$@"
+    fi
+    """)
+
+    File.chmod!(stat_wrapper, 0o755)
+
+    File.write!(fake_ssh, """
+    #!/usr/bin/env bash
+    set -euo pipefail
+    remote_command="${!#}"
+    printf '%s\\n' "$remote_command" >> "$SYMP_TEST_SSH_TRACE"
+    case "$remote_command" in
+      "bash -lc "*)
+        eval "remote_script=${remote_command#bash -lc }"
+        HOME="$SYMP_TEST_REMOTE_HOME" PATH="$PATH" /bin/bash -c "$remote_script"
+        ;;
+      *) exit 2 ;;
+    esac
+    """)
+
+    File.chmod!(fake_ssh, 0o755)
+    System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
+    System.put_env("HOME", remote_home)
+    System.put_env("SYMP_TEST_REMOTE_HOME", remote_home)
+    System.put_env("SYMP_TEST_STAT_PATH", workspace)
+    System.put_env("SYMP_TEST_STAT_BIRTH_TIME_FILE", birth_time_file)
+    System.put_env("SYMP_TEST_SSH_TRACE", trace_file)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      worker_ssh_hosts: [worker_host]
+    )
+
+    issue = %Issue{id: "remote-inode-reuse", identifier: "MT-REMOTE-INODE-REUSE"}
+    ledger = workspace_ownership_ledger()
+
+    assert {:ok, ^workspace} = Workspace.create_for_issue(issue, worker_host, ledger)
+    assert {:ok, [owned]} = OwnershipLedger.list_for_work_item(ledger, issue.id)
+    assert owned.top_level_filesystem_identity == "39:999:1704067200000000001"
+
+    for offset <- 1..3 do
+      File.rm_rf!(workspace)
+      File.mkdir_p!(workspace)
+      File.write!(Path.join(workspace, "foreign"), "replacement-#{offset}")
+      File.write!(birth_time_file, "2024-01-01 00:00:00.00000000#{offset + 1} +0000")
+
+      assert {:error, {:workspace_ownership_required, ^workspace}} =
+               Workspace.create_for_issue(issue, worker_host, ledger)
+
+      assert {:error, {:workspace_remove_failed, ^worker_host, 99, _output}} =
+               Workspace.remove_issue_workspaces(issue, worker_host, ledger, cleanup_authorized?: true)
+
+      assert File.read!(Path.join(workspace, "foreign")) == "replacement-#{offset}"
+      assert {:ok, [pending]} = OwnershipLedger.list_for_work_item(ledger, issue.id)
+      assert pending.state == :release_pending
+    end
+
+    trace = File.read!(trace_file)
+    assert trace =~ "birth_time_ns"
+    assert trace =~ "rm -rf --"
+  end
+
   test "workspace bootstrap can be implemented in after_create hook" do
     test_root =
       Path.join(
@@ -2986,8 +3165,8 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     System.put_env("SYMP_TEST_REMOTE_RACE_WORKSPACE", workspace_path)
     System.delete_env("SYMP_TEST_REMOTE_RACE_DONE")
 
-    {root_identity, 0} = System.cmd("stat", ["-c", "%d:%i", workspace_root])
-    {workspace_identity, 0} = System.cmd("stat", ["-c", "%d:%i", workspace_path])
+    root_identity = remote_filesystem_identity_for_test(workspace_root)
+    workspace_identity = remote_filesystem_identity_for_test(workspace_path)
 
     write_workflow_file!(Workflow.workflow_file_path(),
       workspace_root: workspace_root,
@@ -3017,8 +3196,8 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
                ledger,
                reserved.workspace_ownership_id,
                :provisioning,
-               configured_root_identity: String.trim(root_identity),
-               top_level_filesystem_identity: String.trim(workspace_identity)
+               configured_root_identity: root_identity,
+               top_level_filesystem_identity: workspace_identity
              )
 
     assert {:ok, _owned} =
@@ -3500,5 +3679,13 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
   test "remote workspace removal rejects an empty workspace path before probing the host" do
     assert {:error, {:workspace_path_unreadable, "", :invalid}, ""} =
              Workspace.remove_recorded("", "worker-empty-path", workspace_ownership_ledger(), cleanup_authorized?: true)
+  end
+
+  defp remote_filesystem_identity_for_test(path) do
+    {output, 0} = System.cmd("stat", ["-c", "%d|%i|%w", "--", path])
+    [device, inode, birth_time] = String.split(String.trim(output), "|", parts: 3)
+    {birth_time_ns, 0} = System.cmd("date", ["-d", birth_time, "+%s%N"])
+
+    Enum.join([device, inode, String.trim(birth_time_ns)], ":")
   end
 end

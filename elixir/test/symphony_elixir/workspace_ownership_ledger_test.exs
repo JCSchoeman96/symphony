@@ -622,7 +622,11 @@ defmodule SymphonyElixir.WorkspaceOwnershipLedgerTest do
     assert is_binary(identity) and byte_size(identity) > 0
 
     assert {:ok, filesystem_identity} = OwnershipLedger.filesystem_identity(workspace)
-    assert Map.keys(filesystem_identity) == [:inode, :major_device, :minor_device]
+
+    case :os.type() do
+      {:unix, :darwin} -> assert Enum.sort(Map.keys(filesystem_identity)) == [:device, :generation, :inode]
+      _other -> assert Enum.sort(Map.keys(filesystem_identity)) == [:birth_time_ns, :device, :inode]
+    end
 
     path = OwnershipLedger.host_identity_path(root: root)
     assert Path.relative_to(path, workspace) == path
@@ -630,6 +634,192 @@ defmodule SymphonyElixir.WorkspaceOwnershipLedgerTest do
     assert Bitwise.band(stat.mode, 0o777) == 0o600
     assert stat.type == :regular
     assert {:ok, ^identity} = OwnershipLedger.local_host_identity(root: root)
+  end
+
+  test "fails closed when the filesystem does not report a birth time", %{root: root} do
+    workspace = Path.join(root, "unknown-birth-time")
+    stat_wrapper = Path.join(root, "stat")
+    previous_path = System.get_env("PATH")
+    previous_stat_path = System.get_env("SYMP_TEST_STAT_PATH")
+
+    on_exit(fn ->
+      if is_nil(previous_path), do: System.delete_env("PATH"), else: System.put_env("PATH", previous_path)
+
+      if is_nil(previous_stat_path),
+        do: System.delete_env("SYMP_TEST_STAT_PATH"),
+        else: System.put_env("SYMP_TEST_STAT_PATH", previous_stat_path)
+    end)
+
+    File.mkdir!(workspace)
+
+    File.write!(stat_wrapper, """
+    #!/bin/sh
+    if { [ "${2:-}" = "%f|%d|%i|%w" ] || [ "${2:-}" = "%Xp|%d|%i|%v" ]; } && [ "${4:-}" = "$SYMP_TEST_STAT_PATH" ]; then
+      if [ "${2:-}" = "%Xp|%d|%i|%v" ]; then
+        printf '41ED|39|999|0\\n'
+        exit 0
+      fi
+      printf '41ed|39|999|-\\n'
+    else
+      exec /usr/bin/stat "$@"
+    fi
+    """)
+
+    File.chmod!(stat_wrapper, 0o755)
+    System.put_env("PATH", root <> ":" <> (previous_path || ""))
+    System.put_env("SYMP_TEST_STAT_PATH", workspace)
+
+    case :os.type() do
+      {:unix, :darwin} ->
+        assert {:error, {:filesystem_identity_failed, :generation_unavailable}} =
+                 OwnershipLedger.filesystem_identity(workspace)
+
+      _other ->
+        assert {:error, {:filesystem_identity_failed, :birth_time_unavailable}} =
+                 OwnershipLedger.filesystem_identity(workspace)
+    end
+  end
+
+  test "rejects invalid stat and date output when building a filesystem identity", %{root: root} do
+    workspace = Path.join(root, "invalid-stat-output")
+    stat_wrapper = Path.join(root, "stat")
+    date_wrapper = Path.join(root, "date")
+    previous_path = System.get_env("PATH")
+    previous_stat_path = System.get_env("SYMP_TEST_STAT_PATH")
+    previous_stat_mode = System.get_env("SYMP_TEST_STAT_MODE")
+    previous_date_mode = System.get_env("SYMP_TEST_DATE_MODE")
+
+    on_exit(fn ->
+      if is_nil(previous_path), do: System.delete_env("PATH"), else: System.put_env("PATH", previous_path)
+
+      if is_nil(previous_stat_path),
+        do: System.delete_env("SYMP_TEST_STAT_PATH"),
+        else: System.put_env("SYMP_TEST_STAT_PATH", previous_stat_path)
+
+      if is_nil(previous_stat_mode),
+        do: System.delete_env("SYMP_TEST_STAT_MODE"),
+        else: System.put_env("SYMP_TEST_STAT_MODE", previous_stat_mode)
+
+      if is_nil(previous_date_mode),
+        do: System.delete_env("SYMP_TEST_DATE_MODE"),
+        else: System.put_env("SYMP_TEST_DATE_MODE", previous_date_mode)
+    end)
+
+    File.mkdir!(workspace)
+
+    File.write!(stat_wrapper, """
+    #!/bin/sh
+    if { [ "${2:-}" = "%f|%d|%i|%w" ] || [ "${2:-}" = "%Xp|%d|%i|%v" ]; } && [ "${4:-}" = "$SYMP_TEST_STAT_PATH" ]; then
+      case "$SYMP_TEST_STAT_MODE" in
+        stat-failure) printf 'stat failed\\n'; exit 9 ;;
+        regular-file)
+          if [ "${2:-}" = "%Xp|%d|%i|%v" ]; then printf '81ED|39|999|100\\n'; else printf '81ed|39|999|2024-01-01 00:00:00.000000001 +0000\\n'; fi
+          ;;
+        malformed) printf 'invalid-output\\n' ;;
+        invalid-birth)
+          if [ "${2:-}" = "%Xp|%d|%i|%v" ]; then printf '41ED|39|999|0\\n'; else printf '41ed|39|999|not-a-date\\n'; fi
+          ;;
+        *)
+          if [ "${2:-}" = "%Xp|%d|%i|%v" ]; then printf '41ED|39|999|100\\n'; else printf '41ed|39|999|2024-01-01 00:00:00.000000001 +0000\\n'; fi
+          ;;
+      esac
+    else
+      exec /usr/bin/stat "$@"
+    fi
+    """)
+
+    File.write!(date_wrapper, """
+    #!/bin/sh
+    if [ "${SYMP_TEST_DATE_MODE:-}" = "nonnumeric" ] && [ "${1:-}" = "-d" ]; then
+      printf 'not-nanoseconds\\n'
+    else
+      exec /usr/bin/date "$@"
+    fi
+    """)
+
+    File.chmod!(stat_wrapper, 0o755)
+    File.chmod!(date_wrapper, 0o755)
+    System.put_env("PATH", root <> ":" <> (previous_path || ""))
+    System.put_env("SYMP_TEST_STAT_PATH", workspace)
+
+    System.put_env("SYMP_TEST_STAT_MODE", "stat-failure")
+
+    assert {:error, {:filesystem_identity_failed, {:stat_failed, 9, "stat failed"}}} =
+             OwnershipLedger.filesystem_identity(workspace)
+
+    System.put_env("SYMP_TEST_STAT_MODE", "regular-file")
+
+    assert {:error, {:filesystem_identity_failed, {:not_directory, :unknown}}} =
+             OwnershipLedger.filesystem_identity(workspace)
+
+    System.put_env("SYMP_TEST_STAT_MODE", "malformed")
+
+    assert {:error, {:filesystem_identity_failed, :invalid_stat_output}} =
+             OwnershipLedger.filesystem_identity(workspace)
+
+    System.put_env("SYMP_TEST_STAT_MODE", "invalid-birth")
+
+    case :os.type() do
+      {:unix, :darwin} ->
+        assert {:error, {:filesystem_identity_failed, :generation_unavailable}} =
+                 OwnershipLedger.filesystem_identity(workspace)
+
+      _other ->
+        assert {:error, {:filesystem_identity_failed, :invalid_birth_time}} =
+                 OwnershipLedger.filesystem_identity(workspace)
+
+        System.put_env("SYMP_TEST_STAT_MODE", "valid")
+        System.put_env("SYMP_TEST_DATE_MODE", "nonnumeric")
+
+        assert {:error, {:filesystem_identity_failed, :invalid_birth_time}} =
+                 OwnershipLedger.filesystem_identity(workspace)
+    end
+  end
+
+  test "filesystem identity supports macOS inode generations and rejects missing generations", %{
+    root: root,
+    path: ledger_path
+  } do
+    path = Path.join(root, "generation-identity")
+
+    assert {darwin_args, :generation} =
+             OwnershipLedger.filesystem_identity_stat_command(path, {:unix, :darwin})
+
+    assert darwin_args == ["-f", "%Xp|%d|%i|%v", "--", path]
+
+    assert {linux_args, :birth_time} =
+             OwnershipLedger.filesystem_identity_stat_command(path, {:unix, :linux})
+
+    assert linux_args == ["-c", "%f|%d|%i|%w", "--", path]
+
+    assert {:ok, %{device: 39, inode: 999, generation: 42}} =
+             OwnershipLedger.parse_stat_filesystem_identity("41ED|39|999|42\n", :generation)
+
+    assert {:error, {:filesystem_identity_failed, :generation_unavailable}} =
+             OwnershipLedger.parse_stat_filesystem_identity("41ED|39|999|0\n", :generation)
+
+    assert {:error, {:filesystem_identity_failed, :invalid_generation}} =
+             OwnershipLedger.parse_stat_filesystem_identity("41ED|39|999|unknown\n", :generation)
+
+    {:ok, ledger} = OwnershipLedger.open("project-a", @identity, root: root, path: ledger_path)
+    record = ownership("ownership-generation", "work-generation", root)
+    assert {:ok, reserved} = OwnershipLedger.reserve_sync(ledger, record)
+    generation_identity = %{device: 39, inode: 999, generation: 42}
+
+    assert {:ok, provisioning} =
+             OwnershipLedger.transition_sync(
+               ledger,
+               reserved.workspace_ownership_id,
+               :provisioning,
+               generation_identity
+             )
+
+    assert provisioning.top_level_filesystem_identity == generation_identity
+
+    assert {:ok, _owned} =
+             OwnershipLedger.transition_sync(ledger, reserved.workspace_ownership_id, :owned)
+
+    assert :ok = OwnershipLedger.close(ledger)
   end
 
   test "fails closed when the local host identity is corrupt", %{root: root} do
