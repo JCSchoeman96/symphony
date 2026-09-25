@@ -43,6 +43,37 @@ defmodule SymphonyElixir.StatusDashboardSnapshotTest do
     Snapshot.assert_dashboard_snapshot!("idle_with_dashboard_url", render_snapshot(snapshot_data, 0.0))
   end
 
+  test "renders bounded Plane dependency epoch and scheduler metrics" do
+    snapshot_data =
+      {:ok,
+       %{
+         running: [],
+         retrying: [],
+         codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+         plane_epoch: %{
+           status: :current,
+           error: nil,
+           metrics: %{
+             item_count: 1_000,
+             edge_count: 5_000,
+             logical_requests: 1_020,
+             attempts: 1_021,
+             scc_pass_count: 1,
+             duration_ms: 12_345,
+             peak_concurrency: 4,
+             throttle_count: 1,
+             backoff_count: 1,
+             total_backoff_ms: 1_000
+           }
+         }
+       }}
+
+    content = render_snapshot(snapshot_data, 0.0)
+
+    assert content =~ "status=current items=1,000 edges=5,000 GETs=1,020 attempts=1,021 SCC=1 time=12,345ms"
+    assert content =~ "peak=4 throttles=1 backoff=1/1,000ms failure=none"
+  end
+
   test "snapshot fixture: super busy dashboard" do
     snapshot_data =
       {:ok,

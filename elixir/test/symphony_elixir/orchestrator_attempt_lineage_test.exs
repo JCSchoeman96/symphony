@@ -937,7 +937,10 @@ defmodule SymphonyElixir.OrchestratorAttemptLineageTest do
       codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
     }
 
-    assert {:noreply, ^state} = Orchestrator.handle_info({:retry_issue, issue_id, retry_token}, state)
+    assert {:noreply, next_state} =
+             Orchestrator.handle_info({:retry_issue, issue_id, retry_token}, state)
+
+    assert next_state.retry_attempts[issue_id].deferred?
     refute_receive {:attempt_ledger_runner_started, ^issue_id, _opts}, 100
   end
 

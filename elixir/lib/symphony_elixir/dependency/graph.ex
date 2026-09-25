@@ -43,6 +43,8 @@ defmodule SymphonyElixir.Dependency.Graph do
 
   @type completeness :: :complete | {:incomplete, term()} | {:unavailable, term()}
 
+  @type epoch_id :: term()
+
   @type diagnostic :: %{
           kind: atom(),
           dependent_id: String.t() | nil,
@@ -67,6 +69,10 @@ defmodule SymphonyElixir.Dependency.Graph do
   def build(issues) when is_list(issues), do: build(issues, [])
   def build(_issues), do: %__MODULE__{completeness: {:incomplete, :invalid_issue_collection}, epoch: make_ref()}
 
+  @spec build([Issue.t()], epoch_id()) :: t()
+  def build(issues, epoch_id) when is_list(issues) and not is_list(epoch_id),
+    do: build(issues, epoch_id: epoch_id)
+
   @spec build([Issue.t()], keyword()) :: t()
   def build(issues, opts) when is_list(issues) and is_list(opts) do
     {nodes, diagnostics} = collect_nodes(issues)
@@ -83,7 +89,7 @@ defmodule SymphonyElixir.Dependency.Graph do
     graph = %__MODULE__{
       source: Keyword.get(opts, :source),
       scope: normalize_scope(Keyword.get(opts, :scope, %{})),
-      epoch: Keyword.get(opts, :epoch, make_ref()),
+      epoch: Keyword.get(opts, :epoch_id, Keyword.get(opts, :epoch, make_ref())),
       acquired_at: Keyword.get(opts, :acquired_at, DateTime.utc_now()),
       nodes: nodes,
       edges: edges,
@@ -92,10 +98,19 @@ defmodule SymphonyElixir.Dependency.Graph do
     }
 
     cycles = strongly_connected_components(graph)
-    %{graph | cycles: cycles, cycle_members: cycles |> List.flatten() |> MapSet.new()}
+
+    graph = %{graph | cycles: cycles, cycle_members: cycles |> List.flatten() |> MapSet.new()}
+    notify_scc(Keyword.get(opts, :on_scc), graph, cycles)
+    graph
   end
 
-  def build(_issues, _opts), do: %__MODULE__{completeness: {:incomplete, :invalid_issue_collection}, epoch: make_ref()}
+  def build(_issues, _opts),
+    do: %__MODULE__{completeness: {:incomplete, :invalid_issue_collection}, epoch: make_ref()}
+
+  @spec build([Issue.t()], epoch_id(), keyword()) :: t()
+  def build(issues, epoch_id, opts) when is_list(issues) and is_list(opts) do
+    build(issues, Keyword.put(opts, :epoch_id, epoch_id))
+  end
 
   @spec unavailable(term()) :: t()
   def unavailable(reason) do
@@ -383,4 +398,15 @@ defmodule SymphonyElixir.Dependency.Graph do
 
   defp cyclic_component?(%__MODULE__{edges: edges}, [issue_id]),
     do: issue_id in Map.get(edges, issue_id, [])
+
+  defp notify_scc(observer, _graph, _cycles) when not is_function(observer), do: :ok
+
+  defp notify_scc(observer, graph, cycles) do
+    cond do
+      is_function(observer, 0) -> observer.()
+      is_function(observer, 1) -> observer.(cycles)
+      is_function(observer, 2) -> observer.(graph, cycles)
+      true -> :ok
+    end
+  end
 end

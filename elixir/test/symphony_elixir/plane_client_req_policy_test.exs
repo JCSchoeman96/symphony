@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.PlaneClientReqPolicyTest do
   use ExUnit.Case, async: false
 
-  alias SymphonyElixir.Plane.Client
+  alias SymphonyElixir.Plane.{Client, ReadScheduler}
 
   @config %{
     base_url: "https://api.plane.so",
@@ -45,7 +45,24 @@ defmodule SymphonyElixir.PlaneClientReqPolicyTest do
     assert is_function(request.into, 2)
   end
 
-  test "does not retry a provider failure" do
+  test "retries a transient provider failure once with Req retries disabled" do
+    parent = self()
+    {:ok, scheduler} = ReadScheduler.start_link(backoff_base_ms: 1, max_backoff_ms: 10)
+
+    request_fun = fn request ->
+      send(parent, {:request, request})
+      {:ok, %{status: 503, headers: %{}, body: %{}}}
+    end
+
+    assert {:error, :provider_unavailable} =
+             Client.get_project(@config, request_fun: request_fun, scheduler: scheduler)
+
+    assert_receive {:request, _request}
+    assert_receive {:request, _request}
+    refute_receive {:request, _request}
+  end
+
+  test "does not retry a raw Req failure when the shared scheduler is bypassed" do
     parent = self()
 
     Req.default_options(
@@ -55,8 +72,9 @@ defmodule SymphonyElixir.PlaneClientReqPolicyTest do
       end
     )
 
-    assert {:error, :provider_unavailable} = Client.get_project(@config)
-    assert_receive {:request, _request}
+    assert {:error, :provider_unavailable} = Client.get_project(@config, scheduler: nil)
+    assert_receive {:request, request}
+    assert request.options[:retry] == false
     refute_receive {:request, _request}
   end
 

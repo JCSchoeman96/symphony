@@ -1,5 +1,28 @@
 import Config
 
+config :logger, :default_formatter,
+  metadata: [
+    :attempt,
+    :backoff_count,
+    :duration_ms,
+    :edge_count,
+    :epoch_id,
+    :finished_at,
+    :item_count,
+    :logical_requests,
+    :attempts,
+    :peak_concurrency,
+    :rate_limit_remaining,
+    :rate_limit_reset_at,
+    :reason,
+    :request_class,
+    :retry_after_seconds,
+    :scc_pass_count,
+    :started_at,
+    :throttle_count,
+    :total_backoff_ms
+  ]
+
 config :phoenix, :json_library, Jason
 
 config :symphony_elixir, SymphonyElixirWeb.Endpoint,

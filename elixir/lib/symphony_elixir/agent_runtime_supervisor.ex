@@ -32,13 +32,41 @@ defmodule SymphonyElixir.AgentRuntimeSupervisor do
       |> Keyword.get(:transition_coordinator_opts, [])
       |> Keyword.merge(name: transition_coordinator_name, orchestrator: orchestrator_name)
 
+    runtime_name = Keyword.get(opts, :name, __MODULE__)
+
+    default_read_scheduler_name =
+      case runtime_name do
+        name when name == __MODULE__ -> SymphonyElixir.Plane.ReadScheduler
+        name when is_atom(name) -> Module.concat(name, "PlaneReadScheduler")
+        _other -> SymphonyElixir.Plane.ReadScheduler
+      end
+
+    read_scheduler_name =
+      Keyword.get(
+        opts,
+        :read_scheduler_name,
+        Keyword.get(opts, :plane_read_scheduler_name, default_read_scheduler_name)
+      )
+
+    read_scheduler_opts =
+      opts
+      |> Keyword.get(:read_scheduler_opts, Keyword.get(opts, :plane_read_scheduler_opts, []))
+      |> Keyword.merge(name: read_scheduler_name)
+
     children = [
+      Supervisor.child_spec(
+        {SymphonyElixir.Plane.ReadScheduler, read_scheduler_opts},
+        id: read_scheduler_name
+      ),
       Supervisor.child_spec(
         {Task.Supervisor, name: task_supervisor_name},
         id: task_supervisor_name
       ),
       Supervisor.child_spec(
-        {SymphonyElixir.Orchestrator, name: orchestrator_name, task_supervisor: task_supervisor_name},
+        {
+          SymphonyElixir.Orchestrator,
+          name: orchestrator_name, task_supervisor: task_supervisor_name, read_scheduler: read_scheduler_name
+        },
         id: orchestrator_name
       ),
       Supervisor.child_spec(

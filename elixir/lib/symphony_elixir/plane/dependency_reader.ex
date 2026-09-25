@@ -11,7 +11,7 @@ defmodule SymphonyElixir.Plane.DependencyReader do
   alias SymphonyElixir.Tracker.Issue
 
   @max_concurrency 4
-  @relation_task_timeout_ms 20_000
+  @relation_task_timeout_ms 240_000
   @max_relation_entries 10_000
   @phase_transitions %{
     not_built: [:enumerating_items, :failed],
@@ -41,6 +41,13 @@ defmodule SymphonyElixir.Plane.DependencyReader do
   @spec fetch(Client.config(), keyword()) :: {:ok, Graph.t()} | {:error, term()}
   def fetch(config, opts) when is_map(config) and is_list(opts) do
     acquisition = %{phase: :not_built}
+    epoch_id = Keyword.get(opts, :epoch_id, Keyword.get(opts, :epoch, make_ref()))
+    request_metrics = Keyword.get(opts, :request_metrics) || :atomics.new(2, signed: true)
+
+    opts =
+      opts
+      |> Keyword.put(:epoch_id, epoch_id)
+      |> Keyword.put(:request_metrics, request_metrics)
 
     with {:ok, config} <- validate_configuration(config),
          {:ok, acquisition} <- advance(acquisition, :enumerating_items),
@@ -59,7 +66,7 @@ defmodule SymphonyElixir.Plane.DependencyReader do
          :ok <- ensure_node_set_unchanged(opening_issues, closing_issues),
          {:ok, final_issues} <- apply_edges(closing_issues, edges),
          {:ok, acquisition} <- advance(acquisition, :analyzing_cycles),
-         {:ok, graph} <- build_graph(final_issues, config),
+         {:ok, graph} <- build_graph(final_issues, config, opts),
          true <- Graph.complete?(graph),
          {:ok, _complete} <- advance(acquisition, :complete) do
       {:ok, graph}
@@ -175,7 +182,7 @@ defmodule SymphonyElixir.Plane.DependencyReader do
 
   defp read_relations(config, issues, opts) do
     task_opts = [
-      ordered: true,
+      ordered: false,
       max_concurrency: bounded_concurrency(opts),
       timeout: bounded_task_timeout(opts),
       on_timeout: :kill_task
@@ -342,13 +349,15 @@ defmodule SymphonyElixir.Plane.DependencyReader do
     if opening_ids == closing_ids, do: :ok, else: {:error, :node_set_changed}
   end
 
-  defp build_graph(issues, config) do
+  defp build_graph(issues, config, opts) do
     graph =
       Graph.build(issues,
         source: :plane,
         scope: scope(config),
+        epoch_id: Keyword.get(opts, :epoch_id),
         completeness: :complete,
-        acquired_at: DateTime.utc_now()
+        acquired_at: DateTime.utc_now(),
+        on_scc: Keyword.get(opts, :on_scc)
       )
 
     if Graph.complete?(graph), do: {:ok, graph}, else: {:error, :graph_incomplete}
@@ -384,7 +393,8 @@ defmodule SymphonyElixir.Plane.DependencyReader do
 
   defp normalize_failure(_reason), do: :provider_unavailable
 
-  defp client_opts(opts), do: Keyword.take(opts, [:request_fun])
+  defp client_opts(opts),
+    do: Keyword.take(opts, [:request_fun, :request_metrics, :scheduler, :read_scheduler, :class, :epoch_id])
 
   defp bounded_concurrency(opts) do
     case Keyword.get(opts, :max_concurrency, @max_concurrency) do

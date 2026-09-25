@@ -28,6 +28,21 @@ defmodule SymphonyElixir.AttemptLedgerTest do
     assert :ok = AttemptLedger.close(reopened)
   end
 
+  test "accepts Plane provider scope as the attempt ledger identity", %{path: path} do
+    identity = %{
+      tracker_kind: "plane",
+      provider_scope: %{
+        workspace_slug: "workspace-a",
+        workspace_id: "workspace-id-a",
+        project_id: "project-a"
+      }
+    }
+
+    assert {:ok, ledger} = AttemptLedger.open("project-a", identity, path: path)
+    assert ledger.tracker_identity == identity
+    assert :ok = AttemptLedger.close(ledger)
+  end
+
   test "accepts explicitly persisted false safety fields after DETS reopen", %{path: path} do
     record = snapshot("project-a", "issue-a", "lineage-a", %{})
 

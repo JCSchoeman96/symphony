@@ -106,6 +106,46 @@ defmodule SymphonyElixir.TrackerCapabilitiesTest do
     refute :conditional_transition in declared
   end
 
+  test "tracker read options preserve legacy adapters and reject invalid or unknown scopes" do
+    settings = %{kind: "memory"}
+
+    assert {:ok, []} = Tracker.fetch_issues_by_ids(["missing"], tracker_settings: settings)
+    assert {:ok, issues} = Tracker.fetch_dependency_graph(tracker_settings: settings)
+    assert is_list(issues)
+    assert {:error, :project_snapshot_unsupported} = Tracker.fetch_project_snapshot(tracker_settings: settings)
+
+    assert {:error, :invalid_tracker_settings} =
+             Tracker.fetch_dependency_graph(tracker_settings: %{kind: :memory})
+
+    assert {:error, {:unsupported_tracker_kind, "unknown"}} =
+             Tracker.fetch_project_snapshot(tracker_settings: %{kind: "unknown"})
+  end
+
+  test "tracker forwards read options to adapters that support them" do
+    System.put_env("PLANE_API_KEY", "plane-options-test-secret")
+    on_exit(fn -> System.delete_env("PLANE_API_KEY") end)
+
+    settings = %{
+      kind: "plane",
+      endpoint: "https://api.plane.so",
+      api_key: "$PLANE_API_KEY",
+      workspace_slug: "workspace-1",
+      workspace_id: "workspace-stable-1",
+      project_id: "project-1",
+      provider: %{
+        "workspace_slug" => "workspace-1",
+        "workspace_id" => "workspace-stable-1",
+        "project_id" => "project-1",
+        "api_key" => "$PLANE_API_KEY"
+      }
+    }
+
+    request_fun = fn _request -> {:ok, %{status: 404, headers: %{}, body: %{}}} end
+
+    assert {:ok, []} =
+             Tracker.fetch_issues_by_ids(["missing"], tracker_settings: settings, request_fun: request_fun)
+  end
+
   test "missing routed capabilities reject configuration before dispatch" do
     assert {:ok, settings} =
              Schema.parse(%{
