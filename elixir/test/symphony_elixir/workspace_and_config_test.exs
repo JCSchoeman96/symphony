@@ -1763,6 +1763,265 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert File.ls!(workspace) == []
   end
 
+  test "local cleanup deletes the detached workspace and preserves a replacement at its original path" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-workspace-detach-race-#{System.unique_integer([:positive])}")
+    workspace_root = Path.join(test_root, "workspaces")
+    issue = %Issue{id: "workspace-detach-race", identifier: "MT-DETACH-RACE"}
+    workspace = Path.join(workspace_root, issue.identifier)
+    test_process = self()
+
+    File.mkdir_p!(workspace_root)
+    on_exit(fn -> File.rm_rf(test_root) end)
+
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+    ledger = workspace_ownership_ledger()
+    assert {:ok, ^workspace} = Workspace.create_for_issue(issue, nil, ledger)
+    File.write!(Path.join(workspace, "owned"), "owned")
+
+    workspace_tree_remover = fn quarantine_path ->
+      if File.dir?(workspace), do: File.rename!(workspace, workspace <> ".replaced-owned")
+
+      File.mkdir!(workspace)
+      File.write!(Path.join(workspace, "foreign"), "foreign")
+      send(test_process, {:workspace_quarantine_delete, quarantine_path})
+      File.rm_rf(quarantine_path)
+    end
+
+    assert :ok =
+             Workspace.remove_issue_workspaces(issue, nil, ledger,
+               cleanup_authorized?: true,
+               workspace_tree_remover: workspace_tree_remover
+             )
+
+    assert_receive {:workspace_quarantine_delete, quarantine_path}
+    refute quarantine_path == workspace
+    assert File.read!(Path.join(workspace, "foreign")) == "foreign"
+    refute File.exists?(Path.join(workspace <> ".replaced-owned", "owned"))
+    assert {:ok, [released]} = OwnershipLedger.list_for_work_item(ledger, issue.id)
+    assert released.state == :released
+  end
+
+  test "local cleanup resumes deletion from an owned quarantine after a failed tree removal" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-workspace-quarantine-retry-#{System.unique_integer([:positive])}")
+    workspace_root = Path.join(test_root, "workspaces")
+    issue = %Issue{id: "workspace-quarantine-retry", identifier: "MT-QUARANTINE-RETRY"}
+    workspace = Path.join(workspace_root, issue.identifier)
+
+    File.mkdir_p!(workspace_root)
+    on_exit(fn -> File.rm_rf(test_root) end)
+
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+    ledger = workspace_ownership_ledger()
+    assert {:ok, ^workspace} = Workspace.create_for_issue(issue, nil, ledger)
+    File.write!(Path.join(workspace, "owned"), "owned")
+
+    assert {:ok, [record]} = OwnershipLedger.list_for_work_item(ledger, issue.id)
+
+    quarantine_token =
+      :crypto.hash(:sha256, record.workspace_ownership_id)
+      |> Base.encode16(case: :lower)
+      |> binary_part(0, 24)
+
+    quarantine_dir = Path.join(record.canonical_root, ".symphony-workspace-release-#{quarantine_token}")
+    File.mkdir!(quarantine_dir)
+    File.chmod!(quarantine_dir, 0o700)
+
+    assert {:error, _reason} =
+             Workspace.remove_issue_workspaces(issue, nil, ledger,
+               cleanup_authorized?: true,
+               workspace_tree_remover: :invalid
+             )
+
+    refute File.exists?(workspace)
+    assert {:ok, [pending]} = OwnershipLedger.list_for_work_item(ledger, issue.id)
+    assert pending.state == :release_pending
+
+    failing_tree_remover = fn quarantine_path ->
+      {:error, :simulated_tree_removal_failure, quarantine_path}
+    end
+
+    assert {:error, _reason} =
+             Workspace.remove_issue_workspaces(issue, nil, ledger,
+               cleanup_authorized?: true,
+               workspace_tree_remover: failing_tree_remover
+             )
+
+    assert {:ok, [pending]} = OwnershipLedger.list_for_work_item(ledger, issue.id)
+    assert pending.state == :release_pending
+
+    assert :ok = Workspace.remove_issue_workspaces(issue, nil, ledger, cleanup_authorized?: true)
+
+    assert {:ok, [released]} = OwnershipLedger.list_for_work_item(ledger, issue.id)
+    assert released.state == :released
+  end
+
+  test "local cleanup fails closed for an invalid quarantine and preserves its owned workspace" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-workspace-quarantine-foreign-#{System.unique_integer([:positive])}")
+    workspace_root = Path.join(test_root, "workspaces")
+    issue = %Issue{id: "workspace-quarantine-foreign", identifier: "MT-QUARANTINE-FOREIGN"}
+    workspace = Path.join(workspace_root, issue.identifier)
+
+    File.mkdir_p!(workspace_root)
+    on_exit(fn -> File.rm_rf(test_root) end)
+
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+    ledger = workspace_ownership_ledger()
+    assert {:ok, ^workspace} = Workspace.create_for_issue(issue, nil, ledger)
+    File.write!(Path.join(workspace, "owned"), "owned")
+
+    assert {:ok, [record]} = OwnershipLedger.list_for_work_item(ledger, issue.id)
+
+    quarantine_token =
+      :crypto.hash(:sha256, record.workspace_ownership_id)
+      |> Base.encode16(case: :lower)
+      |> binary_part(0, 24)
+
+    quarantine_dir = Path.join(record.canonical_root, ".symphony-workspace-release-#{quarantine_token}")
+    File.write!(quarantine_dir, "foreign file")
+
+    assert {:error, _reason} =
+             Workspace.remove_issue_workspaces(issue, nil, ledger, cleanup_authorized?: true)
+
+    assert File.read!(Path.join(workspace, "owned")) == "owned"
+    assert File.read!(quarantine_dir) == "foreign file"
+
+    File.rm!(quarantine_dir)
+    File.mkdir!(quarantine_dir)
+    File.chmod!(quarantine_dir, 0o755)
+
+    assert {:error, _reason} =
+             Workspace.remove_issue_workspaces(issue, nil, ledger, cleanup_authorized?: true)
+
+    assert File.read!(Path.join(workspace, "owned")) == "owned"
+
+    File.chmod!(quarantine_dir, 0o700)
+    File.write!(Path.join(quarantine_dir, "foreign"), "foreign")
+
+    assert {:error, _reason} =
+             Workspace.remove_issue_workspaces(issue, nil, ledger, cleanup_authorized?: true)
+
+    assert File.read!(Path.join(workspace, "owned")) == "owned"
+    assert File.read!(Path.join(quarantine_dir, "foreign")) == "foreign"
+    assert {:ok, [pending]} = OwnershipLedger.list_for_work_item(ledger, issue.id)
+    assert pending.state == :release_pending
+
+    File.rm!(Path.join(quarantine_dir, "foreign"))
+    File.rmdir!(quarantine_dir)
+
+    File.mkdir!(quarantine_dir)
+    File.chmod!(quarantine_dir, 0o700)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      hook_before_remove: "chmod 755 '#{quarantine_dir}'"
+    )
+
+    assert {:error, _reason} =
+             Workspace.remove_issue_workspaces(issue, nil, ledger, cleanup_authorized?: true)
+
+    assert File.read!(Path.join(workspace, "owned")) == "owned"
+    assert {:ok, %File.Stat{mode: mode}} = File.lstat(quarantine_dir)
+    assert Bitwise.band(mode, 0o777) == 0o755
+
+    File.chmod!(quarantine_dir, 0o700)
+    File.rmdir!(quarantine_dir)
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+    assert :ok = Workspace.remove_issue_workspaces(issue, nil, ledger, cleanup_authorized?: true)
+
+    assert {:ok, [released]} = OwnershipLedger.list_for_work_item(ledger, issue.id)
+    assert released.state == :released
+  end
+
+  test "local cleanup releases a missing workspace after validating an empty quarantine" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-workspace-empty-quarantine-#{System.unique_integer([:positive])}")
+    workspace_root = Path.join(test_root, "workspaces")
+    issue = %Issue{id: "workspace-empty-quarantine", identifier: "MT-EMPTY-QUARANTINE"}
+    workspace = Path.join(workspace_root, issue.identifier)
+
+    File.mkdir_p!(workspace_root)
+    on_exit(fn -> File.rm_rf(test_root) end)
+
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+    ledger = workspace_ownership_ledger()
+    assert {:ok, ^workspace} = Workspace.create_for_issue(issue, nil, ledger)
+    assert {:ok, [record]} = OwnershipLedger.list_for_work_item(ledger, issue.id)
+
+    quarantine_token =
+      :crypto.hash(:sha256, record.workspace_ownership_id)
+      |> Base.encode16(case: :lower)
+      |> binary_part(0, 24)
+
+    quarantine_dir = Path.join(record.canonical_root, ".symphony-workspace-release-#{quarantine_token}")
+    File.rm_rf!(workspace)
+    File.mkdir!(quarantine_dir)
+    File.chmod!(quarantine_dir, 0o700)
+
+    assert :ok = Workspace.remove_issue_workspaces(issue, nil, ledger, cleanup_authorized?: true)
+
+    refute File.exists?(quarantine_dir)
+    assert {:ok, [released]} = OwnershipLedger.list_for_work_item(ledger, issue.id)
+    assert released.state == :released
+  end
+
+  test "local cleanup preserves a replacement found in the quarantine path" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-workspace-quarantine-replaced-#{System.unique_integer([:positive])}")
+    workspace_root = Path.join(test_root, "workspaces")
+    issue = %Issue{id: "workspace-quarantine-replaced", identifier: "MT-QUARANTINE-REPLACED"}
+    workspace = Path.join(workspace_root, issue.identifier)
+
+    File.mkdir_p!(workspace_root)
+    on_exit(fn -> File.rm_rf(test_root) end)
+
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+    ledger = workspace_ownership_ledger()
+    assert {:ok, ^workspace} = Workspace.create_for_issue(issue, nil, ledger)
+    File.write!(Path.join(workspace, "owned"), "owned")
+    assert {:ok, [record]} = OwnershipLedger.list_for_work_item(ledger, issue.id)
+
+    quarantine_token =
+      :crypto.hash(:sha256, record.workspace_ownership_id)
+      |> Base.encode16(case: :lower)
+      |> binary_part(0, 24)
+
+    quarantine_dir = Path.join(record.canonical_root, ".symphony-workspace-release-#{quarantine_token}")
+    quarantined_workspace = Path.join(quarantine_dir, "workspace")
+    preserved_workspace = workspace <> ".owned"
+
+    File.mkdir!(quarantine_dir)
+    File.chmod!(quarantine_dir, 0o700)
+    File.rename!(workspace, preserved_workspace)
+    File.mkdir!(quarantined_workspace)
+    File.write!(Path.join(quarantined_workspace, "foreign"), "foreign")
+
+    assert {:error, _reason} =
+             Workspace.remove_issue_workspaces(issue, nil, ledger, cleanup_authorized?: true)
+
+    assert File.read!(Path.join(preserved_workspace, "owned")) == "owned"
+    assert File.read!(Path.join(quarantined_workspace, "foreign")) == "foreign"
+    assert {:ok, [pending]} = OwnershipLedger.list_for_work_item(ledger, issue.id)
+    assert pending.state == :release_pending
+
+    File.rm_rf!(quarantine_dir)
+    File.mkdir!(quarantine_dir)
+    File.chmod!(quarantine_dir, 0o700)
+    File.ln_s!(preserved_workspace, quarantined_workspace)
+
+    assert {:error, _reason} =
+             Workspace.remove_issue_workspaces(issue, nil, ledger, cleanup_authorized?: true)
+
+    assert File.lstat!(quarantined_workspace).type == :symlink
+    assert File.read!(Path.join(preserved_workspace, "owned")) == "owned"
+
+    File.rm_rf!(quarantine_dir)
+    File.rename!(preserved_workspace, workspace)
+
+    assert :ok = Workspace.remove_issue_workspaces(issue, nil, ledger, cleanup_authorized?: true)
+
+    assert {:ok, [released]} = OwnershipLedger.list_for_work_item(ledger, issue.id)
+    assert released.state == :released
+  end
+
   test "failed after_create cleanup preserves the workspace when the configured root changes identity" do
     test_root = Path.join(System.tmp_dir!(), "symphony-workspace-root-replaced-#{System.unique_integer([:positive])}")
     workspace_root = Path.join(test_root, "workspaces")
@@ -2667,6 +2926,110 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     after
       File.rm_rf(test_root)
     end
+  end
+
+  test "remote cleanup deletes the detached workspace and preserves a replacement at its original path" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-remote-workspace-detach-race-#{System.unique_integer([:positive])}")
+    remote_home = Path.join(test_root, "remote-home")
+    workspace_root = Path.join(remote_home, "workspaces")
+    issue = %Issue{id: "remote-workspace-detach-race", identifier: "MT-REMOTE-DETACH-RACE"}
+    workspace_path = Path.join(workspace_root, issue.identifier)
+    host_identity = "host-remote-detach-race"
+    host_identity_path = Path.join(remote_home, ".local/state/symphony/workspace-ownership/host.identity")
+    host_identity_dir = Path.dirname(host_identity_path)
+    worker_host = "worker-remote-detach-race"
+    fake_ssh = Path.join(test_root, "ssh")
+    previous_path = System.get_env("PATH")
+    previous_home = System.get_env("HOME")
+    previous_race_workspace = System.get_env("SYMP_TEST_REMOTE_RACE_WORKSPACE")
+
+    on_exit(fn ->
+      restore_env("PATH", previous_path)
+      restore_env("HOME", previous_home)
+      restore_env("SYMP_TEST_REMOTE_RACE_WORKSPACE", previous_race_workspace)
+      File.rm_rf(test_root)
+    end)
+
+    File.mkdir_p!(workspace_root)
+    File.mkdir_p!(host_identity_dir)
+    File.chmod!(host_identity_dir, 0o700)
+    File.write!(host_identity_path, host_identity <> "\n")
+    File.chmod!(host_identity_path, 0o600)
+    File.mkdir!(workspace_path)
+    File.write!(Path.join(workspace_path, "owned"), "owned")
+
+    File.write!(fake_ssh, """
+    #!/usr/bin/env bash
+    set -euo pipefail
+    remote_command="${!#}"
+
+    rm() {
+      if [ "${1:-}" = "-rf" ] && [ "${SYMP_TEST_REMOTE_RACE_DONE:-0}" != "1" ]; then
+        if [ -e "$SYMP_TEST_REMOTE_RACE_WORKSPACE" ]; then
+          /bin/mv -- "$SYMP_TEST_REMOTE_RACE_WORKSPACE" "$SYMP_TEST_REMOTE_RACE_WORKSPACE.owned"
+        fi
+        /bin/mkdir -p -- "$SYMP_TEST_REMOTE_RACE_WORKSPACE"
+        /usr/bin/printf 'foreign\\n' > "$SYMP_TEST_REMOTE_RACE_WORKSPACE/foreign"
+        export SYMP_TEST_REMOTE_RACE_DONE=1
+      fi
+
+      command rm "$@"
+    }
+
+    export -f rm
+    exec /bin/bash -lc "$remote_command"
+    """)
+
+    File.chmod!(fake_ssh, 0o755)
+    System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
+    System.put_env("HOME", remote_home)
+    System.put_env("SYMP_TEST_REMOTE_RACE_WORKSPACE", workspace_path)
+    System.delete_env("SYMP_TEST_REMOTE_RACE_DONE")
+
+    {root_identity, 0} = System.cmd("stat", ["-c", "%d:%i", workspace_root])
+    {workspace_identity, 0} = System.cmd("stat", ["-c", "%d:%i", workspace_path])
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      worker_ssh_hosts: [worker_host]
+    )
+
+    ledger = workspace_ownership_ledger()
+
+    attrs = %{
+      issue_identifier: issue.identifier,
+      work_item_id: issue.id,
+      workspace_key: Workspace.workspace_key(issue.identifier),
+      workspace_ownership_id: "workspace-" <> Base.encode16(:crypto.strong_rand_bytes(24), case: :lower),
+      location: :remote,
+      worker_host: worker_host,
+      trusted_host_identity: host_identity,
+      configured_root: workspace_root,
+      configured_root_identity: String.trim(root_identity),
+      canonical_root: workspace_root,
+      canonical_workspace_path: workspace_path
+    }
+
+    assert {:ok, reserved} = OwnershipLedger.reserve_sync(ledger, attrs)
+
+    assert {:ok, provisioning} =
+             OwnershipLedger.transition_sync(
+               ledger,
+               reserved.workspace_ownership_id,
+               :provisioning,
+               configured_root_identity: String.trim(root_identity),
+               top_level_filesystem_identity: String.trim(workspace_identity)
+             )
+
+    assert {:ok, _owned} =
+             OwnershipLedger.transition_sync(ledger, provisioning.workspace_ownership_id, :owned)
+
+    assert :ok =
+             Workspace.remove_issue_workspaces(issue, worker_host, ledger, cleanup_authorized?: true)
+
+    assert File.read!(Path.join(workspace_path, "foreign")) == "foreign\n"
+    assert {:ok, [released]} = OwnershipLedger.list_for_work_item(ledger, issue.id)
+    assert released.state == :released
   end
 
   test "remote after_create failures release a workspace through the guarded remote removal path" do

@@ -766,7 +766,7 @@ defmodule SymphonyElixir.Workspace do
   end
 
   defp remove_configured_remote_workspace(record, worker_host, ledger) do
-    script = remote_remove_guard_script(record, true)
+    script = remote_remove_guard_script(record)
 
     case run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms) do
       {:ok, {_output, 0}} ->
@@ -783,64 +783,120 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  defp remote_remove_guard_script(record, include_before_remove?) do
+  defp remote_remove_guard_script(record) do
     root = Config.settings!().workspace.root
     expected_root = record.canonical_root
     workspace = record.canonical_workspace_path
     host_identity_path = @default_remote_host_identity
+    quarantine_dir = workspace_quarantine_dir(record)
+    quarantine_workspace = Path.join(quarantine_dir, "workspace")
     hook = Config.settings!().hooks.before_remove
 
     hook_commands =
       cond do
-        not include_before_remove? -> []
         is_nil(hook) -> []
         CredentialBoundary.routed_workspace_shell_hook_skipped?("before_remove") -> []
         true -> [hook]
       end
+
+    root_binding_checks = [
+      "if [ -L \"$root\" ] || [ ! -d \"$root\" ]; then exit 92; fi",
+      "if [ \"$(cd \"$root\" && pwd -P)\" != #{shell_escape(expected_root)} ]; then exit 93; fi",
+      "if [ \"$(stat -c '%d:%i' -- \"$root\")\" != #{shell_escape(record.configured_root_identity)} ]; then exit 94; fi"
+    ]
+
+    host_identity_checks = [
+      "host_identity_dir=$(dirname \"$host_identity_path\")",
+      "check_dir=\"$host_identity_dir\"",
+      "while [ \"$check_dir\" != \"/\" ] && [ \"$check_dir\" != \".\" ]; do if [ -L \"$check_dir\" ] || [ ! -d \"$check_dir\" ]; then exit 95; fi; check_dir=$(dirname \"$check_dir\"); done",
+      "if [ \"$(stat -c '%a' -- \"$host_identity_dir\")\" != 700 ]; then exit 95; fi",
+      "if [ -L \"$host_identity_path\" ] || [ ! -f \"$host_identity_path\" ] || [ \"$(stat -c '%a' -- \"$host_identity_path\")\" != 600 ]; then exit 95; fi",
+      "if [ \"$(cat \"$host_identity_path\")\" != #{shell_escape(record.trusted_host_identity)} ]; then exit 96; fi"
+    ]
+
+    quarantine_checks = [
+      "case \"$quarantine_dir\" in \"$root\"/*) ;; *) exit 103 ;; esac",
+      "if [ -L \"$quarantine_dir\" ]; then exit 103; fi",
+      "if [ ! -e \"$quarantine_dir\" ]; then (umask 077; mkdir -- \"$quarantine_dir\") || exit 103; fi",
+      "if [ ! -d \"$quarantine_dir\" ] || [ \"$(stat -c '%a' -- \"$quarantine_dir\")\" != 700 ]; then exit 103; fi",
+      "if [ \"$(cd \"$quarantine_dir\" && pwd -P)\" != \"$quarantine_dir\" ]; then exit 103; fi",
+      "if [ \"$(stat -c '%d' -- \"$quarantine_dir\")\" != \"$(stat -c '%d' -- \"$root\")\" ]; then exit 103; fi",
+      "if [ -L \"$quarantined_workspace\" ]; then exit 104; fi"
+    ]
+
+    source_validation = [
+      "if [ -L \"$workspace\" ] || [ ! -d \"$workspace\" ]; then exit 97; fi",
+      "if [ \"$(cd \"$workspace\" && pwd -P)\" != #{shell_escape(workspace)} ]; then exit 98; fi",
+      "if [ \"$(stat -c '%d:%i' -- \"$workspace\")\" != #{shell_escape(record.top_level_filesystem_identity)} ]; then exit 99; fi"
+    ]
+
+    source_hook_and_detach = [
+      "cd \"$workspace\"",
+      CredentialBoundary.unset_shell_command(CredentialBoundary.configured_secret_environment_names()),
+      Enum.join(hook_commands, "\n"),
+      "if [ \"$(cd \"$root\" && pwd -P)\" != #{shell_escape(expected_root)} ] || [ \"$(stat -c '%d:%i' -- \"$root\")\" != #{shell_escape(record.configured_root_identity)} ]; then exit 100; fi",
+      "if [ -L \"$workspace\" ] || [ \"$(cd \"$workspace\" && pwd -P)\" != #{shell_escape(workspace)} ]; then exit 101; fi",
+      "if [ \"$(stat -c '%d:%i' -- \"$workspace\")\" != #{shell_escape(record.top_level_filesystem_identity)} ]; then exit 102; fi",
+      "if [ -e \"$quarantined_workspace\" ] || [ -L \"$quarantined_workspace\" ]; then exit 104; fi",
+      "mv -- \"$workspace\" \"$quarantined_workspace\""
+    ]
+
+    quarantined_workspace_validation = [
+      "if [ -L \"$quarantined_workspace\" ] || [ ! -d \"$quarantined_workspace\" ]; then exit 104; fi",
+      "if [ \"$(cd \"$quarantined_workspace\" && pwd -P)\" != \"$quarantined_workspace\" ]; then exit 104; fi",
+      "if [ \"$(stat -c '%d:%i' -- \"$quarantined_workspace\")\" != #{shell_escape(record.top_level_filesystem_identity)} ]; then exit 104; fi"
+    ]
 
     [
       "set -eu",
       remote_shell_assign("workspace", workspace),
       remote_shell_assign("root", root),
       remote_shell_assign("host_identity_path", host_identity_path),
+      remote_shell_assign("quarantine_dir", quarantine_dir),
+      remote_shell_assign("quarantined_workspace", quarantine_workspace),
       "case \"$workspace\" in \"$root\"/*) ;; *) exit 91 ;; esac",
-      "if [ -L \"$root\" ] || [ ! -d \"$root\" ]; then exit 92; fi",
-      "if [ \"$(cd \"$root\" && pwd -P)\" != #{shell_escape(expected_root)} ]; then exit 93; fi",
-      "if [ \"$(stat -c '%d:%i' -- \"$root\")\" != #{shell_escape(record.configured_root_identity)} ]; then exit 94; fi",
-      "host_identity_dir=$(dirname \"$host_identity_path\")",
-      "check_dir=\"$host_identity_dir\"",
-      "while [ \"$check_dir\" != \"/\" ] && [ \"$check_dir\" != \".\" ]; do if [ -L \"$check_dir\" ] || [ ! -d \"$check_dir\" ]; then exit 95; fi; check_dir=$(dirname \"$check_dir\"); done",
-      "if [ \"$(stat -c '%a' -- \"$host_identity_dir\")\" != 700 ]; then exit 95; fi",
-      "if [ -L \"$host_identity_path\" ] || [ ! -f \"$host_identity_path\" ] || [ \"$(stat -c '%a' -- \"$host_identity_path\")\" != 600 ]; then exit 95; fi",
-      "if [ \"$(cat \"$host_identity_path\")\" != #{shell_escape(record.trusted_host_identity)} ]; then exit 96; fi",
-      "if [ ! -e \"$workspace\" ] && [ ! -L \"$workspace\" ]; then printf '%s\\n' '#{@remote_workspace_marker}\\tabsent'; exit 0; fi",
-      "if [ -L \"$workspace\" ] || [ ! -d \"$workspace\" ]; then exit 97; fi",
-      "if [ \"$(cd \"$workspace\" && pwd -P)\" != #{shell_escape(workspace)} ]; then exit 98; fi",
-      "if [ \"$(stat -c '%d:%i' -- \"$workspace\")\" != #{shell_escape(record.top_level_filesystem_identity)} ]; then exit 99; fi",
-      "cd \"$workspace\"",
-      CredentialBoundary.unset_shell_command(CredentialBoundary.configured_secret_environment_names()),
-      "#{Enum.join(hook_commands, "\n")}",
-      "if [ \"$(cd \"$root\" && pwd -P)\" != #{shell_escape(expected_root)} ] || [ \"$(stat -c '%d:%i' -- \"$root\")\" != #{shell_escape(record.configured_root_identity)} ]; then exit 100; fi",
-      "if [ -L \"$workspace\" ] || [ \"$(cd \"$workspace\" && pwd -P)\" != #{shell_escape(workspace)} ]; then exit 101; fi",
-      "if [ \"$(stat -c '%d:%i' -- \"$workspace\")\" != #{shell_escape(record.top_level_filesystem_identity)} ]; then exit 102; fi",
-      "rm -rf -- \"$workspace\""
+      root_binding_checks,
+      host_identity_checks,
+      quarantine_checks,
+      "if [ -e \"$quarantined_workspace\" ]; then quarantined=1; else quarantined=0; fi",
+      "if [ \"$quarantined\" = 0 ]; then",
+      "  if [ -n \"$(find \"$quarantine_dir\" -mindepth 1 -maxdepth 1 -print -quit)\" ]; then exit 103; fi",
+      "  if [ ! -e \"$workspace\" ] && [ ! -L \"$workspace\" ]; then rmdir -- \"$quarantine_dir\"; exit 0; fi",
+      source_validation,
+      source_hook_and_detach,
+      "fi",
+      root_binding_checks,
+      host_identity_checks,
+      quarantine_checks,
+      quarantined_workspace_validation,
+      "rm -rf -- \"$quarantined_workspace\"",
+      "rmdir -- \"$quarantine_dir\""
     ]
+    |> List.flatten()
     |> Enum.reject(&(&1 in [nil, ""]))
     |> Enum.join("\n")
   end
 
-  defp remove_local_owned_path(%{state: :release_pending} = record, ledger, _opts) do
-    case File.lstat(record.canonical_workspace_path) do
-      {:error, :enoent} -> release_missing_local_workspace(record, ledger)
-      _ -> remove_local_existing_workspace(record, ledger)
+  defp remove_local_owned_path(record, ledger, opts) do
+    with :ok <- validate_local_root_binding(record),
+         {:ok, quarantine_state} <- local_quarantine_state(record) do
+      remove_local_workspace_or_quarantine(record, ledger, opts, quarantine_state)
     end
   end
 
-  defp remove_local_owned_path(record, ledger, _opts) do
-    remove_local_existing_workspace(record, ledger)
+  defp remove_local_workspace_or_quarantine(record, ledger, opts, {:workspace, quarantine_identity}) do
+    remove_local_quarantined_workspace(record, ledger, opts, quarantine_identity)
   end
 
-  defp release_missing_local_workspace(record, ledger) do
+  defp remove_local_workspace_or_quarantine(record, ledger, opts, quarantine_state) do
+    case File.lstat(record.canonical_workspace_path) do
+      {:error, :enoent} -> release_missing_local_workspace(record, ledger, quarantine_state)
+      {:ok, _stat} -> remove_local_existing_workspace(record, ledger, opts, quarantine_state)
+      {:error, reason} -> {:error, {:workspace_identity_mismatch, record.canonical_workspace_path, reason}}
+    end
+  end
+
+  defp release_missing_local_workspace(record, ledger, :absent) do
     with :ok <- validate_local_root_binding(record),
          {:ok, _released} <-
            OwnershipLedger.transition_sync(ledger, record.workspace_ownership_id, :released) do
@@ -848,25 +904,68 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  defp remove_local_existing_workspace(record, ledger) do
+  defp release_missing_local_workspace(record, ledger, {:empty, quarantine_identity}) do
+    quarantine_dir = local_quarantine_dir(record)
+
+    with :ok <- validate_local_quarantine_directory(record, quarantine_dir, quarantine_identity),
+         :ok <- File.rmdir(quarantine_dir),
+         {:ok, _released} <-
+           OwnershipLedger.transition_sync(ledger, record.workspace_ownership_id, :released) do
+      {:ok, [record.canonical_workspace_path]}
+    else
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp remove_local_existing_workspace(record, ledger, opts, quarantine_state) do
+    workspace = record.canonical_workspace_path
+
     with :ok <-
            validate_local_cleanup_identity(
-             record.canonical_workspace_path,
+             workspace,
              record.configured_root_identity,
              record.top_level_filesystem_identity,
              record.canonical_root,
              record.configured_root
            ),
-         :ok <- run_before_remove_hook(record.canonical_workspace_path, record, nil),
+         :ok <- run_before_remove_hook(workspace, record, nil),
          :ok <-
            validate_local_cleanup_identity(
-             record.canonical_workspace_path,
+             workspace,
              record.configured_root_identity,
              record.top_level_filesystem_identity,
              record.canonical_root,
              record.configured_root
            ),
-         {:ok, _removed} <- File.rm_rf(record.canonical_workspace_path),
+         {:ok, quarantine_identity} <- ensure_local_quarantine_directory(record, quarantine_state),
+         quarantine_workspace <- local_quarantine_workspace(record),
+         :ok <- ensure_local_quarantine_workspace_absent(quarantine_workspace),
+         :ok <- rename_local_workspace_to_quarantine(workspace, quarantine_workspace),
+         :ok <-
+           validate_local_quarantined_workspace(
+             record,
+             local_quarantine_dir(record),
+             quarantine_workspace,
+             quarantine_identity
+           ) do
+      remove_local_quarantined_workspace(record, ledger, opts, quarantine_identity)
+    end
+  end
+
+  defp remove_local_quarantined_workspace(record, ledger, opts, quarantine_identity) do
+    quarantine_dir = local_quarantine_dir(record)
+    quarantine_workspace = local_quarantine_workspace(record)
+
+    with :ok <-
+           validate_local_quarantined_workspace(
+             record,
+             quarantine_dir,
+             quarantine_workspace,
+             quarantine_identity
+           ),
+         {:ok, _removed} <- remove_local_workspace_tree(quarantine_workspace, opts),
+         :ok <- ensure_local_quarantine_workspace_absent(quarantine_workspace),
+         :ok <- File.rmdir(quarantine_dir),
          {:ok, _released} <-
            OwnershipLedger.transition_sync(ledger, record.workspace_ownership_id, :released) do
       {:ok, [record.canonical_workspace_path]}
@@ -874,6 +973,159 @@ defmodule SymphonyElixir.Workspace do
       {:error, reason} -> {:error, reason}
       {:error, reason, path} -> {:error, {reason, path}}
     end
+  end
+
+  defp local_quarantine_state(record) do
+    quarantine_dir = local_quarantine_dir(record)
+
+    case File.lstat(quarantine_dir) do
+      {:error, :enoent} ->
+        {:ok, :absent}
+
+      {:ok, %File.Stat{type: :directory, mode: mode}} when Bitwise.band(mode, 0o777) == 0o700 ->
+        local_quarantine_directory_state(record, quarantine_dir)
+
+      {:ok, %File.Stat{type: :directory}} ->
+        {:error, {:workspace_quarantine_permissions_mismatch, quarantine_dir}}
+
+      {:ok, %File.Stat{type: type}} ->
+        {:error, {:workspace_quarantine_type_mismatch, quarantine_dir, type}}
+
+      {:error, reason} ->
+        {:error, {:workspace_quarantine_unavailable, quarantine_dir, reason}}
+    end
+  end
+
+  defp local_quarantine_directory_state(record, quarantine_dir) do
+    with {:ok, quarantine_identity} <- OwnershipLedger.filesystem_identity(quarantine_dir),
+         :ok <- validate_local_quarantine_directory(record, quarantine_dir, quarantine_identity),
+         {:ok, entries} <- File.ls(quarantine_dir) do
+      classify_local_quarantine_entries(entries, quarantine_dir, quarantine_identity)
+    end
+  end
+
+  defp classify_local_quarantine_entries([], _quarantine_dir, quarantine_identity),
+    do: {:ok, {:empty, quarantine_identity}}
+
+  defp classify_local_quarantine_entries(["workspace"], _quarantine_dir, quarantine_identity),
+    do: {:ok, {:workspace, quarantine_identity}}
+
+  defp classify_local_quarantine_entries(entries, quarantine_dir, _quarantine_identity),
+    do: {:error, {:workspace_quarantine_contents_unexpected, quarantine_dir, entries}}
+
+  defp ensure_local_quarantine_directory(record, {:empty, identity}) do
+    with :ok <- validate_local_quarantine_directory(record, local_quarantine_dir(record), identity) do
+      {:ok, identity}
+    end
+  end
+
+  defp ensure_local_quarantine_directory(record, :absent) do
+    quarantine_dir = local_quarantine_dir(record)
+
+    with :ok <- validate_local_root_binding(record),
+         :ok <- create_local_quarantine_directory(quarantine_dir),
+         {:ok, quarantine_identity} <- OwnershipLedger.filesystem_identity(quarantine_dir),
+         :ok <- validate_local_quarantine_directory(record, quarantine_dir, quarantine_identity) do
+      {:ok, quarantine_identity}
+    end
+  end
+
+  defp create_local_quarantine_directory(quarantine_dir) do
+    case File.mkdir(quarantine_dir) do
+      :ok ->
+        with {:ok, before_chmod} <- OwnershipLedger.filesystem_identity(quarantine_dir),
+             :ok <- File.chmod(quarantine_dir, 0o700),
+             {:ok, after_chmod} <- OwnershipLedger.filesystem_identity(quarantine_dir),
+             true <- before_chmod == after_chmod do
+          :ok
+        else
+          false -> {:error, {:workspace_quarantine_changed, quarantine_dir}}
+          {:error, reason} -> {:error, {:workspace_quarantine_create_failed, quarantine_dir, reason}}
+        end
+
+      {:error, :eexist} ->
+        {:error, {:workspace_quarantine_already_exists, quarantine_dir}}
+
+      {:error, reason} ->
+        {:error, {:workspace_quarantine_create_failed, quarantine_dir, reason}}
+    end
+  end
+
+  defp validate_local_quarantine_directory(record, quarantine_dir, expected_identity) do
+    with :ok <- validate_local_root_binding(record),
+         {:ok, %File.Stat{type: :directory, mode: mode}} <- File.lstat(quarantine_dir),
+         true <- Bitwise.band(mode, 0o777) == 0o700,
+         {:ok, ^quarantine_dir} <- PathSafety.canonicalize(quarantine_dir),
+         {:ok, actual_identity} <- OwnershipLedger.filesystem_identity(quarantine_dir),
+         true <- actual_identity == expected_identity,
+         {:ok, root_identity} <- OwnershipLedger.root_identity(record.canonical_root),
+         true <- same_filesystem?(root_identity, actual_identity) do
+      :ok
+    else
+      false -> {:error, {:workspace_quarantine_identity_mismatch, quarantine_dir}}
+      {:ok, %File.Stat{type: type}} -> {:error, {:workspace_quarantine_type_mismatch, quarantine_dir, type}}
+      {:ok, actual} -> {:error, {:workspace_quarantine_path_mismatch, quarantine_dir, actual}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp validate_local_quarantined_workspace(record, quarantine_dir, quarantine_workspace, quarantine_identity) do
+    with :ok <- validate_local_quarantine_directory(record, quarantine_dir, quarantine_identity),
+         {:ok, %File.Stat{type: :directory}} <- File.lstat(quarantine_workspace),
+         {:ok, ^quarantine_workspace} <- PathSafety.canonicalize(quarantine_workspace),
+         {:ok, filesystem_identity} <- OwnershipLedger.filesystem_identity(quarantine_workspace),
+         true <- filesystem_identity == record.top_level_filesystem_identity do
+      :ok
+    else
+      false -> {:error, {:workspace_identity_mismatch, quarantine_workspace}}
+      {:ok, %File.Stat{type: type}} -> {:error, {:workspace_identity_mismatch, quarantine_workspace, type}}
+      {:ok, actual} -> {:error, {:workspace_quarantine_path_mismatch, quarantine_workspace, actual}}
+      {:error, reason} -> {:error, {:workspace_identity_mismatch, quarantine_workspace, reason}}
+    end
+  end
+
+  defp ensure_local_quarantine_workspace_absent(quarantine_workspace) do
+    case File.lstat(quarantine_workspace) do
+      {:error, :enoent} -> :ok
+      {:ok, _stat} -> {:error, {:workspace_quarantine_path_exists, quarantine_workspace}}
+      {:error, reason} -> {:error, {:workspace_quarantine_path_unavailable, quarantine_workspace, reason}}
+    end
+  end
+
+  defp rename_local_workspace_to_quarantine(workspace, quarantine_workspace) do
+    case File.rename(workspace, quarantine_workspace) do
+      :ok -> :ok
+      {:error, reason} -> {:error, {:workspace_quarantine_detach_failed, workspace, quarantine_workspace, reason}}
+    end
+  end
+
+  defp remove_local_workspace_tree(quarantine_workspace, opts) do
+    case Keyword.get(opts, :workspace_tree_remover) do
+      nil -> File.rm_rf(quarantine_workspace)
+      remover when is_function(remover, 1) -> remover.(quarantine_workspace)
+      _ -> {:error, {:invalid_workspace_tree_remover, quarantine_workspace}}
+    end
+  end
+
+  defp workspace_quarantine_dir(record) do
+    Path.join(record.canonical_root, ".symphony-workspace-release-#{quarantine_token(record)}")
+  end
+
+  defp local_quarantine_dir(record), do: workspace_quarantine_dir(record)
+
+  defp local_quarantine_workspace(record), do: Path.join(local_quarantine_dir(record), "workspace")
+
+  defp quarantine_token(record) do
+    :crypto.hash(:sha256, record.workspace_ownership_id)
+    |> Base.encode16(case: :lower)
+    |> binary_part(0, 24)
+  end
+
+  defp same_filesystem?(
+         %{major_device: expected_major, minor_device: expected_minor},
+         %{major_device: actual_major, minor_device: actual_minor}
+       ) do
+    expected_major == actual_major and expected_minor == actual_minor
   end
 
   defp validate_local_root_binding(record) do
@@ -1126,7 +1378,7 @@ defmodule SymphonyElixir.Workspace do
          {:ok, {output, 0}} <-
            run_remote_command(
              worker_host,
-             remote_remove_guard_script(pending, true),
+             remote_remove_guard_script(pending),
              Config.settings!().hooks.timeout_ms
            ),
          {:ok, _released} <-
