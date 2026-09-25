@@ -24,6 +24,7 @@ defmodule SymphonyElixir.AgentRouterOrchestratorTest do
   alias SymphonyElixir.AgentRuntime.Router
   alias SymphonyElixir.Dependency.Graph
   alias SymphonyElixir.WorkControl.{GuardClass, WorkItem}
+  alias SymphonyElixir.Workspace.OwnershipLedger
 
   @now ~U[2026-09-16 00:00:00Z]
 
@@ -275,6 +276,102 @@ defmodule SymphonyElixir.AgentRouterOrchestratorTest do
     assert opts[:route].runtime_name == "codex"
     assert opts[:route].responsibility == "planning"
     assert opts[:work_item].authority_disposition.status == :active
+    assert %OwnershipLedger{} = opts[:ownership_ledger]
+  end
+
+  test "an unavailable workspace ownership ledger fences dispatch" do
+    issue = %Issue{
+      id: "workspace-ledger-unavailable",
+      identifier: "SYM-WORKSPACE-LEDGER",
+      title: "Wait for workspace ownership",
+      state: "In Progress",
+      dispatchable: true
+    }
+
+    invalid_ledger_path =
+      Path.join(System.tmp_dir!(), "symphony-workspace-ledger-directory-#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(invalid_ledger_path)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      agent_routing: "legacy",
+      tracker_active_states: ["In Progress"],
+      poll_interval_ms: 60_000
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+    name = Module.concat(__MODULE__, "WorkspaceLedgerUnavailable#{System.unique_integer([:positive])}")
+
+    {:ok, pid} =
+      Orchestrator.start_link(
+        name: name,
+        workspace_ownership_ledger_opts: [path: invalid_ledger_path]
+      )
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: GenServer.stop(pid)
+      File.rm_rf(invalid_ledger_path)
+    end)
+
+    state = :sys.get_state(pid)
+
+    refute Orchestrator.autonomous_dispatch_allowed_for_test?(state)
+    assert match?({:blocked, {:workspace_ownership_ledger_unavailable, _}}, state.workspace_ownership_ledger_status)
+    refute_receive {:fake_agent_run, ^issue, _opts}, 150
+  end
+
+  test "legacy workspace ownership uses a stable namespace without a project id" do
+    ledger_root =
+      Path.join(System.tmp_dir!(), "symphony-legacy-workspace-ledger-#{System.unique_integer([:positive])}")
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      agent_routing: "legacy",
+      symphony_project_id: nil,
+      tracker_active_states: ["In Progress"],
+      poll_interval_ms: 60_000
+    )
+
+    name = Module.concat(__MODULE__, "LegacyWorkspaceLedger#{System.unique_integer([:positive])}")
+
+    {:ok, pid} =
+      Orchestrator.start_link(
+        name: name,
+        start_quiesced: true,
+        workspace_ownership_ledger_opts: [root: ledger_root]
+      )
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: GenServer.stop(pid)
+      File.rm_rf(ledger_root)
+    end)
+
+    state = :sys.get_state(pid)
+
+    assert state.workspace_ownership_ledger_status == :ready
+    assert state.workspace_ownership_ledger.project_id == "legacy-default"
+  end
+
+  test "AgentRunner fails closed when the workspace ownership ledger is absent" do
+    issue = %Issue{
+      id: "agent-runner-ledger-unavailable",
+      identifier: "SYM-AGENT-RUNNER-LEDGER",
+      title: "Require workspace ownership",
+      state: "In Progress"
+    }
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      agent_routing: "legacy",
+      tracker_active_states: ["In Progress"],
+      poll_interval_ms: 60_000
+    )
+
+    assert_raise RuntimeError, ~r/workspace_ownership_ledger_unavailable/, fn ->
+      AgentRunner.run(issue, self(), max_turns: 1)
+    end
   end
 
   test "legacy workflows dispatch without applying routed profile permissions" do

@@ -131,6 +131,7 @@ defmodule SymphonyElixir.ProfileRuntimeTest do
                runtime: SymphonyElixir.ProfileRuntimeTestFake,
                test_pid: test_pid,
                route: route,
+               ownership_ledger: workspace_ownership_ledger(),
                issue_state_fetcher: fn [_issue_id] -> {:ok, []} end
              )
 

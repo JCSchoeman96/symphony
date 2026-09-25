@@ -8,6 +8,7 @@ defmodule SymphonyElixir.OrchestratorProjectContractTest do
   alias SymphonyElixir.Orchestrator
   alias SymphonyElixir.Tracker.Capabilities
   alias SymphonyElixir.Tracker.Issue
+  alias SymphonyElixir.Workspace.OwnershipLedger
 
   alias SymphonyElixir.WorkControl.{
     AuthorityDisposition,
@@ -22,10 +23,12 @@ defmodule SymphonyElixir.OrchestratorProjectContractTest do
   test "contract drift fences autonomous dispatch without a provider mutation" do
     contract = contract!()
 
-    state = %Orchestrator.State{
-      attempt_ledger_status: :disabled,
-      project_contract_evidence: ProjectContractEvidence.new(contract)
-    }
+    state =
+      %Orchestrator.State{
+        attempt_ledger_status: :disabled,
+        project_contract_evidence: ProjectContractEvidence.new(contract)
+      }
+      |> Map.merge(workspace_ownership_state())
 
     validated = Orchestrator.reconcile_project_contract_for_test(state, snapshot())
     assert validated.project_contract_evidence.validation.status == :valid
@@ -90,10 +93,12 @@ defmodule SymphonyElixir.OrchestratorProjectContractTest do
   test "contract suspension remains closed until revalidation of the current contract" do
     contract = contract!()
 
-    state = %Orchestrator.State{
-      attempt_ledger_status: :disabled,
-      project_contract_evidence: ProjectContractEvidence.new(contract)
-    }
+    state =
+      %Orchestrator.State{
+        attempt_ledger_status: :disabled,
+        project_contract_evidence: ProjectContractEvidence.new(contract)
+      }
+      |> Map.merge(workspace_ownership_state())
 
     suspended =
       state
@@ -114,10 +119,12 @@ defmodule SymphonyElixir.OrchestratorProjectContractTest do
   test "provider snapshot transport failure reuses the canonical incomplete-contract fence" do
     contract = contract!()
 
-    state = %Orchestrator.State{
-      attempt_ledger_status: :disabled,
-      project_contract_evidence: ProjectContractEvidence.new(contract)
-    }
+    state =
+      %Orchestrator.State{
+        attempt_ledger_status: :disabled,
+        project_contract_evidence: ProjectContractEvidence.new(contract)
+      }
+      |> Map.merge(workspace_ownership_state())
 
     validated = Orchestrator.reconcile_provider_project_snapshot_for_test(state, {:ok, snapshot()})
     assert validated.project_contract_evidence.validation.status == :valid
@@ -488,6 +495,13 @@ defmodule SymphonyElixir.OrchestratorProjectContractTest do
     }
 
     {state, work_item}
+  end
+
+  defp workspace_ownership_state do
+    %{
+      workspace_ownership_ledger: %OwnershipLedger{},
+      workspace_ownership_ledger_status: :ready
+    }
   end
 
   defp issue_for(id) when is_binary(id) do

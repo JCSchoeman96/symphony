@@ -10,7 +10,7 @@ The original V4.1 ledger became stale after V4.1-000. The discrepancy is preserv
 
 | Branch | Commit | Tree |
 |---|---|---|
-| protected `main` | `894adda8732c466fa795cd8469d8d0a8710b5cc0` | `6406ebe79ac8c8b3eaec54be49d001d9a47730ea` |
+| protected `main` | `00ebdffdf8685f62e511061b80383fba9617f6b9` | `24d5764022573375df92d0b72e4820dc58b19e16` |
 
 ## Phase index
 
@@ -33,7 +33,8 @@ The original V4.1 ledger became stale after V4.1-000. The discrepancy is preserv
 | H-060A | ACCEPTED per supplied starting authority | [#18](https://github.com/JCSchoeman96/symphony/pull/18) | `d346a91395608242317be4a7375b1052f3000f52` | `baac1c1d0bcaaf9104dad3496015210341bd5a42` | [Reconciliation](GOVERNANCE_RECONCILIATION.md) | GOV-RECON-A; H-060B remains unauthorized |
 | GOV-RECON-A | ACCEPTED | #19 | `e113dda4a58c51df8f56159a9daad3f1854d9d3b` | `be9d1c348a6d2be7a8e9475a4a0a9e077f52a9d2` | [Reconciliation](GOVERNANCE_RECONCILIATION.md) | GOV-RECON-B closure only; H-060B remains unauthorized |
 | GOV-RECON-B | ACCEPTED | [#20](https://github.com/JCSchoeman96/symphony/pull/20) | `894adda8732c466fa795cd8469d8d0a8710b5cc0` | `6406ebe79ac8c8b3eaec54be49d001d9a47730ea` | Post-merge verified | H-060B implementation explicitly authorized |
-| H-060B | IN REVIEW | [#21](https://github.com/JCSchoeman96/symphony/pull/21) | Not accepted | Not accepted | [Implementation PR](https://github.com/JCSchoeman96/symphony/pull/21) | Independent review; do not merge |
-| H-060C | NOT AUTHORIZED | N/A | N/A | N/A | [Roadmap](V4_1_MASTER_ROADMAP.md) | None |
+| H-060B | ACCEPTED | [#21](https://github.com/JCSchoeman96/symphony/pull/21) | `00ebdffdf8685f62e511061b80383fba9617f6b9` | `24d5764022573375df92d0b72e4820dc58b19e16` | [Implementation PR](https://github.com/JCSchoeman96/symphony/pull/21) | H-060C |
+| H-060C | IN REVIEW | [#22](https://github.com/JCSchoeman96/symphony/pull/22) | Not accepted | Not accepted | [Implementation PR](https://github.com/JCSchoeman96/symphony/pull/22) | Independent review; do not merge |
+| H-070A | NOT AUTHORIZED | N/A | N/A | N/A | [Roadmap](V4_1_MASTER_ROADMAP.md) | None |
 
-GOV-RECON-B is accepted on protected `main` at `894adda8732c466fa795cd8469d8d0a8710b5cc0`. H-060B is in review under PR #21. H-060C is not authorized.
+H-060B is accepted on protected `main` at `00ebdffdf8685f62e511061b80383fba9617f6b9`. H-060C is in review under PR #22. H-070A is not authorized.

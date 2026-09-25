@@ -237,12 +237,14 @@ defmodule SymphonyElixir.DependencyCompletenessTest do
 
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [candidate, inactive])
 
-    state = %Orchestrator.State{
-      poll_interval_ms: 60_000,
-      max_concurrent_agents: 10,
-      task_supervisor: SymphonyElixir.TaskSupervisor,
-      agent_runner: SymphonyElixir.AgentRouterOrchestratorRunnerFake
-    }
+    state =
+      %Orchestrator.State{
+        poll_interval_ms: 60_000,
+        max_concurrent_agents: 10,
+        task_supervisor: SymphonyElixir.TaskSupervisor,
+        agent_runner: SymphonyElixir.AgentRouterOrchestratorRunnerFake
+      }
+      |> Map.merge(workspace_ownership_state())
 
     {:noreply, updated_state} = Orchestrator.handle_info(:run_poll_cycle, state)
 
@@ -275,12 +277,14 @@ defmodule SymphonyElixir.DependencyCompletenessTest do
       poll_interval_ms: 60_000
     )
 
-    state = %Orchestrator.State{
-      poll_interval_ms: 60_000,
-      max_concurrent_agents: 10,
-      task_supervisor: SymphonyElixir.TaskSupervisor,
-      agent_runner: SymphonyElixir.AgentRouterOrchestratorRunnerFake
-    }
+    state =
+      %Orchestrator.State{
+        poll_interval_ms: 60_000,
+        max_concurrent_agents: 10,
+        task_supervisor: SymphonyElixir.TaskSupervisor,
+        agent_runner: SymphonyElixir.AgentRouterOrchestratorRunnerFake
+      }
+      |> Map.merge(workspace_ownership_state())
 
     {:noreply, first_epoch_state} = Orchestrator.handle_info(:run_poll_cycle, state)
 
