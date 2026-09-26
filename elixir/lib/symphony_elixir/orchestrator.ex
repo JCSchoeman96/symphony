@@ -1748,25 +1748,6 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp tracker_fetch_issues_by_ids(tracker, issue_ids, opts) do
-    cond do
-      function_exported?(tracker, :fetch_issues_by_ids, 2) -> tracker.fetch_issues_by_ids(issue_ids, opts)
-      function_exported?(tracker, :fetch_issues_by_ids, 1) -> tracker.fetch_issues_by_ids(issue_ids)
-      true -> {:error, :current_issue_refresh_unsupported}
-    end
-  end
-
-  defp plane_read_options(%State{} = state) do
-    metrics = if is_map(state.plane_epoch_metrics), do: Map.get(state.plane_epoch_metrics, :request_metrics)
-
-    [
-      tracker_settings: Config.settings!().tracker,
-      scheduler: state.read_scheduler,
-      epoch_id: state.plane_epoch_id,
-      request_metrics: metrics
-    ]
-  end
-
   defp plane_epoch_result_current?(%State{}, task, epoch_id, config_fingerprint, contract_fingerprint) do
     config = Config.settings!()
 
@@ -3195,20 +3176,10 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp reconcile_plane_missing_running_issue_ids(%State{} = state, []), do: state
 
+  # dispatch_plane_epoch/1 only reaches these helpers after plane_epoch_current?/1
+  # has verified a complete graph for this epoch, so graph absence is authoritative.
   defp reconcile_plane_missing_running_issue_ids(%State{} = state, missing_ids) do
-    case tracker_fetch_issues_by_ids(state.tracker, missing_ids, plane_read_options(state)) do
-      {:ok, issues} when is_list(issues) ->
-        issues
-        |> reconcile_running_issue_states(state, active_state_set(), terminal_state_set())
-        |> reconcile_missing_running_issue_ids(missing_ids, issues)
-
-      {:error, reason} ->
-        Logger.warning("Unable to confirm missing running Plane issues; keeping active workers", reason: inspect(reason))
-        state
-
-      _invalid ->
-        state
-    end
+    reconcile_missing_running_issue_ids(state, missing_ids, [])
   end
 
   defp refresh_dependency_state_for_running(%State{} = state, running_issues)
@@ -3273,19 +3244,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp reconcile_plane_missing_blocked_issue_ids(%State{} = state, []), do: state
 
   defp reconcile_plane_missing_blocked_issue_ids(%State{} = state, missing_ids) do
-    case tracker_fetch_issues_by_ids(state.tracker, missing_ids, plane_read_options(state)) do
-      {:ok, issues} when is_list(issues) ->
-        issues
-        |> reconcile_blocked_issue_states(state, active_state_set(), terminal_state_set())
-        |> reconcile_missing_blocked_issue_ids(missing_ids, issues)
-
-      {:error, reason} ->
-        Logger.warning("Unable to confirm missing blocked Plane issues; keeping blocked work", reason: inspect(reason))
-        state
-
-      _invalid ->
-        state
-    end
+    reconcile_missing_blocked_issue_ids(state, missing_ids, [])
   end
 
   @doc false
