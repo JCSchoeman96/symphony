@@ -451,10 +451,17 @@ defmodule SymphonyElixir.PlaneClientTest do
                request_fun: fn _request -> {:error, %Client.Error{kind: :provider_unavailable}} end
              )
 
-    assert {:error, {:rate_limited, %{retry_after: 7}}} =
+    assert {:error, {:rate_limited, %{retry_after: nil, retry_after_seconds: nil, reset_at_unix: 7}}} =
              Client.get_project(@config,
                request_fun: fn _request ->
                  {:ok, %{status: 429, headers: [{"x-ratelimit-reset", ["7"]}], body: %{}}}
+               end
+             )
+
+    assert {:error, {:rate_limited, %{reset_at_unix: nil}}} =
+             Client.get_project(@config,
+               request_fun: fn _request ->
+                 {:ok, %{status: 429, headers: %{"x-ratelimit-reset" => -1}, body: %{}}}
                end
              )
 

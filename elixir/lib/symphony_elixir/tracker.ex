@@ -26,7 +26,9 @@ defmodule SymphonyElixir.Tracker do
   @callback fetch_issues_by_states([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
   @callback fetch_issues_by_ids([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
   @callback fetch_dependency_graph() :: {:ok, term()} | {:error, term()}
+  @callback fetch_dependency_graph(keyword()) :: {:ok, term()} | {:error, term()}
   @callback fetch_project_snapshot() :: {:ok, map()} | {:error, term()}
+  @callback fetch_project_snapshot(keyword()) :: {:ok, map()} | {:error, term()}
   @callback agent_tool_specs() :: [map()]
   @callback agent_tool_specs(map()) :: [map()]
   @callback execute_agent_tool(String.t(), term(), keyword()) :: map()
@@ -38,7 +40,9 @@ defmodule SymphonyElixir.Tracker do
                       agent_tool_specs: 1,
                       execute_agent_tool: 3,
                       fetch_dependency_graph: 0,
+                      fetch_dependency_graph: 1,
                       fetch_project_snapshot: 0,
+                      fetch_project_snapshot: 1,
                       validate_config: 1,
                       capabilities: 0
 
@@ -48,31 +52,67 @@ defmodule SymphonyElixir.Tracker do
   end
 
   @spec fetch_issues_by_ids([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
-  def fetch_issues_by_ids(issue_ids) do
-    adapter().fetch_issues_by_ids(issue_ids)
+  def fetch_issues_by_ids(issue_ids), do: fetch_issues_by_ids(issue_ids, [])
+
+  @spec fetch_issues_by_ids([String.t()], keyword()) :: {:ok, [Issue.t()]} | {:error, term()}
+  def fetch_issues_by_ids(issue_ids, opts) when is_list(issue_ids) and is_list(opts) do
+    with {:ok, adapter} <- adapter_for_opts(opts) do
+      cond do
+        Code.ensure_loaded?(adapter) and function_exported?(adapter, :fetch_issues_by_ids, 2) ->
+          adapter.fetch_issues_by_ids(issue_ids, opts)
+
+        Code.ensure_loaded?(adapter) and function_exported?(adapter, :fetch_issues_by_ids, 1) ->
+          adapter.fetch_issues_by_ids(issue_ids)
+
+        true ->
+          {:error, :current_issue_refresh_unsupported}
+      end
+    end
   end
+
+  def fetch_issues_by_ids(_issue_ids, _opts), do: {:error, :current_issue_refresh_unsupported}
 
   @spec fetch_dependency_graph() :: {:ok, term()} | {:error, term()}
-  def fetch_dependency_graph do
-    adapter = adapter()
+  def fetch_dependency_graph, do: fetch_dependency_graph([])
 
-    if Code.ensure_loaded?(adapter) and function_exported?(adapter, :fetch_dependency_graph, 0) do
-      adapter.fetch_dependency_graph()
-    else
-      {:error, :dependency_graph_unsupported}
+  @spec fetch_dependency_graph(keyword()) :: {:ok, term()} | {:error, term()}
+  def fetch_dependency_graph(opts) when is_list(opts) do
+    with {:ok, adapter} <- adapter_for_opts(opts) do
+      cond do
+        Code.ensure_loaded?(adapter) and function_exported?(adapter, :fetch_dependency_graph, 1) ->
+          adapter.fetch_dependency_graph(opts)
+
+        Code.ensure_loaded?(adapter) and function_exported?(adapter, :fetch_dependency_graph, 0) ->
+          adapter.fetch_dependency_graph()
+
+        true ->
+          {:error, :dependency_graph_unsupported}
+      end
     end
   end
+
+  def fetch_dependency_graph(_opts), do: {:error, :dependency_graph_unsupported}
 
   @spec fetch_project_snapshot() :: {:ok, map()} | {:error, term()}
-  def fetch_project_snapshot do
-    adapter = adapter()
+  def fetch_project_snapshot, do: fetch_project_snapshot([])
 
-    if Code.ensure_loaded?(adapter) and function_exported?(adapter, :fetch_project_snapshot, 0) do
-      adapter.fetch_project_snapshot()
-    else
-      {:error, :project_snapshot_unsupported}
+  @spec fetch_project_snapshot(keyword()) :: {:ok, map()} | {:error, term()}
+  def fetch_project_snapshot(opts) when is_list(opts) do
+    with {:ok, adapter} <- adapter_for_opts(opts) do
+      cond do
+        Code.ensure_loaded?(adapter) and function_exported?(adapter, :fetch_project_snapshot, 1) ->
+          adapter.fetch_project_snapshot(opts)
+
+        Code.ensure_loaded?(adapter) and function_exported?(adapter, :fetch_project_snapshot, 0) ->
+          adapter.fetch_project_snapshot()
+
+        true ->
+          {:error, :project_snapshot_unsupported}
+      end
     end
   end
+
+  def fetch_project_snapshot(_opts), do: {:error, :project_snapshot_unsupported}
 
   @doc """
   Executes one complete host-owned controlled transition through the durable
@@ -218,6 +258,14 @@ defmodule SymphonyElixir.Tracker do
   def adapter do
     Config.settings!().tracker
     |> adapter_for_settings!()
+  end
+
+  defp adapter_for_opts(opts) do
+    case Keyword.get(opts, :tracker_settings) do
+      %{kind: kind} when is_binary(kind) -> adapter_for_kind(kind)
+      nil -> {:ok, adapter()}
+      _invalid -> {:error, :invalid_tracker_settings}
+    end
   end
 
   @spec adapter_for_kind(String.t()) :: {:ok, module()} | {:error, term()}

@@ -6,7 +6,11 @@ defmodule SymphonyElixir.Plane.Client do
   state-ID PATCH used by the host transition coordinator.
   """
 
+  alias SymphonyElixir.Plane.ReadScheduler
+
   @default_base_url "https://api.plane.so"
+  @default_read_scheduler SymphonyElixir.Plane.ReadScheduler
+  @read_wait_timeout_ms 240_000
   @connect_timeout_ms 5_000
   @receive_timeout_ms 15_000
   @page_size 100
@@ -21,7 +25,7 @@ defmodule SymphonyElixir.Plane.Client do
   defmodule Error do
     @moduledoc "Safe Plane transport error without response bodies or headers."
     defstruct [:kind, :status, :retry_after]
-    @type t :: %__MODULE__{kind: atom(), status: integer() | nil, retry_after: integer() | nil}
+    @type t :: %__MODULE__{kind: atom(), status: integer() | nil, retry_after: number() | nil}
   end
 
   @type config :: map()
@@ -34,7 +38,7 @@ defmodule SymphonyElixir.Plane.Client do
   @spec get_project(config(), keyword()) :: {:ok, map()} | {:error, term()}
   def get_project(config, opts \\ []) when is_map(config) and is_list(opts) do
     with {:ok, config} <- normalize_config(config, opts),
-         {:ok, response} <- request(config, project_path(config), %{}, opts) do
+         {:ok, response} <- request(config, project_path(config), %{}, opts, :control) do
       successful_body(response, :object)
     end
   end
@@ -44,7 +48,8 @@ defmodule SymphonyElixir.Plane.Client do
       when is_map(config) and is_binary(work_item_id) and is_list(opts) do
     with {:ok, config} <- normalize_config(config, opts),
          {:ok, id} <- identifier(work_item_id),
-         {:ok, response} <- request(config, work_item_path(config, id), state_expansion_params(), opts) do
+         {:ok, response} <-
+           request(config, work_item_path(config, id), state_expansion_params(), opts, :control) do
       successful_body(response, :object)
     end
   end
@@ -54,7 +59,7 @@ defmodule SymphonyElixir.Plane.Client do
       when is_map(config) and is_binary(work_item_id) and is_list(opts) do
     with {:ok, config} <- normalize_config(config, opts),
          {:ok, id} <- identifier(work_item_id),
-         {:ok, response} <- request(config, relation_path(config, id), %{}, opts) do
+         {:ok, response} <- request(config, relation_path(config, id), %{}, opts, :bulk) do
       successful_body(response, :object)
     end
   end
@@ -83,7 +88,8 @@ defmodule SymphonyElixir.Plane.Client do
         cursors: [],
         page_count: 0,
         item_count: 0,
-        total_results: nil
+        total_results: nil,
+        request_class: :bulk
       })
     end
   end
@@ -101,7 +107,8 @@ defmodule SymphonyElixir.Plane.Client do
         cursors: [],
         page_count: 0,
         item_count: 0,
-        total_results: nil
+        total_results: nil,
+        request_class: :bulk
       })
     end
   end
@@ -131,8 +138,8 @@ defmodule SymphonyElixir.Plane.Client do
     end
   end
 
-  defp paginate_page(%{config: config, path: path, params: params, kind: kind, opts: opts} = context) do
-    with {:ok, response} <- request(config, path, params, opts),
+  defp paginate_page(%{config: config, path: path, params: params, kind: kind, opts: opts, request_class: request_class} = context) do
+    with {:ok, response} <- request(config, path, params, opts, request_class),
          {:ok, page, next_cursor, next?, page_total} <- decode_page(response, kind),
          {:ok, updated_acc} <- append_page(context.acc, page, kind, context.item_count) do
       advance_pagination(context, updated_acc, page, page_total, next_cursor, next?)
@@ -164,6 +171,7 @@ defmodule SymphonyElixir.Plane.Client do
           path: context.path,
           params: Map.put(context.params, "cursor", next_cursor),
           kind: context.kind,
+          request_class: context.request_class,
           opts: context.opts,
           acc: updated_acc,
           cursors: [next_cursor | context.cursors],
@@ -272,7 +280,7 @@ defmodule SymphonyElixir.Plane.Client do
 
   defp valid_page_count?(value), do: is_integer(value) and value >= 0
 
-  defp request(config, path, params, opts) do
+  defp request(config, path, params, opts, request_class) do
     request = %{
       method: :get,
       path: path,
@@ -280,20 +288,106 @@ defmodule SymphonyElixir.Plane.Client do
       headers: [{"X-API-Key", config.api_key}, {"Accept", "application/json"}]
     }
 
-    case Keyword.get(opts, :request_fun) do
-      fun when is_function(fun) ->
-        case invoke_request_fun(fun, request, config) do
-          {:ok, response} when is_map(response) -> normalize_response(response)
-          {:error, reason} -> {:error, transport_error(reason)}
-          _invalid -> {:error, :provider_unavailable}
-        end
+    increment_request_metric(Keyword.get(opts, :request_metrics), 1)
 
-      nil ->
-        perform_request(config, request)
+    request_fun = Keyword.get(opts, :request_fun)
+    scheduler = scheduler_option(opts, request_fun)
 
-      _invalid ->
-        {:error, :provider_unavailable}
+    result =
+      if scheduler do
+        ReadScheduler.execute(
+          scheduler,
+          request_class,
+          fn ->
+            increment_request_metric(Keyword.get(opts, :request_metrics), 2)
+            raw_get_request(config, request, request_fun)
+          end,
+          wait_timeout: @read_wait_timeout_ms,
+          epoch_id: Keyword.get(opts, :epoch_id),
+          request_metrics: Keyword.get(opts, :request_metrics)
+        )
+      else
+        raw_get_request(config, request, request_fun)
+      end
+
+    sanitize_get_result(result)
+  end
+
+  defp scheduler_option(opts, request_fun) do
+    explicit_scheduler =
+      cond do
+        Keyword.has_key?(opts, :scheduler) -> Keyword.get(opts, :scheduler)
+        Keyword.has_key?(opts, :read_scheduler) -> Keyword.get(opts, :read_scheduler)
+        true -> :not_given
+      end
+
+    cond do
+      explicit_scheduler == :not_given and is_function(request_fun) -> nil
+      explicit_scheduler == :not_given -> @default_read_scheduler
+      true -> explicit_scheduler
     end
+  end
+
+  defp raw_get_request(config, request, request_fun) do
+    result =
+      case request_fun do
+        fun when is_function(fun) -> invoke_request_fun(fun, request, config)
+        nil -> perform_request(config, request)
+        _invalid -> {:error, :provider_unavailable}
+      end
+
+    case result do
+      {:ok, response} when is_map(response) -> normalize_response(response)
+      {:error, _reason} = error -> error
+      _invalid -> {:error, :provider_unavailable}
+    end
+  end
+
+  defp sanitize_get_result({:ok, response}) when is_map(response), do: {:ok, response}
+
+  defp sanitize_get_result({:error, {:rate_limited, metadata}}) do
+    {:error, {:rate_limited, sanitize_rate_limit_metadata(metadata)}}
+  end
+
+  defp sanitize_get_result({:error, reason}) when reason in [:provider_malformed, :provider_response_too_large],
+    do: {:error, reason}
+
+  defp sanitize_get_result({:error, reason}), do: {:error, transport_error(reason)}
+  defp sanitize_get_result(_invalid), do: {:error, :provider_unavailable}
+
+  defp sanitize_rate_limit_metadata(metadata) when is_map(metadata) do
+    headers = first_present_value(metadata, [:headers, "headers"])
+    retry_after_header = header_value(headers, "retry-after")
+    reset_header = header_value(headers, "x-ratelimit-reset")
+
+    retry_after_seconds =
+      first_present_value(metadata, [:retry_after_seconds, "retry_after_seconds", :retry_after, "retry_after"]) ||
+        parse_seconds(retry_after_header)
+
+    reset_at_unix =
+      first_present_value(metadata, [:reset_at_unix, "reset_at_unix", :reset_at, "reset_at"]) ||
+        parse_integer(reset_header)
+
+    %{
+      retry_after: parse_seconds(retry_after_seconds),
+      retry_after_seconds: parse_seconds(retry_after_seconds),
+      reset_at_unix: parse_integer(reset_at_unix)
+    }
+  end
+
+  defp sanitize_rate_limit_metadata(_metadata), do: rate_limit_metadata(%{})
+
+  defp first_present_value(map, keys), do: Enum.find_value(keys, &Map.get(map, &1))
+
+  defp increment_request_metric(nil, _index), do: :ok
+
+  defp increment_request_metric(metrics, index) do
+    :atomics.add(metrics, index, 1)
+    :ok
+  rescue
+    _error -> :ok
+  catch
+    _kind, _reason -> :ok
   end
 
   defp mutation_request(config, path, body, opts) do
@@ -422,7 +516,7 @@ defmodule SymphonyElixir.Plane.Client do
         normalize_response(%{status: status, headers: response_headers, body: body})
 
       {:error, reason} ->
-        {:error, transport_error(reason)}
+        {:error, reason}
     end
   end
 
@@ -593,22 +687,37 @@ defmodule SymphonyElixir.Plane.Client do
   defp present_value(_value), do: nil
 
   defp rate_limit_metadata(headers) do
-    retry_after = header_value(headers, "retry-after") |> parse_integer()
-    reset = header_value(headers, "x-ratelimit-reset") |> parse_integer()
-    %{retry_after: retry_after || reset}
+    retry_after_seconds = header_value(headers, "retry-after") |> parse_seconds()
+    reset_at_unix = header_value(headers, "x-ratelimit-reset") |> parse_integer()
+
+    %{
+      retry_after: retry_after_seconds,
+      retry_after_seconds: retry_after_seconds,
+      reset_at_unix: reset_at_unix
+    }
   end
 
   defp header_value(headers, name) when is_map(headers) do
-    Enum.find_value(headers, fn {key, value} -> if String.downcase(to_string(key)) == name, do: value end)
+    Enum.find_value(headers, fn
+      {key, value} -> if header_name(key) == name, do: value
+      _malformed -> nil
+    end)
   end
 
   defp header_value(headers, name) when is_list(headers) do
-    Enum.find_value(headers, fn {key, value} -> if String.downcase(to_string(key)) == name, do: value end)
+    Enum.find_value(headers, fn
+      {key, value} -> if header_name(key) == name, do: value
+      _malformed -> nil
+    end)
   end
 
   defp header_value(_headers, _name), do: nil
 
-  defp parse_integer(value) when is_integer(value), do: value
+  defp header_name(key) when is_binary(key), do: String.downcase(key)
+  defp header_name(key) when is_atom(key), do: key |> Atom.to_string() |> String.downcase()
+  defp header_name(_key), do: nil
+
+  defp parse_integer(value) when is_integer(value) and value >= 0, do: value
 
   defp parse_integer(value) when is_binary(value) do
     case Integer.parse(String.trim(value)) do
@@ -620,6 +729,27 @@ defmodule SymphonyElixir.Plane.Client do
   defp parse_integer([value | _rest]), do: parse_integer(value)
 
   defp parse_integer(_value), do: nil
+
+  defp parse_seconds(value) when is_integer(value) and value >= 0, do: value
+  defp parse_seconds(value) when is_float(value) and value >= 0, do: value
+
+  defp parse_seconds(value) when is_binary(value) do
+    value = String.trim(value)
+
+    case Integer.parse(value) do
+      {integer, ""} when integer >= 0 ->
+        integer
+
+      _ ->
+        case Float.parse(value) do
+          {seconds, ""} when seconds >= 0 -> seconds
+          _ -> nil
+        end
+    end
+  end
+
+  defp parse_seconds([value | _rest]), do: parse_seconds(value)
+  defp parse_seconds(_value), do: nil
 
   defp transport_error(%Error{kind: kind}), do: kind
   defp transport_error(_reason), do: :provider_unavailable

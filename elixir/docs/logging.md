@@ -32,6 +32,10 @@ When logging Codex execution lifecycle events, include:
 - `Orchestrator`: log dispatch, retry, terminal/non-active transitions, and worker exits with issue context. Include `session_id` whenever running-entry data has it.
 - `Codex.AppServer`: log session start/completion/error with issue context and `session_id`.
 
+Plane dependency epoch logs include the epoch ID, item and edge counts,
+logical GET and attempt counts, peak concurrency, throttle/backoff totals,
+duration, and SCC pass count. Failed epochs include the failure reason.
+
 ## Checklist For New Logs
 
 - Is this event tied to a Linear issue? Include `issue_id` and `issue_identifier`.

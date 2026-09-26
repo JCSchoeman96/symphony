@@ -180,6 +180,7 @@ defmodule SymphonyElixir.AgentRunner do
     route = Keyword.get(opts, :route)
     max_turns = max_turns_for_run(route, opts)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issues_by_ids/1)
+    plane_epoch_snapshot_reader = Keyword.get(opts, :plane_epoch_snapshot_reader)
     runtime = Keyword.get(opts, :runtime, AgentRuntime.Codex)
 
     runtime_identity = runtime_attempt_identity(opts)
@@ -190,6 +191,8 @@ defmodule SymphonyElixir.AgentRunner do
       |> profile_runtime_options(route)
       |> Keyword.put(:agent_tool_context, agent_tool_context(issue, route, opts))
       |> Keyword.delete(:route)
+      |> Keyword.delete(:issue_state_fetcher)
+      |> Keyword.delete(:plane_epoch_snapshot_reader)
 
     role_prompt = PromptBuilder.role_prompt(route)
 
@@ -205,6 +208,7 @@ defmodule SymphonyElixir.AgentRunner do
         runtime_attempt_identity: runtime_identity,
         opts: runtime_opts,
         issue_state_fetcher: issue_state_fetcher,
+        plane_epoch_snapshot_reader: plane_epoch_snapshot_reader,
         route: route,
         role_prompt: role_prompt,
         work_item: Keyword.get(opts, :work_item),
@@ -246,49 +250,82 @@ defmodule SymphonyElixir.AgentRunner do
           "workspace=#{context.workspace} turn=#{turn_number}/#{max_turns}"
       )
 
-      case continue_with_issue_and_route(
-             context.issue,
-             context.issue_state_fetcher,
-             context.route,
-             context.work_item,
-             context.opts
-           ) do
-        {:continue, refreshed_issue, refreshed_route, refreshed_work_item} ->
-          continue_after_turn(
-            context,
-            refreshed_issue,
-            refreshed_route,
-            refreshed_work_item,
-            turn_number,
-            max_turns
-          )
+      continue_from_completed_turn(context, turn_number, max_turns)
+    end
+  end
 
-        {:continue, refreshed_issue, refreshed_route} ->
-          continue_after_turn(
-            context,
-            refreshed_issue,
-            refreshed_route,
-            nil,
-            turn_number,
-            max_turns
-          )
+  defp continue_from_completed_turn(context, turn_number, max_turns) do
+    case refreshed_issue_state(context) do
+      {:continue, refreshed_issue, refreshed_route, refreshed_work_item, refreshed_opts} ->
+        continue_after_turn(
+          %{context | opts: refreshed_opts},
+          refreshed_issue,
+          refreshed_route,
+          refreshed_work_item,
+          turn_number,
+          max_turns
+        )
 
-        {:done, _refreshed_issue} ->
-          :ok
+      {:continue, refreshed_issue, refreshed_route, refreshed_work_item} ->
+        continue_after_turn(
+          context,
+          refreshed_issue,
+          refreshed_route,
+          refreshed_work_item,
+          turn_number,
+          max_turns
+        )
 
-        {:suspended, refreshed_issue, assessment} ->
-          notify_lifecycle_suspended(
-            context.codex_update_recipient,
-            refreshed_issue,
-            context.runtime_attempt_identity,
-            assessment
-          )
+      {:continue, refreshed_issue, refreshed_route} ->
+        continue_after_turn(
+          context,
+          refreshed_issue,
+          refreshed_route,
+          nil,
+          turn_number,
+          max_turns
+        )
 
-          :ok
+      {:done, _refreshed_issue} ->
+        :ok
 
-        {:error, reason} ->
-          {:error, reason}
-      end
+      {:suspended, refreshed_issue, assessment} ->
+        notify_lifecycle_suspended(
+          context.codex_update_recipient,
+          refreshed_issue,
+          context.runtime_attempt_identity,
+          assessment
+        )
+
+        :ok
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp refreshed_issue_state(context) do
+    case {Config.settings!().tracker.kind, context.plane_epoch_snapshot_reader} do
+      {"plane", reader} when is_function(reader, 0) ->
+        continue_with_plane_epoch_snapshot(
+          context.issue,
+          reader,
+          context.route,
+          context.work_item,
+          context.opts
+        )
+
+      {"plane", _missing_reader} ->
+        {:error, {:issue_state_refresh_failed, :plane_epoch_snapshot_reader_unavailable}}
+
+      {_non_plane_tracker, _reader} ->
+        continue_with_issue_and_route(
+          context.issue,
+          context.issue_state_fetcher,
+          context.route,
+          context.work_item,
+          context.opts
+        )
     end
   end
 
@@ -348,7 +385,11 @@ defmodule SymphonyElixir.AgentRunner do
          turn_number,
          max_turns
        ) do
-    decision = dependency_decision(refreshed_issue, refreshed_route, context.opts)
+    decision =
+      case Keyword.get(context.opts, :plane_epoch_dependency_decision) do
+        %{allowed?: _allowed?} = current_epoch_decision -> current_epoch_decision
+        _missing -> dependency_decision(refreshed_issue, refreshed_route, context.opts)
+      end
 
     cond do
       decision.allowed? != true ->
@@ -481,6 +522,131 @@ defmodule SymphonyElixir.AgentRunner do
 
       other ->
         other
+    end
+  end
+
+  defp continue_with_plane_epoch_snapshot(issue, snapshot_reader, route, prior_work_item, opts) do
+    case snapshot_reader.() do
+      {:ok, []} ->
+        {:done, issue}
+
+      {:ok,
+       %{
+         issue: %Issue{} = refreshed_issue,
+         work_item: %WorkItem{} = work_item,
+         work_control: work_control
+       } = snapshot}
+      when is_map(work_control) ->
+        continue_with_plane_epoch_issue(
+          refreshed_issue,
+          work_item,
+          snapshot,
+          route,
+          prior_work_item,
+          opts
+        )
+
+      {:error, reason} ->
+        {:error, {:issue_state_refresh_failed, reason}}
+
+      other ->
+        {:error, {:invalid_plane_epoch_snapshot, other}}
+    end
+  rescue
+    exception -> {:error, {:issue_state_refresh_failed, {:snapshot_reader_exception, exception}}}
+  catch
+    kind, reason -> {:error, {:issue_state_refresh_failed, {kind, reason}}}
+  end
+
+  defp continue_with_plane_epoch_issue(
+         %Issue{id: issue_id} = issue,
+         %WorkItem{id: issue_id} = work_item,
+         snapshot,
+         %Route{} = route,
+         %WorkItem{} = prior_work_item,
+         opts
+       ) do
+    continue_with_plane_epoch_issue_and_route(issue, work_item, snapshot, route, prior_work_item, opts)
+  end
+
+  defp continue_with_plane_epoch_issue(
+         %Issue{id: issue_id} = issue,
+         %WorkItem{id: issue_id} = work_item,
+         snapshot,
+         nil,
+         _prior_work_item,
+         opts
+       ) do
+    if active_issue_state?(issue.state) and issue_routable?(issue) do
+      snapshot = Map.put(snapshot, :work_item, work_item)
+      {:continue, issue, nil, work_item, plane_epoch_snapshot_opts(opts, snapshot)}
+    else
+      {:done, issue}
+    end
+  end
+
+  defp continue_with_plane_epoch_issue(issue, _work_item, _snapshot, _route, _prior_work_item, _opts),
+    do: {:error, {:invalid_plane_epoch_snapshot_issue, issue.id}}
+
+  defp continue_with_plane_epoch_issue_and_route(
+         %Issue{} = issue,
+         %WorkItem{} = work_item,
+         snapshot,
+         %Route{} = route,
+         %WorkItem{} = prior_work_item,
+         opts
+       ) do
+    if Config.settings!().agent.routing == "legacy" do
+      continue_legacy_plane_epoch_issue(issue, work_item, snapshot, opts)
+    else
+      continue_routed_plane_epoch_issue(issue, work_item, snapshot, route, prior_work_item, opts)
+    end
+  end
+
+  defp continue_legacy_plane_epoch_issue(issue, work_item, snapshot, opts) do
+    case continue_with_issue?(issue, fn _issue_ids -> {:ok, [issue]} end) do
+      {:continue, refreshed_issue} ->
+        snapshot = Map.put(snapshot, :work_item, work_item)
+
+        {:continue, refreshed_issue, Route.legacy(refreshed_issue), work_item, plane_epoch_snapshot_opts(opts, snapshot)}
+
+      other ->
+        other
+    end
+  end
+
+  defp continue_routed_plane_epoch_issue(issue, work_item, snapshot, route, prior_work_item, opts) do
+    if routed_issue_in_scope?(issue) do
+      continue_routed_plane_epoch_route(issue, work_item, snapshot, route, prior_work_item, opts)
+    else
+      {:done, issue}
+    end
+  end
+
+  defp continue_routed_plane_epoch_route(issue, work_item, snapshot, route, prior_work_item, opts) do
+    case routed_continuation_route(work_item, prior_work_item, route) do
+      {:ok, %Route{} = refreshed_route} ->
+        snapshot = Map.put(snapshot, :work_item, work_item)
+        {:continue, issue, refreshed_route, work_item, plane_epoch_snapshot_opts(opts, snapshot)}
+
+      :error ->
+        {:suspended, issue, work_item.lifecycle_assessment}
+    end
+  end
+
+  defp plane_epoch_snapshot_opts(opts, snapshot) do
+    opts
+    |> Keyword.put(:work_item, Map.fetch!(snapshot, :work_item))
+    |> Keyword.put(:work_control, Map.fetch!(snapshot, :work_control))
+    |> maybe_put_plane_epoch_snapshot_value(:dependency_decision, snapshot)
+    |> maybe_put_plane_epoch_snapshot_value(:plane_epoch_dependency_decision, snapshot)
+    |> maybe_put_plane_epoch_snapshot_value(:plane_epoch_id, snapshot)
+  end
+
+  defp maybe_put_plane_epoch_snapshot_value(opts, key, snapshot) do
+    case Map.fetch(snapshot, key) do
+      {:ok, value} -> Keyword.put(opts, key, value)
+      :error -> Keyword.delete(opts, key)
     end
   end
 

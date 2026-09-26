@@ -319,6 +319,7 @@ defmodule SymphonyElixir.StatusDashboard do
              dependency_diagnostics: Map.get(snapshot, :dependency_diagnostics, []),
              dependency_graph: Map.get(snapshot, :dependency_graph, %{}),
              recent_attempts: Map.get(snapshot, :recent_attempts, []),
+             plane_epoch: Map.get(snapshot, :plane_epoch),
              codex_totals: codex_totals,
              rate_limits: Map.get(snapshot, :rate_limits),
              polling: Map.get(snapshot, :polling)
@@ -339,6 +340,7 @@ defmodule SymphonyElixir.StatusDashboard do
       {:ok, %{running: running, retrying: retrying, codex_totals: codex_totals} = snapshot} ->
         rate_limits = Map.get(snapshot, :rate_limits)
         blocked = Map.get(snapshot, :blocked, [])
+        plane_epoch_lines = format_plane_epoch_lines(Map.get(snapshot, :plane_epoch))
         project_link_lines = format_project_link_lines()
         project_refresh_line = format_project_refresh_line(Map.get(snapshot, :polling))
         codex_input_tokens = Map.get(codex_totals, :input_tokens, 0)
@@ -377,6 +379,7 @@ defmodule SymphonyElixir.StatusDashboard do
              colorize(" | ", @ansi_gray) <>
              colorize("total #{format_count(codex_total_tokens)}", @ansi_yellow),
            colorize("│ Rate Limits: ", @ansi_bold) <> format_rate_limits(rate_limits),
+           plane_epoch_lines,
            project_link_lines,
            project_refresh_line,
            colorize("├─ Running", @ansi_bold),
@@ -444,6 +447,57 @@ defmodule SymphonyElixir.StatusDashboard do
   defp format_project_refresh_line(_) do
     colorize("│ Next refresh: ", @ansi_bold) <> colorize("n/a", @ansi_gray)
   end
+
+  defp format_plane_epoch_lines(nil), do: []
+
+  defp format_plane_epoch_lines(plane_epoch) when is_map(plane_epoch) do
+    status = plane_epoch |> Map.get(:status, :unknown) |> safe_plane_epoch_text()
+    metrics = Map.get(plane_epoch, :metrics, Map.get(plane_epoch, :request_metrics, %{}))
+    scheduler = Map.get(plane_epoch, :read_scheduler, %{})
+    error = plane_epoch |> Map.get(:error) |> safe_plane_epoch_error()
+
+    [
+      colorize("│ Plane epoch: ", @ansi_bold) <>
+        "id=#{plane_epoch_text(Map.get(metrics, :epoch_id))} " <>
+        "started=#{plane_epoch_text(Map.get(metrics, :started_at))} " <>
+        "finished=#{plane_epoch_text(Map.get(metrics, :finished_at))}",
+      colorize("│ Plane dependency: ", @ansi_bold) <>
+        "status=#{status} items=#{plane_metric(metrics, :item_count)} edges=#{plane_metric(metrics, :edge_count)} " <>
+        "GETs=#{plane_metric(metrics, :logical_requests)} attempts=#{plane_metric(metrics, :attempts)} " <>
+        "SCC=#{plane_metric(metrics, :scc_pass_count)} time=#{plane_metric(metrics, :duration_ms)}ms",
+      colorize("│ Plane reads: ", @ansi_bold) <>
+        "peak=#{plane_metric(metrics, :peak_concurrency, scheduler)} " <>
+        "throttles=#{plane_metric(metrics, :throttle_count, scheduler)} " <>
+        "backoff=#{plane_metric(metrics, :backoff_count, scheduler)}/#{plane_metric(metrics, :total_backoff_ms, scheduler)}ms " <>
+        "failure=#{error}"
+    ]
+  end
+
+  defp format_plane_epoch_lines(_plane_epoch), do: []
+
+  defp plane_epoch_text(value) when is_binary(value) and value != "", do: String.slice(value, 0, 40)
+  defp plane_epoch_text(_value), do: "n/a"
+
+  defp plane_metric(primary, key, fallback \\ %{}) do
+    value = map_value(primary, [key]) || map_value(fallback, [key])
+
+    if is_integer(value) and value >= 0, do: format_count(value), else: "n/a"
+  end
+
+  defp safe_plane_epoch_text(value) when value in [:current, :refreshing, :failed, :unavailable], do: Atom.to_string(value)
+  defp safe_plane_epoch_text(_value), do: "unknown"
+
+  defp safe_plane_epoch_error(nil), do: "none"
+
+  defp safe_plane_epoch_error(value) when is_atom(value), do: Atom.to_string(value)
+
+  defp safe_plane_epoch_error(value) when is_binary(value) do
+    value
+    |> String.replace(~r/[\r\n]+/, " ")
+    |> String.slice(0, 80)
+  end
+
+  defp safe_plane_epoch_error(_value), do: "redacted"
 
   defp linear_project_url(project_slug), do: "https://linear.app/project/#{project_slug}/issues"
 
@@ -581,6 +635,7 @@ defmodule SymphonyElixir.StatusDashboard do
              blocked: Map.get(snapshot, :blocked, []),
              dependency_diagnostics: Map.get(snapshot, :dependency_diagnostics, []),
              dependency_graph: Map.get(snapshot, :dependency_graph, %{}),
+             plane_epoch: Map.get(snapshot, :plane_epoch),
              codex_totals: codex_totals,
              rate_limits: Map.get(snapshot, :rate_limits),
              polling: Map.get(snapshot, :polling)

@@ -56,19 +56,30 @@ defmodule SymphonyElixir.Plane.Adapter do
   end
 
   @spec fetch_issues_by_ids([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
-  def fetch_issues_by_ids(ids) when is_list(ids) do
-    fetch_issues_by_ids(ids, Config.settings!().tracker, nil)
+  def fetch_issues_by_ids(ids) when is_list(ids), do: fetch_issues_by_ids(ids, [])
+
+  @spec fetch_issues_by_ids([String.t()], keyword()) :: {:ok, [Issue.t()]} | {:error, term()}
+  def fetch_issues_by_ids(ids, opts) when is_list(ids) and is_list(opts) do
+    tracker_settings = Keyword.get_lazy(opts, :tracker_settings, fn -> Config.settings!().tracker end)
+    fetch_issues_by_ids(ids, tracker_settings, Keyword.get(opts, :request_fun), opts)
   end
 
   @spec fetch_project_snapshot() :: {:ok, map()} | {:error, term()}
-  def fetch_project_snapshot do
-    fetch_project_snapshot(Config.settings!().tracker, nil)
+  @spec fetch_project_snapshot(keyword()) :: {:ok, map()} | {:error, term()}
+  def fetch_project_snapshot(opts \\ []) when is_list(opts) do
+    tracker_settings = Keyword.get_lazy(opts, :tracker_settings, fn -> Config.settings!().tracker end)
+    request_fun = Keyword.get(opts, :request_fun)
+    fetch_project_snapshot(tracker_settings, request_fun, opts)
   end
 
   @spec fetch_dependency_graph() ::
           {:ok, SymphonyElixir.Dependency.Graph.t()} | {:error, term()}
-  def fetch_dependency_graph do
-    fetch_dependency_graph(Config.settings!().tracker, nil)
+  @spec fetch_dependency_graph(keyword()) ::
+          {:ok, SymphonyElixir.Dependency.Graph.t()} | {:error, term()}
+  def fetch_dependency_graph(opts \\ []) when is_list(opts) do
+    tracker_settings = Keyword.get_lazy(opts, :tracker_settings, fn -> Config.settings!().tracker end)
+    request_fun = Keyword.get(opts, :request_fun)
+    fetch_dependency_graph(tracker_settings, request_fun, Keyword.drop(opts, [:tracker_settings, :request_fun]))
   end
 
   @doc """
@@ -122,7 +133,7 @@ defmodule SymphonyElixir.Plane.Adapter do
           {:ok, [Issue.t()]} | {:error, term()}
   def fetch_issues_by_ids_for_test(ids, tracker_settings, request_fun)
       when is_list(ids) and is_map(tracker_settings) and is_function(request_fun, 1) do
-    fetch_issues_by_ids(ids, tracker_settings, request_fun)
+    fetch_issues_by_ids(ids, tracker_settings, request_fun, [])
   end
 
   @doc false
@@ -172,12 +183,12 @@ defmodule SymphonyElixir.Plane.Adapter do
     end
   end
 
-  defp fetch_issues_by_ids(ids, tracker_settings, request_fun) do
+  defp fetch_issues_by_ids(ids, tracker_settings, request_fun, opts) do
     with :ok <- validate_config(tracker_settings),
          {:ok, config} <- client_config(tracker_settings) do
       ids
       |> Enum.uniq()
-      |> Enum.reduce_while({:ok, []}, &fetch_item(&1, &2, config, request_fun))
+      |> Enum.reduce_while({:ok, []}, &fetch_item(&1, &2, config, request_fun, opts))
       |> case do
         {:ok, issues} -> {:ok, Enum.reverse(issues)}
         {:error, reason} -> {:error, reason}
@@ -185,8 +196,8 @@ defmodule SymphonyElixir.Plane.Adapter do
     end
   end
 
-  defp fetch_item(id, {:ok, acc}, config, request_fun) do
-    case Client.get_work_item(config, id, request_opts(request_fun)) do
+  defp fetch_item(id, {:ok, acc}, config, request_fun, opts) do
+    case Client.get_work_item(config, id, request_opts(request_fun, opts)) do
       {:ok, raw_item} ->
         case StateProjection.project_work_item(raw_item, scope(config)) do
           {:ok, projected} -> {:cont, {:ok, [issue_from_projection(projected) | acc]}}
@@ -201,13 +212,17 @@ defmodule SymphonyElixir.Plane.Adapter do
     end
   end
 
-  defp fetch_project_snapshot(tracker_settings, request_fun) do
+  defp fetch_project_snapshot(tracker_settings, request_fun), do: fetch_project_snapshot(tracker_settings, request_fun, [])
+
+  defp fetch_project_snapshot(tracker_settings, request_fun, opts) do
+    client_opts = request_opts(request_fun, opts)
+
     with :ok <- validate_config(tracker_settings),
          {:ok, config} <- client_config(tracker_settings),
-         {:ok, raw_project} <- Client.get_project(config, request_opts(request_fun)),
+         {:ok, raw_project} <- Client.get_project(config, Keyword.put(client_opts, :class, :control)),
          {:ok, project} <- StateProjection.project_project(raw_project),
          :ok <- validate_project_scope(project, config),
-         {:ok, raw_states} <- Client.list_states(config, request_opts(request_fun)),
+         {:ok, raw_states} <- Client.list_states(config, Keyword.put(client_opts, :class, :control)),
          {:ok, states} <- project_states(raw_states, config),
          {:ok, workspace_id} <- observed_workspace_id(project, states) do
       {:ok,
@@ -227,14 +242,12 @@ defmodule SymphonyElixir.Plane.Adapter do
     end
   end
 
-  defp fetch_dependency_graph(tracker_settings, request_fun) do
-    fetch_dependency_graph(tracker_settings, request_fun, [])
-  end
+  defp fetch_dependency_graph(tracker_settings, request_fun), do: fetch_dependency_graph(tracker_settings, request_fun, [])
 
   defp fetch_dependency_graph(tracker_settings, request_fun, opts) do
     with :ok <- validate_config(tracker_settings),
          {:ok, config} <- client_config(tracker_settings) do
-      DependencyReader.fetch(config, Keyword.merge(opts, request_opts(request_fun)))
+      DependencyReader.fetch(config, Keyword.merge(opts, request_opts(request_fun, opts)))
     end
   end
 
@@ -431,6 +444,11 @@ defmodule SymphonyElixir.Plane.Adapter do
 
   defp request_opts(nil), do: []
   defp request_opts(request_fun), do: [request_fun: request_fun]
+
+  defp request_opts(request_fun, opts) do
+    propagated = Keyword.take(opts, [:request_metrics, :scheduler, :class, :epoch_id])
+    Keyword.merge(propagated, request_opts(request_fun))
+  end
 
   defp normalize_contract(%ProviderProjectContract{} = contract), do: {:ok, contract}
   defp normalize_contract(nil), do: {:error, :provider_project_contract_required}

@@ -27,7 +27,7 @@ defmodule SymphonyElixir.AgentRuntime.AttemptLedger do
   ]
   @history_record_keys @base_record_keys ++ [:closed_reason, :rearm_reason, :rearmed_by, :rearmed_at]
   @allowed_identity_keys [:tracker_kind, :provider_scope]
-  @allowed_scope_keys [:project_slug, :repo, :project_key, :project_gid]
+  @allowed_scope_keys [:project_slug, :repo, :project_key, :project_gid, :workspace_slug, :workspace_id, :project_id]
 
   defstruct [:table, :path, :project_id, :tracker_identity, :write_fun, :sync_fun]
 

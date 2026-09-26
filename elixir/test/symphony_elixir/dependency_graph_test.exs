@@ -61,6 +61,57 @@ defmodule SymphonyElixir.DependencyGraphTest do
     assert Graph.cycles(graph) == [["left", "right"]]
   end
 
+  test "uses the supplied epoch ID and observes SCC analysis once" do
+    observer = :atomics.new(1, signed: true)
+
+    graph =
+      Graph.build(
+        [
+          issue("left", [%{id: "right", state: "Ready"}]),
+          issue("right", [%{id: "left", state: "Ready"}])
+        ],
+        epoch_id: "epoch-1",
+        on_scc: fn _cycles -> :atomics.add(observer, 1, 1) end
+      )
+
+    assert graph.epoch == "epoch-1"
+    assert Graph.cycles(graph) == [["left", "right"]]
+    assert Graph.cycle_members(graph) == MapSet.new(["left", "right"])
+    assert Graph.cyclic?(graph, "left")
+    refute Graph.cyclic?(graph, "missing")
+    assert :atomics.get(observer, 1) == 1
+  end
+
+  test "supports positional epoch options and all SCC observer arities" do
+    issues = [issue("left", [%{id: "right", state: "Ready"}]), issue("right", [])]
+    zero_arity_calls = :atomics.new(1, signed: true)
+    two_arity_calls = :atomics.new(1, signed: true)
+
+    first = Graph.build(issues, "positional-epoch")
+
+    second =
+      Graph.build(issues, "configured-epoch",
+        source: :plane,
+        on_scc: fn -> :atomics.add(zero_arity_calls, 1, 1) end
+      )
+
+    third =
+      Graph.build(issues,
+        epoch_id: "observer-epoch",
+        on_scc: fn graph, cycles ->
+          assert graph.epoch == "observer-epoch"
+          assert cycles == []
+          :atomics.add(two_arity_calls, 1, 1)
+        end
+      )
+
+    assert first.epoch == "positional-epoch"
+    assert second.epoch == "configured-epoch"
+    assert third.epoch == "observer-epoch"
+    assert :atomics.get(zero_arity_calls, 1) == 1
+    assert :atomics.get(two_arity_calls, 1) == 1
+  end
+
   test "keeps independent branches separate and orders multiple blockers" do
     graph =
       Graph.build([
