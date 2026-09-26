@@ -1429,7 +1429,14 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp maybe_dispatch_plane(%State{} = state) do
-    start_plane_epoch_acquisition(state)
+    if state.startup_reconciliation == :ready and plane_epoch_current?(state) do
+      case retryable_attempt_ledger_block_reason(state) do
+        {:ok, reason} -> maybe_reconcile_blocked_ledger(state, reason)
+        :none -> start_plane_epoch_acquisition(state)
+      end
+    else
+      start_plane_epoch_acquisition(state)
+    end
   end
 
   defp plane_tracker?(%State{tracker: tracker}) do
@@ -2024,7 +2031,10 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp continue_plane_epoch(%State{} = state) do
     if state.startup_reconciliation == :ready do
-      dispatch_plane_epoch(state)
+      case retryable_attempt_ledger_block_reason(state) do
+        {:ok, reason} -> maybe_reconcile_blocked_ledger(state, reason)
+        :none -> dispatch_plane_epoch(state)
+      end
     else
       state = reconcile_startup(state)
 
@@ -2910,7 +2920,7 @@ defmodule SymphonyElixir.Orchestrator do
           {:ok, state} ->
             state = %{state | attempt_ledger_status: :ready}
             state = reschedule_pending_retries(state)
-            maybe_dispatch_ready(state)
+            continue_after_attempt_ledger_reconciliation(state)
 
           {:blocked, state, reason} ->
             Logger.debug("Attempt ledger reconciliation remains blocked: #{inspect(reason)}")
@@ -2943,6 +2953,38 @@ defmodule SymphonyElixir.Orchestrator do
   defp blocked_ledger_state(%State{} = state, reason) do
     Logger.debug("Skipping autonomous dispatch while attempt ledger is blocked: #{inspect(reason)}")
     state
+  end
+
+  defp retryable_attempt_ledger_block_reason(%State{attempt_ledger_status: {:blocked, reason}}) do
+    if retryable_ledger_reconciliation_reason?(reason), do: {:ok, reason}, else: :none
+  end
+
+  defp retryable_attempt_ledger_block_reason(%State{}), do: :none
+
+  defp continue_after_attempt_ledger_reconciliation(%State{} = state) do
+    if plane_tracker?(state) do
+      state = release_plane_attempt_ledger_recovery_blocks(state)
+
+      if plane_epoch_current?(state) do
+        dispatch_plane_epoch(state)
+      else
+        start_plane_epoch_acquisition(state)
+      end
+    else
+      maybe_dispatch_ready(state)
+    end
+  end
+
+  defp release_plane_attempt_ledger_recovery_blocks(%State{} = state) do
+    issue_ids =
+      state.blocked
+      |> Enum.flat_map(fn {issue_id, blocked_entry} ->
+        if Map.get(blocked_entry, :attempt_ledger_recovery_pending?, false), do: [issue_id], else: []
+      end)
+
+    Enum.reduce(issue_ids, state, fn issue_id, state_acc ->
+      release_issue_claim(state_acc, issue_id)
+    end)
   end
 
   defp retryable_ledger_reconciliation_reason?({:attempt_ledger_issue_missing, _}), do: true
@@ -4270,6 +4312,14 @@ defmodule SymphonyElixir.Orchestrator do
       last_codex_timestamp: Map.get(running_entry, :last_codex_timestamp),
       dependency: dependency
     }
+
+    blocked_entry =
+      if plane_tracker?(state) and retryable_attempt_ledger_block_reason(state) != :none and
+           is_binary(error) and String.starts_with?(error, "attempt ledger unavailable; automatic work is blocked:") do
+        Map.put(blocked_entry, :attempt_ledger_recovery_pending?, true)
+      else
+        blocked_entry
+      end
 
     state = %{
       state

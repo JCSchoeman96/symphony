@@ -260,6 +260,7 @@ defmodule SymphonyElixir.OrchestratorPlaneEpochFakeRunner do
 
     receive do
       :release_agent -> :ok
+      :fail_agent -> exit(:injected_agent_failure)
     after
       5_000 -> :ok
     end
@@ -815,6 +816,167 @@ defmodule SymphonyElixir.OrchestratorPlaneEpochTest do
   end
 
   @tag timeout: 15_000
+  test "recovers a retryable runtime AttemptLedger failure through the current Plane epoch" do
+    issue = OrchestratorPlaneEpochFakeTracker.issue()
+    Application.put_env(:symphony_elixir, :plane_epoch_test_graph_issues, [issue])
+
+    root = Path.join(System.tmp_dir!(), "symphony-plane-ledger-recovery-#{System.unique_integer([:positive])}")
+    path = Path.join(root, "attempt-ledger.dets")
+    fail_sync = :atomics.new(1, [])
+    sync_count = :atomics.new(1, [])
+    sync_fun = controlled_test_sync_fun(fail_sync, sync_count)
+
+    {pid, task_supervisor} =
+      start_orchestrator(
+        startup_ready: true,
+        attempt_ledger_status: :ready,
+        attempt_ledger_opts: [path: path, sync_fun: sync_fun]
+      )
+
+    on_exit(fn -> File.rm_rf(root) end)
+
+    send(pid, :run_poll_cycle)
+
+    assert_receive {:plane_project_snapshot, _snapshot_task, _snapshot_opts}, 1_000
+    assert_receive {:plane_dependency_graph, graph_task, _graph_opts}, 1_000
+    assert graph_task != pid
+    assert_receive {:plane_project_snapshot, _closing_snapshot_task, _closing_snapshot_opts}, 1_000
+    assert_receive {:fake_plane_agent_started, first_agent, "plane-epoch-issue"}, 2_000
+
+    assert eventually(fn ->
+             state = :sys.get_state(pid)
+
+             state.startup_reconciliation == :ready and state.plane_epoch_status == :current and
+               map_size(state.running) == 1 and state.attempt_ledger_status == :ready
+           end)
+
+    :atomics.put(fail_sync, 1, 1)
+    send(first_agent, :fail_agent)
+
+    assert eventually(fn ->
+             state = :sys.get_state(pid)
+
+             match?(
+               {:blocked, {:attempt_ledger_unavailable, {:ledger_sync_failed, :injected_sync_failure}}},
+               state.attempt_ledger_status
+             ) and Map.has_key?(state.blocked, issue.id) and map_size(state.running) == 0
+           end),
+           "post-failure state: #{inspect(Map.take(:sys.get_state(pid), [:attempt_ledger_status, :startup_reconciliation, :plane_epoch_status, :running, :blocked]))}"
+
+    blocked_state = :sys.get_state(pid)
+    assert blocked_state.startup_reconciliation == :ready
+    assert blocked_state.plane_epoch_status == :current
+
+    send(pid, :run_poll_cycle)
+    assert eventually(fn -> :atomics.get(sync_count, 1) >= 3 end)
+    refute_receive {:fake_plane_agent_started, _agent, "plane-epoch-issue"}, 100
+    assert match?({:blocked, _reason}, :sys.get_state(pid).attempt_ledger_status)
+
+    :atomics.put(fail_sync, 1, 0)
+    send(pid, :run_poll_cycle)
+
+    assert_receive {:fake_plane_agent_started, recovered_agent, "plane-epoch-issue"}, 2_000
+    assert recovered_agent != first_agent
+
+    assert eventually(fn ->
+             state = :sys.get_state(pid)
+
+             state.attempt_ledger_status == :ready and state.plane_epoch_status == :current and
+               Map.has_key?(state.running, issue.id) and not Map.has_key?(state.blocked, issue.id)
+           end)
+
+    assert :atomics.get(Application.fetch_env!(:symphony_elixir, :plane_epoch_issue_read_counter), 1) == 0
+    assert :atomics.get(Application.fetch_env!(:symphony_elixir, :plane_epoch_graph_fetch_counter), 1) == 1
+    assert :atomics.get(Application.fetch_env!(:symphony_elixir, :plane_epoch_snapshot_counter), 1) == 2
+    refute_receive {:unexpected_provider_id_read, _provider, _ids}, 50
+    refute_receive {:unexpected_provider_state_read, _provider}, 50
+
+    stop_orchestrator(pid, task_supervisor)
+  end
+
+  @tag timeout: 15_000
+  test "uses asynchronous Plane epoch acquisition before retrying a blocked ledger without a current epoch" do
+    root = Path.join(System.tmp_dir!(), "symphony-plane-ledger-no-epoch-#{System.unique_integer([:positive])}")
+    path = Path.join(root, "attempt-ledger.dets")
+    sync_count = :atomics.new(1, [])
+
+    {pid, task_supervisor} =
+      start_orchestrator(
+        startup_ready: true,
+        attempt_ledger_status: {:blocked, {:attempt_ledger_unavailable, {:ledger_sync_failed, :temporary}}},
+        attempt_ledger_opts: [path: path, sync_fun: controlled_test_sync_fun(:atomics.new(1, []), sync_count)]
+      )
+
+    on_exit(fn -> File.rm_rf(root) end)
+    Application.put_env(:symphony_elixir, :plane_epoch_test_mode, :block_graph)
+    send(pid, :run_poll_cycle)
+
+    assert_receive {:plane_project_snapshot, _snapshot_task, _snapshot_opts}, 1_000
+    assert_receive {:plane_dependency_graph, graph_task, _graph_opts}, 1_000
+    assert graph_task != pid
+
+    state = :sys.get_state(pid)
+    assert state.startup_reconciliation == :ready
+    assert state.attempt_ledger_status == {:blocked, {:attempt_ledger_unavailable, {:ledger_sync_failed, :temporary}}}
+    assert state.plane_epoch_status == :refreshing
+    refute_receive {:fake_plane_agent_started, _agent, _issue_id}, 100
+
+    Application.put_env(:symphony_elixir, :plane_epoch_test_mode, :normal)
+    send(graph_task, :release_graph)
+    assert_receive {:plane_project_snapshot, _closing_snapshot_task, _closing_snapshot_opts}, 1_000
+    assert_receive {:fake_plane_agent_started, _agent, "plane-epoch-issue"}, 2_000
+
+    assert eventually(fn ->
+             state = :sys.get_state(pid)
+
+             state.plane_epoch_status == :current and state.attempt_ledger_status == :ready and
+               map_size(state.running) == 1
+           end)
+
+    assert :atomics.get(Application.fetch_env!(:symphony_elixir, :plane_epoch_issue_read_counter), 1) == 0
+    assert :atomics.get(Application.fetch_env!(:symphony_elixir, :plane_epoch_graph_fetch_counter), 1) == 1
+    assert :atomics.get(sync_count, 1) > 0
+
+    stop_orchestrator(pid, task_supervisor)
+  end
+
+  @tag timeout: 15_000
+  test "does not retry reconciliation for a non-retryable blocked Plane ledger" do
+    root = Path.join(System.tmp_dir!(), "symphony-plane-ledger-nonretryable-#{System.unique_integer([:positive])}")
+    path = Path.join(root, "attempt-ledger.dets")
+    sync_count = :atomics.new(1, [])
+
+    {pid, task_supervisor} =
+      start_orchestrator(
+        startup_ready: true,
+        attempt_ledger_status: {:blocked, {:attempt_ledger_unavailable, :corrupt_store}},
+        attempt_ledger_opts: [path: path, sync_fun: controlled_test_sync_fun(:atomics.new(1, []), sync_count)]
+      )
+
+    on_exit(fn -> File.rm_rf(root) end)
+    sync_count_before_poll = :atomics.get(sync_count, 1)
+    Application.put_env(:symphony_elixir, :plane_epoch_test_mode, :block_graph)
+    send(pid, :run_poll_cycle)
+
+    assert_receive {:plane_project_snapshot, _snapshot_task, _snapshot_opts}, 1_000
+    assert_receive {:plane_dependency_graph, graph_task, _graph_opts}, 1_000
+    assert graph_task != pid
+    refute_receive {:fake_plane_agent_started, _agent, _issue_id}, 100
+
+    Application.put_env(:symphony_elixir, :plane_epoch_test_mode, :normal)
+    send(graph_task, :release_graph)
+    assert_receive {:plane_project_snapshot, _closing_snapshot_task, _closing_snapshot_opts}, 1_000
+    assert eventually(fn -> :sys.get_state(pid).plane_epoch_status == :current end)
+    refute_receive {:fake_plane_agent_started, _agent, _issue_id}, 100
+
+    assert :sys.get_state(pid).attempt_ledger_status == {:blocked, {:attempt_ledger_unavailable, :corrupt_store}}
+    assert :atomics.get(sync_count, 1) == sync_count_before_poll
+    assert :atomics.get(Application.fetch_env!(:symphony_elixir, :plane_epoch_issue_read_counter), 1) == 0
+
+    stop_orchestrator(pid, task_supervisor)
+  end
+
+  @tag timeout: 15_000
   test "startup cleans up a thousand terminal Plane nodes without blocking on item GETs" do
     ledger_root = Path.join(System.tmp_dir!(), "symphony-plane-terminal-epoch-#{System.unique_integer([:positive])}")
     terminal_issues = OrchestratorPlaneEpochFakeTracker.terminal_issues(1_000)
@@ -1066,6 +1228,7 @@ defmodule SymphonyElixir.OrchestratorPlaneEpochTest do
       task_supervisor: task_supervisor,
       work_control: Keyword.get(opts, :work_control, %{"plane-epoch-issue" => valid_work_item()}),
       attempt_ledger_status: :disabled,
+      attempt_ledger_opts: Keyword.get(opts, :attempt_ledger_opts, []),
       recovery_ledger_status: :disabled,
       workspace_ownership_ledger_opts: Keyword.get(opts, :workspace_ownership_ledger_opts, [])
     ]
@@ -1073,7 +1236,11 @@ defmodule SymphonyElixir.OrchestratorPlaneEpochTest do
     {:ok, pid} = Orchestrator.start_link(start_opts)
 
     :sys.replace_state(pid, fn state ->
-      state = %{state | attempt_ledger_status: :disabled, recovery_ledger_status: :disabled}
+      state = %{
+        state
+        | attempt_ledger_status: Keyword.get(opts, :attempt_ledger_status, :disabled),
+          recovery_ledger_status: :disabled
+      }
 
       case Keyword.fetch(opts, :max_concurrent_agents) do
         {:ok, max_concurrent_agents} -> %{state | max_concurrent_agents: max_concurrent_agents}
@@ -1088,6 +1255,18 @@ defmodule SymphonyElixir.OrchestratorPlaneEpochTest do
     on_exit(fn -> stop_orchestrator(pid, task_supervisor) end)
 
     {pid, task_supervisor}
+  end
+
+  defp controlled_test_sync_fun(fail_sync, sync_count) do
+    fn table ->
+      :atomics.add(sync_count, 1, 1)
+
+      if :atomics.get(fail_sync, 1) == 1 do
+        {:error, :injected_sync_failure}
+      else
+        :dets.sync(table)
+      end
+    end
   end
 
   defp valid_work_item(issue \\ OrchestratorPlaneEpochFakeTracker.issue()) do
