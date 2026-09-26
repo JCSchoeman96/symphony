@@ -3458,7 +3458,11 @@ defmodule SymphonyElixir.Orchestrator do
   defp reconcile_plane_missing_blocked_issue_ids(%State{} = state, []), do: state
 
   defp reconcile_plane_missing_blocked_issue_ids(%State{} = state, missing_ids) do
-    reconcile_missing_blocked_issue_ids(state, missing_ids, [])
+    Enum.reduce(missing_ids, state, fn issue_id, state_acc ->
+      state_acc
+      |> reconcile_missing_plane_attempt_lineage(issue_id)
+      |> reconcile_missing_blocked_issue_ids([issue_id], [])
+    end)
   end
 
   @doc false
@@ -3852,6 +3856,49 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp reconcile_missing_blocked_issue_ids(state, _requested_issue_ids, _issues), do: state
 
+  defp reconcile_missing_plane_attempt_lineage(%State{attempt_ledger_status: :disabled} = state, issue_id) do
+    clear_durable_in_flight(state, issue_id)
+  end
+
+  defp reconcile_missing_plane_attempt_lineage(
+         %State{attempt_ledger_status: :ready, attempt_ledger: %AttemptLedger{} = ledger} = state,
+         issue_id
+       ) do
+    case AttemptLedger.current(ledger, issue_id) do
+      {:ok, record} ->
+        state =
+          if Map.get(record, :in_flight, false) do
+            mark_durable_in_flight(state, issue_id, true)
+          else
+            clear_durable_in_flight(state, issue_id)
+          end
+
+        if Map.get(record, :status) in [:open, :exhausted] or Map.get(record, :close_pending, false) do
+          mark_missing_durable_attempt_lineage(state, issue_id)
+        else
+          clear_missing_attempt_ledger_block(state, issue_id)
+        end
+
+      :not_found ->
+        state
+        |> clear_durable_in_flight(issue_id)
+        |> clear_missing_attempt_ledger_block(issue_id)
+
+      {:error, reason} ->
+        block_ledger(state, reason)
+    end
+  end
+
+  defp reconcile_missing_plane_attempt_lineage(%State{} = state, _issue_id), do: state
+
+  defp mark_missing_durable_attempt_lineage(%State{} = state, issue_id) do
+    case Map.get(state.durable_blocked, issue_id) do
+      nil -> mark_durable_blocked(state, issue_id, {:attempt_ledger_issue_missing, issue_id})
+      {:attempt_ledger_issue_missing, ^issue_id} -> state
+      _unrelated_reason -> state
+    end
+  end
+
   defp forget_work_item(%State{} = state, issue_id) when is_binary(issue_id) do
     %{state | work_control: Map.delete(state.work_control, issue_id)}
   end
@@ -3925,7 +3972,20 @@ defmodule SymphonyElixir.Orchestrator do
 
         state
         |> record_session_completion_totals(running_entry)
-        |> stop_and_block_issue(issue.id, updated_entry, dependency_blocker_error(decision), decision)
+        |> stop_and_block_refreshed_dependency_issue(
+          issue.id,
+          updated_entry,
+          dependency_blocker_error(decision),
+          decision
+        )
+    end
+  end
+
+  defp stop_and_block_refreshed_dependency_issue(%State{} = state, issue_id, running_entry, error, dependency) do
+    if plane_tracker?(state) do
+      stop_and_block_plane_dependency_issue(state, issue_id, running_entry, error, dependency)
+    else
+      stop_and_block_issue(state, issue_id, running_entry, error, dependency)
     end
   end
 
@@ -4381,6 +4441,34 @@ defmodule SymphonyElixir.Orchestrator do
         )
 
         do_block_issue_from_entry(state, issue_id, running_entry, error, dependency)
+
+      {:error, :invalid_runtime_attempt_transition} ->
+        state
+    end
+  end
+
+  defp stop_and_block_plane_dependency_issue(%State{} = state, issue_id, running_entry, error, dependency) do
+    case transition_running_entry_attempt(running_entry, :blocked) do
+      {:ok, running_entry} ->
+        stop_running_task(
+          Map.get(running_entry, :pid),
+          Map.get(running_entry, :ref),
+          state.task_supervisor
+        )
+
+        case clear_attempt_in_flight(state, issue_id) do
+          {:ok, cleared_state} ->
+            do_block_issue_from_entry(cleared_state, issue_id, running_entry, error, dependency)
+
+          {:error, blocked_state, reason} ->
+            do_block_issue_from_entry(
+              blocked_state,
+              issue_id,
+              running_entry,
+              attempt_ledger_error(reason),
+              dependency
+            )
+        end
 
       {:error, :invalid_runtime_attempt_transition} ->
         state
