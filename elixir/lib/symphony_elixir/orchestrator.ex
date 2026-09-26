@@ -6349,14 +6349,26 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp handle_retry_issue(%State{} = state, issue_id, attempt, metadata) do
-    result =
-      if plane_tracker?(state) do
-        tracker_fetch_issues_by_ids(state.tracker, [issue_id], plane_read_options(state))
-      else
-        Tracker.fetch_issues_by_ids([issue_id])
-      end
+    if plane_tracker?(state) do
+      handle_plane_retry_issue(state, issue_id, attempt, metadata)
+    else
+      handle_provider_retry_issue(state, issue_id, attempt, metadata)
+    end
+  end
 
-    case result do
+  defp handle_plane_retry_issue(state, issue_id, attempt, metadata) do
+    case plane_epoch_issue_lookup(state, [issue_id]) do
+      {:ok, [%Issue{} = issue]} ->
+        handle_retry_issue_lookup(issue, state, issue_id, attempt, metadata)
+
+      _unavailable_or_missing ->
+        Logger.info("Skipping retry because the current Plane dependency epoch has no node for #{issue_id}")
+        {:noreply, release_issue_claim(state, issue_id)}
+    end
+  end
+
+  defp handle_provider_retry_issue(state, issue_id, attempt, metadata) do
+    case Tracker.fetch_issues_by_ids([issue_id]) do
       {:ok, issues} ->
         issues
         |> find_issue_by_id(issue_id)
@@ -6574,38 +6586,21 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp run_plane_terminal_workspace_cleanup(%State{dependency_graph: %Graph{} = graph} = state) do
-    if Graph.complete?(graph) do
+    if plane_epoch_current?(state) and Graph.complete?(graph) do
       terminal_states = terminal_state_set()
 
-      issue_ids =
+      terminal_issues =
         graph.nodes
         |> Map.values()
         |> Enum.filter(&terminal_issue_state?(&1.state, terminal_states))
-        |> Enum.map(& &1.id)
 
-      fetch_plane_terminal_issues(state, issue_ids, terminal_states)
+      run_terminal_workspace_cleanup(state, terminal_issues)
     else
       {:error, :dependency_epoch_unavailable}
     end
   end
 
   defp run_plane_terminal_workspace_cleanup(%State{}), do: {:error, :dependency_epoch_unavailable}
-
-  defp fetch_plane_terminal_issues(state, issue_ids, terminal_states) do
-    case tracker_fetch_issues_by_ids(state.tracker, issue_ids, plane_read_options(state)) do
-      {:ok, current_issues} when is_list(current_issues) ->
-        current_issues
-        |> Enum.filter(&terminal_issue_state?(&1.state, terminal_states))
-        |> then(&run_terminal_workspace_cleanup(state, &1))
-
-      {:error, reason} ->
-        Logger.warning("Skipping terminal workspace cleanup; fresh Plane reads failed", reason: inspect(reason))
-        {:error, {:terminal_issue_fetch_failed, reason}}
-
-      _invalid ->
-        {:error, :terminal_issue_fetch_failed}
-    end
-  end
 
   defp run_other_terminal_workspace_cleanup(state) do
     case Tracker.fetch_issues_by_states(Config.settings!().tracker.terminal_states) do
@@ -6650,18 +6645,12 @@ defmodule SymphonyElixir.Orchestrator do
     issue_ids = Enum.map(records, &Map.get(&1, :work_item_id)) |> Enum.filter(&is_binary/1)
 
     if plane_tracker?(state) do
-      case tracker_fetch_issues_by_ids(state.tracker, issue_ids, plane_read_options(state)) do
-        {:ok, issues} when is_list(issues) and length(issues) == length(issue_ids) ->
+      case plane_epoch_issue_lookup(state, issue_ids) do
+        {:ok, issues} ->
           reconcile_pending_workspace_records_with_issues(state, records, issues)
 
-        {:ok, _incomplete_issues} ->
-          Logger.error("Unable to reconcile pending workspace releases because some Plane issues are missing")
-
-          blocked_reason = {:workspace_pending_reconciliation_unavailable, :provider_issue_missing}
-          %{state | startup_reconciliation: {:blocked, blocked_reason}}
-
         {:error, reason} ->
-          Logger.error("Unable to fetch fresh Plane state for pending workspace releases", reason: inspect(reason))
+          Logger.error("Unable to validate pending workspace releases against the current Plane dependency epoch", reason: inspect(reason))
 
           %{state | startup_reconciliation: {:blocked, {:workspace_pending_reconciliation_unavailable, reason}}}
       end

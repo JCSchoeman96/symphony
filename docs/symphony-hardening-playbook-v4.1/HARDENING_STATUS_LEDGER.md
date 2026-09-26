@@ -35,7 +35,7 @@ The original V4.1 ledger became stale after V4.1-000. The discrepancy is preserv
 | GOV-RECON-B | ACCEPTED | [#20](https://github.com/JCSchoeman96/symphony/pull/20) | `894adda8732c466fa795cd8469d8d0a8710b5cc0` | `6406ebe79ac8c8b3eaec54be49d001d9a47730ea` | Post-merge verified | H-060B implementation explicitly authorized |
 | H-060B | ACCEPTED | [#21](https://github.com/JCSchoeman96/symphony/pull/21) | `00ebdffdf8685f62e511061b80383fba9617f6b9` | `24d5764022573375df92d0b72e4820dc58b19e16` | [Implementation PR](https://github.com/JCSchoeman96/symphony/pull/21) | H-060C |
 | H-060C | ACCEPTED | [#22](https://github.com/JCSchoeman96/symphony/pull/22) | `eb68f5405b49400c0444de5d610c3d31f2565d49` | `8afb7022016aa88c942aee7bd9f28293572b9f01` | Post-merge verified | H-070A implementation |
-| H-070A | IN REVIEW | N/A | Not accepted | Not accepted | [Roadmap](V4_1_MASTER_ROADMAP.md) | Independent review; do not merge |
+| H-070A | IN REVIEW | [#23](https://github.com/JCSchoeman96/symphony/pull/23) | Not accepted | Not accepted | [Roadmap](V4_1_MASTER_ROADMAP.md) | Independent review; do not merge |
 | H-070B | NOT AUTHORIZED | N/A | N/A | N/A | [Roadmap](V4_1_MASTER_ROADMAP.md) | None |
 
 H-060B is accepted on protected `main` at `00ebdffdf8685f62e511061b80383fba9617f6b9`. H-060C is accepted at `eb68f5405b49400c0444de5d610c3d31f2565d49`. H-070A is in review; H-070B remains not authorized.
