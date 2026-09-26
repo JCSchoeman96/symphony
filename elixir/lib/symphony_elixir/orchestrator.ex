@@ -640,27 +640,60 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp reconcile_durable_issue_states(%State{} = state, ledger, records, issue_ids) do
-    result =
-      if plane_tracker?(state) do
-        plane_epoch_issue_lookup(state, issue_ids)
-      else
-        Tracker.fetch_issues_by_ids(issue_ids)
-      end
+    if plane_tracker?(state) do
+      reconcile_plane_durable_issue_states(state, ledger, records, issue_ids)
+    else
+      reconcile_provider_durable_issue_states(state, ledger, records, issue_ids)
+    end
+  end
 
-    case result do
-      {:ok, issues} when is_list(issues) ->
-        case durable_issue_map(issues) do
-          {:ok, issues_by_id} ->
-            reconcile_fetched_durable_issue_states(state, ledger, records, issues_by_id)
-
-          :error ->
-            {:blocked, state, {:attempt_ledger_tracker_unavailable, :invalid_issue_collection}}
-        end
+  defp reconcile_plane_durable_issue_states(state, ledger, records, issue_ids) do
+    case plane_epoch_issue_map(state, issue_ids) do
+      {:ok, issues_by_id} ->
+        reconcile_fetched_durable_issue_states(state, ledger, records, issues_by_id)
 
       {:error, reason} ->
         {:blocked, state, {:attempt_ledger_tracker_unavailable, reason}}
     end
   end
+
+  defp reconcile_provider_durable_issue_states(state, ledger, records, issue_ids) do
+    case Tracker.fetch_issues_by_ids(issue_ids) do
+      {:ok, issues} when is_list(issues) ->
+        reconcile_provider_durable_issue_collection(state, ledger, records, issues)
+
+      {:error, reason} ->
+        {:blocked, state, {:attempt_ledger_tracker_unavailable, reason}}
+    end
+  end
+
+  defp reconcile_provider_durable_issue_collection(state, ledger, records, issues) do
+    case durable_issue_map(issues) do
+      {:ok, issues_by_id} ->
+        reconcile_fetched_durable_issue_states(state, ledger, records, issues_by_id)
+
+      :error ->
+        {:blocked, state, {:attempt_ledger_tracker_unavailable, :invalid_issue_collection}}
+    end
+  end
+
+  defp plane_epoch_issue_map(%State{dependency_graph: %Graph{nodes: nodes}} = state, issue_ids) do
+    case plane_epoch_current?(state) do
+      true ->
+        issues_by_id =
+          for issue_id <- issue_ids,
+              %Issue{} = issue <- [Map.get(nodes, issue_id)],
+              into: %{},
+              do: {issue_id, issue}
+
+        {:ok, issues_by_id}
+
+      false ->
+        {:error, :dependency_epoch_unavailable}
+    end
+  end
+
+  defp plane_epoch_issue_map(_state, _issue_ids), do: {:error, :dependency_epoch_unavailable}
 
   defp plane_epoch_issue_lookup(%State{dependency_graph: %Graph{nodes: nodes}} = state, issue_ids) do
     if plane_epoch_current?(state) do
@@ -1455,6 +1488,89 @@ defmodule SymphonyElixir.Orchestrator do
     state.plane_epoch_status == :current and is_nil(state.plane_epoch_task) and graph_current?
   end
 
+  defp plane_epoch_runtime_snapshot(%State{} = state, issue_id, identity, caller_pid) do
+    with :ok <- plane_epoch_runtime_snapshot_ready(state),
+         {:ok, _entry} <- current_plane_runtime_entry(state, issue_id, identity, caller_pid) do
+      plane_epoch_issue_snapshot(state, issue_id)
+    else
+      :stale ->
+        {:error, :stale_runtime_attempt}
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp plane_epoch_runtime_snapshot_ready(state) do
+    cond do
+      not plane_tracker?(state) -> {:error, :plane_epoch_unavailable}
+      state.startup_reconciliation != :ready -> {:error, :startup_reconciliation_pending}
+      not plane_epoch_current?(state) -> {:error, :plane_epoch_unavailable}
+      true -> :ok
+    end
+  end
+
+  defp plane_epoch_issue_snapshot(state, issue_id) do
+    case Map.get(state.dependency_graph.nodes, issue_id) do
+      nil ->
+        {:ok, []}
+
+      %Issue{} = issue ->
+        plane_epoch_visible_issue_snapshot(state, issue, issue_id)
+    end
+  end
+
+  defp plane_epoch_visible_issue_snapshot(state, issue, issue_id) do
+    case Map.get(state.work_control, issue_id) do
+      %WorkItem{} = work_item ->
+        entry = Map.fetch!(state.running, issue_id)
+        dependency_decision = current_runtime_dependency_decision_for(state, issue, entry, issue_id)
+
+        {:ok,
+         %{
+           issue: issue,
+           work_item: work_item,
+           work_control: state.work_control,
+           dependency_decision: dependency_decision,
+           plane_epoch_dependency_decision: dependency_decision,
+           plane_epoch_id: state.plane_epoch_id
+         }}
+
+      _missing_work_item ->
+        {:error, :plane_epoch_work_control_unavailable}
+    end
+  end
+
+  defp current_runtime_dependency_decision_for(state, issue, entry, issue_id) do
+    Map.get(state.dependency_diagnostics, issue_id) || current_runtime_dependency_decision(issue, entry, state)
+  end
+
+  defp current_plane_runtime_entry(%State{} = state, issue_id, identity, caller_pid)
+       when is_binary(issue_id) and is_pid(caller_pid) do
+    case Map.get(state.running, issue_id) do
+      %{pid: ^caller_pid, runtime_attempt: %RuntimeAttempt{identity: current, state: :running}} = entry ->
+        if match?(%RuntimeAttemptIdentity{}, identity) and RuntimeAttemptIdentity.same?(identity, current) and
+             identity.work_item_id == issue_id do
+          {:ok, entry}
+        else
+          :stale
+        end
+
+      %{pid: ^caller_pid, runtime_attempt: nil} = entry when is_nil(identity) ->
+        {:ok, entry}
+
+      _stale_or_missing ->
+        :stale
+    end
+  end
+
+  defp current_plane_runtime_entry(_state, _issue_id, _identity, _caller_pid), do: :stale
+
+  defp current_runtime_dependency_decision(%Issue{} = issue, %{route: %Route{} = route}, %State{} = state),
+    do: dependency_decision_for_state(issue, route, state)
+
+  defp current_runtime_dependency_decision(_issue, _entry, _state), do: nil
+
   defp start_plane_epoch_acquisition(%State{plane_epoch_task: task} = state) when is_map(task), do: state
 
   defp start_plane_epoch_acquisition(%State{} = state) do
@@ -2036,12 +2152,67 @@ defmodule SymphonyElixir.Orchestrator do
         state
 
       true ->
-        state
-        |> reconcile_plane_running_issues()
-        |> reconcile_plane_blocked_issues()
-        |> dispatch_plane_graph()
+        state = reconcile_reappearing_plane_attempt_ledger_records(state)
+
+        if autonomous_dispatch_allowed?(state) do
+          state
+          |> reconcile_plane_running_issues()
+          |> reconcile_plane_blocked_issues()
+          |> dispatch_plane_graph()
+        else
+          state
+        end
     end
   end
+
+  defp reconcile_reappearing_plane_attempt_ledger_records(%State{dependency_graph: %Graph{nodes: nodes}} = state) do
+    state
+    |> reappearing_plane_attempt_ledger_ids(nodes)
+    |> reconcile_reappearing_plane_attempt_ledger_records_for_ids(state, nodes)
+  end
+
+  defp reconcile_reappearing_plane_attempt_ledger_records(%State{} = state), do: state
+
+  defp reappearing_plane_attempt_ledger_ids(state, nodes) do
+    Enum.flat_map(state.durable_blocked, fn
+      {issue_id, {:attempt_ledger_issue_missing, issue_id}}
+      when is_binary(issue_id) ->
+        if match?(%Issue{}, Map.get(nodes, issue_id)), do: [issue_id], else: []
+
+      _other ->
+        []
+    end)
+  end
+
+  defp reconcile_reappearing_plane_attempt_ledger_records_for_ids([], state, _nodes), do: state
+
+  defp reconcile_reappearing_plane_attempt_ledger_records_for_ids(issue_ids, state, nodes) do
+    case reconcile_attempt_ledger_from_snapshot(state, Map.values(nodes)) do
+      {:ok, reconciled_state} ->
+        clear_reappearing_plane_in_flight_fences(reconciled_state, issue_ids)
+
+      {:blocked, blocked_state, reason} ->
+        %{blocked_state | attempt_ledger_status: {:blocked, reason}}
+    end
+  end
+
+  defp clear_reappearing_plane_in_flight_fences(state, issue_ids) do
+    issue_ids
+    |> Enum.reduce_while({:ok, state}, &clear_reappearing_plane_in_flight_fence/2)
+    |> finish_reappearing_plane_in_flight_fences()
+  end
+
+  defp clear_reappearing_plane_in_flight_fence(issue_id, {:ok, state}) do
+    case clear_reconciled_stale_in_flight_for_issue(state, issue_id) do
+      {:ok, next_state} -> {:cont, {:ok, next_state}}
+      {:blocked, blocked_state, reason} -> {:halt, {:blocked, blocked_state, reason}}
+    end
+  end
+
+  defp finish_reappearing_plane_in_flight_fences({:ok, state}), do: state
+
+  defp finish_reappearing_plane_in_flight_fences({:blocked, state, reason}),
+    do: %{state | attempt_ledger_status: {:blocked, reason}}
 
   defp dispatch_plane_graph(%State{dependency_graph: %Graph{} = graph} = state) do
     if Graph.complete?(graph), do: choose_issues(Map.values(graph.nodes), state), else: state
@@ -2771,18 +2942,24 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp clear_reconciled_stale_in_flight_for_issue(%State{} = state, issue_id) do
-    case stale_in_flight_block_reason(state, issue_id) do
-      nil ->
-        clear_reconciled_in_flight_record(state, issue_id)
-
-      :running ->
+    case Map.get(state.durable_blocked, issue_id) do
+      {:attempt_ledger_issue_missing, ^issue_id} ->
         {:ok, state}
 
-      :stale_in_flight_attempt_ledger_unavailable ->
-        {:blocked, state, {:stale_in_flight_attempt_ledger_unavailable, issue_id}}
+      _other_reason ->
+        case stale_in_flight_block_reason(state, issue_id) do
+          nil ->
+            clear_reconciled_in_flight_record(state, issue_id)
 
-      reason ->
-        {:ok, mark_durable_blocked(state, issue_id, reason)}
+          :running ->
+            {:ok, state}
+
+          :stale_in_flight_attempt_ledger_unavailable ->
+            {:blocked, state, {:stale_in_flight_attempt_ledger_unavailable, issue_id}}
+
+          reason ->
+            {:ok, mark_durable_blocked(state, issue_id, reason)}
+        end
     end
   end
 
@@ -2824,11 +3001,28 @@ defmodule SymphonyElixir.Orchestrator do
         {:ok,
          state
          |> clear_durable_in_flight(issue_id)
-         |> then(&%{&1 | durable_blocked: Map.delete(&1.durable_blocked, issue_id)})}
+         |> clear_resolved_in_flight_block(issue_id)}
 
       {:error, reason} ->
         blocked_state = block_ledger(state, reason)
         {:blocked, blocked_state, {:attempt_ledger_clear_in_flight_failed, issue_id, reason}}
+    end
+  end
+
+  defp clear_resolved_in_flight_block(%State{} = state, issue_id) do
+    case Map.get(state.durable_blocked, issue_id) do
+      {:attempt_ledger_issue_missing, ^issue_id} ->
+        %{state | durable_blocked: Map.delete(state.durable_blocked, issue_id)}
+
+      reason when is_atom(reason) ->
+        if String.starts_with?(Atom.to_string(reason), "stale_in_flight_") do
+          %{state | durable_blocked: Map.delete(state.durable_blocked, issue_id)}
+        else
+          state
+        end
+
+      _unrelated_reason ->
+        state
     end
   end
 
@@ -3179,7 +3373,27 @@ defmodule SymphonyElixir.Orchestrator do
   # dispatch_plane_epoch/1 only reaches these helpers after plane_epoch_current?/1
   # has verified a complete graph for this epoch, so graph absence is authoritative.
   defp reconcile_plane_missing_running_issue_ids(%State{} = state, missing_ids) do
-    reconcile_missing_running_issue_ids(state, missing_ids, [])
+    Enum.reduce(missing_ids, state, &reconcile_missing_plane_running_issue/2)
+  end
+
+  defp reconcile_missing_plane_running_issue(issue_id, %State{} = state) do
+    log_missing_running_issue(state, issue_id)
+
+    case finalize_running_attempt_removal(state, issue_id, false, :tracker_missing) do
+      {:ok, terminalized_state} ->
+        case clear_attempt_in_flight(terminalized_state, issue_id) do
+          {:ok, cleared_state} ->
+            forget_work_item(cleared_state, issue_id)
+
+          {:error, blocked_state, reason} ->
+            Logger.warning("Missing Plane issue remains fenced after AttemptLedger clear failed issue_id=#{issue_id}: #{inspect(reason)}")
+
+            blocked_state
+        end
+
+      {:error, unchanged_state} ->
+        unchanged_state
+    end
   end
 
   defp refresh_dependency_state_for_running(%State{} = state, running_issues)
@@ -5695,6 +5909,9 @@ defmodule SymphonyElixir.Orchestrator do
     work_item = active_work_item_for_attempt(state, issue.id)
     runtime_attempt_identity = runtime_attempt_identity_from(runtime_attempt)
 
+    plane_epoch_snapshot_reader =
+      plane_epoch_snapshot_reader_for(state, recipient, issue.id, runtime_attempt_identity)
+
     case Task.Supervisor.start_child(state.task_supervisor, fn ->
            state.agent_runner.run(issue, recipient,
              attempt: attempt,
@@ -5704,7 +5921,8 @@ defmodule SymphonyElixir.Orchestrator do
              work_control: state.work_control,
              dependency_decision: Map.get(state.dependency_diagnostics, issue.id),
              ownership_ledger: state.workspace_ownership_ledger,
-             runtime_attempt_identity: runtime_attempt_identity
+             runtime_attempt_identity: runtime_attempt_identity,
+             plane_epoch_snapshot_reader: plane_epoch_snapshot_reader
            )
          end) do
       {:ok, pid} ->
@@ -5789,6 +6007,17 @@ defmodule SymphonyElixir.Orchestrator do
         end
     end
   end
+
+  defp plane_epoch_snapshot_reader_for(%State{} = state, recipient, issue_id, identity)
+       when is_pid(recipient) and is_binary(issue_id) do
+    if plane_tracker?(state) do
+      fn ->
+        GenServer.call(recipient, {:plane_epoch_runtime_snapshot, issue_id, identity}, 5_000)
+      end
+    end
+  end
+
+  defp plane_epoch_snapshot_reader_for(_state, _recipient, _issue_id, _identity), do: nil
 
   defp runtime_attempt_identity_from(%RuntimeAttempt{identity: identity}), do: identity
   defp runtime_attempt_identity_from(_runtime_attempt), do: nil
@@ -8214,6 +8443,18 @@ defmodule SymphonyElixir.Orchestrator do
        requested_at: DateTime.utc_now(),
        operations: ["poll", "reconcile"]
      }, state}
+  end
+
+  def handle_call(
+        {:plane_epoch_runtime_snapshot, issue_id, identity},
+        {caller_pid, _tag},
+        %State{} = state
+      )
+      when is_binary(issue_id) do
+    case plane_epoch_runtime_snapshot(state, issue_id, identity, caller_pid) do
+      {:ok, snapshot} -> {:reply, {:ok, snapshot}, state}
+      {:error, _reason} = error -> {:reply, error, state}
+    end
   end
 
   def handle_call({:transition_context, work_item_id, opts}, _from, %State{} = state)

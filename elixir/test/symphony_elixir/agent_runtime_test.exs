@@ -433,7 +433,30 @@ defmodule SymphonyElixir.AgentRuntimeTest do
 
     assert {:ok, route} = Router.resolve(work_item, Config.settings!().agent.profiles)
 
+    {:ok, refreshed_work_item} =
+      WorkItem.from_issue(refreshed_issue, %{
+        provider: :plane,
+        observed_at: @work_control_now,
+        prior_validated_lifecycle_state: issue.state,
+        evidence: [GuardClass.requirement(:mechanical_guard, :dispatch_guard)]
+      })
+
     runtime_identity = RuntimeAttempt.Identity.allocate(issue.id, route, "lineage-catalogue-refresh")
+    snapshot_reads = :atomics.new(1, [])
+    provider_reads = :atomics.new(1, [])
+
+    snapshot_reader = fn ->
+      :atomics.add(snapshot_reads, 1, 1)
+
+      {:ok,
+       %{
+         issue: refreshed_issue,
+         work_item: refreshed_work_item,
+         work_control: %{issue.id => refreshed_work_item},
+         dependency_decision: %{allowed?: true, source: :current_plane_epoch},
+         epoch_id: "current-plane-epoch"
+       }}
+    end
 
     try do
       assert :ok =
@@ -445,7 +468,11 @@ defmodule SymphonyElixir.AgentRuntimeTest do
                  ownership_ledger: workspace_ownership_ledger(),
                  runtime_attempt_identity: runtime_identity,
                  guard_evidence: [GuardClass.requirement(:mechanical_guard, :dispatch_guard)],
-                 issue_state_fetcher: fn [_issue_id] -> {:ok, [refreshed_issue]} end
+                 issue_state_fetcher: fn [_issue_id] ->
+                   :atomics.add(provider_reads, 1, 1)
+                   {:ok, [refreshed_issue]}
+                 end,
+                 plane_epoch_snapshot_reader: snapshot_reader
                )
 
       assert_receive {:plane_catalogue_runtime_started, first_session, first_specs, first_context}
@@ -457,6 +484,8 @@ defmodule SymphonyElixir.AgentRuntimeTest do
       assert first_turn_opts[:runtime_attempt_identity] == runtime_identity
       assert first_turn_opts[:agent_tool_context].runtime_attempt_identity == runtime_identity
       assert first_turn_opts[:agent_tool_context].route.starting_state == "ready"
+      refute Keyword.has_key?(first_turn_opts, :plane_epoch_snapshot_reader)
+      refute Keyword.has_key?(first_turn_opts, :issue_state_fetcher)
       assert_receive {:plane_catalogue_runtime_stopped, ^first_session}
 
       assert_receive {:plane_catalogue_runtime_started, second_session, second_specs, second_context}
@@ -469,10 +498,130 @@ defmodule SymphonyElixir.AgentRuntimeTest do
       assert second_turn_opts[:runtime_attempt_identity] == runtime_identity
       assert second_turn_opts[:agent_tool_context].runtime_attempt_identity == runtime_identity
       assert second_turn_opts[:agent_tool_context].route.starting_state == "in progress"
+      assert second_turn_opts[:agent_tool_context].work_item.validated_lifecycle_state == :in_progress
+
+      assert second_turn_opts[:agent_tool_context].work_control[issue.id] ==
+               second_turn_opts[:agent_tool_context].work_item
+
       assert_receive {:plane_catalogue_runtime_stopped, ^second_session}
       refute_receive {:plane_catalogue_runtime_started, _session, _specs, _context}, 50
       refute_receive {:plane_catalogue_runtime_turn, _session, _prompt, _issue, _opts}, 50
       refute_receive {:plane_catalogue_runtime_stopped, _session}, 50
+      assert :atomics.get(snapshot_reads, 1) == 2
+      assert :atomics.get(provider_reads, 1) == 0
+    after
+      restore_env("PLANE_API_KEY", previous_plane_api_key)
+      File.rm_rf(workspace_root)
+    end
+  end
+
+  test "Plane continuation stops on complete epoch absence without a provider read" do
+    test_pid = self()
+    previous_plane_api_key = System.get_env("PLANE_API_KEY")
+    System.put_env("PLANE_API_KEY", "test-plane-secret")
+    workspace_root = Path.join(System.tmp_dir!(), "symphony-plane-absence-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(workspace_root)
+    write_plane_workflow_file!(Workflow.workflow_file_path(), workspace_root)
+    issue = %Issue{id: "plane-epoch-absent", identifier: "SYM-PLANE-ABSENT", state: "Ready", dispatchable: true}
+    work_item = trusted_work_item(issue)
+    assert {:ok, route} = Router.resolve(work_item, Config.settings!().agent.profiles)
+    provider_reads = :atomics.new(1, [])
+
+    try do
+      assert :ok =
+               AgentRunner.run(issue, test_pid,
+                 runtime: SymphonyElixir.AgentRuntimeTestFake,
+                 test_pid: test_pid,
+                 route: route,
+                 work_item: work_item,
+                 ownership_ledger: workspace_ownership_ledger(),
+                 plane_epoch_snapshot_reader: fn -> {:ok, []} end,
+                 issue_state_fetcher: fn _ids ->
+                   :atomics.add(provider_reads, 1, 1)
+                   {:ok, [issue]}
+                 end
+               )
+
+      assert_receive {:runtime_started, _workspace, _start_opts}
+      assert_receive {:runtime_turn, _session, _prompt, ^issue}
+      assert_receive {:runtime_stopped, _session}
+      refute_receive {:runtime_turn, _session, _prompt, _issue}, 50
+      assert :atomics.get(provider_reads, 1) == 0
+    after
+      restore_env("PLANE_API_KEY", previous_plane_api_key)
+      File.rm_rf(workspace_root)
+    end
+  end
+
+  test "Plane continuation fails closed when the complete epoch is unavailable" do
+    test_pid = self()
+    previous_plane_api_key = System.get_env("PLANE_API_KEY")
+    System.put_env("PLANE_API_KEY", "test-plane-secret")
+    workspace_root = Path.join(System.tmp_dir!(), "symphony-plane-unavailable-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(workspace_root)
+    write_plane_workflow_file!(Workflow.workflow_file_path(), workspace_root)
+    issue = %Issue{id: "plane-epoch-unavailable", identifier: "SYM-PLANE-UNAVAILABLE", state: "Ready", dispatchable: true}
+    work_item = trusted_work_item(issue)
+    assert {:ok, route} = Router.resolve(work_item, Config.settings!().agent.profiles)
+    provider_reads = :atomics.new(1, [])
+
+    try do
+      assert_raise RuntimeError, ~r/issue_state_refresh_failed, :plane_epoch_unavailable/, fn ->
+        AgentRunner.run(issue, test_pid,
+          runtime: SymphonyElixir.AgentRuntimeTestFake,
+          test_pid: test_pid,
+          route: route,
+          work_item: work_item,
+          ownership_ledger: workspace_ownership_ledger(),
+          plane_epoch_snapshot_reader: fn -> {:error, :plane_epoch_unavailable} end,
+          issue_state_fetcher: fn _ids ->
+            :atomics.add(provider_reads, 1, 1)
+            {:ok, [issue]}
+          end
+        )
+      end
+
+      assert_receive {:runtime_started, _workspace, _start_opts}
+      assert_receive {:runtime_turn, _session, _prompt, ^issue}
+      assert_receive {:runtime_stopped, _session}
+      assert :atomics.get(provider_reads, 1) == 0
+    after
+      restore_env("PLANE_API_KEY", previous_plane_api_key)
+      File.rm_rf(workspace_root)
+    end
+  end
+
+  test "Plane continuation fails closed when the host snapshot reader is missing" do
+    test_pid = self()
+    previous_plane_api_key = System.get_env("PLANE_API_KEY")
+    System.put_env("PLANE_API_KEY", "test-plane-secret")
+    workspace_root = Path.join(System.tmp_dir!(), "symphony-plane-missing-reader-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(workspace_root)
+    write_plane_workflow_file!(Workflow.workflow_file_path(), workspace_root)
+    issue = %Issue{id: "plane-epoch-no-reader", identifier: "SYM-PLANE-NO-READER", state: "Ready", dispatchable: true}
+    work_item = trusted_work_item(issue)
+    assert {:ok, route} = Router.resolve(work_item, Config.settings!().agent.profiles)
+    provider_reads = :atomics.new(1, [])
+
+    try do
+      assert_raise RuntimeError, ~r/plane_epoch_snapshot_reader_unavailable/, fn ->
+        AgentRunner.run(issue, test_pid,
+          runtime: SymphonyElixir.AgentRuntimeTestFake,
+          test_pid: test_pid,
+          route: route,
+          work_item: work_item,
+          ownership_ledger: workspace_ownership_ledger(),
+          issue_state_fetcher: fn _ids ->
+            :atomics.add(provider_reads, 1, 1)
+            {:ok, [issue]}
+          end
+        )
+      end
+
+      assert_receive {:runtime_started, _workspace, _start_opts}
+      assert_receive {:runtime_turn, _session, _prompt, ^issue}
+      assert_receive {:runtime_stopped, _session}
+      assert :atomics.get(provider_reads, 1) == 0
     after
       restore_env("PLANE_API_KEY", previous_plane_api_key)
       File.rm_rf(workspace_root)
