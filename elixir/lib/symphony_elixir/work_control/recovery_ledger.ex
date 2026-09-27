@@ -51,7 +51,7 @@ defmodule SymphonyElixir.WorkControl.RecoveryLedger do
     :resume_target,
     :status
   ]
-  @provider_observation_keys [
+  @legacy_provider_observation_keys [
     :provider,
     :work_item_id,
     :workspace_id,
@@ -63,6 +63,7 @@ defmodule SymphonyElixir.WorkControl.RecoveryLedger do
     :observed_at,
     :snapshot_identity
   ]
+  @provider_observation_keys @legacy_provider_observation_keys ++ [:presence]
   @forbidden_keys [
     :api_key,
     :authority_disposition,
@@ -407,7 +408,10 @@ defmodule SymphonyElixir.WorkControl.RecoveryLedger do
     do: {:error, :invalid_suspension_context}
 
   defp validate_provider_observation(%ProviderObservation{} = observation, work_item_id) do
-    with :ok <- validate_exact_keys(Map.from_struct(observation), @provider_observation_keys),
+    observation_record = Map.from_struct(observation)
+    presence = Map.get(observation_record, :presence, :present)
+
+    with :ok <- validate_provider_observation_keys(observation_record),
          :ok <- validate_work_item_id(observation.work_item_id),
          :ok <- validate_matching_work_item_id(observation.work_item_id, work_item_id),
          :ok <- validate_safe_term(observation.provider),
@@ -415,7 +419,7 @@ defmodule SymphonyElixir.WorkControl.RecoveryLedger do
          :ok <- validate_non_empty_optional_string(observation.project_id),
          :ok <- validate_non_empty_optional_string(observation.provider_state_id),
          :ok <- validate_safe_term(observation.provider_state_group),
-         :ok <- validate_non_empty_string(observation.provider_state_name),
+         :ok <- validate_provider_observation_state(observation_record, presence),
          :ok <- validate_datetime(observation.observed_at),
          :ok <- validate_optional_datetime(observation.provider_updated_at) do
       validate_safe_term(observation.snapshot_identity)
@@ -423,6 +427,32 @@ defmodule SymphonyElixir.WorkControl.RecoveryLedger do
   end
 
   defp validate_provider_observation(_observation, _work_item_id),
+    do: {:error, :invalid_provider_observation}
+
+  defp validate_provider_observation_keys(record) do
+    if validate_exact_keys(record, @legacy_provider_observation_keys) == :ok or
+         validate_exact_keys(record, @provider_observation_keys) == :ok,
+       do: :ok,
+       else: {:error, :invalid_provider_observation}
+  end
+
+  defp validate_provider_observation_state(record, :present),
+    do: validate_non_empty_string(Map.get(record, :provider_state_name))
+
+  defp validate_provider_observation_state(record, :not_found) do
+    valid_absence? =
+      Map.get(record, :provider) in [:plane, "plane"] and
+        non_empty_binary?(Map.get(record, :workspace_id)) and
+        non_empty_binary?(Map.get(record, :project_id)) and
+        is_nil(Map.get(record, :provider_state_id)) and
+        is_nil(Map.get(record, :provider_state_group)) and
+        is_nil(Map.get(record, :provider_state_name)) and
+        is_nil(Map.get(record, :provider_updated_at))
+
+    if valid_absence?, do: :ok, else: {:error, :invalid_provider_observation}
+  end
+
+  defp validate_provider_observation_state(_record, _presence),
     do: {:error, :invalid_provider_observation}
 
   defp validate_context_status(status, :active) when status in [:open, :resolving], do: :ok
@@ -513,6 +543,9 @@ defmodule SymphonyElixir.WorkControl.RecoveryLedger do
   end
 
   defp validate_non_empty_string(_value), do: {:error, :invalid_record}
+
+  defp non_empty_binary?(value) when is_binary(value), do: String.trim(value) != ""
+  defp non_empty_binary?(_value), do: false
 
   defp validate_exact_keys(map, expected_keys) when is_map(map) do
     if Enum.sort(Map.keys(map)) == Enum.sort(expected_keys), do: :ok, else: {:error, :invalid_record}

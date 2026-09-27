@@ -5,6 +5,8 @@ defmodule SymphonyElixirWeb.Endpoint do
 
   use Phoenix.Endpoint, otp_app: :symphony_elixir
 
+  alias SymphonyElixirWeb.Plugs.RequestParsers
+
   @session_options [
     store: :cookie,
     key: "_symphony_elixir_key",
@@ -19,13 +21,7 @@ defmodule SymphonyElixirWeb.Endpoint do
   plug(Plug.RequestId)
   plug(Plug.Telemetry, event_prefix: [:phoenix, :endpoint])
 
-  plug(Plug.Parsers,
-    parsers: [:urlencoded, :multipart, :json],
-    pass: ["*/*"],
-    json_decoder: Jason
-  )
-
-  plug(Plug.MethodOverride)
+  plug(RequestParsers)
   plug(Plug.Head)
   plug(Plug.Session, @session_options)
   plug(SymphonyElixirWeb.Router)

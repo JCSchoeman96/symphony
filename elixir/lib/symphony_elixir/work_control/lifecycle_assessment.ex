@@ -68,13 +68,19 @@ defmodule SymphonyElixir.WorkControl.LifecycleAssessment do
   @spec resolve_mapping(t(), map()) ::
           {:ok, t()} | {:error, t()} | {:error, :assessment_already_resolved}
   def resolve_mapping(%__MODULE__{status: :unassessed} = assessment, context) when is_map(context) do
-    mapping_result =
-      case Map.get(context, :provider_project_contract) do
-        %ProviderProjectContract{} = contract ->
-          ProviderObservation.map_state(assessment.provider_observation, contract)
+    observation = assessment.provider_observation
 
-        _missing_contract ->
-          ProviderObservation.map_state(assessment.provider_observation)
+    mapping_result =
+      if observation.presence == :not_found do
+        {:ok, nil}
+      else
+        case Map.get(context, :provider_project_contract) do
+          %ProviderProjectContract{} = contract ->
+            ProviderObservation.map_state(observation, contract)
+
+          _missing_contract ->
+            ProviderObservation.map_state(observation)
+        end
       end
 
     case mapping_result do
@@ -160,6 +166,10 @@ defmodule SymphonyElixir.WorkControl.LifecycleAssessment do
 
   @spec dependency_satisfying?(t()) :: boolean()
   def dependency_satisfying?(assessment), do: completion_validated?(assessment)
+
+  defp assess_mapped(%__MODULE__{provider_observation: %{presence: :not_found}} = assessment, prior_state, evidence, context) do
+    finalize(assessment, :authority_reducing, nil, prior_state, [], evidence, :provider_not_found, context)
+  end
 
   defp assess_mapped(%__MODULE__{mapped_state: mapped_state} = assessment, nil, evidence, context) do
     cond do

@@ -14,6 +14,10 @@ defmodule SymphonyElixirWeb.Router do
     plug(:put_secure_browser_headers)
   end
 
+  pipeline :plane_webhook do
+    plug(SymphonyElixirWeb.Plugs.PlaneWebhookIngress)
+  end
+
   scope "/", SymphonyElixirWeb do
     get("/dashboard.css", StaticAssetController, :dashboard_css)
     get("/favicon.png", StaticAssetController, :favicon)
@@ -29,12 +33,19 @@ defmodule SymphonyElixirWeb.Router do
   end
 
   scope "/", SymphonyElixirWeb do
+    pipe_through(:plane_webhook)
+
+    post("/api/v1/webhooks/plane", PlaneWebhookController, :create)
+  end
+
+  scope "/", SymphonyElixirWeb do
     get("/api/v1/state", ObservabilityApiController, :state)
 
     match(:*, "/", ObservabilityApiController, :method_not_allowed)
     match(:*, "/api/v1/state", ObservabilityApiController, :method_not_allowed)
     post("/api/v1/refresh", ObservabilityApiController, :refresh)
     match(:*, "/api/v1/refresh", ObservabilityApiController, :method_not_allowed)
+    match(:*, "/api/v1/webhooks/plane", ObservabilityApiController, :method_not_allowed)
     get("/api/v1/:issue_identifier", ObservabilityApiController, :issue)
     match(:*, "/api/v1/:issue_identifier", ObservabilityApiController, :method_not_allowed)
     match(:*, "/*path", ObservabilityApiController, :not_found)

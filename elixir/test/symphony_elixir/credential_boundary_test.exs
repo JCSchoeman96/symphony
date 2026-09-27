@@ -7,7 +7,7 @@ defmodule SymphonyElixir.CredentialBoundaryTest do
     deny = CredentialBoundary.deny_environment_names([])
 
     for name <-
-          ~w(PLANE_API_KEY GITHUB_TOKEN GH_TOKEN SSH_AUTH_SOCK GIT_ASKPASS GIT_SSH_COMMAND) do
+          ~w(PLANE_API_KEY PLANE_WEBHOOK_SECRET GITHUB_TOKEN GH_TOKEN SSH_AUTH_SOCK GIT_ASKPASS GIT_SSH_COMMAND) do
       assert name in deny
     end
   end
@@ -15,11 +15,13 @@ defmodule SymphonyElixir.CredentialBoundaryTest do
   test "unset command includes canonical deny names even without configured secrets" do
     assert CredentialBoundary.unset_shell_command([]) =~ "unset "
     assert CredentialBoundary.unset_shell_command([]) =~ "PLANE_API_KEY"
+    assert CredentialBoundary.unset_shell_command([]) =~ "PLANE_WEBHOOK_SECRET"
   end
 
   test "port env marks every denied variable as unset" do
     env = CredentialBoundary.port_env(["EXTRA_SECRET"])
     assert {~c"PLANE_API_KEY", false} in env
+    assert {~c"PLANE_WEBHOOK_SECRET", false} in env
     assert {~c"EXTRA_SECRET", false} in env
   end
 

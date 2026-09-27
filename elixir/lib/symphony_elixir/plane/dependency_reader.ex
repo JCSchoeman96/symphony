@@ -160,7 +160,7 @@ defmodule SymphonyElixir.Plane.DependencyReader do
       state: projected.state,
       branch_name: nil,
       url: projected.url,
-      assignee_id: nil,
+      assignee_id: projected.assignee_id,
       workspace_id: projected.workspace_id,
       project_id: projected.project_id,
       provider_state_id: projected.provider_state_id,

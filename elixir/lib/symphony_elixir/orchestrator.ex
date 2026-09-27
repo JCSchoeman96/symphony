@@ -21,7 +21,16 @@ defmodule SymphonyElixir.Orchestrator do
 
   alias SymphonyElixir.AgentRuntime.RuntimeAttempt.Identity, as: RuntimeAttemptIdentity
   alias SymphonyElixir.Dependency.{Graph, Guard, Policy}
-  alias SymphonyElixir.Plane.ProjectContract
+
+  alias SymphonyElixir.Plane.{
+    ProjectContract,
+    ReconciliationIntent,
+    WebhookDedupRegistry,
+    WebhookDelivery,
+    WebhookIngressMetrics
+  }
+
+  alias SymphonyElixir.Plane.WebhookDelivery.EventIdentity
   alias SymphonyElixir.Tracker.Issue
 
   alias SymphonyElixir.WorkControl.{
@@ -39,6 +48,19 @@ defmodule SymphonyElixir.Orchestrator do
   }
 
   @continuation_retry_delay_ms 1_000
+  @plane_webhook_max_pending 64
+  @plane_webhook_max_in_flight 2
+  @plane_webhook_metrics [
+    :received,
+    :signature_rejected,
+    :malformed,
+    :scope_rejected,
+    :duplicate_delivery,
+    :duplicate_event,
+    :scheduled,
+    :coalesced,
+    :reconciliation_failed
+  ]
   @failure_retry_base_ms 10_000
   @durable_attempt_events [:ordinary_failure, :review_cycle, :ci_failure]
   @recent_attempt_limit 20
@@ -158,7 +180,17 @@ defmodule SymphonyElixir.Orchestrator do
       plane_epoch_contract_fingerprint: nil,
       plane_epoch_status: :unavailable,
       plane_epoch_error: nil,
-      plane_epoch_metrics: nil
+      plane_epoch_metrics: nil,
+      plane_epoch_coverage_generation: 0,
+      plane_reconciliation_generation: 0,
+      plane_webhook_dedup: nil,
+      plane_webhook_pending: %{},
+      plane_webhook_queue: :queue.new(),
+      plane_webhook_tasks: %{},
+      plane_webhook_latest_generation_by_item: %{},
+      plane_webhook_metrics: %{},
+      plane_webhook_last_accepted_at: nil,
+      plane_webhook_full_epoch_dirty_generation: nil
     ]
   end
 
@@ -189,6 +221,8 @@ defmodule SymphonyElixir.Orchestrator do
           transition_coordinator: Keyword.get(opts, :transition_coordinator, TransitionCoordinator),
           work_control: initial_work_control(Keyword.get(opts, :work_control, %{})),
           project_contract_evidence: ProjectContractEvidence.new(config.provider_project_contract),
+          plane_webhook_dedup: WebhookDedupRegistry.new(),
+          plane_webhook_metrics: initial_plane_webhook_metrics(),
           startup_reconciliation: startup_reconciliation_initial_state(config.agent.routing),
           codex_totals: @empty_codex_totals,
           codex_rate_limits: nil
@@ -214,9 +248,24 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp startup_reconciliation_initial_state(_routing), do: :pending
 
+  defp initial_plane_webhook_metrics do
+    Map.new(@plane_webhook_metrics, &{&1, 0})
+  end
+
+  defp stop_plane_webhook_tasks(tasks) when is_map(tasks) do
+    Enum.each(tasks, fn {_task_ref, task} ->
+      if is_pid(Map.get(task, :pid)), do: Process.exit(task.pid, :shutdown)
+      if is_reference(Map.get(task, :monitor_ref)), do: Process.demonitor(task.monitor_ref, [:flush])
+    end)
+
+    :ok
+  end
+
   @impl true
   def terminate(_reason, %State{} = state) do
     _ = cancel_plane_epoch_task(state, :orchestrator_shutdown)
+    stop_plane_webhook_tasks(state.plane_webhook_tasks)
+    if match?(%WebhookDedupRegistry{}, state.plane_webhook_dedup), do: WebhookDedupRegistry.close(state.plane_webhook_dedup)
     close_attempt_ledger(state.attempt_ledger)
     close_recovery_ledger(state.recovery_ledger)
     close_workspace_ownership_ledger(state.workspace_ownership_ledger)
@@ -1004,6 +1053,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   def handle_info(:run_poll_cycle, state) do
     state = refresh_runtime_config(state)
+    state = drain_plane_webhook_queue(state)
     state = maybe_dispatch(state)
     state = schedule_tick(state, state.poll_interval_ms)
     state = %{state | poll_check_in_progress: false}
@@ -1013,19 +1063,48 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   def handle_info(
+        {:plane_webhook_item_result, task_pid, task_ref, result},
+        %State{} = state
+      ) do
+    case Map.get(state.plane_webhook_tasks, task_ref) do
+      %{pid: ^task_pid} = task ->
+        state
+        |> finish_plane_webhook_task(task, result)
+        |> drain_plane_webhook_queue()
+        |> then(fn next_state ->
+          notify_dashboard()
+          {:noreply, next_state}
+        end)
+
+      _stale ->
+        {:noreply, state}
+    end
+  end
+
+  def handle_info({:plane_webhook_item_result, _task_pid, _task_ref, _result}, state),
+    do: {:noreply, state}
+
+  def handle_info(
         {:plane_epoch_result, task_pid, task_ref, epoch_id, config_fingerprint, contract_fingerprint, result},
         %State{plane_epoch_task: %{pid: task_pid, task_ref: task_ref} = task} = state
       ) do
     state =
       if plane_epoch_result_current?(state, task, epoch_id, config_fingerprint, contract_fingerprint) do
-        accept_plane_epoch_result(
-          state,
-          task,
-          epoch_id,
-          config_fingerprint,
-          contract_fingerprint,
-          result
-        )
+        if plane_epoch_requires_followup?(state, task) do
+          state
+          |> clear_plane_epoch_task(task)
+          |> Map.put(:plane_epoch_status, :refreshing)
+          |> start_plane_epoch_acquisition()
+        else
+          accept_plane_epoch_result(
+            state,
+            task,
+            epoch_id,
+            config_fingerprint,
+            contract_fingerprint,
+            result
+          )
+        end
       else
         reject_plane_epoch_result(state, task, :stale, Map.get(result, :metrics))
       end
@@ -1042,29 +1121,29 @@ defmodule SymphonyElixir.Orchestrator do
         %State{plane_epoch_task: %{monitor_ref: monitor_ref} = task} = state
       ) do
     state = handle_plane_epoch_down(state, task, reason)
+
+    state =
+      if plane_epoch_requires_followup?(state, task),
+        do: start_plane_epoch_acquisition(state),
+        else: state
+
     notify_dashboard()
     {:noreply, state}
   end
 
-  def handle_info(
-        {:DOWN, ref, :process, _pid, reason},
-        %{running: running} = state
-      ) do
-    case find_issue_id_for_ref(running, ref) do
-      nil ->
-        {:noreply, state}
-
-      issue_id ->
-        {running_entry, state} = pop_running_entry(state, issue_id)
-        state = record_session_completion_totals(state, running_entry)
-        session_id = running_entry_session_id(running_entry)
-
-        state = handle_agent_down(reason, state, issue_id, running_entry, session_id)
-
-        Logger.info("Agent task finished for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}")
+  def handle_info({:DOWN, monitor_ref, :process, _pid, reason}, %State{} = state) do
+    case find_plane_webhook_task(state, monitor_ref) do
+      {_task_ref, task} ->
+        state =
+          state
+          |> finish_plane_webhook_task(task, {:error, {:task_exit, reason}})
+          |> drain_plane_webhook_queue()
 
         notify_dashboard()
         {:noreply, state}
+
+      nil ->
+        handle_running_task_down(monitor_ref, reason, state)
     end
   end
 
@@ -1289,6 +1368,25 @@ defmodule SymphonyElixir.Orchestrator do
   def handle_info(msg, state) do
     Logger.debug("Orchestrator ignored message: #{inspect(msg)}")
     {:noreply, state}
+  end
+
+  defp handle_running_task_down(ref, reason, %{running: running} = state) do
+    case find_issue_id_for_ref(running, ref) do
+      nil ->
+        {:noreply, state}
+
+      issue_id ->
+        {running_entry, state} = pop_running_entry(state, issue_id)
+        state = record_session_completion_totals(state, running_entry)
+        session_id = running_entry_session_id(running_entry)
+
+        state = handle_agent_down(reason, state, issue_id, running_entry, session_id)
+
+        Logger.info("Agent task finished for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}")
+
+        notify_dashboard()
+        {:noreply, state}
+    end
   end
 
   defp handle_agent_down(:normal, state, issue_id, running_entry, session_id) do
@@ -1571,6 +1669,714 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp current_runtime_dependency_decision(_issue, _entry, _state), do: nil
 
+  defp admit_plane_webhook(%State{} = state, %EventIdentity{} = identity) do
+    config = Config.settings!()
+    contract = config.provider_project_contract
+
+    cond do
+      config.tracker.kind != "plane" or not match?(%ProviderProjectContract{}, contract) ->
+        {{:error, :plane_webhook_unavailable}, state}
+
+      identity.workspace_id != contract.workspace_id ->
+        {{:error, :wrong_workspace}, increment_plane_webhook_metric(state, :scope_rejected)}
+
+      not match?(%WebhookDedupRegistry{}, state.plane_webhook_dedup) ->
+        {{:error, :plane_webhook_unavailable}, state}
+
+      true ->
+        admit_scoped_plane_webhook(state, identity, contract.project_id, config)
+    end
+  rescue
+    _error -> {{:error, :plane_webhook_unavailable}, state}
+  end
+
+  defp admit_scoped_plane_webhook(state, identity, configured_project_id, config) do
+    classification = WebhookDelivery.classify(identity, configured_project_id)
+
+    case classification.kind do
+      :other_project ->
+        next_state = increment_plane_webhook_metric(state, :scope_rejected)
+        {{:ok, :other_project}, next_state}
+
+      kind when kind in [:targeted, :full_epoch, :ignore] ->
+        {claim, registry} =
+          WebhookDedupRegistry.claim(
+            state.plane_webhook_dedup,
+            identity,
+            System.monotonic_time(:millisecond)
+          )
+
+        state = %{state | plane_webhook_dedup: registry}
+
+        case claim do
+          :new_event -> safely_admit_new_plane_webhook(state, identity, classification, config)
+          _duplicate -> admit_claimed_plane_webhook(state, identity, classification, config, claim)
+        end
+    end
+  end
+
+  defp safely_admit_new_plane_webhook(state, identity, classification, config) do
+    case admit_claimed_plane_webhook(state, identity, classification, config, :new_event) do
+      {{:error, _reason} = result, next_state} ->
+        {result, rollback_plane_webhook_claim(next_state, identity)}
+
+      result ->
+        result
+    end
+  rescue
+    _error ->
+      {{:error, :plane_webhook_unavailable}, rollback_plane_webhook_claim(state, identity)}
+  catch
+    _kind, _reason ->
+      {{:error, :plane_webhook_unavailable}, rollback_plane_webhook_claim(state, identity)}
+  end
+
+  defp rollback_plane_webhook_claim(
+         %State{plane_webhook_dedup: %WebhookDedupRegistry{} = registry} = state,
+         %EventIdentity{} = identity
+       ) do
+    %{state | plane_webhook_dedup: WebhookDedupRegistry.rollback(registry, identity)}
+  rescue
+    _error -> state
+  catch
+    _kind, _reason -> state
+  end
+
+  defp admit_claimed_plane_webhook(state, _identity, _classification, _config, :duplicate_delivery) do
+    state = increment_plane_webhook_metric(state, :duplicate_delivery)
+    {{:ok, :duplicate_delivery}, state}
+  end
+
+  defp admit_claimed_plane_webhook(state, _identity, _classification, _config, :duplicate_event) do
+    state = increment_plane_webhook_metric(state, :duplicate_event)
+    {{:ok, :duplicate_event}, state}
+  end
+
+  defp admit_claimed_plane_webhook(state, _identity, %{kind: :ignore}, _config, :new_event) do
+    state = %{state | plane_webhook_last_accepted_at: DateTime.utc_now()}
+    {{:ok, :ignored}, state}
+  end
+
+  defp admit_claimed_plane_webhook(state, _identity, %{kind: :full_epoch}, _config, :new_event) do
+    {state, generation} = next_plane_reconciliation_generation(state)
+
+    state =
+      state
+      |> put_plane_webhook_last_accepted_at()
+      |> increment_plane_webhook_metric(:scheduled)
+      |> mark_plane_full_epoch_dirty(generation)
+      |> maybe_start_dirty_plane_epoch()
+
+    {{:ok, :scheduled}, state}
+  end
+
+  defp admit_claimed_plane_webhook(
+         state,
+         identity,
+         %{kind: :targeted, work_item_id: work_item_id},
+         config,
+         :new_event
+       ) do
+    {state, generation} = next_plane_reconciliation_generation(state)
+
+    case ReconciliationIntent.new(%{
+           identity: identity,
+           host_generation: generation,
+           work_item_id: work_item_id,
+           event: identity.event,
+           config_fingerprint: plane_config_fingerprint(config),
+           contract_fingerprint: plane_contract_fingerprint(config.provider_project_contract)
+         }) do
+      {:ok, intent} ->
+        admit_targeted_intent(state, work_item_id, intent, generation)
+
+      {:error, _reason} ->
+        registry = WebhookDedupRegistry.rollback(state.plane_webhook_dedup, identity)
+        {{:error, :admission_failed}, %{state | plane_webhook_dedup: registry}}
+    end
+  end
+
+  defp admit_claimed_plane_webhook(state, _identity, _classification, _config, _claim),
+    do: {{:error, :admission_failed}, state}
+
+  defp admit_targeted_intent(state, work_item_id, intent, generation) do
+    prior = Map.get(state.plane_webhook_pending, work_item_id)
+    new_pending? = is_nil(prior)
+
+    if new_pending? and map_size(state.plane_webhook_pending) >= @plane_webhook_max_pending do
+      coalesce_to_full_epoch(state, generation)
+    else
+      queue_targeted_intent(state, work_item_id, intent, prior)
+    end
+  end
+
+  defp coalesce_to_full_epoch(state, generation) do
+    state =
+      state
+      |> put_plane_webhook_last_accepted_at()
+      |> increment_plane_webhook_metric(:coalesced)
+      |> mark_plane_full_epoch_dirty(generation)
+      |> maybe_start_dirty_plane_epoch()
+
+    {{:ok, :coalesced}, state}
+  end
+
+  defp queue_targeted_intent(state, work_item_id, intent, prior) do
+    in_flight? = plane_webhook_item_in_flight?(state, work_item_id)
+    coalesced? = not is_nil(prior) or in_flight?
+    intent = update_coalesced_intent(intent, prior, in_flight?)
+    queue = if prior, do: state.plane_webhook_queue, else: :queue.in(work_item_id, state.plane_webhook_queue)
+
+    state = %{
+      state
+      | plane_webhook_pending: Map.put(state.plane_webhook_pending, work_item_id, intent),
+        plane_webhook_queue: queue,
+        plane_webhook_latest_generation_by_item: Map.put(state.plane_webhook_latest_generation_by_item, work_item_id, intent.host_generation)
+    }
+
+    state =
+      state
+      |> put_plane_webhook_last_accepted_at()
+      |> increment_plane_webhook_metric(if(coalesced?, do: :coalesced, else: :scheduled))
+      |> drain_plane_webhook_queue()
+
+    {{:ok, if(coalesced?, do: :coalesced, else: :scheduled)}, state}
+  end
+
+  defp update_coalesced_intent(intent, nil, true), do: %{intent | coalesced_count: 1}
+  defp update_coalesced_intent(intent, nil, false), do: intent
+
+  defp update_coalesced_intent(intent, %ReconciliationIntent{} = prior, _in_flight?),
+    do: %{intent | coalesced_count: prior.coalesced_count + 1}
+
+  defp next_plane_reconciliation_generation(%State{} = state) do
+    generation = state.plane_reconciliation_generation + 1
+    {%{state | plane_reconciliation_generation: generation}, generation}
+  end
+
+  defp put_plane_webhook_last_accepted_at(%State{} = state),
+    do: %{state | plane_webhook_last_accepted_at: DateTime.utc_now()}
+
+  defp increment_plane_webhook_metric(%State{} = state, metric) when metric in @plane_webhook_metrics do
+    %{state | plane_webhook_metrics: Map.update(state.plane_webhook_metrics, metric, 1, &(&1 + 1))}
+  end
+
+  defp plane_webhook_item_in_flight?(%State{} = state, work_item_id) do
+    Enum.any?(state.plane_webhook_tasks, fn {_task_ref, task} -> task.work_item_id == work_item_id end)
+  end
+
+  defp mark_plane_full_epoch_dirty(%State{} = state, generation) do
+    dirty_generation =
+      case state.plane_webhook_full_epoch_dirty_generation do
+        current when is_integer(current) -> max(current, generation)
+        _missing -> generation
+      end
+
+    %{state | plane_webhook_full_epoch_dirty_generation: dirty_generation}
+  end
+
+  defp maybe_start_dirty_plane_epoch(%State{} = state) do
+    if is_nil(state.plane_epoch_task), do: start_plane_epoch_acquisition(state), else: state
+  rescue
+    error -> plane_epoch_start_failed(state, {:exception, error})
+  catch
+    kind, reason -> plane_epoch_start_failed(state, {kind, reason})
+  end
+
+  defp plane_epoch_start_failed(%State{} = state, reason) do
+    Logger.warning("Unable to start Plane dependency epoch task: #{inspect(reason)}")
+    %{state | plane_epoch_status: :failed, plane_epoch_error: {:task_start_failed, reason}}
+  end
+
+  defp clear_covered_full_epoch_dirty(nil, _coverage_generation), do: nil
+
+  defp clear_covered_full_epoch_dirty(dirty_generation, coverage_generation)
+       when is_integer(dirty_generation) and dirty_generation <= coverage_generation,
+       do: nil
+
+  defp clear_covered_full_epoch_dirty(dirty_generation, _coverage_generation), do: dirty_generation
+
+  defp plane_epoch_requires_followup?(%State{} = state, task) do
+    case state.plane_webhook_full_epoch_dirty_generation do
+      dirty_generation when is_integer(dirty_generation) ->
+        dirty_generation > Map.get(task, :coverage_generation, 0)
+
+      _not_dirty ->
+        false
+    end
+  end
+
+  defp supersede_covered_plane_webhook_intents(%State{} = state, coverage_generation) do
+    pending =
+      Enum.reject(state.plane_webhook_pending, fn {_work_item_id, intent} ->
+        ReconciliationIntent.covered_by?(intent, coverage_generation)
+      end)
+      |> Map.new()
+
+    latest =
+      Enum.reject(state.plane_webhook_latest_generation_by_item, fn {_work_item_id, generation} ->
+        generation <= coverage_generation
+      end)
+      |> Map.new()
+
+    queue =
+      state.plane_webhook_queue
+      |> :queue.to_list()
+      |> Enum.reduce({[], MapSet.new()}, fn work_item_id, {reversed_queue, queued_ids} ->
+        if Map.has_key?(pending, work_item_id) and not MapSet.member?(queued_ids, work_item_id) do
+          {[work_item_id | reversed_queue], MapSet.put(queued_ids, work_item_id)}
+        else
+          {reversed_queue, queued_ids}
+        end
+      end)
+      |> then(fn {reversed_queue, _queued_ids} -> reversed_queue |> Enum.reverse() |> :queue.from_list() end)
+
+    %{
+      state
+      | plane_webhook_pending: pending,
+        plane_webhook_latest_generation_by_item: latest,
+        plane_webhook_queue: queue
+    }
+  end
+
+  defp drain_plane_webhook_queue(%State{} = state) do
+    slots = max(@plane_webhook_max_in_flight - map_size(state.plane_webhook_tasks), 0)
+    drain_plane_webhook_queue(state, slots, :queue.len(state.plane_webhook_queue))
+  end
+
+  defp drain_plane_webhook_queue(%State{} = state, 0, _remaining), do: state
+  defp drain_plane_webhook_queue(%State{} = state, _slots, 0), do: state
+
+  defp drain_plane_webhook_queue(%State{} = state, slots, remaining) do
+    case :queue.out(state.plane_webhook_queue) do
+      {:empty, _queue} ->
+        state
+
+      {{:value, work_item_id}, queue} ->
+        state = %{state | plane_webhook_queue: queue}
+        drain_queued_plane_webhook_item(state, work_item_id, slots, remaining)
+    end
+  end
+
+  defp drain_queued_plane_webhook_item(state, work_item_id, slots, remaining) do
+    case Map.get(state.plane_webhook_pending, work_item_id) do
+      nil ->
+        drain_plane_webhook_queue(state, slots, remaining - 1)
+
+      %ReconciliationIntent{} = intent ->
+        start_queued_plane_webhook_item(state, work_item_id, intent, remaining)
+    end
+  end
+
+  defp start_queued_plane_webhook_item(state, work_item_id, intent, remaining) do
+    if plane_webhook_item_in_flight?(state, work_item_id) do
+      state = %{state | plane_webhook_queue: :queue.in(work_item_id, state.plane_webhook_queue)}
+
+      drain_plane_webhook_queue(
+        state,
+        max(@plane_webhook_max_in_flight - map_size(state.plane_webhook_tasks), 0),
+        remaining - 1
+      )
+    else
+      schedule_queued_plane_webhook_item(state, work_item_id, intent, remaining)
+    end
+  end
+
+  defp schedule_queued_plane_webhook_item(state, work_item_id, intent, remaining) do
+    case start_plane_webhook_item_task(state, intent) do
+      {:ok, next_state} ->
+        drain_plane_webhook_queue(
+          next_state,
+          max(@plane_webhook_max_in_flight - map_size(next_state.plane_webhook_tasks), 0),
+          remaining - 1
+        )
+
+      {:error, next_state} ->
+        %{next_state | plane_webhook_queue: :queue.in(work_item_id, next_state.plane_webhook_queue)}
+    end
+  end
+
+  defp start_plane_webhook_item_task(%State{} = state, %ReconciliationIntent{} = intent) do
+    do_start_plane_webhook_item_task(state, intent)
+  rescue
+    _error -> {:error, state}
+  end
+
+  defp do_start_plane_webhook_item_task(%State{} = state, %ReconciliationIntent{} = intent) do
+    config = Config.settings!()
+
+    if intent.config_fingerprint != plane_config_fingerprint(config) or
+         intent.contract_fingerprint != plane_contract_fingerprint(config.provider_project_contract) or
+         Map.get(state.plane_webhook_latest_generation_by_item, intent.work_item_id) != intent.host_generation do
+      state =
+        case Map.get(state.plane_webhook_pending, intent.work_item_id) do
+          %ReconciliationIntent{host_generation: generation} when generation == intent.host_generation ->
+            %{state | plane_webhook_pending: Map.delete(state.plane_webhook_pending, intent.work_item_id)}
+
+          _newer_or_missing ->
+            state
+        end
+
+      {:ok, drop_plane_webhook_intent(state, intent.work_item_id, intent.host_generation)}
+    else
+      recipient = self()
+      task_ref = make_ref()
+      tracker = state.tracker
+      issue_id = intent.work_item_id
+      tracker_settings = config.tracker
+      scheduler = state.read_scheduler
+      epoch_id = {:plane_webhook, intent.host_generation}
+      contract = config.provider_project_contract
+
+      task_fun = fn ->
+        result =
+          fetch_plane_webhook_issue(
+            tracker,
+            issue_id,
+            tracker_settings,
+            scheduler,
+            epoch_id
+          )
+
+        send(recipient, {:plane_webhook_item_result, self(), task_ref, result})
+        :ok
+      end
+
+      case safe_start_supervised_task(state.task_supervisor, task_fun) do
+        {:ok, pid} ->
+          task = %{
+            pid: pid,
+            monitor_ref: Process.monitor(pid),
+            task_ref: task_ref,
+            work_item_id: issue_id,
+            identity: intent.identity,
+            event: intent.event,
+            generation: intent.host_generation,
+            config_fingerprint: intent.config_fingerprint,
+            contract_fingerprint: intent.contract_fingerprint,
+            contract: contract,
+            requested_at: intent.requested_at
+          }
+
+          {:ok,
+           %{
+             state
+             | plane_webhook_pending: Map.delete(state.plane_webhook_pending, issue_id),
+               plane_webhook_tasks: Map.put(state.plane_webhook_tasks, task_ref, task)
+           }}
+
+        {:error, _reason} ->
+          {:error, state}
+      end
+    end
+  end
+
+  defp safe_start_supervised_task(supervisor, fun) do
+    Task.Supervisor.start_child(supervisor, fun)
+  rescue
+    error -> {:error, {:task_start_exception, error}}
+  catch
+    kind, reason -> {:error, {kind, reason}}
+  end
+
+  defp fetch_plane_webhook_issue(tracker, issue_id, tracker_settings, scheduler, epoch_id) do
+    opts = [
+      tracker_settings: tracker_settings,
+      scheduler: scheduler,
+      class: :control,
+      epoch_id: epoch_id
+    ]
+
+    if function_exported?(tracker, :fetch_issues_by_ids, 2),
+      do: tracker.fetch_issues_by_ids([issue_id], opts),
+      else: {:error, :current_issue_refresh_unsupported}
+  rescue
+    _error -> {:error, :provider_read_failed}
+  catch
+    _kind, _reason -> {:error, :provider_read_failed}
+  end
+
+  defp find_plane_webhook_task(%State{} = state, monitor_ref) do
+    Enum.find(state.plane_webhook_tasks, fn {_task_ref, task} -> task.monitor_ref == monitor_ref end)
+  end
+
+  defp finish_plane_webhook_task(%State{} = state, task, result) do
+    Process.demonitor(task.monitor_ref, [:flush])
+    state = %{state | plane_webhook_tasks: Map.delete(state.plane_webhook_tasks, task.task_ref)}
+
+    cond do
+      Map.get(state.plane_webhook_latest_generation_by_item, task.work_item_id) != task.generation ->
+        state
+
+      state.plane_epoch_coverage_generation >= task.generation ->
+        drop_plane_webhook_intent(state, task.work_item_id, task.generation)
+
+      not plane_webhook_task_current?(task) ->
+        drop_plane_webhook_intent(state, task.work_item_id, task.generation)
+
+      match?({:error, _reason}, result) ->
+        state
+        |> increment_plane_webhook_metric(:reconciliation_failed)
+        |> rollback_plane_webhook_claim(task.identity)
+        |> drop_plane_webhook_intent(task.work_item_id, task.generation)
+
+      true ->
+        state
+        |> apply_plane_webhook_read_result(task, result)
+        |> drop_plane_webhook_intent(task.work_item_id, task.generation)
+    end
+  end
+
+  defp plane_webhook_task_current?(task) do
+    config = Config.settings!()
+
+    task.config_fingerprint == plane_config_fingerprint(config) and
+      task.contract_fingerprint == plane_contract_fingerprint(config.provider_project_contract)
+  rescue
+    _error -> false
+  end
+
+  defp drop_plane_webhook_intent(%State{} = state, work_item_id, generation) do
+    latest =
+      if Map.get(state.plane_webhook_latest_generation_by_item, work_item_id) == generation and
+           not Map.has_key?(state.plane_webhook_pending, work_item_id) do
+        Map.delete(state.plane_webhook_latest_generation_by_item, work_item_id)
+      else
+        state.plane_webhook_latest_generation_by_item
+      end
+
+    %{state | plane_webhook_latest_generation_by_item: latest}
+  end
+
+  defp apply_plane_webhook_read_result(state, task, {:ok, []}) do
+    apply_plane_webhook_not_found(state, task)
+  end
+
+  defp apply_plane_webhook_read_result(state, task, {:ok, [%Issue{id: issue_id} = issue]})
+       when issue_id == task.work_item_id do
+    apply_plane_webhook_issue(state, task, issue)
+  end
+
+  defp apply_plane_webhook_read_result(state, _task, {:ok, _invalid_or_wrong_scope}) do
+    increment_plane_webhook_metric(state, :reconciliation_failed)
+  end
+
+  defp apply_plane_webhook_read_result(state, _task, _result),
+    do: increment_plane_webhook_metric(state, :reconciliation_failed)
+
+  defp apply_plane_webhook_not_found(
+         %State{} = state,
+         %{
+           work_item_id: work_item_id,
+           generation: generation,
+           contract: %ProviderProjectContract{workspace_id: workspace_id, project_id: project_id} = contract
+         } = task
+       )
+       when is_binary(work_item_id) and work_item_id != "" and is_binary(workspace_id) and workspace_id != "" and
+              is_binary(project_id) and project_id != "" do
+    case Map.get(state.work_control, work_item_id) do
+      %WorkItem{} = existing ->
+        observation =
+          ProviderObservation.new_plane_not_found(
+            work_item_id,
+            contract,
+            %{source: :targeted_webhook_rest, host_generation: generation}
+          )
+
+        assessment =
+          LifecycleAssessment.assess(
+            observation,
+            existing.validated_lifecycle_state,
+            [],
+            %{provider_project_contract: contract}
+          )
+
+        if LifecycleAssessment.authority_reducing?(assessment) do
+          reduce_plane_webhook_work_item(state, task, existing, nil, observation, assessment, :provider_not_found)
+        else
+          request_plane_full_epoch(state, generation)
+        end
+
+      _missing ->
+        request_plane_full_epoch(state, generation)
+    end
+  end
+
+  defp apply_plane_webhook_issue(%State{} = state, task, %Issue{} = issue) do
+    contract = task.contract
+
+    if issue.workspace_id != contract.workspace_id or issue.project_id != contract.project_id do
+      increment_plane_webhook_metric(state, :reconciliation_failed)
+    else
+      case Map.get(state.work_control, issue.id) do
+        %WorkItem{} = existing ->
+          assess_plane_webhook_issue(state, task, existing, issue, contract)
+
+        _missing ->
+          request_plane_full_epoch(state, task.generation)
+      end
+    end
+  end
+
+  defp assess_plane_webhook_issue(state, task, existing, issue, contract) do
+    opts = %{
+      provider: :plane,
+      observed_at: DateTime.utc_now(),
+      snapshot_identity: %{source: :targeted_webhook_rest, host_generation: task.generation}
+    }
+
+    case ProviderObservation.from_issue(issue, opts) do
+      {:ok, observation} ->
+        assess_plane_webhook_observation(state, task, existing, issue, contract, observation)
+
+      {:error, _reason} ->
+        state
+        |> increment_plane_webhook_metric(:reconciliation_failed)
+        |> request_plane_full_epoch(task.generation)
+    end
+  end
+
+  defp assess_plane_webhook_observation(state, task, existing, issue, contract, observation) do
+    assessment =
+      LifecycleAssessment.assess(
+        observation,
+        existing.validated_lifecycle_state,
+        [],
+        %{provider_project_contract: contract}
+      )
+
+    reason = plane_webhook_reduction_reason(existing, issue, assessment)
+
+    cond do
+      not is_nil(reason) ->
+        reduce_plane_webhook_work_item(state, task, existing, issue, observation, assessment, reason)
+
+      assessment.mapped_state == existing.validated_lifecycle_state and task.event != "workitem.deleted" ->
+        state
+
+      true ->
+        request_plane_full_epoch(state, task.generation)
+    end
+  end
+
+  defp plane_webhook_reduction_reason(existing, issue, assessment) do
+    cond do
+      not issue_in_routing_scope?(issue) ->
+        :not_routable
+
+      is_binary(existing.assignee_id) and existing.assignee_id != issue.assignee_id ->
+        :assignee_unassigned
+
+      LifecycleAssessment.authority_reducing?(assessment) ->
+        assessment.reason || :unsafe_lifecycle_observation
+
+      LifecycleAssessment.invalid?(assessment) ->
+        :invalid_provider_observation
+
+      true ->
+        nil
+    end
+  end
+
+  defp reduce_plane_webhook_work_item(state, task, existing, issue, observation, assessment, reason) do
+    reduced =
+      case issue do
+        %Issue{} = observed_issue -> merge_targeted_issue_fields(existing, observed_issue)
+        _absent -> existing
+      end
+
+    reduced = %{
+      reduced
+      | provider_observation: observation,
+        lifecycle_assessment: assessment,
+        validated_lifecycle_state: existing.validated_lifecycle_state,
+        authority_disposition: AuthorityDisposition.derive(assessment, existing.authority_disposition)
+    }
+
+    reduced =
+      if AuthorityDisposition.escalated?(reduced.authority_disposition) do
+        reduced
+      else
+        case WorkItem.suspend(reduced, reason) do
+          {:ok, suspended} -> suspended
+          {:error, _reason} -> force_plane_webhook_suspension(reduced, task, reason)
+        end
+      end
+
+    state = terminate_running_issue(state, task.work_item_id, false, plane_webhook_termination_reason(reason))
+    checkpoint = Map.get(state.recovery_checkpoints, task.work_item_id)
+    reduced = suspend_work_item_with_checkpoint_context(reduced, checkpoint, state, reason)
+
+    case persist_suspended_work_item(state, task.work_item_id, reduced) do
+      {:ok, next_state, persisted} ->
+        next_state = %{next_state | work_control: Map.put(next_state.work_control, task.work_item_id, persisted)}
+        request_plane_full_epoch(next_state, task.generation)
+
+      {:error, blocked_state, _persistence_reason} ->
+        blocked_state
+        |> increment_plane_webhook_metric(:reconciliation_failed)
+        |> request_plane_full_epoch(task.generation)
+    end
+  end
+
+  defp merge_targeted_issue_fields(%WorkItem{} = work_item, %Issue{} = issue) do
+    %{
+      work_item
+      | native_ref: issue.native_ref,
+        identifier: issue.identifier,
+        title: issue.title,
+        description: issue.description,
+        priority: issue.priority,
+        branch_name: issue.branch_name,
+        url: issue.url,
+        assignee_id: issue.assignee_id,
+        labels: issue.labels,
+        created_at: issue.created_at,
+        updated_at: issue.updated_at
+    }
+  end
+
+  defp force_plane_webhook_suspension(%WorkItem{} = work_item, task, reason) do
+    disposition =
+      AuthorityDisposition.new(%{
+        status: :suspended,
+        lifecycle_state: work_item.validated_lifecycle_state,
+        reason: reason
+      })
+
+    context =
+      SuspensionContext.new(%{
+        work_item_id: work_item.id,
+        last_validated_lifecycle_state: work_item.validated_lifecycle_state,
+        provider_observation: work_item.provider_observation,
+        reason: reason,
+        lineage_generation: Map.get(task, :lineage_generation),
+        created_at: work_item.provider_observation.observed_at,
+        recovery_policy: :fresh_reconciliation,
+        required_evidence: [],
+        resume_target: work_item.validated_lifecycle_state
+      })
+
+    case context do
+      {:ok, suspension_context} ->
+        %{work_item | authority_disposition: disposition, suspension_context: suspension_context}
+
+      _invalid ->
+        %{work_item | authority_disposition: disposition}
+    end
+  end
+
+  defp plane_webhook_termination_reason(:provider_not_found), do: :tracker_missing
+  defp plane_webhook_termination_reason(:not_routable), do: :not_routable
+  defp plane_webhook_termination_reason(:assignee_unassigned), do: :not_routable
+  defp plane_webhook_termination_reason(_reason), do: :observed
+
+  defp request_plane_full_epoch(%State{} = state, generation) do
+    state
+    |> mark_plane_full_epoch_dirty(generation)
+    |> maybe_start_dirty_plane_epoch()
+  end
+
   defp start_plane_epoch_acquisition(%State{plane_epoch_task: task} = state) when is_map(task), do: state
 
   defp start_plane_epoch_acquisition(%State{} = state) do
@@ -1579,6 +2385,7 @@ defmodule SymphonyElixir.Orchestrator do
     task_ref = make_ref()
     config_fingerprint = plane_config_fingerprint(config)
     contract_fingerprint = plane_contract_fingerprint(config.provider_project_contract)
+    coverage_generation = state.plane_reconciliation_generation
     recipient = self()
     tracker = state.tracker
     read_scheduler = state.read_scheduler
@@ -1604,7 +2411,7 @@ defmodule SymphonyElixir.Orchestrator do
       :ok
     end
 
-    case Task.Supervisor.start_child(state.task_supervisor, task_fun) do
+    case safe_start_supervised_task(state.task_supervisor, task_fun) do
       {:ok, pid} ->
         monitor_ref = Process.monitor(pid)
 
@@ -1617,6 +2424,7 @@ defmodule SymphonyElixir.Orchestrator do
               epoch_id: epoch_id,
               config_fingerprint: config_fingerprint,
               contract_fingerprint: contract_fingerprint,
+              coverage_generation: coverage_generation,
               metrics: initial_metrics,
               request_metrics: request_metrics,
               started_at: started_at,
@@ -1908,6 +2716,7 @@ defmodule SymphonyElixir.Orchestrator do
               epoch_id: epoch_id,
               config_fingerprint: config_fingerprint,
               contract_fingerprint: contract_fingerprint,
+              coverage_generation: Map.get(task, :coverage_generation, 0),
               request_metrics: request_metrics,
               metrics: metrics,
               snapshot: snapshot,
@@ -1957,6 +2766,7 @@ defmodule SymphonyElixir.Orchestrator do
       epoch_id: epoch_id,
       config_fingerprint: config_fingerprint,
       contract_fingerprint: contract_fingerprint,
+      coverage_generation: coverage_generation,
       request_metrics: request_metrics,
       metrics: metrics,
       snapshot: snapshot,
@@ -1971,10 +2781,18 @@ defmodule SymphonyElixir.Orchestrator do
         plane_epoch_id: epoch_id,
         plane_epoch_config_fingerprint: config_fingerprint,
         plane_epoch_contract_fingerprint: contract_fingerprint,
+        plane_epoch_coverage_generation: coverage_generation,
         plane_epoch_status: :current,
         plane_epoch_error: nil,
-        plane_epoch_metrics: Map.put(metrics, :request_metrics, request_metrics)
+        plane_epoch_metrics: Map.put(metrics, :request_metrics, request_metrics),
+        plane_webhook_full_epoch_dirty_generation:
+          clear_covered_full_epoch_dirty(
+            state.plane_webhook_full_epoch_dirty_generation,
+            coverage_generation
+          )
     }
+
+    state = supersede_covered_plane_webhook_intents(state, coverage_generation)
 
     Logger.info("Plane dependency epoch published",
       epoch_id: epoch_id,
@@ -1994,6 +2812,7 @@ defmodule SymphonyElixir.Orchestrator do
 
     state
     |> reschedule_deferred_retries()
+    |> drain_plane_webhook_queue()
     |> continue_plane_epoch()
   end
 
@@ -2074,14 +2893,30 @@ defmodule SymphonyElixir.Orchestrator do
       scc_pass_count: Map.get(metrics, :scc_pass_count, 0)
     )
 
-    state
-    |> clear_plane_epoch_task(task)
-    |> Map.merge(%{
-      plane_epoch_status: :failed,
-      plane_epoch_error: reason,
-      plane_epoch_metrics: metrics
-    })
+    state =
+      state
+      |> clear_plane_epoch_task(task)
+      |> Map.merge(%{
+        plane_epoch_status: :failed,
+        plane_epoch_error: reason,
+        plane_epoch_metrics: metrics
+      })
+
+    count_plane_webhook_epoch_failure(state, task, reason)
   end
+
+  defp count_plane_webhook_epoch_failure(
+         %State{plane_webhook_full_epoch_dirty_generation: dirty_generation} = state,
+         task,
+         reason
+       )
+       when is_integer(dirty_generation) and reason != :stale do
+    if dirty_generation <= Map.get(task, :coverage_generation, 0),
+      do: increment_plane_webhook_metric(state, :reconciliation_failed),
+      else: state
+  end
+
+  defp count_plane_webhook_epoch_failure(%State{} = state, _task, _reason), do: state
 
   defp failed_task_metrics(task, scheduler) do
     started_at_ms = Map.get(task, :started_at_ms, System.monotonic_time(:millisecond))
@@ -2114,13 +2949,15 @@ defmodule SymphonyElixir.Orchestrator do
         duration_ms: Map.get(metrics, :duration_ms, 0)
       )
 
-      %{
+      next_state = %{
         state
         | plane_epoch_task: nil,
           plane_epoch_status: :failed,
           plane_epoch_error: {:task_exit, reason},
           plane_epoch_metrics: metrics
       }
+
+      count_plane_webhook_epoch_failure(next_state, task, {:task_exit, reason})
     else
       %{state | plane_epoch_task: nil}
     end
@@ -8226,6 +9063,37 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  @spec record_plane_webhook_metric(GenServer.server(), atom()) :: :ok | {:error, :invalid_metric} | :unavailable
+  def record_plane_webhook_metric(server, metric) when metric in @plane_webhook_metrics do
+    if server_available?(server) do
+      try do
+        GenServer.call(server, {:plane_webhook_metric, metric}, 1_000)
+      catch
+        :exit, _reason -> :unavailable
+      end
+    else
+      :unavailable
+    end
+  end
+
+  def record_plane_webhook_metric(_server, _metric), do: {:error, :invalid_metric}
+
+  @spec accept_plane_webhook(GenServer.server(), EventIdentity.t()) ::
+          {:ok, atom()} | {:error, atom()} | :unavailable
+  def accept_plane_webhook(server, %EventIdentity{} = identity) do
+    if server_available?(server) do
+      try do
+        GenServer.call(server, {:accept_plane_webhook, identity}, 1_000)
+      catch
+        :exit, _reason -> :unavailable
+      end
+    else
+      :unavailable
+    end
+  end
+
+  def accept_plane_webhook(_server, _identity), do: {:error, :invalid_webhook_identity}
+
   @spec snapshot() :: map() | :timeout | :unavailable
   def snapshot, do: snapshot(__MODULE__, 15_000)
 
@@ -8497,12 +9365,25 @@ defmodule SymphonyElixir.Orchestrator do
          request_metrics: plane_epoch_request_metrics_snapshot(state),
          read_scheduler: read_scheduler_stats
        },
+       plane_webhook: plane_webhook_snapshot(state),
        polling: %{
          checking?: state.poll_check_in_progress == true,
          next_poll_in_ms: next_poll_in_ms(state.next_poll_due_at_ms, now_ms),
          poll_interval_ms: state.poll_interval_ms
        }
      }, state}
+  end
+
+  def handle_call({:plane_webhook_metric, metric}, _from, %State{} = state)
+      when metric in @plane_webhook_metrics do
+    metrics = Map.update(state.plane_webhook_metrics, metric, 1, &(&1 + 1))
+    {:reply, :ok, %{state | plane_webhook_metrics: metrics}}
+  end
+
+  def handle_call({:accept_plane_webhook, %EventIdentity{} = identity}, _from, %State{} = state) do
+    {reply, state} = admit_plane_webhook(state, identity)
+    notify_dashboard()
+    {:reply, reply, state}
   end
 
   def handle_call({:reconcile_project_contract, snapshot}, _from, %State{} = state)
@@ -8855,6 +9736,28 @@ defmodule SymphonyElixir.Orchestrator do
       edge_count: plane_epoch_metric_value(metrics, :edge_count, 0),
       scc_pass_count: plane_epoch_counter(metrics, request_metrics, :scc_pass_count, 5, %{}, :scc_pass_count)
     }
+  end
+
+  defp plane_webhook_snapshot(%State{} = state) do
+    metrics =
+      if is_map(state.plane_webhook_metrics),
+        do: state.plane_webhook_metrics,
+        else: initial_plane_webhook_metrics()
+
+    dedup_size =
+      if match?(%WebhookDedupRegistry{}, state.plane_webhook_dedup),
+        do: WebhookDedupRegistry.size(state.plane_webhook_dedup),
+        else: 0
+
+    metrics
+    |> Map.merge(WebhookIngressMetrics.snapshot())
+    |> Map.merge(%{
+      last_accepted_at: state.plane_webhook_last_accepted_at,
+      dedup_entry_count: dedup_size,
+      pending_count: map_size(state.plane_webhook_pending),
+      in_flight_count: map_size(state.plane_webhook_tasks),
+      full_epoch_dirty?: not is_nil(state.plane_webhook_full_epoch_dirty_generation)
+    })
   end
 
   defp plane_epoch_counter(metrics, request_metrics, key, index, scheduler_stats, scheduler_key) do
@@ -9455,6 +10358,48 @@ defmodule SymphonyElixir.Orchestrator do
     |> synchronize_attempt_ledger_config(config)
     |> synchronize_workspace_ownership_ledger_config(config)
     |> cancel_obsolete_plane_epoch_task(config)
+    |> cancel_obsolete_plane_webhook_tasks(config)
+  end
+
+  defp cancel_obsolete_plane_webhook_tasks(%State{} = state, config) do
+    config_fingerprint = plane_config_fingerprint(config)
+    contract_fingerprint = plane_contract_fingerprint(config.provider_project_contract)
+
+    obsolete_tasks =
+      Enum.filter(state.plane_webhook_tasks, fn {_task_ref, task} ->
+        not plane_webhook_work_current?(task, config_fingerprint, contract_fingerprint)
+      end)
+
+    stop_plane_webhook_tasks(Map.new(obsolete_tasks))
+    tasks = Map.drop(state.plane_webhook_tasks, Enum.map(obsolete_tasks, &elem(&1, 0)))
+
+    pending =
+      Enum.reject(state.plane_webhook_pending, fn {_work_item_id, intent} ->
+        not plane_webhook_work_current?(intent, config_fingerprint, contract_fingerprint)
+      end)
+      |> Map.new()
+
+    retained_items = MapSet.new(Enum.map(Map.values(tasks), & &1.work_item_id) ++ Map.keys(pending))
+    latest_generations = Map.take(state.plane_webhook_latest_generation_by_item, MapSet.to_list(retained_items))
+
+    queued_items =
+      state.plane_webhook_queue
+      |> :queue.to_list()
+      |> Enum.filter(&Map.has_key?(pending, &1))
+      |> Enum.uniq()
+
+    %{
+      state
+      | plane_webhook_tasks: tasks,
+        plane_webhook_pending: pending,
+        plane_webhook_queue: :queue.from_list(queued_items),
+        plane_webhook_latest_generation_by_item: latest_generations
+    }
+  end
+
+  defp plane_webhook_work_current?(work, config_fingerprint, contract_fingerprint) do
+    Map.get(work, :config_fingerprint) == config_fingerprint and
+      Map.get(work, :contract_fingerprint) == contract_fingerprint
   end
 
   defp cancel_obsolete_plane_epoch_task(%State{} = state, config) do

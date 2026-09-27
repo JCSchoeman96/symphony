@@ -34,6 +34,7 @@ defmodule SymphonyElixir.Plane.StateProjection do
          provider_state_group: state.group,
          provider_state_name: state.name,
          provider_updated_at: updated_at,
+         assignee_id: project_assignee(raw_value(raw_item, :assignees)),
          identifier: first_text(raw_item, [:identifier, :sequence_id, :name]) || id,
          title: first_text(raw_item, [:name, :title]) || id,
          description: optional_text(raw_value(raw_item, :description)),
@@ -302,6 +303,10 @@ defmodule SymphonyElixir.Plane.StateProjection do
   end
 
   defp project_labels(_labels), do: []
+
+  defp project_assignee([assignee | _rest]) when is_binary(assignee), do: text_value(assignee)
+  defp project_assignee([assignee | _rest]) when is_map(assignee), do: first_text(assignee, [:id, :uuid])
+  defp project_assignee(_assignees), do: nil
 
   defp first_text(map, keys) when is_map(map) do
     Enum.find_value(keys, &text_value(raw_value(map, &1)))
