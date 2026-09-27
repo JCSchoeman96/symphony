@@ -6,15 +6,17 @@
 |---|---|
 | `BASE_SHA` | `05fac06e771bbf1928e4975092741db0c94ecede` |
 | `BASE_TREE` | `09c4f133ee53e685e5d0f5a427f7df72e0985c8f` |
-| `TESTED_IMPLEMENTATION_HEAD` | `17bf5ebf45dc23aa4106381a48b5fb4970db71cf` |
-| `TESTED_IMPLEMENTATION_TREE` | `11cf73f914858a595d5f1f0ebd168d36fa032b63` |
-| `CURRENT_PR_HEAD` | `17bf5ebf45dc23aa4106381a48b5fb4970db71cf` — PR candidate used for this verification snapshot. |
-| `CURRENT_PR_TREE` | `11cf73f914858a595d5f1f0ebd168d36fa032b63` |
-| `CURRENT_SYNTHETIC_MERGE_HEAD` | `54b046620c4094b9efa7d1895743301a6edab30f` |
-| `CURRENT_SYNTHETIC_MERGE_TREE` | `11cf73f914858a595d5f1f0ebd168d36fa032b63` |
-| `CURRENT_SYNTHETIC_MERGE_PARENTS` | accepted base `05fac06e771bbf1928e4975092741db0c94ecede`, PR head `17bf5ebf45dc23aa4106381a48b5fb4970db71cf` |
-| `EVIDENCE_SNAPSHOT` | The identities above are the exact source candidate and synthetic merge used for this verification. This documentation-only refresh advances the PR; the live identity is recorded in the PR description. |
-| `COMMITS` | `be761300f99d8f9c6d86e16f0614a6145c8e9f0e`, `0a36322bb8807ea02f7fd2c13319b49f21468fc2`, `f45de883c6ccaf0fbf2e3693bc9c782333c75c9d`, `8245e0be2457f1b53cc834b29f33905066886a06`, `94c555566b4a539cd809178ddd2380d867719eab`, and `17bf5ebf45dc23aa4106381a48b5fb4970db71cf` (tested implementation candidate). |
+| `TESTED_IMPLEMENTATION_HEAD` | `a4e8d093e48abb8f7efb4f7014e9590597512ea9` |
+| `TESTED_IMPLEMENTATION_TREE` | `46d9b78ad694a31bf5eb1dbda3790155f8266110` |
+| `VERIFIED_PR_HEAD` | `a4e8d093e48abb8f7efb4f7014e9590597512ea9` — source candidate covered by the local gate and exact synthetic-merge CI below. |
+| `VERIFIED_PR_TREE` | `46d9b78ad694a31bf5eb1dbda3790155f8266110` |
+| `VERIFIED_SYNTHETIC_MERGE_HEAD` | `a47b10d3ea485c10fdd806972ecdfc3debff3ae5` |
+| `VERIFIED_SYNTHETIC_MERGE_TREE` | `46d9b78ad694a31bf5eb1dbda3790155f8266110` |
+| `VERIFIED_SYNTHETIC_MERGE_PARENTS` | accepted base `05fac06e771bbf1928e4975092741db0c94ecede`, PR head `a4e8d093e48abb8f7efb4f7014e9590597512ea9` |
+| `CURRENT_PR_HEAD/TREE` | Canonical live identity is in the current [PR #24 description](https://github.com/JCSchoeman96/symphony/pull/24). The values above are the separately labeled source candidate used for this verification snapshot. |
+| `CURRENT_SYNTHETIC_MERGE_HEAD/TREE/PARENTS` | Canonical live identity is in the current [PR #24 description](https://github.com/JCSchoeman96/symphony/pull/24) and its exact-merge CI run. |
+| `EVIDENCE_SNAPSHOT` | `TESTED_IMPLEMENTATION_*` and `VERIFIED_*` identify the implementation and merge that were tested. This evidence-only follow-up advances the PR head; the current PR and synthetic-merge identities are recorded in the live PR description and rerun against that head. |
+| `COMMITS` | `be761300f99d8f9c6d86e16f0614a6145c8e9f0e`, `0a36322bb8807ea02f7fd2c13319b49f21468fc2`, `f45de883c6ccaf0fbf2e3693bc9c782333c75c9d`, `8245e0be2457f1b53cc834b29f33905066886a06`, `94c555566b4a539cd809178ddd2380d867719eab`, `17bf5ebf45dc23aa4106381a48b5fb4970db71cf`, and `a4e8d093e48abb8f7efb4f7014e9590597512ea9` (tested implementation candidate). |
 | `PR_NUMBER` | [#24](https://github.com/JCSchoeman96/symphony/pull/24) — open against `main`. |
 | Governance | H-070A remains accepted at PR #23. H-070B is under review at PR #24 and is not accepted. H-080A remains unauthorized. |
 
@@ -24,17 +26,17 @@
 |---|---|
 | `WEBHOOK_ENDPOINT` | `POST /api/v1/webhooks/plane` |
 | `SIGNATURE_SCHEME` | Plane v2 HMAC-SHA256 over the exact raw request bytes; fixed-length decoded digest comparison uses a constant-time primitive. `PLANE_WEBHOOK_SECRET` is host-only and missing configuration fails closed. |
-| `REQUEST_PARSER_ORDER` | Ordinary requests are parsed before method override. Plane webhook POST bodies bypass both until the raw-body HMAC check succeeds. |
+| `REQUEST_PARSER_ORDER` | Ordinary requests are parsed before method override. Plane webhook POST bodies bypass both until the raw-body HMAC check succeeds, including URI-decoded route aliases, repeated slashes, and trailing slashes. |
 | `RAW_BODY_TESTS` | Tests cover exact-byte signing, one-byte tampering, reserialized-body mismatch, missing/invalid signatures, invalid media type and content length, malformed envelopes, bounded chunked reads, overflow during a `:more` body read, and zero Orchestrator calls for pre-authentication failures. A validly signed request with unavailable host secret returns 503; an invalid signature returns 401. The limit is 1,048,576 bytes. |
 | `DEDUP_KEYS` | Delivery `{workspace_id, webhook_id, delivery_id}` and logical event `{workspace_id, webhook_id, event_id}`. Logical event identity suppresses Plane retries with new delivery IDs. |
 | `DEDUP_STORAGE` | Private Orchestrator-owned ETS registry; in-memory and empty after restart. |
 | `TTL` | 24 hours, based on monotonic time. |
 | `MAX_ENTRIES` | 20,000 combined delivery and event keys, with oldest-entry eviction. |
-| `REPLAY_TESTS` | Concurrent retry test sends 20 delivery attempts for one logical event: one admission and one scheduler-backed REST read; 19 attempts are classified as duplicate events. Tests also cover duplicate delivery IDs, TTL expiry, bounded eviction, restart behavior, and admission rollback. |
+| `REPLAY_TESTS` | Concurrent retry test sends 20 delivery attempts for one logical event: one admission and one scheduler-backed REST read; 19 attempts are classified as duplicate events. Tests also cover duplicate delivery IDs, TTL expiry, bounded eviction, restart behavior, rejected-admission rollback, and retry after a failed scheduler read with a new delivery ID. |
 | `OUT_OF_ORDER_TESTS` | A full epoch begun before a webhook is discarded as stale and followed by one covering epoch. A same-item burst of 1,000 newer events while a read is blocked coalesces to one latest rerun; the provider-read counter is exactly 2. A preserving targeted result leaves an unrelated in-flight full epoch valid. |
 | `PROVIDER_READ_COUNTS` | Targeted work-item reconciliation makes singleton reads through the existing `Plane.ReadScheduler`. The concurrent duplicate test makes exactly 1 read. The 1,000-event same-item coalescing test makes exactly 2 reads. A distinct-item burst holds at 2 targeted reads in flight and 64 pending intents; overflow marks one full-epoch reconciliation dirty. |
-| `QUEUE_BOUNDS` | Repeated bursts with both targeted read slots held open publish full epochs while superseding pending work. The regression verifies that two successive 64-item queues are cleared at publication and remain bounded while both reads stay in flight. Queue compaction also removes duplicate IDs while preserving FIFO order for surviving intents. |
-| `FULL_EPOCH_COUNTS` | The epoch overlap test observes 2 graph fetches and 4 project-snapshot fetches: the stale in-flight epoch and one follow-up that covers webhook generations. Existing scale tests also completed at 1,000, 5,000, and 10,000 items; the 10,000-item run reported 10,200 calls, peak scheduler concurrency 3, and 149,211 ms elapsed. |
+| `QUEUE_BOUNDS` | A 1,000-unique-item burst with both targeted slots held open leaves exactly 64 pending intents and coalesces 934 overflow events into a dirty full epoch. The regression observes a 2-slot cap and verifies the follow-up epoch clears the pending map and FIFO while both targeted reads remain blocked. Repeated 132-item bursts also prove queue compaction removes superseded and duplicate IDs while preserving surviving FIFO order. |
+| `FULL_EPOCH_COUNTS` | The epoch overlap test observes 2 graph fetches and 4 project-snapshot fetches: the stale in-flight epoch and one follow-up that covers webhook generations. Scale tests completed at 1,000, 5,000, and 10,000 items; the 10,000-item run reported 10,200 calls, peak scheduler concurrency 3, and 156,562 ms elapsed. |
 
 Targeted results can preserve or reduce current authority. Verified exact Plane 404 is represented as explicit absence and may reduce existing authority. Timeouts, throttling, server errors, malformed or wrong-scope responses do not become absence. Targeted reconciliation cannot create work-control state, restore or advance authority, satisfy dependencies, prove completion, mutate Plane, or patch the dependency graph. Graph-sensitive events request a complete immutable epoch. A fresh Plane `Done` value still cannot satisfy completion without `CompletionProof`.
 
@@ -83,9 +85,10 @@ The Plane v2 contract adjudication records that `event_id` is the retry-stable l
 
 | Field | Result |
 |---|---|
-| `FULL_TEST_RESULTS` | `make -C elixir all` passed: 1,444 tests, 0 failures, 6 skipped. |
-| `COVERAGE` | 90.02% total; project threshold passed. |
+| `FULL_TEST_RESULTS` | `make -C elixir all` passed: 1,450 tests, 0 failures, 6 skipped. |
+| `COVERAGE` | 90.05% total; project threshold passed. |
 | `CREDO` | Clean; all 204 source files checked and all public functions have specs or an exemption. |
 | `DIALYZER` | Passed with 0 errors, 0 skips, and 0 unnecessary skips. |
 | Formatting | `mix format --check-formatted` passed. |
 | Diff validation | `git diff --check` passed; the new evidence file was checked for trailing whitespace. |
+| `VERIFIED_SYNTHETIC_MERGE_CI` | [GitHub `make-all` passed](https://github.com/JCSchoeman96/symphony/actions/runs/36325108060/job/108636268983) on synthetic merge `a47b10d3ea485c10fdd806972ecdfc3debff3ae5`; checkout log confirms parents are accepted base `05fac06e771bbf1928e4975092741db0c94ecede` and PR head `a4e8d093e48abb8f7efb4f7014e9590597512ea9`. |
