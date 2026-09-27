@@ -12,6 +12,7 @@ defmodule SymphonyElixir.PlaneWebhookTest do
   alias SymphonyElixir.Workflow
   alias SymphonyElixirWeb.PlaneWebhookController
   alias SymphonyElixirWeb.Plugs.PlaneWebhookIngress
+  alias SymphonyElixirWeb.Router
 
   @secret "plane-wh_test-secret"
   @event_id "0afa042d-92a9-4326-bdca-5ff5490dbf09"
@@ -192,19 +193,19 @@ defmodule SymphonyElixir.PlaneWebhookTest do
     WebhookDedupRegistry.close(registry)
   end
 
-  test "reconciliation intents carry host generations and require complete epoch coverage" do
+  test "reconciliation intents model queued metadata and require complete epoch coverage" do
     event = identity("workitem.updated")
 
     assert {:ok, intent} =
              ReconciliationIntent.new(%{
                identity: event,
                host_generation: 7,
-               kind: :work_item,
                work_item_id: @entity_id,
                config_fingerprint: :config,
                contract_fingerprint: :contract
              })
 
+    refute Map.has_key?(intent, :state)
     refute ReconciliationIntent.covered_by?(intent, 6)
     assert ReconciliationIntent.covered_by?(intent, 7)
     assert {:error, :invalid_reconciliation_intent} = ReconciliationIntent.new(%{identity: event})
@@ -293,6 +294,65 @@ defmodule SymphonyElixir.PlaneWebhookTest do
       |> PlaneWebhookIngress.call([])
 
     assert oversized.status == 413
+  end
+
+  test "pre-authentication failures do not call the Orchestrator" do
+    {:ok, orchestrator_probe} = SymphonyElixir.PlaneWebhookOrchestratorProbe.start_link(self())
+    previous_endpoint_config = Application.get_env(:symphony_elixir, SymphonyElixirWeb.Endpoint)
+    previous_secret = System.get_env("PLANE_WEBHOOK_SECRET")
+    Application.put_env(:symphony_elixir, SymphonyElixirWeb.Endpoint, orchestrator: orchestrator_probe)
+    System.put_env("PLANE_WEBHOOK_SECRET", @secret)
+
+    on_exit(fn ->
+      if Process.alive?(orchestrator_probe), do: GenServer.stop(orchestrator_probe)
+      restore_env("PLANE_WEBHOOK_SECRET", previous_secret)
+      restore_application_env(SymphonyElixirWeb.Endpoint, previous_endpoint_config)
+    end)
+
+    body = Jason.encode!(payload())
+
+    requests = [
+      {router_post(body, [
+         {"content-type", "application/json"},
+         {"x-plane-signature", signature(body <> "tampered", @secret)}
+       ]), 401},
+      {router_post(body, [{"content-type", "application/json"}]), 401},
+      {router_post(body, [{"content-type", "text/plain"}]), 415},
+      {router_post("{}", [
+         {"content-type", "application/json"},
+         {"content-length", "2bytes"}
+       ]), 400}
+    ]
+
+    for {conn, expected_status} <- requests do
+      assert conn.status == expected_status
+      refute_receive {:plane_webhook_orchestrator_call, _request}, 0
+    end
+  end
+
+  test "valid signature returns 503 when the host secret is unavailable" do
+    {:ok, orchestrator_probe} = SymphonyElixir.PlaneWebhookOrchestratorProbe.start_link(self())
+    previous_endpoint_config = Application.get_env(:symphony_elixir, SymphonyElixirWeb.Endpoint)
+    previous_secret = System.get_env("PLANE_WEBHOOK_SECRET")
+    Application.put_env(:symphony_elixir, SymphonyElixirWeb.Endpoint, orchestrator: orchestrator_probe)
+
+    on_exit(fn ->
+      if Process.alive?(orchestrator_probe), do: GenServer.stop(orchestrator_probe)
+      restore_env("PLANE_WEBHOOK_SECRET", previous_secret)
+      restore_application_env(SymphonyElixirWeb.Endpoint, previous_endpoint_config)
+    end)
+
+    body = Jason.encode!(payload())
+    System.delete_env("PLANE_WEBHOOK_SECRET")
+
+    conn =
+      router_post(body, [
+        {"content-type", "application/json"},
+        {"x-plane-signature", signature(body, @secret)}
+      ])
+
+    assert conn.status == 503
+    refute_receive {:plane_webhook_orchestrator_call, _request}, 0
   end
 
   test "raw ingress rejects chunked bodies that exceed the byte limit" do
@@ -495,6 +555,25 @@ defmodule SymphonyElixir.PlaneWebhookTest do
     :crypto.mac(:hmac, :sha256, secret, body) |> Base.encode16(case: :lower)
   end
 
+  defp router_post(body, headers) do
+    conn = Plug.Test.conn(:post, "/api/v1/webhooks/plane", body)
+
+    conn =
+      Enum.reduce(headers, conn, fn {name, value}, acc ->
+        Plug.Conn.put_req_header(acc, name, value)
+      end)
+
+    Router.call(conn, Router.init([]))
+  end
+
+  defp restore_env(key, nil), do: System.delete_env(key)
+  defp restore_env(key, value), do: System.put_env(key, value)
+
+  defp restore_application_env(key, nil), do: Application.delete_env(:symphony_elixir, key)
+
+  defp restore_application_env(key, value),
+    do: Application.put_env(:symphony_elixir, key, value)
+
   defp use_chunked_adapter(conn, body) do
     %{conn | adapter: {SymphonyElixir.PlaneWebhookChunkedAdapter, chunk_body(body, 16_384)}}
   end
@@ -505,6 +584,21 @@ defmodule SymphonyElixir.PlaneWebhookTest do
     chunk_size = min(byte_size(body), size)
     <<chunk::binary-size(chunk_size), rest::binary>> = body
     [chunk | chunk_body(rest, size)]
+  end
+end
+
+defmodule SymphonyElixir.PlaneWebhookOrchestratorProbe do
+  use GenServer
+
+  def start_link(test_pid), do: GenServer.start_link(__MODULE__, test_pid)
+
+  @impl GenServer
+  def init(test_pid), do: {:ok, test_pid}
+
+  @impl GenServer
+  def handle_call(request, _from, test_pid) do
+    send(test_pid, {:plane_webhook_orchestrator_call, request})
+    {:reply, :ok, test_pid}
   end
 end
 

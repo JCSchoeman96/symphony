@@ -10,20 +10,21 @@ defmodule SymphonyElixirWeb.Plugs.PlaneWebhookIngress do
   @max_body_bytes 1_048_576
   @body_read_length 16_384
   @body_read_timeout_ms 15_000
+  @ingress_telemetry_event [:symphony_elixir, :plane_webhook, :ingress]
 
   @impl Plug
   def init(opts), do: opts
 
   @impl Plug
   def call(%Conn{} = conn, _opts) do
-    record_metric(conn, :received)
+    record_ingress_telemetry(:received, :none)
 
     case process_request(conn) do
       {:ok, conn} ->
         conn
 
       {:error, status, conn, metric} ->
-        record_metric(conn, metric)
+        record_ingress_telemetry(:rejected, metric)
         conn |> Conn.resp(status, "") |> Conn.halt()
     end
   end
@@ -49,23 +50,32 @@ defmodule SymphonyElixirWeb.Plugs.PlaneWebhookIngress do
   end
 
   defp process_signed_body(raw_body, conn) do
-    with :ok <- verify_signature(raw_body, conn),
-         {:ok, payload} <- decode_payload(raw_body),
-         {:ok, identity} <- WebhookDelivery.validate_envelope(payload, signature_headers(conn)) do
-      {:ok, Conn.assign(conn, :plane_webhook_event_identity, identity)}
-    else
-      {:error, reason} -> ingress_error(reason, conn)
+    case verify_signature(raw_body, conn) do
+      :ok ->
+        record_authenticated_metric(:received)
+
+        with {:ok, payload} <- decode_payload(raw_body),
+             {:ok, identity} <- WebhookDelivery.validate_envelope(payload, signature_headers(conn)) do
+          {:ok, Conn.assign(conn, :plane_webhook_event_identity, identity)}
+        else
+          {:error, reason} ->
+            record_authenticated_metric(:malformed)
+            ingress_error(reason, conn)
+        end
+
+      {:error, reason} ->
+        ingress_error(reason, conn)
     end
   end
 
-  defp ingress_error(:unsupported_media_type, conn), do: {:error, 415, conn, nil}
-  defp ingress_error(:body_too_large, conn), do: {:error, 413, conn, nil}
+  defp ingress_error(:unsupported_media_type, conn), do: {:error, 415, conn, :unsupported_media_type}
+  defp ingress_error(:body_too_large, conn), do: {:error, 413, conn, :body_too_large}
 
   defp ingress_error(reason, conn) when reason in [:invalid_content_length, :body_read_failed, :invalid_json],
     do: {:error, 400, conn, :malformed}
 
-  defp ingress_error(reason, conn) when reason in [:secret_unavailable, :invalid_signature],
-    do: {:error, 401, conn, :signature_rejected}
+  defp ingress_error(:secret_unavailable, conn), do: {:error, 503, conn, :verification_unavailable}
+  defp ingress_error(:invalid_signature, conn), do: {:error, 401, conn, :signature_rejected}
 
   defp ingress_error(_reason, conn), do: {:error, 400, conn, :malformed}
 
@@ -169,8 +179,8 @@ defmodule SymphonyElixirWeb.Plugs.PlaneWebhookIngress do
     end
   end
 
-  defp record_metric(_conn, metric) do
-    if metric in [:received, :signature_rejected, :malformed] do
+  defp record_authenticated_metric(metric) do
+    if metric in [:received, :malformed] do
       server =
         :symphony_elixir
         |> Application.get_env(Endpoint, [])
@@ -184,5 +194,14 @@ defmodule SymphonyElixirWeb.Plugs.PlaneWebhookIngress do
     _error -> :ok
   catch
     :exit, _reason -> :ok
+  end
+
+  defp record_ingress_telemetry(event, reason) do
+    :telemetry.execute(@ingress_telemetry_event, %{count: 1}, %{event: event, reason: reason})
+    :ok
+  rescue
+    _error -> :ok
+  catch
+    _kind, _reason -> :ok
   end
 end

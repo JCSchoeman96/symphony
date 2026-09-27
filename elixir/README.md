@@ -318,8 +318,11 @@ codex:
 - Webhook wake-ups are optional. Set the host environment variable `PLANE_WEBHOOK_SECRET` to the
   secret from the Plane v2 webhook; it is not a `WORKFLOW.md` setting. The endpoint verifies the
   HMAC-SHA256 signature over the exact raw request bytes before decoding JSON and rejects bodies
-  larger than 1 MiB. Missing or invalid secrets fail closed with `401`; periodic Plane polling
-  continues to reconcile changes if webhooks are disabled or unavailable. Configure Plane v2
+  larger than 1 MiB. Invalid signatures fail closed with `401`; unavailable host verification
+  configuration returns `503` so Plane can retry. Pre-authentication request and rejection events
+  use bounded Telemetry metadata; Orchestrator metrics are recorded only after HMAC verification.
+  Periodic Plane polling continues to reconcile changes if webhooks are disabled or unavailable.
+  Configure Plane v2
   webhooks only: the endpoint requires `version: "v2"`, and Plane's v2 payload supplies stable
   `event_id` values for logical-event deduplication while each retry has a new `delivery_id`.
   Both identities are retained for 24 hours in a private in-memory registry bounded to 20,000

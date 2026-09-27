@@ -1743,7 +1743,6 @@ defmodule SymphonyElixir.Orchestrator do
     case ReconciliationIntent.new(%{
            identity: identity,
            host_generation: generation,
-           kind: :work_item,
            work_item_id: work_item_id,
            event: identity.event,
            config_fingerprint: plane_config_fingerprint(config),
