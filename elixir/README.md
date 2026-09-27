@@ -236,7 +236,8 @@ codex:
 - If a later reload fails, Symphony keeps running with the last known good workflow and logs the
   reload error until the file is fixed.
 - `server.port` or CLI `--port` enables the optional Phoenix LiveView dashboard and JSON API at
-  `/`, `/api/v1/state`, `/api/v1/<issue_identifier>`, and `/api/v1/refresh`.
+  `/`, `/api/v1/state`, `/api/v1/<issue_identifier>`, and `/api/v1/refresh`. Plane deployments
+  can also receive signed webhook wake-ups at `/api/v1/webhooks/plane`.
 
 ### Source-control authority (H-050C)
 
@@ -314,6 +315,24 @@ codex:
   epoch only after the closing node set remains stable. Routed configuration remains fail-closed
   because later transition and agent-tool capabilities are still unsupported. Plane reads never
   grant lifecycle authority or completion proof.
+- Webhook wake-ups are optional. Set the host environment variable `PLANE_WEBHOOK_SECRET` to the
+  secret from the Plane v2 webhook; it is not a `WORKFLOW.md` setting. The endpoint verifies the
+  HMAC-SHA256 signature over the exact raw request bytes before decoding JSON and rejects bodies
+  larger than 1 MiB. Missing or invalid secrets fail closed with `401`; periodic Plane polling
+  continues to reconcile changes if webhooks are disabled or unavailable. Configure Plane v2
+  webhooks only: the endpoint requires `version: "v2"`, and Plane's v2 payload supplies stable
+  `event_id` values for logical-event deduplication while each retry has a new `delivery_id`.
+  Both identities are retained for 24 hours in a private in-memory registry bounded to 20,000
+  total keys. Provision secret rotations in step with Plane: Plane invalidates the old key as soon
+  as a new one is generated, so update the host environment before enabling the new key.
+- A signed webhook is only a wake-up hint. Work-item updates and deletes trigger a fresh singleton
+  REST read through the existing Plane read scheduler. Targeted results may preserve or reduce
+  authority; positive lifecycle or dependency decisions wait for the ordinary complete epoch.
+  Dependency, relation, project, create, and archive events request a complete epoch directly.
+  The webhook payload never supplies lifecycle truth, dependency edges, completion proof, or
+  provider mutations. Unknown event strings are acknowledged and ignored. Plane's current webhook
+  reference lists dot-notation event names, while one `workitem.updated` payload example uses an
+  enum-style value; Symphony does not add aliases for that documentation mismatch.
 
 ### GitHub Issues adapter
 

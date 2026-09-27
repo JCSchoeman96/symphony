@@ -10,6 +10,7 @@ defmodule SymphonyElixir.Plane.Adapter do
   alias SymphonyElixir.WorkControl.ProviderProjectContract
 
   @plane_api_key_env "PLANE_API_KEY"
+  @plane_webhook_secret_env "PLANE_WEBHOOK_SECRET"
 
   @spec capabilities() :: [Capabilities.capability()]
   def capabilities do
@@ -115,7 +116,11 @@ defmodule SymphonyElixir.Plane.Adapter do
     provider = provider_settings(tracker_settings)
     configured = Map.get(tracker_settings, :secret_environment_names, [])
 
-    [@plane_api_key_env | configured ++ env_reference_names([provider_value(provider, "api_key")])]
+    [
+      @plane_api_key_env,
+      @plane_webhook_secret_env
+      | configured ++ env_reference_names([provider_value(provider, "api_key")])
+    ]
     |> Enum.filter(&is_binary/1)
     |> Enum.uniq()
   end
@@ -305,7 +310,7 @@ defmodule SymphonyElixir.Plane.Adapter do
       state: projected.state,
       branch_name: nil,
       url: projected.url,
-      assignee_id: nil,
+      assignee_id: projected.assignee_id,
       workspace_id: projected.workspace_id,
       project_id: projected.project_id,
       provider_state_id: projected.provider_state_id,

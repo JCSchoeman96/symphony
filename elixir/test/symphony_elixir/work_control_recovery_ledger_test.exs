@@ -252,6 +252,52 @@ defmodule SymphonyElixir.WorkControlRecoveryLedgerTest do
     assert :ok = RecoveryLedger.close(ledger)
   end
 
+  test "round-trips explicit Plane absence and accepts legacy present observations", %{path: path} do
+    {:ok, ledger} = RecoveryLedger.open("project-a", @identity, path: path)
+
+    assert {:ok, not_found} =
+             ProviderObservation.new_not_found(%{
+               provider: :plane,
+               work_item_id: "work-a",
+               workspace_id: "workspace-a",
+               project_id: "project-a",
+               snapshot_identity: %{source: :targeted_webhook_rest}
+             })
+
+    absence_context = %{
+      suspension_context("work-a", :open)
+      | provider_observation: not_found
+    }
+
+    absence_checkpoint =
+      checkpoint("work-a")
+      |> Map.put(:active_suspension_context, absence_context)
+
+    assert :ok = RecoveryLedger.put_sync(ledger, absence_checkpoint)
+    assert {:ok, ^absence_checkpoint} = RecoveryLedger.current(ledger, "work-a")
+
+    present_observation = suspension_context("work-b", :open).provider_observation
+
+    legacy_observation =
+      present_observation
+      |> Map.from_struct()
+      |> Map.delete(:presence)
+      |> Map.put(:__struct__, ProviderObservation)
+
+    legacy_context = %{
+      suspension_context("work-b", :open)
+      | provider_observation: legacy_observation
+    }
+
+    legacy_checkpoint =
+      checkpoint("work-b")
+      |> Map.put(:active_suspension_context, legacy_context)
+
+    assert :ok = RecoveryLedger.put_sync(ledger, legacy_checkpoint)
+    assert {:ok, ^legacy_checkpoint} = RecoveryLedger.current(ledger, "work-b")
+    assert :ok = RecoveryLedger.close(ledger)
+  end
+
   test "validates every recovery field before storing suspension evidence", %{path: path} do
     {:ok, ledger} = RecoveryLedger.open("project-a", @identity, path: path)
     context = suspension_context("work-a", :open)

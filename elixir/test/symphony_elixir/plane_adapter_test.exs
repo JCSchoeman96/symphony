@@ -28,7 +28,7 @@ defmodule SymphonyElixir.PlaneAdapterTest do
            ]
 
     assert {:ok, Adapter.capabilities()} == Capabilities.validate_adapter(Adapter)
-    assert Adapter.secret_environment_names(@settings) == ["PLANE_API_KEY"]
+    assert Adapter.secret_environment_names(@settings) == ["PLANE_API_KEY", "PLANE_WEBHOOK_SECRET"]
   end
 
   test "forwards semantic Plane tool callbacks without exposing provider scope" do
@@ -66,6 +66,7 @@ defmodule SymphonyElixir.PlaneAdapterTest do
            "state" => %{"id" => "state-ready", "name" => "Ready", "group" => "unstarted"},
            "project" => "project-1",
            "workspace" => "workspace-stable-1",
+           "assignees" => ["user-1"],
            "updated_at" => "2026-09-17T08:09:10Z"
          }
        }}
@@ -78,6 +79,7 @@ defmodule SymphonyElixir.PlaneAdapterTest do
     assert first.project_id == "project-1"
     assert first.provider_state_id == "state-ready"
     assert first.provider_state_group == :unstarted
+    assert first.assignee_id == "user-1"
     assert first.updated_at == ~U[2026-09-17 08:09:10Z]
     assert_receive {:request, _}
     assert_receive {:request, _}
@@ -88,7 +90,7 @@ defmodule SymphonyElixir.PlaneAdapterTest do
       case request.path do
         "/api/v1/workspaces/workspace-1/projects/project-1/work-items/" ->
           assert request.params["fields"] ==
-                   "id,name,description,priority,sequence_id,state,labels,created_at,updated_at,project,workspace"
+                   "id,name,description,priority,sequence_id,state,assignees,labels,created_at,updated_at,project,workspace"
 
           {:ok,
            %{

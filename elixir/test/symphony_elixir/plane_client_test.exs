@@ -24,7 +24,7 @@ defmodule SymphonyElixir.PlaneClientTest do
 
     assert_receive {:request, %{method: :get, path: path, params: params, headers: headers}}
     assert path == "/api/v1/workspaces/workspace-1/projects/project-1/work-items/item-1/"
-    assert params == %{"expand" => "state"}
+    assert params == %{"expand" => "state,assignees"}
     assert {"X-API-Key", "secret"} in headers
   end
 
@@ -61,8 +61,8 @@ defmodule SymphonyElixir.PlaneClientTest do
     assert {:ok, []} = Client.list_work_items(@config, request_fun: request_fun)
     assert_receive {:request, work_items_path, work_item_params}
     assert String.ends_with?(work_items_path, "/work-items/")
-    assert work_item_params["expand"] == "state"
-    assert work_item_params["fields"] == "id,name,description,priority,sequence_id,state,labels,created_at,updated_at,project,workspace"
+    assert work_item_params["expand"] == "state,assignees"
+    assert work_item_params["fields"] == "id,name,description,priority,sequence_id,state,assignees,labels,created_at,updated_at,project,workspace"
 
     assert {:ok, []} = Client.list_states(@config, request_fun: request_fun)
     assert_receive {:request, states_path, state_params}
@@ -110,8 +110,8 @@ defmodule SymphonyElixir.PlaneClientTest do
 
     assert_receive {:request, %{params: first_params}}
     assert first_params["per_page"] == 100
-    assert first_params["expand"] == "state"
-    assert first_params["fields"] == "id,name,description,priority,sequence_id,state,labels,created_at,updated_at,project,workspace"
+    assert first_params["expand"] == "state,assignees"
+    assert first_params["fields"] == "id,name,description,priority,sequence_id,state,assignees,labels,created_at,updated_at,project,workspace"
     assert_receive {:request, %{params: second_params}}
     assert second_params["cursor"] == "c1"
 

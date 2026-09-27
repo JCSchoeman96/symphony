@@ -19,7 +19,7 @@ defmodule SymphonyElixir.Plane.Client do
   @max_states 64
   @max_response_bytes 4_000_000
   @response_too_large_marker :symphony_plane_response_too_large
-  @work_item_fields "id,name,description,priority,sequence_id,state,labels,created_at,updated_at,project,workspace"
+  @work_item_fields "id,name,description,priority,sequence_id,state,assignees,labels,created_at,updated_at,project,workspace"
   @state_fields "id,name,group,project,workspace"
 
   defmodule Error do
@@ -652,7 +652,7 @@ defmodule SymphonyElixir.Plane.Client do
   defp work_items_path(config), do: project_path(config) <> "work-items/"
   defp states_path(config), do: project_path(config) <> "states/"
 
-  defp state_expansion_params, do: %{"expand" => "state"}
+  defp state_expansion_params, do: %{"expand" => "state,assignees"}
 
   defp work_item_params do
     state_expansion_params()

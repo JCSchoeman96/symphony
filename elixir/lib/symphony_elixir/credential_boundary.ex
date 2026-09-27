@@ -9,6 +9,7 @@ defmodule SymphonyElixir.CredentialBoundary do
   alias SymphonyElixir.Config
 
   @plane_api_key_env "PLANE_API_KEY"
+  @plane_webhook_secret_env "PLANE_WEBHOOK_SECRET"
 
   @standard_github_token_envs ["GITHUB_TOKEN", "GH_TOKEN"]
 
@@ -49,7 +50,10 @@ defmodule SymphonyElixir.CredentialBoundary do
     configured =
       Enum.filter(secret_environment_names, &valid_environment_name?/1)
 
-    Enum.uniq(@standard_github_token_envs ++ [@plane_api_key_env] ++ configured ++ @scm_delegation_envs)
+    Enum.uniq(
+      @standard_github_token_envs ++
+        [@plane_api_key_env, @plane_webhook_secret_env] ++ configured ++ @scm_delegation_envs
+    )
   end
 
   @spec configured_secret_environment_names() :: [String.t()]
