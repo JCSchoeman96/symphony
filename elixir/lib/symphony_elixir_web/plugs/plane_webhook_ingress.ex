@@ -4,7 +4,7 @@ defmodule SymphonyElixirWeb.Plugs.PlaneWebhookIngress do
   @behaviour Plug
 
   alias Plug.Conn
-  alias SymphonyElixir.Plane.{WebhookDelivery, WebhookSignature}
+  alias SymphonyElixir.Plane.{WebhookDelivery, WebhookIngressMetrics, WebhookSignature}
   alias SymphonyElixirWeb.Endpoint
 
   @max_body_bytes 1_048_576
@@ -24,6 +24,10 @@ defmodule SymphonyElixirWeb.Plugs.PlaneWebhookIngress do
         conn
 
       {:error, status, conn, metric} ->
+        if metric == :signature_rejected do
+          WebhookIngressMetrics.record_signature_rejected()
+        end
+
         record_ingress_telemetry(:rejected, metric)
         conn |> Conn.resp(status, "") |> Conn.halt()
     end

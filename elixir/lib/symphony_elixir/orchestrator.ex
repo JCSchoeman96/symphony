@@ -21,7 +21,15 @@ defmodule SymphonyElixir.Orchestrator do
 
   alias SymphonyElixir.AgentRuntime.RuntimeAttempt.Identity, as: RuntimeAttemptIdentity
   alias SymphonyElixir.Dependency.{Graph, Guard, Policy}
-  alias SymphonyElixir.Plane.{ProjectContract, ReconciliationIntent, WebhookDedupRegistry, WebhookDelivery}
+
+  alias SymphonyElixir.Plane.{
+    ProjectContract,
+    ReconciliationIntent,
+    WebhookDedupRegistry,
+    WebhookDelivery,
+    WebhookIngressMetrics
+  }
+
   alias SymphonyElixir.Plane.WebhookDelivery.EventIdentity
   alias SymphonyElixir.Tracker.Issue
 
@@ -9674,7 +9682,9 @@ defmodule SymphonyElixir.Orchestrator do
         do: WebhookDedupRegistry.size(state.plane_webhook_dedup),
         else: 0
 
-    Map.merge(metrics, %{
+    metrics
+    |> Map.merge(WebhookIngressMetrics.snapshot())
+    |> Map.merge(%{
       last_accepted_at: state.plane_webhook_last_accepted_at,
       dedup_entry_count: dedup_size,
       pending_count: map_size(state.plane_webhook_pending),

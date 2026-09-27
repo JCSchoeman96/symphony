@@ -330,6 +330,42 @@ defmodule SymphonyElixir.PlaneWebhookTest do
     end
   end
 
+  test "signature rejections appear in the webhook snapshot without calling the Orchestrator" do
+    {:ok, task_supervisor} = Task.Supervisor.start_link()
+    name = Module.concat(__MODULE__, "IngressMetrics#{System.unique_integer([:positive])}")
+
+    {:ok, orchestrator} =
+      SymphonyElixir.Orchestrator.start_link(
+        name: name,
+        task_supervisor: task_supervisor,
+        start_quiesced: true
+      )
+
+    previous_endpoint_config = Application.get_env(:symphony_elixir, SymphonyElixirWeb.Endpoint)
+    previous_secret = System.get_env("PLANE_WEBHOOK_SECRET")
+    Application.put_env(:symphony_elixir, SymphonyElixirWeb.Endpoint, orchestrator: orchestrator)
+    System.put_env("PLANE_WEBHOOK_SECRET", @secret)
+
+    on_exit(fn ->
+      safely_stop(orchestrator)
+      safely_stop(task_supervisor)
+      restore_env("PLANE_WEBHOOK_SECRET", previous_secret)
+      restore_application_env(SymphonyElixirWeb.Endpoint, previous_endpoint_config)
+    end)
+
+    body = "{}"
+    before = SymphonyElixir.Orchestrator.snapshot(orchestrator, 1_000).plane_webhook.signature_rejected
+
+    rejected =
+      Plug.Test.conn(:post, "/api/v1/webhooks/plane", body)
+      |> Plug.Conn.put_req_header("content-type", "application/json")
+      |> Plug.Conn.put_req_header("x-plane-signature", signature(body <> "tampered", @secret))
+      |> PlaneWebhookIngress.call([])
+
+    assert rejected.status == 401
+    assert SymphonyElixir.Orchestrator.snapshot(orchestrator, 1_000).plane_webhook.signature_rejected == before + 1
+  end
+
   test "valid signature returns 503 when the host secret is unavailable" do
     {:ok, orchestrator_probe} = SymphonyElixir.PlaneWebhookOrchestratorProbe.start_link(self())
     previous_endpoint_config = Application.get_env(:symphony_elixir, SymphonyElixirWeb.Endpoint)
@@ -573,6 +609,12 @@ defmodule SymphonyElixir.PlaneWebhookTest do
 
   defp restore_application_env(key, value),
     do: Application.put_env(:symphony_elixir, key, value)
+
+  defp safely_stop(pid) do
+    if Process.alive?(pid), do: GenServer.stop(pid)
+  catch
+    :exit, _reason -> :ok
+  end
 
   defp use_chunked_adapter(conn, body) do
     %{conn | adapter: {SymphonyElixir.PlaneWebhookChunkedAdapter, chunk_body(body, 16_384)}}
