@@ -14,21 +14,11 @@ defmodule SymphonyElixirWeb.Router do
     plug(:put_secure_browser_headers)
   end
 
-  pipeline :parsed_request do
-    plug(Plug.Parsers,
-      parsers: [:urlencoded, :multipart, :json],
-      pass: ["*/*"],
-      json_decoder: Jason
-    )
-  end
-
   pipeline :plane_webhook do
     plug(SymphonyElixirWeb.Plugs.PlaneWebhookIngress)
   end
 
   scope "/", SymphonyElixirWeb do
-    pipe_through(:parsed_request)
-
     get("/dashboard.css", StaticAssetController, :dashboard_css)
     get("/favicon.png", StaticAssetController, :favicon)
     get("/vendor/phoenix_html/phoenix_html.js", StaticAssetController, :phoenix_html_js)
@@ -37,7 +27,7 @@ defmodule SymphonyElixirWeb.Router do
   end
 
   scope "/", SymphonyElixirWeb do
-    pipe_through([:parsed_request, :browser])
+    pipe_through(:browser)
 
     live("/", DashboardLive, :index)
   end
@@ -49,8 +39,6 @@ defmodule SymphonyElixirWeb.Router do
   end
 
   scope "/", SymphonyElixirWeb do
-    pipe_through(:parsed_request)
-
     get("/api/v1/state", ObservabilityApiController, :state)
 
     match(:*, "/", ObservabilityApiController, :method_not_allowed)

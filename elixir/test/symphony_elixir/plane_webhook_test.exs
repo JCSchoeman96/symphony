@@ -12,6 +12,7 @@ defmodule SymphonyElixir.PlaneWebhookTest do
   alias SymphonyElixir.Workflow
   alias SymphonyElixirWeb.PlaneWebhookController
   alias SymphonyElixirWeb.Plugs.PlaneWebhookIngress
+  alias SymphonyElixirWeb.Plugs.RequestParsers
   alias SymphonyElixirWeb.Router
 
   @secret "plane-wh_test-secret"
@@ -34,6 +35,18 @@ defmodule SymphonyElixir.PlaneWebhookTest do
 
     assert {:error, :invalid_signature} =
              WebhookSignature.verify(reserialized_json, signature(signed_json, @secret), secret: @secret)
+  end
+
+  test "form bodies retain method override handling" do
+    conn =
+      Plug.Test.conn(:post, "/api/v1/state", "_method=PATCH")
+      |> Plug.Conn.put_req_header("content-type", "application/x-www-form-urlencoded")
+      |> RequestParsers.call([])
+      |> Router.call(Router.init([]))
+
+    assert conn.status == 405
+    assert conn.method == "PATCH"
+    assert conn.body_params == %{"_method" => "PATCH"}
   end
 
   test "rejects a missing signature and an unavailable host secret" do
@@ -261,6 +274,7 @@ defmodule SymphonyElixir.PlaneWebhookTest do
       |> Plug.Conn.put_req_header("x-plane-signature", signature(body, @secret))
       |> Plug.Conn.put_req_header("x-plane-delivery", @delivery_id)
       |> Plug.Conn.put_req_header("x-plane-event", "workitem.updated")
+      |> RequestParsers.call([])
       |> PlaneWebhookIngress.call([])
 
     assert conn.halted == false

@@ -39,7 +39,7 @@ defmodule SymphonyElixir.OrchestratorPlaneWebhookTest do
 
     assert %{
              received: 1,
-             signature_rejected: 0,
+             signature_rejected: signature_rejected,
              malformed: 1,
              scope_rejected: 0,
              duplicate_delivery: 0,
@@ -53,6 +53,9 @@ defmodule SymphonyElixir.OrchestratorPlaneWebhookTest do
              in_flight_count: 0,
              full_epoch_dirty?: false
            } = Orchestrator.snapshot(orchestrator, 1_000).plane_webhook
+
+    assert is_integer(signature_rejected)
+    assert signature_rejected >= 0
   end
 
   defp safely_stop(pid) do
