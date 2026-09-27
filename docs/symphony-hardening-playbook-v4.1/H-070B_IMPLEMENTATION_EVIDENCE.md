@@ -6,14 +6,15 @@
 |---|---|
 | `BASE_SHA` | `05fac06e771bbf1928e4975092741db0c94ecede` |
 | `BASE_TREE` | `09c4f133ee53e685e5d0f5a427f7df72e0985c8f` |
-| `TESTED_IMPLEMENTATION_HEAD` | `94c555566b4a539cd809178ddd2380d867719eab` |
-| `TESTED_IMPLEMENTATION_TREE` | `9e365fe0cfe0ee4e66a0fa9f0cb4a99567c6d9c4` |
-| `CURRENT_PR_HEAD` | `94c555566b4a539cd809178ddd2380d867719eab` — exact PR head used for the verification snapshot below. This evidence file is a documentation-only follow-up; the live PR head is recorded in the PR description. |
-| `CURRENT_PR_TREE` | `9e365fe0cfe0ee4e66a0fa9f0cb4a99567c6d9c4` |
-| `CURRENT_SYNTHETIC_MERGE_HEAD` | `12a68058c79c9e6abf418da41eac252919b2f6aa` |
-| `CURRENT_SYNTHETIC_MERGE_TREE` | `9e365fe0cfe0ee4e66a0fa9f0cb4a99567c6d9c4` |
-| `CURRENT_SYNTHETIC_MERGE_PARENTS` | accepted base `05fac06e771bbf1928e4975092741db0c94ecede`, PR head `94c555566b4a539cd809178ddd2380d867719eab` |
-| `COMMITS` | `be761300f99d8f9c6d86e16f0614a6145c8e9f0e`, `0a36322bb8807ea02f7fd2c13319b49f21468fc2`, `f45de883c6ccaf0fbf2e3693bc9c782333c75c9d`, `8245e0be2457f1b53cc834b29f33905066886a06`, and `94c555566b4a539cd809178ddd2380d867719eab` (implementation candidate at the verification snapshot). |
+| `TESTED_IMPLEMENTATION_HEAD` | `17bf5ebf45dc23aa4106381a48b5fb4970db71cf` |
+| `TESTED_IMPLEMENTATION_TREE` | `11cf73f914858a595d5f1f0ebd168d36fa032b63` |
+| `CURRENT_PR_HEAD` | `17bf5ebf45dc23aa4106381a48b5fb4970db71cf` — PR candidate used for this verification snapshot. |
+| `CURRENT_PR_TREE` | `11cf73f914858a595d5f1f0ebd168d36fa032b63` |
+| `CURRENT_SYNTHETIC_MERGE_HEAD` | `54b046620c4094b9efa7d1895743301a6edab30f` |
+| `CURRENT_SYNTHETIC_MERGE_TREE` | `11cf73f914858a595d5f1f0ebd168d36fa032b63` |
+| `CURRENT_SYNTHETIC_MERGE_PARENTS` | accepted base `05fac06e771bbf1928e4975092741db0c94ecede`, PR head `17bf5ebf45dc23aa4106381a48b5fb4970db71cf` |
+| `EVIDENCE_SNAPSHOT` | The identities above are the exact source candidate and synthetic merge used for this verification. This documentation-only refresh advances the PR; the live identity is recorded in the PR description. |
+| `COMMITS` | `be761300f99d8f9c6d86e16f0614a6145c8e9f0e`, `0a36322bb8807ea02f7fd2c13319b49f21468fc2`, `f45de883c6ccaf0fbf2e3693bc9c782333c75c9d`, `8245e0be2457f1b53cc834b29f33905066886a06`, `94c555566b4a539cd809178ddd2380d867719eab`, and `17bf5ebf45dc23aa4106381a48b5fb4970db71cf` (tested implementation candidate). |
 | `PR_NUMBER` | [#24](https://github.com/JCSchoeman96/symphony/pull/24) — open against `main`. |
 | Governance | H-070A remains accepted at PR #23. H-070B is under review at PR #24 and is not accepted. H-080A remains unauthorized. |
 
@@ -32,7 +33,8 @@
 | `REPLAY_TESTS` | Concurrent retry test sends 20 delivery attempts for one logical event: one admission and one scheduler-backed REST read; 19 attempts are classified as duplicate events. Tests also cover duplicate delivery IDs, TTL expiry, bounded eviction, restart behavior, and admission rollback. |
 | `OUT_OF_ORDER_TESTS` | A full epoch begun before a webhook is discarded as stale and followed by one covering epoch. A same-item burst of 1,000 newer events while a read is blocked coalesces to one latest rerun; the provider-read counter is exactly 2. A preserving targeted result leaves an unrelated in-flight full epoch valid. |
 | `PROVIDER_READ_COUNTS` | Targeted work-item reconciliation makes singleton reads through the existing `Plane.ReadScheduler`. The concurrent duplicate test makes exactly 1 read. The 1,000-event same-item coalescing test makes exactly 2 reads. A distinct-item burst holds at 2 targeted reads in flight and 64 pending intents; overflow marks one full-epoch reconciliation dirty. |
-| `FULL_EPOCH_COUNTS` | The epoch overlap test observes 2 graph fetches and 4 project-snapshot fetches: the stale in-flight epoch and one follow-up that covers webhook generations. Existing scale tests also completed at 1,000, 5,000, and 10,000 items; the 10,000-item run reported 10,200 calls, peak scheduler concurrency 3, and 153,736 ms elapsed. |
+| `QUEUE_BOUNDS` | Repeated bursts with both targeted read slots held open publish full epochs while superseding pending work. The regression verifies that two successive 64-item queues are cleared at publication and remain bounded while both reads stay in flight. Queue compaction also removes duplicate IDs while preserving FIFO order for surviving intents. |
+| `FULL_EPOCH_COUNTS` | The epoch overlap test observes 2 graph fetches and 4 project-snapshot fetches: the stale in-flight epoch and one follow-up that covers webhook generations. Existing scale tests also completed at 1,000, 5,000, and 10,000 items; the 10,000-item run reported 10,200 calls, peak scheduler concurrency 3, and 149,211 ms elapsed. |
 
 Targeted results can preserve or reduce current authority. Verified exact Plane 404 is represented as explicit absence and may reduce existing authority. Timeouts, throttling, server errors, malformed or wrong-scope responses do not become absence. Targeted reconciliation cannot create work-control state, restore or advance authority, satisfy dependencies, prove completion, mutate Plane, or patch the dependency graph. Graph-sensitive events request a complete immutable epoch. A fresh Plane `Done` value still cannot satisfy completion without `CompletionProof`.
 
@@ -81,8 +83,8 @@ The Plane v2 contract adjudication records that `event_id` is the retry-stable l
 
 | Field | Result |
 |---|---|
-| `FULL_TEST_RESULTS` | `make -C elixir all` passed: 1,443 tests, 0 failures, 6 skipped. |
-| `COVERAGE` | 90.01% total; project threshold passed. |
+| `FULL_TEST_RESULTS` | `make -C elixir all` passed: 1,444 tests, 0 failures, 6 skipped. |
+| `COVERAGE` | 90.02% total; project threshold passed. |
 | `CREDO` | Clean; all 204 source files checked and all public functions have specs or an exemption. |
 | `DIALYZER` | Passed with 0 errors, 0 skips, and 0 unnecessary skips. |
 | Formatting | `mix format --check-formatted` passed. |
