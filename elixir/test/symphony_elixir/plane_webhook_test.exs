@@ -49,6 +49,24 @@ defmodule SymphonyElixir.PlaneWebhookTest do
     assert conn.body_params == %{"_method" => "PATCH"}
   end
 
+  test "raw webhook parser bypass covers normalized Phoenix route paths" do
+    body = Jason.encode!(payload())
+
+    for path <- [
+          "/api/v1/webhooks/%70lane",
+          "/api//v1/webhooks/plane",
+          "/api/v1/webhooks/plane/"
+        ] do
+      conn =
+        Plug.Test.conn(:post, path, body)
+        |> Plug.Conn.put_req_header("content-type", "application/json")
+        |> RequestParsers.call([])
+
+      assert match?(%Plug.Conn.Unfetched{}, conn.body_params),
+             "expected raw body to stay unread for #{path}"
+    end
+  end
+
   test "rejects a missing signature and an unavailable host secret" do
     assert {:error, :invalid_signature} = WebhookSignature.verify("{}", nil, secret: @secret)
     assert {:error, :secret_unavailable} = WebhookSignature.verify("{}", signature("{}", @secret), secret: nil)

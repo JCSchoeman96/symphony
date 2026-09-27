@@ -10,6 +10,7 @@ defmodule SymphonyElixir.Plane.ReconciliationIntent do
   alias SymphonyElixir.Plane.WebhookDelivery.EventIdentity
 
   @enforce_keys [
+    :identity,
     :work_item_id,
     :event,
     :host_generation,
@@ -18,6 +19,7 @@ defmodule SymphonyElixir.Plane.ReconciliationIntent do
     :requested_at
   ]
   defstruct [
+    :identity,
     :work_item_id,
     :event,
     :host_generation,
@@ -28,6 +30,7 @@ defmodule SymphonyElixir.Plane.ReconciliationIntent do
   ]
 
   @type t :: %__MODULE__{
+          identity: EventIdentity.t(),
           work_item_id: String.t(),
           event: String.t(),
           host_generation: non_neg_integer(),
@@ -48,6 +51,7 @@ defmodule SymphonyElixir.Plane.ReconciliationIntent do
          true <- is_binary(work_item_id) and work_item_id != "" do
       {:ok,
        %__MODULE__{
+         identity: identity,
          work_item_id: work_item_id,
          event: identity.event,
          host_generation: generation,

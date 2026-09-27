@@ -46,6 +46,7 @@ defmodule SymphonyElixir.OrchestratorPlaneEpochFakeTracker do
 
     case mode do
       :block_graph -> wait_for(:release_graph)
+      :block_provider_id_reads_and_graph -> wait_for(:release_graph)
       :crash_graph -> raise "fake Plane graph crash"
       _normal -> :ok
     end
@@ -115,7 +116,7 @@ defmodule SymphonyElixir.OrchestratorPlaneEpochFakeTracker do
       :wrong_missing_ids ->
         {:ok, [%{build_issue() | id: "unexpected-plane-work-item"}]}
 
-      :block_provider_id_reads ->
+      mode when mode in [:block_provider_id_reads, :block_provider_id_reads_and_graph] ->
         send(test_pid, {:plane_provider_id_read_blocked, self(), ids})
 
         receive do
@@ -353,6 +354,21 @@ defmodule SymphonyElixir.OrchestratorPlaneEpochSnapshotOnlyTracker do
   end
 end
 
+defmodule SymphonyElixir.OrchestratorPlaneEpochSchedulerFailureTracker do
+  alias SymphonyElixir.Plane.ReadScheduler
+
+  def fetch_issues_by_ids([work_item_id], opts) do
+    test_pid = Application.fetch_env!(:symphony_elixir, :plane_epoch_test_pid)
+    send(test_pid, {:plane_scheduler_failure_read, self(), work_item_id})
+
+    ReadScheduler.execute(
+      Keyword.fetch!(opts, :scheduler),
+      :control,
+      fn -> {:ok, []} end
+    )
+  end
+end
+
 defmodule SymphonyElixir.OrchestratorPlaneEpochNoSnapshotTracker do
   def fetch_issues_by_ids(ids), do: {:ok, ids}
 end
@@ -473,6 +489,98 @@ defmodule SymphonyElixir.OrchestratorPlaneEpochTest do
     assert state.work_control[work_item_id].authority_disposition.status == :eligible
     assert state.plane_webhook_metrics.scheduled == 1
     assert state.plane_webhook_metrics.duplicate_event == 19
+
+    stop_orchestrator(pid, task_supervisor)
+  end
+
+  test "a failed scheduler read releases the webhook claim so the same event can retry" do
+    work_item_id = uuid(117)
+
+    {pid, task_supervisor} =
+      start_orchestrator(
+        tracker: SymphonyElixir.OrchestratorPlaneEpochSchedulerFailureTracker,
+        read_scheduler: :missing_plane_read_scheduler,
+        startup_ready: true
+      )
+
+    identity = webhook_identity("workitem.updated", 117, work_item_id, "project-1")
+
+    assert {:ok, :scheduled} = Orchestrator.accept_plane_webhook(pid, identity)
+    assert_receive {:plane_scheduler_failure_read, _first_reader, ^work_item_id}
+
+    assert eventually(fn ->
+             state = :sys.get_state(pid)
+             map_size(state.plane_webhook_tasks) == 0 and state.plane_webhook_metrics.reconciliation_failed == 1
+           end)
+
+    retry_identity = %{identity | delivery_id: uuid(118)}
+    assert {:ok, :scheduled} = Orchestrator.accept_plane_webhook(pid, retry_identity)
+    assert_receive {:plane_scheduler_failure_read, _retry_reader, ^work_item_id}
+
+    assert eventually(fn ->
+             state = :sys.get_state(pid)
+             map_size(state.plane_webhook_tasks) == 0 and state.plane_webhook_metrics.reconciliation_failed == 2
+           end)
+
+    state = :sys.get_state(pid)
+    assert state.plane_reconciliation_generation == 2
+    assert state.plane_webhook_metrics.scheduled == 2
+
+    stop_orchestrator(pid, task_supervisor)
+  end
+
+  test "a rejected targeted admission rolls back its dedup claim" do
+    work_item_id = uuid(118)
+    {pid, task_supervisor} = start_orchestrator(startup_ready: true)
+    identity = webhook_identity("workitem.updated", 118, work_item_id, "project-1")
+    invalid_identity = %{identity | entity_id: ""}
+
+    assert {:error, :admission_failed} = Orchestrator.accept_plane_webhook(pid, invalid_identity)
+    assert {:ok, :scheduled} = Orchestrator.accept_plane_webhook(pid, identity)
+    assert :sys.get_state(pid).plane_webhook_metrics.scheduled == 1
+
+    stop_orchestrator(pid, task_supervisor)
+  end
+
+  test "a missing full-epoch supervisor preserves the dirty fallback without crashing admission" do
+    {pid, task_supervisor} =
+      start_orchestrator(
+        startup_ready: true,
+        task_supervisor: :missing_plane_task_supervisor
+      )
+
+    Process.unlink(pid)
+    identity = webhook_identity("project.updated", 119, "project-1", "project-1")
+
+    result =
+      try do
+        Orchestrator.accept_plane_webhook(pid, identity)
+      catch
+        :exit, reason -> {:exit, reason}
+      end
+
+    assert result == {:ok, :scheduled}
+    assert Process.alive?(pid)
+
+    state = :sys.get_state(pid)
+    assert state.plane_webhook_full_epoch_dirty_generation == state.plane_reconciliation_generation
+    assert state.plane_epoch_status == :failed
+    assert {:ok, :duplicate_delivery} = Orchestrator.accept_plane_webhook(pid, identity)
+
+    stop_orchestrator(pid, task_supervisor)
+  end
+
+  test "an invalid full-epoch supervisor argument preserves the dirty fallback" do
+    {pid, task_supervisor} = start_orchestrator(startup_ready: true, task_supervisor: 1)
+    Process.unlink(pid)
+    identity = webhook_identity("project.updated", 120, "project-1", "project-1")
+
+    assert {:ok, :scheduled} = Orchestrator.accept_plane_webhook(pid, identity)
+    assert Process.alive?(pid)
+
+    state = :sys.get_state(pid)
+    assert state.plane_webhook_full_epoch_dirty_generation == state.plane_reconciliation_generation
+    assert state.plane_epoch_status == :failed
 
     stop_orchestrator(pid, task_supervisor)
   end
@@ -1002,6 +1110,48 @@ defmodule SymphonyElixir.OrchestratorPlaneEpochTest do
     if Process.alive?(task_supervisor), do: GenServer.stop(task_supervisor)
   end
 
+  test "a queued targeted intent with a stale generation is discarded before its provider read" do
+    work_item_ids = Enum.map(121..123, &uuid/1)
+
+    issues =
+      Enum.map(work_item_ids, fn work_item_id ->
+        %{OrchestratorPlaneEpochFakeTracker.issue() | id: work_item_id}
+      end)
+
+    Application.put_env(:symphony_elixir, :plane_epoch_test_graph_issues, issues)
+    Application.put_env(:symphony_elixir, :plane_epoch_test_mode, :block_provider_id_reads)
+    {pid, task_supervisor} = start_orchestrator(startup_ready: true, work_control: Map.new(issues, &{&1.id, valid_work_item(&1)}))
+
+    [first_id, second_id, queued_id] = work_item_ids
+
+    assert {:ok, :scheduled} = Orchestrator.accept_plane_webhook(pid, webhook_identity("workitem.updated", 121, first_id, "project-1"))
+    assert_receive {:plane_provider_id_read_blocked, first_reader, [^first_id]}
+    assert {:ok, :scheduled} = Orchestrator.accept_plane_webhook(pid, webhook_identity("workitem.updated", 122, second_id, "project-1"))
+    assert_receive {:plane_provider_id_read_blocked, second_reader, [^second_id]}
+    assert {:ok, :scheduled} = Orchestrator.accept_plane_webhook(pid, webhook_identity("workitem.updated", 123, queued_id, "project-1"))
+
+    intent = :sys.get_state(pid).plane_webhook_pending[queued_id]
+
+    :sys.replace_state(pid, fn state ->
+      %{state | plane_webhook_latest_generation_by_item: Map.put(state.plane_webhook_latest_generation_by_item, queued_id, intent.host_generation - 1)}
+    end)
+
+    Application.put_env(:symphony_elixir, :plane_epoch_test_mode, :normal)
+    send(first_reader, :release_provider_id_read)
+
+    assert eventually(fn ->
+             state = :sys.get_state(pid)
+             not Map.has_key?(state.plane_webhook_pending, queued_id) and map_size(state.plane_webhook_tasks) == 1
+           end)
+
+    refute_receive {:plane_provider_id_read_blocked, _reader, [^queued_id]}, 50
+
+    send(second_reader, :release_provider_id_read)
+    assert eventually(fn -> map_size(:sys.get_state(pid).plane_webhook_tasks) == 0 end)
+
+    stop_orchestrator(pid, task_supervisor)
+  end
+
   test "one thousand events for a blocked item keep only one active read and one latest rerun" do
     workspace_id = uuid(171)
     project_id = uuid(172)
@@ -1057,22 +1207,22 @@ defmodule SymphonyElixir.OrchestratorPlaneEpochTest do
   end
 
   test "distinct-item bursts cap pending work and targeted tasks before using one full epoch" do
-    workspace_id = uuid(181)
-    project_id = uuid(182)
-    plane_workflow!(project_id, "", workspace_id: workspace_id)
+    workspace_id = "workspace-stable-1"
+    project_id = "project-1"
 
     issues =
-      for sequence <- 183..249 do
+      for sequence <- 183..1_182 do
         %{
           OrchestratorPlaneEpochFakeTracker.issue()
           | id: uuid(sequence),
             workspace_id: workspace_id,
-            project_id: project_id
+            project_id: project_id,
+            dispatchable: false
         }
       end
 
     Application.put_env(:symphony_elixir, :plane_epoch_test_graph_issues, issues)
-    Application.put_env(:symphony_elixir, :plane_epoch_test_mode, :block_provider_id_reads)
+    Application.put_env(:symphony_elixir, :plane_epoch_test_mode, :block_provider_id_reads_and_graph)
 
     work_control = Map.new(issues, &{&1.id, valid_work_item(&1)})
     {pid, task_supervisor} = start_orchestrator(startup_ready: true, work_control: work_control)
@@ -1097,12 +1247,31 @@ defmodule SymphonyElixir.OrchestratorPlaneEpochTest do
       if sequence <= 315, do: assert(result == {:ok, :scheduled}), else: assert(result == {:ok, :coalesced})
     end)
 
+    assert_receive {:plane_dependency_graph, graph_reader, _graph_opts}, 1_000
+
     state = :sys.get_state(pid)
     assert map_size(state.plane_webhook_tasks) == 2
     assert map_size(state.plane_webhook_pending) == 64
-    assert state.plane_webhook_full_epoch_dirty_generation == 67
+    assert :queue.len(state.plane_webhook_queue) == 64
+    assert state.plane_webhook_full_epoch_dirty_generation == 1_000
+    assert state.plane_epoch_task.coverage_generation == 67
+    assert length(Task.Supervisor.children(task_supervisor)) == 3
+    assert state.plane_webhook_metrics.coalesced == 934
 
     Application.put_env(:symphony_elixir, :plane_epoch_test_mode, :normal)
+    send(graph_reader, :release_graph)
+
+    assert eventually(fn ->
+             state = :sys.get_state(pid)
+             state.plane_epoch_coverage_generation >= 1_000 and is_nil(state.plane_epoch_task)
+           end)
+
+    state = :sys.get_state(pid)
+    assert map_size(state.plane_webhook_tasks) == 2
+    assert map_size(state.plane_webhook_pending) == 0
+    assert :queue.len(state.plane_webhook_queue) == 0
+    assert :atomics.get(Application.fetch_env!(:symphony_elixir, :plane_epoch_graph_fetch_counter), 1) == 2
+
     send(first_reader, :release_provider_id_read)
     send(second_reader, :release_provider_id_read)
 
@@ -1114,7 +1283,7 @@ defmodule SymphonyElixir.OrchestratorPlaneEpochTest do
              400
            )
 
-    assert :sys.get_state(pid).plane_webhook_metrics.coalesced == 1
+    assert :atomics.get(Application.fetch_env!(:symphony_elixir, :plane_epoch_issue_read_counter), 1) == 2
 
     stop_orchestrator(pid, task_supervisor)
   end
@@ -3125,7 +3294,7 @@ defmodule SymphonyElixir.OrchestratorPlaneEpochTest do
       read_scheduler: Keyword.get(opts, :read_scheduler, SymphonyElixir.Plane.ReadScheduler),
       agent_runner: Keyword.get(opts, :agent_runner, SymphonyElixir.OrchestratorPlaneEpochFakeRunner),
       transition_coordinator: Keyword.get(opts, :transition_coordinator, SymphonyElixir.TransitionCoordinator),
-      task_supervisor: task_supervisor,
+      task_supervisor: Keyword.get(opts, :task_supervisor, task_supervisor),
       work_control: Keyword.get(opts, :work_control, %{"plane-epoch-issue" => valid_work_item()}),
       attempt_ledger_status: :disabled,
       attempt_ledger_opts: Keyword.get(opts, :attempt_ledger_opts, []),

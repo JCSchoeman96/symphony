@@ -1707,8 +1707,39 @@ defmodule SymphonyElixir.Orchestrator do
           )
 
         state = %{state | plane_webhook_dedup: registry}
-        admit_claimed_plane_webhook(state, identity, classification, config, claim)
+
+        case claim do
+          :new_event -> safely_admit_new_plane_webhook(state, identity, classification, config)
+          _duplicate -> admit_claimed_plane_webhook(state, identity, classification, config, claim)
+        end
     end
+  end
+
+  defp safely_admit_new_plane_webhook(state, identity, classification, config) do
+    case admit_claimed_plane_webhook(state, identity, classification, config, :new_event) do
+      {{:error, _reason} = result, next_state} ->
+        {result, rollback_plane_webhook_claim(next_state, identity)}
+
+      result ->
+        result
+    end
+  rescue
+    _error ->
+      {{:error, :plane_webhook_unavailable}, rollback_plane_webhook_claim(state, identity)}
+  catch
+    _kind, _reason ->
+      {{:error, :plane_webhook_unavailable}, rollback_plane_webhook_claim(state, identity)}
+  end
+
+  defp rollback_plane_webhook_claim(
+         %State{plane_webhook_dedup: %WebhookDedupRegistry{} = registry} = state,
+         %EventIdentity{} = identity
+       ) do
+    %{state | plane_webhook_dedup: WebhookDedupRegistry.rollback(registry, identity)}
+  rescue
+    _error -> state
+  catch
+    _kind, _reason -> state
   end
 
   defp admit_claimed_plane_webhook(state, _identity, _classification, _config, :duplicate_delivery) do
@@ -1846,6 +1877,15 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp maybe_start_dirty_plane_epoch(%State{} = state) do
     if is_nil(state.plane_epoch_task), do: start_plane_epoch_acquisition(state), else: state
+  rescue
+    error -> plane_epoch_start_failed(state, {:exception, error})
+  catch
+    kind, reason -> plane_epoch_start_failed(state, {kind, reason})
+  end
+
+  defp plane_epoch_start_failed(%State{} = state, reason) do
+    Logger.warning("Unable to start Plane dependency epoch task: #{inspect(reason)}")
+    %{state | plane_epoch_status: :failed, plane_epoch_error: {:task_start_failed, reason}}
   end
 
   defp clear_covered_full_epoch_dirty(nil, _coverage_generation), do: nil
@@ -1957,6 +1997,12 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp start_plane_webhook_item_task(%State{} = state, %ReconciliationIntent{} = intent) do
+    do_start_plane_webhook_item_task(state, intent)
+  rescue
+    _error -> {:error, state}
+  end
+
+  defp do_start_plane_webhook_item_task(%State{} = state, %ReconciliationIntent{} = intent) do
     config = Config.settings!()
 
     if intent.config_fingerprint != plane_config_fingerprint(config) or
@@ -2003,6 +2049,7 @@ defmodule SymphonyElixir.Orchestrator do
             monitor_ref: Process.monitor(pid),
             task_ref: task_ref,
             work_item_id: issue_id,
+            identity: intent.identity,
             event: intent.event,
             generation: intent.host_generation,
             config_fingerprint: intent.config_fingerprint,
@@ -2026,8 +2073,10 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp safe_start_supervised_task(supervisor, fun) do
     Task.Supervisor.start_child(supervisor, fun)
+  rescue
+    error -> {:error, {:task_start_exception, error}}
   catch
-    :exit, reason -> {:error, reason}
+    kind, reason -> {:error, {kind, reason}}
   end
 
   defp fetch_plane_webhook_issue(tracker, issue_id, tracker_settings, scheduler, epoch_id) do
@@ -2068,6 +2117,7 @@ defmodule SymphonyElixir.Orchestrator do
       match?({:error, _reason}, result) ->
         state
         |> increment_plane_webhook_metric(:reconciliation_failed)
+        |> rollback_plane_webhook_claim(task.identity)
         |> drop_plane_webhook_intent(task.work_item_id, task.generation)
 
       true ->
@@ -2361,7 +2411,7 @@ defmodule SymphonyElixir.Orchestrator do
       :ok
     end
 
-    case Task.Supervisor.start_child(state.task_supervisor, task_fun) do
+    case safe_start_supervised_task(state.task_supervisor, task_fun) do
       {:ok, pid} ->
         monitor_ref = Process.monitor(pid)
 

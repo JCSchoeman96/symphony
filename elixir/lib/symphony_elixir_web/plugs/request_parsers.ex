@@ -22,11 +22,24 @@ defmodule SymphonyElixirWeb.Plugs.RequestParsers do
 
   @impl Plug
   @spec call(Conn.t(), keyword()) :: Conn.t()
-  def call(%Conn{method: "POST", request_path: @plane_webhook_path} = conn, _opts), do: conn
-
   def call(%Conn{} = conn, _opts) do
-    conn
-    |> Plug.Parsers.call(@parsers)
-    |> Plug.MethodOverride.call(@method_override)
+    if raw_plane_webhook_post?(conn) do
+      conn
+    else
+      conn
+      |> Plug.Parsers.call(@parsers)
+      |> Plug.MethodOverride.call(@method_override)
+    end
   end
+
+  defp raw_plane_webhook_post?(%Conn{method: "POST", request_path: request_path}) do
+    request_path
+    |> String.split("/", trim: true)
+    |> Enum.map(&decode_path_segment/1)
+    |> Kernel.==(@plane_webhook_path |> String.split("/", trim: true))
+  end
+
+  defp raw_plane_webhook_post?(_conn), do: false
+
+  defp decode_path_segment(segment), do: URI.decode(segment)
 end
