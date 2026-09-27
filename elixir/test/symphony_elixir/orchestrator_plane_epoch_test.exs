@@ -1119,6 +1119,88 @@ defmodule SymphonyElixir.OrchestratorPlaneEpochTest do
     stop_orchestrator(pid, task_supervisor)
   end
 
+  test "published full epochs remove superseded queue IDs during repeated distinct-item bursts" do
+    workspace_id = "workspace-stable-1"
+    project_id = "project-1"
+
+    issues =
+      for sequence <- 503..634 do
+        %{
+          OrchestratorPlaneEpochFakeTracker.issue()
+          | id: uuid(sequence),
+            identifier: "PLANE-#{sequence}",
+            workspace_id: workspace_id,
+            project_id: project_id
+        }
+      end
+
+    Application.put_env(:symphony_elixir, :plane_epoch_test_mode, :block_provider_id_reads)
+    {pid, task_supervisor} = start_orchestrator(startup_ready: true, work_control: Map.new(issues, &{&1.id, valid_work_item(&1)}))
+    starting_generation = :sys.get_state(pid).plane_reconciliation_generation
+
+    blocked_readers =
+      issues
+      |> Enum.take(2)
+      |> Enum.with_index(800)
+      |> Enum.map(fn {issue, event_sequence} ->
+        assert {:ok, :scheduled} =
+                 Orchestrator.accept_plane_webhook(
+                   pid,
+                   webhook_identity("workitem.updated", event_sequence, issue.id, project_id)
+                 )
+
+        assert_receive {:plane_provider_id_read_blocked, reader, [work_item_id]}
+        assert work_item_id == issue.id
+        reader
+      end)
+
+    cycles = [
+      {Enum.slice(issues, 2, 64), Enum.at(issues, 66)},
+      {Enum.slice(issues, 67, 64), Enum.at(issues, 131)}
+    ]
+
+    Enum.reduce(Enum.with_index(cycles), 802, fn {{pending_issues, overflow_issue}, cycle_index}, event_sequence ->
+      Enum.each(Enum.with_index(pending_issues, event_sequence), fn {issue, sequence} ->
+        assert {:ok, :scheduled} =
+                 Orchestrator.accept_plane_webhook(
+                   pid,
+                   webhook_identity("workitem.updated", sequence, issue.id, project_id)
+                 )
+      end)
+
+      assert map_size(:sys.get_state(pid).plane_webhook_pending) == 64
+
+      assert {:ok, :coalesced} =
+               Orchestrator.accept_plane_webhook(
+                 pid,
+                 webhook_identity("workitem.updated", event_sequence + 64, overflow_issue.id, project_id)
+               )
+
+      assert_receive {:plane_dependency_graph, _epoch_reader, _epoch_opts}, 1_000
+
+      coverage_generation = starting_generation + 67 + cycle_index * 65
+
+      assert eventually(fn ->
+               state = :sys.get_state(pid)
+               state.plane_epoch_coverage_generation >= coverage_generation and is_nil(state.plane_epoch_task)
+             end)
+
+      state = :sys.get_state(pid)
+      assert map_size(state.plane_webhook_tasks) == 2
+      assert map_size(state.plane_webhook_pending) == 0
+      assert :queue.len(state.plane_webhook_queue) == 0
+
+      event_sequence + 65
+    end)
+
+    Application.put_env(:symphony_elixir, :plane_epoch_test_mode, :normal)
+    Enum.each(blocked_readers, &send(&1, :release_provider_id_read))
+
+    assert eventually(fn -> map_size(:sys.get_state(pid).plane_webhook_tasks) == 0 end)
+
+    stop_orchestrator(pid, task_supervisor)
+  end
+
   test "an epoch started before a webhook generation is discarded and followed once" do
     Application.put_env(:symphony_elixir, :plane_epoch_test_mode, :block_graph)
     {pid, task_supervisor} = start_orchestrator(startup_ready: true)

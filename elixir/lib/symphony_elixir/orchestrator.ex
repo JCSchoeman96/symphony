@@ -1879,7 +1879,24 @@ defmodule SymphonyElixir.Orchestrator do
       end)
       |> Map.new()
 
-    %{state | plane_webhook_pending: pending, plane_webhook_latest_generation_by_item: latest}
+    queue =
+      state.plane_webhook_queue
+      |> :queue.to_list()
+      |> Enum.reduce({[], MapSet.new()}, fn work_item_id, {reversed_queue, queued_ids} ->
+        if Map.has_key?(pending, work_item_id) and not MapSet.member?(queued_ids, work_item_id) do
+          {[work_item_id | reversed_queue], MapSet.put(queued_ids, work_item_id)}
+        else
+          {reversed_queue, queued_ids}
+        end
+      end)
+      |> then(fn {reversed_queue, _queued_ids} -> reversed_queue |> Enum.reverse() |> :queue.from_list() end)
+
+    %{
+      state
+      | plane_webhook_pending: pending,
+        plane_webhook_latest_generation_by_item: latest,
+        plane_webhook_queue: queue
+    }
   end
 
   defp drain_plane_webhook_queue(%State{} = state) do
