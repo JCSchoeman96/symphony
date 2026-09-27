@@ -6,11 +6,11 @@
 |---|---|
 | `BASE_SHA` | `05fac06e771bbf1928e4975092741db0c94ecede` |
 | `BASE_TREE` | `09c4f133ee53e685e5d0f5a427f7df72e0985c8f` |
-| `FINAL_HEAD` | `05fac06e771bbf1928e4975092741db0c94ecede` (unchanged; no commit created) |
-| `FINAL_TREE` | `09c4f133ee53e685e5d0f5a427f7df72e0985c8f` is the unchanged `HEAD` tree. Candidate changes remain uncommitted, so they have no commit tree hash. |
-| `COMMITS` | None |
-| `PR_NUMBER` | N/A — local unpublished candidate |
-| Governance | H-070A remains accepted at PR #23. H-070B is an unaccepted local candidate in review. H-080A remains unauthorized. |
+| `FINAL_HEAD` | `be761300f99d8f9c6d86e16f0614a6145c8e9f0e` is the tested implementation commit. PR #24 adds a documentation-only follow-up for PR tracking. |
+| `FINAL_TREE` | `51ec976c626eb95454c8d94bc3e5b32908baf195` is the tree for the tested implementation commit above. |
+| `COMMITS` | `be761300f99d8f9c6d86e16f0614a6145c8e9f0e` (implementation); PR #24 also contains a documentation-only governance update. |
+| `PR_NUMBER` | [#24](https://github.com/JCSchoeman96/symphony/pull/24) — open against `main`. |
+| Governance | H-070A remains accepted at PR #23. H-070B is under review at PR #24 and is not accepted. H-080A remains unauthorized. |
 
 ## Implementation
 
