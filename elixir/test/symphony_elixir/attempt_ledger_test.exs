@@ -2,6 +2,8 @@ defmodule SymphonyElixir.AttemptLedgerTest do
   use ExUnit.Case
 
   alias SymphonyElixir.AgentRuntime.AttemptLedger
+  alias SymphonyElixir.AgentRuntime.RuntimeAttempt.Identity
+  alias SymphonyElixir.WorkControl.{ProviderObservation, SuspensionContext}
 
   @identity %{tracker_kind: "memory", provider_scope: %{project_slug: "test-project"}}
 
@@ -104,6 +106,19 @@ defmodule SymphonyElixir.AttemptLedgerTest do
 
     assert {:error, {:corrupt_attempt_record, {:current, "issue-a"}, :invalid_record}} =
              AttemptLedger.open("project-a", @identity, path: path)
+
+    invalid_fence =
+      snapshot("project-a", "issue-a", "lineage-a", %{})
+      |> Map.put(:in_flight, true)
+      |> Map.put(:authority_fence, %{state: :unknown})
+
+    seed(path, [
+      {{:meta, "project-a"}, metadata("project-a", @identity)},
+      {{:current, "issue-a"}, invalid_fence}
+    ])
+
+    assert {:error, {:corrupt_attempt_record, {:current, "issue-a"}, :invalid_record}} =
+             AttemptLedger.open("project-a", @identity, path: path)
   end
 
   test "rejects a real DETS record missing in_flight", %{path: path} do
@@ -174,8 +189,446 @@ defmodule SymphonyElixir.AttemptLedgerTest do
     {:ok, reopened} = AttemptLedger.open("project-a", @identity, path: path)
     assert {:ok, %{in_flight: true}} = AttemptLedger.current(reopened, "issue-a")
     assert {:error, :attempt_in_flight} = AttemptLedger.begin_attempt(reopened, "issue-a")
-    assert :ok = AttemptLedger.clear_in_flight(reopened, "issue-a", updated_at: 1_700_000_000_001)
-    assert {:ok, %{in_flight: false}} = AttemptLedger.current(reopened, "issue-a")
+
+    assert {:error, :authority_fence_unresolved} =
+             AttemptLedger.clear_in_flight(reopened, "issue-a", updated_at: 1_700_000_000_001)
+
+    assert {:ok, %{in_flight: true, authority_fence: %{state: :armed}}} = AttemptLedger.current(reopened, "issue-a")
+    assert :ok = AttemptLedger.close(reopened)
+  end
+
+  test "reservation binds a durable authority fence before it can be released", %{path: path} do
+    {:ok, ledger} = AttemptLedger.open("project-a", @identity, path: path)
+
+    assert {:ok, armed} = AttemptLedger.begin_attempt(ledger, "issue-a", route_fingerprint: "route-a")
+    assert armed.in_flight
+    assert armed.authority_fence == %{state: :armed}
+    assert {:error, :authority_fence_unresolved} = AttemptLedger.clear_in_flight(ledger, "issue-a")
+
+    identity = %Identity{
+      runtime_attempt_id: "runtime-a",
+      work_item_id: "issue-a",
+      lineage_generation: armed.lineage_id,
+      responsibility: "implementation",
+      runtime_profile: "implementation"
+    }
+
+    assert {:ok, bound} = AttemptLedger.bind_runtime_attempt(ledger, "issue-a", identity)
+    assert bound.authority_fence.state == :bound
+    assert bound.authority_fence.runtime_attempt == identity
+    assert bound.authority_fence.route_fingerprint == "route-a"
+    assert {:error, :authority_fence_unresolved} = AttemptLedger.clear_in_flight(ledger, "issue-a")
+    assert {:error, :authority_fence_unresolved} = AttemptLedger.release_armed_authority_fence(ledger, "issue-a")
+
+    assert :ok = AttemptLedger.release_authority_fence(ledger, "issue-a", identity)
+
+    assert {:ok, %{authority_fence: %{state: :released}, in_flight: true}} =
+             AttemptLedger.current(ledger, "issue-a")
+
+    assert :ok = AttemptLedger.release_authority_fence(ledger, "issue-a", identity)
+
+    assert :ok = AttemptLedger.clear_in_flight(ledger, "issue-a")
+
+    assert {:ok, %{authority_fence: %{state: :released}, in_flight: false}} =
+             AttemptLedger.current(ledger, "issue-a")
+
+    assert {:error, :authority_fence_terminal} = AttemptLedger.bind_runtime_attempt(ledger, "issue-a", identity)
+    assert :ok = AttemptLedger.close(ledger)
+  end
+
+  test "an ARMED reservation can be retired after restart before any runtime was bound", %{path: path} do
+    {:ok, ledger} = AttemptLedger.open("project-a", @identity, path: path)
+
+    assert {:ok, reserved = %{authority_fence: %{state: :armed}, in_flight: true}} =
+             AttemptLedger.begin_attempt(ledger, "issue-a")
+
+    assert :ok = AttemptLedger.release_armed_authority_fence(ledger, "issue-a")
+
+    assert {:ok, %{authority_fence: %{state: :released}, in_flight: true}} =
+             AttemptLedger.current(ledger, "issue-a")
+
+    assert :ok = AttemptLedger.release_armed_authority_fence(ledger, "issue-a")
+    assert :ok = AttemptLedger.clear_in_flight(ledger, "issue-a")
+
+    assert {:error, :authority_fence_terminal} =
+             AttemptLedger.bind_runtime_attempt(ledger, "issue-a", %Identity{
+               runtime_attempt_id: "runtime-too-late",
+               work_item_id: "issue-a",
+               lineage_generation: reserved.lineage_id,
+               responsibility: "implementation",
+               runtime_profile: "implementation"
+             })
+
+    assert :ok = AttemptLedger.close(ledger)
+  end
+
+  test "put and release preserve the fence transition order", %{path: path} do
+    {:ok, ledger} = AttemptLedger.open("project-a", @identity, path: path)
+    assert {:ok, armed} = AttemptLedger.begin_attempt(ledger, "issue-a")
+    assert {:error, :attempt_in_flight} = AttemptLedger.fence_attempt(ledger, "issue-a")
+    assert :ok = AttemptLedger.put(ledger, armed)
+
+    replaced_fence = %{armed | authority_fence: %{state: :released}}
+    assert {:error, :authority_fence_transition_invalid} = AttemptLedger.put(ledger, replaced_fence)
+
+    premature_clear = %{armed | in_flight: false}
+    assert {:error, :authority_fence_unresolved} = AttemptLedger.put(ledger, premature_clear)
+
+    assert :ok = AttemptLedger.release_armed_authority_fence(ledger, "issue-a")
+    assert {:ok, released} = AttemptLedger.current(ledger, "issue-a")
+    assert :ok = AttemptLedger.put(ledger, %{released | in_flight: false})
+
+    assert {:ok, %{in_flight: false, authority_fence: %{state: :released}}} =
+             AttemptLedger.current(ledger, "issue-a")
+
+    assert :ok = AttemptLedger.close(ledger)
+  end
+
+  test "authority fence operations reject invalid identities and conflicting suspension intent", %{path: path} do
+    {:ok, ledger} = AttemptLedger.open("project-a", @identity, path: path)
+    assert {:ok, armed} = AttemptLedger.begin_attempt(ledger, "issue-a")
+
+    identity = %Identity{
+      runtime_attempt_id: "runtime-a",
+      work_item_id: "issue-a",
+      lineage_generation: armed.lineage_id,
+      responsibility: "implementation",
+      runtime_profile: "implementation"
+    }
+
+    wrong_identity = %{identity | responsibility: "review", runtime_profile: "review"}
+    assert {:error, :invalid_runtime_attempt_identity} = AttemptLedger.bind_runtime_attempt(ledger, "issue-a", %{})
+    assert {:ok, _bound} = AttemptLedger.bind_runtime_attempt(ledger, "issue-a", identity)
+    assert {:error, :authority_fence_transition_invalid} = AttemptLedger.bind_runtime_attempt(ledger, "issue-a", identity)
+
+    assert {:error, :runtime_attempt_identity_mismatch} =
+             AttemptLedger.release_authority_fence(ledger, "issue-a", wrong_identity)
+
+    assert {:error, :invalid_runtime_attempt_identity} = AttemptLedger.release_authority_fence(ledger, "issue-a", %{})
+
+    assert {:error, :invalid_suspension_intent} =
+             AttemptLedger.mark_suspension_pending(ledger, "issue-a", identity, %{})
+
+    observed_at = ~U[2026-09-27 00:00:00Z]
+
+    observation = %ProviderObservation{
+      provider: :memory,
+      work_item_id: "issue-a",
+      provider_state_name: "In Progress",
+      observed_at: observed_at
+    }
+
+    intent = %{
+      reason: :provider_blocked,
+      provider_observation: observation,
+      required_evidence: [],
+      created_at: observed_at
+    }
+
+    assert {:error, :runtime_attempt_identity_mismatch} =
+             AttemptLedger.mark_suspension_pending(ledger, "issue-a", wrong_identity, intent)
+
+    assert {:ok, _pending} = AttemptLedger.mark_suspension_pending(ledger, "issue-a", identity, intent)
+    conflicting_intent = %{intent | required_evidence: [:operator_review]}
+
+    assert {:error, :suspension_intent_conflict} =
+             AttemptLedger.mark_suspension_pending(ledger, "issue-a", identity, conflicting_intent)
+
+    assert {:error, :authority_fence_unresolved} = AttemptLedger.release_authority_fence(ledger, "issue-a", identity)
+    assert {:error, :authority_fence_unresolved} = AttemptLedger.release_armed_authority_fence(ledger, "issue-a")
+
+    assert {:error, :suspension_context_not_terminal} =
+             AttemptLedger.release_suspension_fence(ledger, "issue-a", identity, %{})
+
+    assert :ok = AttemptLedger.close(ledger)
+  end
+
+  test "pending suspension fence is idempotent and releases only with matching terminal context", %{path: path} do
+    {:ok, ledger} = AttemptLedger.open("project-a", @identity, path: path)
+    assert {:ok, armed} = AttemptLedger.begin_attempt(ledger, "issue-a", route_fingerprint: "route-a")
+
+    identity = %Identity{
+      runtime_attempt_id: "runtime-a",
+      work_item_id: "issue-a",
+      lineage_generation: armed.lineage_id,
+      responsibility: "implementation",
+      runtime_profile: "implementation"
+    }
+
+    assert {:ok, _bound} = AttemptLedger.bind_runtime_attempt(ledger, "issue-a", identity)
+    observed_at = ~U[2026-09-27 00:00:00Z]
+
+    observation = %ProviderObservation{
+      provider: :memory,
+      work_item_id: "issue-a",
+      provider_state_name: "In Progress",
+      observed_at: observed_at
+    }
+
+    intent = %{
+      reason: :provider_blocked,
+      provider_observation: observation,
+      required_evidence: [],
+      created_at: observed_at
+    }
+
+    assert {:ok, pending} = AttemptLedger.mark_suspension_pending(ledger, "issue-a", identity, intent)
+    assert pending.authority_fence.state == :suspension_pending
+    assert {:ok, ^pending} = AttemptLedger.mark_suspension_pending(ledger, "issue-a", identity, intent)
+    assert {:error, :authority_fence_unresolved} = AttemptLedger.clear_in_flight(ledger, "issue-a")
+
+    {:ok, open_context} =
+      SuspensionContext.new(%{
+        work_item_id: "issue-a",
+        suspension_id: pending.authority_fence.intent.suspension_id,
+        last_validated_lifecycle_state: :in_progress,
+        provider_observation: observation,
+        reason: :provider_blocked,
+        lineage_generation: armed.lineage_id,
+        created_at: observed_at,
+        recovery_policy: :fresh_reconciliation,
+        required_evidence: [],
+        resume_target: :in_progress
+      })
+
+    {:ok, resolving_context} = SuspensionContext.begin_resolution(open_context)
+
+    {:ok, resolved_context} =
+      SuspensionContext.resolve(resolving_context, %{
+        fresh_reconciliation: true,
+        resume_target: :in_progress,
+        required_evidence: []
+      })
+
+    assert {:error, :suspension_context_not_terminal} =
+             AttemptLedger.release_suspension_fence(ledger, "issue-a", identity, open_context)
+
+    assert :ok = AttemptLedger.release_suspension_fence(ledger, "issue-a", identity, resolved_context)
+
+    assert {:ok, %{authority_fence: %{state: :released}, in_flight: true}} =
+             AttemptLedger.current(ledger, "issue-a")
+
+    assert :ok = AttemptLedger.release_suspension_fence(ledger, "issue-a", identity, resolved_context)
+
+    assert :ok = AttemptLedger.close(ledger)
+  end
+
+  test "pending suspension fence rejects terminal context from another runtime in the same lineage", %{path: path} do
+    {:ok, ledger} = AttemptLedger.open("project-a", @identity, path: path)
+    assert {:ok, armed} = AttemptLedger.begin_attempt(ledger, "issue-a")
+
+    current_identity = %Identity{
+      runtime_attempt_id: "runtime-current",
+      work_item_id: "issue-a",
+      lineage_generation: armed.lineage_id,
+      responsibility: "implementation",
+      runtime_profile: "implementation"
+    }
+
+    assert {:ok, _bound} = AttemptLedger.bind_runtime_attempt(ledger, "issue-a", current_identity)
+
+    observed_at = ~U[2026-09-27 00:00:00Z]
+
+    observation = %ProviderObservation{
+      provider: :memory,
+      work_item_id: "issue-a",
+      provider_state_name: "In Progress",
+      observed_at: observed_at
+    }
+
+    intent = %{
+      reason: :provider_blocked,
+      provider_observation: observation,
+      required_evidence: [],
+      created_at: observed_at
+    }
+
+    assert {:ok, _pending} =
+             AttemptLedger.mark_suspension_pending(ledger, "issue-a", current_identity, intent)
+
+    assert {:ok, stale_terminal} =
+             SuspensionContext.new(%{
+               work_item_id: "issue-a",
+               last_validated_lifecycle_state: :in_progress,
+               provider_observation: observation,
+               reason: :provider_blocked,
+               lineage_generation: armed.lineage_id,
+               created_at: observed_at,
+               recovery_policy: :fresh_reconciliation,
+               required_evidence: [],
+               resume_target: :in_progress,
+               suspension_id: "suspension-stale",
+               status: :resolved
+             })
+
+    assert {:error, :suspension_context_mismatch} =
+             AttemptLedger.release_suspension_fence(ledger, "issue-a", current_identity, stale_terminal)
+
+    assert {:error, :suspension_context_mismatch} =
+             AttemptLedger.release_suspension_fence(
+               ledger,
+               "issue-a",
+               current_identity,
+               %{stale_terminal | suspension_id: nil}
+             )
+
+    assert {:ok, current_record} = AttemptLedger.current(ledger, "issue-a")
+    assert current_record.in_flight
+    assert current_record.authority_fence.state == :suspension_pending
+    assert current_record.authority_fence.runtime_attempt == current_identity
+
+    assert {:error, :authority_fence_unresolved} = AttemptLedger.clear_in_flight(ledger, "issue-a")
+    assert :ok = AttemptLedger.close(ledger)
+  end
+
+  test "legacy in-flight records remain readable but cannot be cleared", %{path: path} do
+    legacy_in_flight = snapshot("project-a", "issue-a", "lineage-a", %{}) |> Map.put(:in_flight, true)
+    legacy_released = snapshot("project-a", "issue-b", "lineage-b", %{})
+
+    seed(path, [
+      {{:meta, "project-a"}, metadata("project-a", @identity)},
+      {{:current, "issue-a"}, legacy_in_flight},
+      {{:current, "issue-b"}, legacy_released}
+    ])
+
+    {:ok, ledger} = AttemptLedger.open("project-a", @identity, path: path)
+    assert {:ok, ^legacy_in_flight} = AttemptLedger.current(ledger, "issue-a")
+    assert {:error, :authority_fence_unresolved} = AttemptLedger.clear_in_flight(ledger, "issue-a")
+    assert {:ok, ^legacy_released} = AttemptLedger.current(ledger, "issue-b")
+    assert :ok = AttemptLedger.clear_in_flight(ledger, "issue-b")
+    assert :ok = AttemptLedger.close(ledger)
+  end
+
+  test "pending write and sync failures retain a non-releaseable fence after reopen", %{path: path} do
+    observed_at = ~U[2026-09-27 00:00:00Z]
+
+    observation = %ProviderObservation{
+      provider: :memory,
+      work_item_id: "issue-a",
+      provider_state_name: "In Progress",
+      observed_at: observed_at
+    }
+
+    intent = %{
+      reason: :provider_blocked,
+      provider_observation: observation,
+      required_evidence: [],
+      created_at: observed_at
+    }
+
+    write_path = String.replace_suffix(path, ".dets", "-write.dets")
+    {:ok, write_ledger} = AttemptLedger.open("project-a", @identity, path: write_path)
+    {:ok, armed} = AttemptLedger.begin_attempt(write_ledger, "issue-a")
+
+    identity = %Identity{
+      runtime_attempt_id: "runtime-write",
+      work_item_id: "issue-a",
+      lineage_generation: armed.lineage_id,
+      responsibility: "implementation",
+      runtime_profile: "implementation"
+    }
+
+    {:ok, _} = AttemptLedger.bind_runtime_attempt(write_ledger, "issue-a", identity)
+    failing_write = %{write_ledger | write_fun: fn _table, _records -> {:error, :disk_full} end}
+
+    assert {:error, {:ledger_write_failed, :disk_full}} =
+             AttemptLedger.mark_suspension_pending(failing_write, "issue-a", identity, intent)
+
+    assert {:ok, %{authority_fence: %{state: :bound}, in_flight: true}} = AttemptLedger.current(write_ledger, "issue-a")
+    assert :ok = AttemptLedger.close(write_ledger)
+    {:ok, write_reopened} = AttemptLedger.open("project-a", @identity, path: write_path)
+    assert {:error, :authority_fence_unresolved} = AttemptLedger.clear_in_flight(write_reopened, "issue-a")
+    assert {:ok, %{authority_fence: %{state: :bound}, in_flight: true}} = AttemptLedger.current(write_reopened, "issue-a")
+    assert :ok = AttemptLedger.close(write_reopened)
+
+    sync_path = String.replace_suffix(path, ".dets", "-sync.dets")
+    {:ok, sync_ledger} = AttemptLedger.open("project-a", @identity, path: sync_path)
+    {:ok, sync_armed} = AttemptLedger.begin_attempt(sync_ledger, "issue-a")
+    sync_identity = %{identity | runtime_attempt_id: "runtime-sync", lineage_generation: sync_armed.lineage_id}
+    {:ok, _} = AttemptLedger.bind_runtime_attempt(sync_ledger, "issue-a", sync_identity)
+    failing_sync = %{sync_ledger | sync_fun: fn _table -> {:error, :disk_sync_failed} end}
+
+    assert {:error, {:ledger_sync_failed, :disk_sync_failed}} =
+             AttemptLedger.mark_suspension_pending(failing_sync, "issue-a", sync_identity, intent)
+
+    assert :ok = AttemptLedger.close(sync_ledger)
+    {:ok, sync_reopened} = AttemptLedger.open("project-a", @identity, path: sync_path)
+    assert {:error, :authority_fence_unresolved} = AttemptLedger.clear_in_flight(sync_reopened, "issue-a")
+
+    assert {:ok, %{authority_fence: %{state: :suspension_pending}, in_flight: true}} =
+             AttemptLedger.current(sync_reopened, "issue-a")
+
+    assert :ok = AttemptLedger.close(sync_reopened)
+  end
+
+  test "release write failure preserves the fence and clear failure is retryable", %{path: path} do
+    {:ok, ledger} = AttemptLedger.open("project-a", @identity, path: path)
+    {:ok, armed} = AttemptLedger.begin_attempt(ledger, "issue-a")
+
+    identity = %Identity{
+      runtime_attempt_id: "runtime-release-failure",
+      work_item_id: "issue-a",
+      lineage_generation: armed.lineage_id,
+      responsibility: "implementation",
+      runtime_profile: "implementation"
+    }
+
+    {:ok, _} = AttemptLedger.bind_runtime_attempt(ledger, "issue-a", identity)
+
+    failing_write = %{ledger | write_fun: fn _table, _records -> {:error, :disk_full} end}
+
+    assert {:error, {:ledger_write_failed, :disk_full}} =
+             AttemptLedger.release_authority_fence(failing_write, "issue-a", identity)
+
+    assert {:ok, %{in_flight: true, authority_fence: %{state: :bound}}} = AttemptLedger.current(ledger, "issue-a")
+    assert :ok = AttemptLedger.close(ledger)
+
+    {:ok, reopened} = AttemptLedger.open("project-a", @identity, path: path)
+    assert {:error, :authority_fence_unresolved} = AttemptLedger.clear_in_flight(reopened, "issue-a")
+    assert :ok = AttemptLedger.release_authority_fence(reopened, "issue-a", identity)
+    failing_clear = %{reopened | write_fun: fn _table, _records -> {:error, :clear_disk_full} end}
+    assert {:error, {:ledger_write_failed, :clear_disk_full}} = AttemptLedger.clear_in_flight(failing_clear, "issue-a")
+    assert {:ok, %{in_flight: true, authority_fence: %{state: :released}}} = AttemptLedger.current(reopened, "issue-a")
+    assert :ok = AttemptLedger.clear_in_flight(reopened, "issue-a")
+    assert {:ok, %{in_flight: false, authority_fence: %{state: :released}}} = AttemptLedger.current(reopened, "issue-a")
+    assert :ok = AttemptLedger.close(reopened)
+  end
+
+  test "release sync failure is retained for a healthy reopen", %{path: path} do
+    {:ok, ledger} = AttemptLedger.open("project-a", @identity, path: path)
+    {:ok, armed} = AttemptLedger.begin_attempt(ledger, "issue-a")
+
+    identity = %Identity{
+      runtime_attempt_id: "runtime-release-sync-failure",
+      work_item_id: "issue-a",
+      lineage_generation: armed.lineage_id,
+      responsibility: "implementation",
+      runtime_profile: "implementation"
+    }
+
+    {:ok, _} = AttemptLedger.bind_runtime_attempt(ledger, "issue-a", identity)
+    failing_sync = %{ledger | sync_fun: fn _table -> {:error, :release_sync_failed} end}
+
+    assert {:error, {:ledger_sync_failed, :release_sync_failed}} =
+             AttemptLedger.release_authority_fence(failing_sync, "issue-a", identity)
+
+    assert {:ok, %{in_flight: true, authority_fence: %{state: :released}}} =
+             AttemptLedger.current(ledger, "issue-a")
+
+    assert {:error, {:ledger_sync_failed, :release_sync_failed}} =
+             AttemptLedger.clear_in_flight(failing_sync, "issue-a")
+
+    assert {:ok, %{in_flight: true, authority_fence: %{state: :released}}} =
+             AttemptLedger.current(failing_sync, "issue-a")
+
+    assert :ok = AttemptLedger.close(ledger)
+
+    {:ok, reopened} = AttemptLedger.open("project-a", @identity, path: path)
+
+    assert {:ok, %{in_flight: true, authority_fence: %{state: :released}}} =
+             AttemptLedger.current(reopened, "issue-a")
+
+    assert :ok = AttemptLedger.clear_in_flight(reopened, "issue-a")
     assert :ok = AttemptLedger.close(reopened)
   end
 
@@ -229,21 +682,26 @@ defmodule SymphonyElixir.AttemptLedgerTest do
     assert {:error, :invalid_attempt_arguments} = AttemptLedger.clear_in_flight(:invalid, "issue-a")
 
     assert :ok = AttemptLedger.put(ledger, valid)
-    assert {:ok, %{in_flight: true}} = AttemptLedger.fence_attempt(ledger, "issue-a")
-    assert :ok = AttemptLedger.clear_in_flight(ledger, "issue-a")
-    assert {:ok, %{in_flight: true}} = AttemptLedger.begin_attempt(ledger, "issue-a")
+    assert {:ok, %{in_flight: true, authority_fence: %{state: :armed}}} = AttemptLedger.fence_attempt(ledger, "issue-a")
+    assert {:error, :authority_fence_unresolved} = AttemptLedger.clear_in_flight(ledger, "issue-a")
     assert {:error, :attempt_in_flight} = AttemptLedger.begin_attempt(ledger, "issue-a")
-    assert :ok = AttemptLedger.clear_in_flight(ledger, "issue-a")
-    assert :ok = AttemptLedger.clear_in_flight(ledger, "issue-a")
-    assert :ok = AttemptLedger.close_lineage(ledger, "issue-a")
-    assert :ok = AttemptLedger.clear_in_flight(ledger, "issue-a")
-    assert {:ok, %{in_flight: true}} = AttemptLedger.begin_attempt(ledger, "issue-a")
-    assert :ok = AttemptLedger.clear_in_flight(ledger, "issue-a")
-    assert :ok = AttemptLedger.close_lineage(ledger, "issue-a")
-    assert {:ok, %{in_flight: true}} = AttemptLedger.fence_attempt(ledger, "issue-a")
-    assert :ok = AttemptLedger.clear_in_flight(ledger, "issue-a")
+    assert {:ok, record} = AttemptLedger.current(ledger, "issue-a")
 
-    assert {:ok, %{in_flight: true}} = AttemptLedger.fence_attempt(ledger, "missing")
+    identity = %Identity{
+      runtime_attempt_id: "runtime-a",
+      work_item_id: "issue-a",
+      lineage_generation: record.lineage_id,
+      responsibility: "implementation",
+      runtime_profile: "implementation"
+    }
+
+    assert {:ok, _} = AttemptLedger.bind_runtime_attempt(ledger, "issue-a", identity)
+    assert :ok = AttemptLedger.release_authority_fence(ledger, "issue-a", identity)
+    assert :ok = AttemptLedger.clear_in_flight(ledger, "issue-a")
+    assert {:ok, %{in_flight: true, authority_fence: %{state: :armed}}} = AttemptLedger.begin_attempt(ledger, "issue-a")
+    assert {:error, :authority_fence_unresolved} = AttemptLedger.clear_in_flight(ledger, "issue-a")
+
+    assert {:ok, %{in_flight: true, authority_fence: %{state: :armed}}} = AttemptLedger.fence_attempt(ledger, "missing")
     assert :ok = AttemptLedger.clear_in_flight(ledger, "never-started")
 
     exhausted = snapshot("project-a", "exhausted", "lineage-exhausted", %{ordinary_failures: 4, ordinary_retries: 3})
@@ -310,6 +768,7 @@ defmodule SymphonyElixir.AttemptLedgerTest do
     assert rearmed.status == :open
     assert rearmed.lineage_id != exhausted.lineage_id
     assert rearmed.safety_counters == %{ordinary_failures: 0, ordinary_retries: 0, review_cycles: 0}
+    assert rearmed.authority_fence == nil
     assert rearmed.rearm_reason == "verified provider state"
     assert rearmed.rearmed_by == "operator@example.com"
     assert rearmed.rearmed_at == 1_700_000_000_000

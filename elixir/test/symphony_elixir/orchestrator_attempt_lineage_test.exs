@@ -13,7 +13,7 @@ defmodule SymphonyElixir.OrchestratorAttemptLineageTest do
   use SymphonyElixir.TestSupport
 
   alias SymphonyElixir.AgentRuntime.AttemptLedger
-  alias SymphonyElixir.AgentRuntime.{Route, Router}
+  alias SymphonyElixir.AgentRuntime.{Route, Router, RuntimeAttempt}
   alias SymphonyElixir.AgentRuntime.RuntimeAttempt.Identity, as: RuntimeAttemptIdentity
   alias SymphonyElixir.WorkControl.RecoveryLedger
   alias SymphonyElixir.WorkControl.SuspensionRecovery
@@ -746,7 +746,7 @@ defmodule SymphonyElixir.OrchestratorAttemptLineageTest do
            end)
   end
 
-  test "does not schedule a retry when a safety snapshot sync fails" do
+  test "does not start an agent when the durable RuntimeAttempt bind sync fails" do
     project_id = "sync-failure-#{System.unique_integer([:positive])}"
     issue = active_issue("sync-failure-issue")
     ledger_root = temporary_ledger_root()
@@ -781,14 +781,18 @@ defmodule SymphonyElixir.OrchestratorAttemptLineageTest do
       Application.delete_env(:symphony_elixir, :attempt_ledger_test_pid)
     end)
 
-    assert_receive {:attempt_ledger_runner_started, ^issue_id, _opts}, 1_000
+    refute_receive {:attempt_ledger_runner_started, ^issue_id, _opts}, 300
 
     assert eventually(fn ->
              state = :sys.get_state(pid)
 
-             state.retry_attempts == %{} and
-               String.contains?(to_string(get_in(state.blocked, [issue_id, :error])), "attempt ledger")
+             String.contains?(to_string(get_in(state.blocked, [issue_id, :error])), "attempt ledger")
            end)
+
+    assert {:ok, %{in_flight: true, authority_fence: %{state: fence_state}}} =
+             AttemptLedger.current(:sys.get_state(pid).attempt_ledger, issue_id)
+
+    assert fence_state in [:armed, :bound]
   end
 
   test "keeps a sync-failed ledger blocked when recovery resync fails again" do
@@ -1008,6 +1012,14 @@ defmodule SymphonyElixir.OrchestratorAttemptLineageTest do
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [terminal_issue, unrelated_issue])
     seed_snapshot(path, project_id, terminal_issue.id, %{ordinary_failures: 2, ordinary_retries: 2})
 
+    route = Route.legacy(%{terminal_issue | state: "In Progress"})
+
+    {:ok, seed_ledger} = AttemptLedger.open(project_id, Tracker.identity(Config.settings!().tracker), path: path)
+    assert {:ok, reserved} = AttemptLedger.begin_attempt(seed_ledger, terminal_issue.id, route_fingerprint: route.fingerprint)
+    runtime_identity = RuntimeAttemptIdentity.allocate(terminal_issue.id, route, reserved.lineage_id)
+    assert {:ok, %{authority_fence: %{state: :bound}}} = AttemptLedger.bind_runtime_attempt(seed_ledger, terminal_issue.id, runtime_identity)
+    assert :ok = AttemptLedger.close(seed_ledger)
+
     {:ok, ledger} =
       AttemptLedger.open(project_id, Tracker.identity(Config.settings!().tracker),
         path: path,
@@ -1036,10 +1048,13 @@ defmodule SymphonyElixir.OrchestratorAttemptLineageTest do
             ref: nil,
             identifier: terminal_issue.identifier,
             issue: terminal_issue,
+            runtime_attempt: RuntimeAttempt.new(runtime_identity, :running),
             started_at: DateTime.utc_now()
           }
         },
         claimed: MapSet.new([terminal_issue.id]),
+        durable_in_flight: MapSet.new([terminal_issue.id]),
+        attempt_lineages: %{terminal_issue.id => reserved.lineage_id},
         retry_attempts: %{
           "queued-after-terminal-fence" => %{
             attempt: 1,
@@ -1098,6 +1113,12 @@ defmodule SymphonyElixir.OrchestratorAttemptLineageTest do
 
     assert eventually(fn -> :sys.get_state(first_pid).blocked[issue_id] != nil end)
     refute_receive {:attempt_ledger_runner_started, ^issue_id, _opts}, 300
+
+    first_state = :sys.get_state(first_pid)
+
+    assert {:ok, %{in_flight: true, authority_fence: %{state: :armed}}} =
+             AttemptLedger.current(first_state.attempt_ledger, issue_id)
+
     :ok = GenServer.stop(first_pid)
 
     second_name = Module.concat(__MODULE__, "InitialWriteSecond#{System.unique_integer([:positive])}")
@@ -1117,7 +1138,15 @@ defmodule SymphonyElixir.OrchestratorAttemptLineageTest do
     end)
 
     assert_receive {:attempt_ledger_runner_started, ^issue_id, second_opts}, 1_000
-    assert %RuntimeAttemptIdentity{} = second_opts[:runtime_attempt_identity]
+    restarted_state = :sys.get_state(second_pid)
+
+    runtime_identity = second_opts[:runtime_attempt_identity]
+    assert RuntimeAttemptIdentity.valid?(runtime_identity)
+
+    assert {:ok, %{authority_fence: %{state: fence_state, runtime_attempt: ^runtime_identity}}} =
+             AttemptLedger.current(restarted_state.attempt_ledger, issue_id)
+
+    assert fence_state in [:bound, :released]
   end
 
   test "does not reuse an old ledger identity while reconciliation is blocked" do
@@ -1161,7 +1190,7 @@ defmodule SymphonyElixir.OrchestratorAttemptLineageTest do
     assert updated.attempt_ledger_status == expected_status
   end
 
-  test "holds an in-flight reservation across restart when failure persistence fails" do
+  test "retires an ARMED reservation after runtime binding persistence fails" do
     project_id = "in-flight-restart-#{System.unique_integer([:positive])}"
     issue = active_issue("in-flight-restart-issue")
     ledger_root = temporary_ledger_root()
@@ -1190,10 +1219,14 @@ defmodule SymphonyElixir.OrchestratorAttemptLineageTest do
     {:ok, first_pid} = start_orchestrator(first_name, attempt_ledger_opts: [write_fun: write_fun])
     issue_id = issue.id
 
-    assert_receive {:attempt_ledger_runner_started, ^issue_id, first_opts}, 1_000
-    assert %RuntimeAttemptIdentity{} = first_opts[:runtime_attempt_identity]
-    first_runtime_attempt_id = first_opts[:runtime_attempt_identity].runtime_attempt_id
+    refute_receive {:attempt_ledger_runner_started, ^issue_id, _first_opts}, 300
     assert eventually(fn -> :sys.get_state(first_pid).blocked[issue_id] != nil end)
+
+    first_state = :sys.get_state(first_pid)
+
+    assert {:ok, %{in_flight: true, authority_fence: %{state: :armed}}} =
+             AttemptLedger.current(first_state.attempt_ledger, issue_id)
+
     :ok = GenServer.stop(first_pid)
 
     second_name = Module.concat(__MODULE__, "InFlightSecond#{System.unique_integer([:positive])}")
@@ -1212,8 +1245,15 @@ defmodule SymphonyElixir.OrchestratorAttemptLineageTest do
     end)
 
     assert_receive {:attempt_ledger_runner_started, ^issue_id, second_opts}, 1_000
-    assert %RuntimeAttemptIdentity{} = second_opts[:runtime_attempt_identity]
-    refute second_opts[:runtime_attempt_identity].runtime_attempt_id == first_runtime_attempt_id
+    restarted_state = :sys.get_state(second_pid)
+
+    runtime_identity = second_opts[:runtime_attempt_identity]
+    assert RuntimeAttemptIdentity.valid?(runtime_identity)
+
+    assert {:ok, %{authority_fence: %{state: fence_state, runtime_attempt: ^runtime_identity}}} =
+             AttemptLedger.current(restarted_state.attempt_ledger, issue_id)
+
+    assert fence_state in [:bound, :released]
   end
 
   test "retries a pending terminal close before reopening autonomous dispatch" do
@@ -1308,12 +1348,17 @@ defmodule SymphonyElixir.OrchestratorAttemptLineageTest do
 
     {:ok, ledger} = AttemptLedger.open(project_id, Tracker.identity(Config.settings!().tracker), path: path)
 
-    assert {:ok, %{status: :open, in_flight: true}} =
-             AttemptLedger.persist_safety(ledger, issue.id, counters,
-               status: :open,
-               in_flight: true,
-               updated_at: 1_700_000_000_000
-             )
+    assert {:ok, reserved} = AttemptLedger.begin_attempt(ledger, issue.id, route_fingerprint: "review-exhaustion-route")
+
+    runtime_identity = %RuntimeAttemptIdentity{
+      runtime_attempt_id: "review-exhaustion-runtime",
+      work_item_id: issue.id,
+      lineage_generation: reserved.lineage_id,
+      responsibility: "implementation",
+      runtime_profile: "implementation"
+    }
+
+    assert {:ok, _bound} = AttemptLedger.bind_runtime_attempt(ledger, issue.id, runtime_identity)
 
     {:ok, previous_route} = Router.resolve(trusted_work_item(issue), Config.settings!().agent.profiles)
 
@@ -1327,6 +1372,7 @@ defmodule SymphonyElixir.OrchestratorAttemptLineageTest do
         issue.id => %{
           pid: nil,
           ref: nil,
+          runtime_attempt: RuntimeAttempt.new(runtime_identity, :running),
           identifier: issue.identifier,
           issue: issue,
           route: previous_route,

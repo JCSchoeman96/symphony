@@ -2137,6 +2137,17 @@ defmodule SymphonyElixir.OrchestratorStartupReconciliationTest do
     assert {:ok, in_flight_record} = AttemptLedger.fence_attempt(attempt_ledger, work_item_id)
     assert in_flight_record.in_flight
 
+    runtime_identity = %SymphonyElixir.AgentRuntime.RuntimeAttempt.Identity{
+      runtime_attempt_id: "startup-order-runtime",
+      work_item_id: work_item_id,
+      lineage_generation: in_flight_record.lineage_id,
+      responsibility: "implementation",
+      runtime_profile: "implementation"
+    }
+
+    assert {:ok, _bound} = AttemptLedger.bind_runtime_attempt(attempt_ledger, work_item_id, runtime_identity)
+    assert :ok = AttemptLedger.release_authority_fence(attempt_ledger, work_item_id, runtime_identity)
+
     stale_state = %{
       reconciled_state
       | attempt_ledger: attempt_ledger,
@@ -2144,62 +2155,130 @@ defmodule SymphonyElixir.OrchestratorStartupReconciliationTest do
     }
 
     assert {:ok, cleared_state} = Orchestrator.clear_stale_in_flight_for_test(stale_state, work_item_id)
-    assert {:ok, %{in_flight: false}} = AttemptLedger.current(attempt_ledger, work_item_id)
+
+    assert {:ok, %{in_flight: false, authority_fence: %{state: :released}}} =
+             AttemptLedger.current(attempt_ledger, work_item_id)
+
     refute MapSet.member?(cleared_state.durable_in_flight, work_item_id)
+
+    unresolved_ledger_root = ledger_root <> "-pending"
+    {:ok, unresolved_ledger} = AttemptLedger.open(project_id, identity, root: unresolved_ledger_root)
+
+    on_exit(fn ->
+      AttemptLedger.close(unresolved_ledger)
+      File.rm_rf(unresolved_ledger_root)
+    end)
+
+    {:ok, unresolved_record} = AttemptLedger.fence_attempt(unresolved_ledger, work_item_id)
+
+    pending_intent = %{
+      reason: :conflict,
+      provider_observation: observation,
+      required_evidence: [],
+      created_at: observed_at
+    }
+
+    {:ok, _} =
+      AttemptLedger.bind_runtime_attempt(
+        unresolved_ledger,
+        work_item_id,
+        %{runtime_identity | lineage_generation: unresolved_record.lineage_id}
+      )
+
+    unresolved_identity = %{runtime_identity | lineage_generation: unresolved_record.lineage_id}
+
+    {:ok, _} =
+      AttemptLedger.mark_suspension_pending(
+        unresolved_ledger,
+        work_item_id,
+        unresolved_identity,
+        pending_intent
+      )
 
     unresolved_suspension_state = %{
       stale_state
-      | recovery_checkpoints: state.recovery_checkpoints
+      | attempt_ledger: unresolved_ledger,
+        recovery_checkpoints: state.recovery_checkpoints
     }
 
     assert {:ok, blocked_stale_state} =
              Orchestrator.clear_stale_in_flight_for_test(unresolved_suspension_state, work_item_id)
 
     assert blocked_stale_state.durable_blocked[work_item_id] == :stale_in_flight_suspension_unresolved
-    assert {:ok, %{in_flight: false}} = AttemptLedger.current(attempt_ledger, work_item_id)
+
+    assert {:ok, %{in_flight: true, authority_fence: %{state: :suspension_pending}}} =
+             AttemptLedger.current(unresolved_ledger, work_item_id)
+
+    fresh_released_state = fn suffix ->
+      fresh_root = ledger_root <> suffix
+      {:ok, fresh_ledger} = AttemptLedger.open(project_id, identity, root: fresh_root)
+
+      on_exit(fn ->
+        AttemptLedger.close(fresh_ledger)
+        File.rm_rf(fresh_root)
+      end)
+
+      {:ok, fresh_record} = AttemptLedger.fence_attempt(fresh_ledger, work_item_id)
+
+      fresh_identity = %{
+        runtime_identity
+        | runtime_attempt_id: "runtime-#{suffix}",
+          lineage_generation: fresh_record.lineage_id
+      }
+
+      {:ok, _} = AttemptLedger.bind_runtime_attempt(fresh_ledger, work_item_id, fresh_identity)
+      :ok = AttemptLedger.release_authority_fence(fresh_ledger, work_item_id, fresh_identity)
+      %{stale_state | attempt_ledger: fresh_ledger, durable_in_flight: MapSet.new([work_item_id])}
+    end
 
     stale_in_flight_cases = [
-      {
-        %{stale_state | durable_exhausted: %{work_item_id => "lineage-old"}},
-        :stale_in_flight_lineage_exhausted
-      },
-      {
-        %{stale_state | transition_reconciliation_candidates: [candidate]},
-        :stale_in_flight_transition_unresolved
-      },
-      {%{stale_state | work_control: %{}}, :stale_in_flight_work_item_unavailable},
+      {%{durable_exhausted: %{work_item_id => "lineage-old"}}, :stale_in_flight_lineage_exhausted},
+      {%{transition_reconciliation_candidates: [candidate]}, :stale_in_flight_transition_unresolved},
+      {%{work_control: %{}}, :stale_in_flight_work_item_unavailable},
       {
         %{
-          stale_state
-          | work_control: %{
-              work_item_id => %{work_item | lifecycle_assessment: %{assessment | status: :stale}}
-            }
+          work_control: %{
+            work_item_id => %{work_item | lifecycle_assessment: %{assessment | status: :stale}}
+          }
         },
         :stale_in_flight_lifecycle_unvalidated
       },
-      {
-        %{stale_state | dependency_diagnostics: %{work_item_id => %{allowed?: false}}},
-        :stale_in_flight_dependency_unavailable
-      }
+      {%{dependency_diagnostics: %{work_item_id => %{allowed?: false}}}, :stale_in_flight_dependency_unavailable}
     ]
 
-    for {unsafe_state, expected_reason} <- stale_in_flight_cases do
+    for {{updates, expected_reason}, index} <- Enum.with_index(stale_in_flight_cases) do
+      unsafe_state = Map.merge(fresh_released_state.("-unsafe-#{index}"), updates)
       assert {:ok, blocked_state} = Orchestrator.clear_stale_in_flight_for_test(unsafe_state, work_item_id)
       assert blocked_state.durable_blocked[work_item_id] == expected_reason
       assert MapSet.member?(blocked_state.durable_in_flight, work_item_id)
+
+      assert {:ok, %{in_flight: true, authority_fence: %{state: :released}}} =
+               AttemptLedger.current(unsafe_state.attempt_ledger, work_item_id)
     end
 
-    running_state = %{stale_state | running: %{work_item_id => self()}}
+    running_state = %{fresh_released_state.("-running") | running: %{work_item_id => self()}}
     assert {:ok, still_running_state} = Orchestrator.clear_stale_in_flight_for_test(running_state, work_item_id)
     assert MapSet.member?(still_running_state.durable_in_flight, work_item_id)
 
+    assert {:ok, %{in_flight: true, authority_fence: %{state: :released}}} =
+             AttemptLedger.current(running_state.attempt_ledger, work_item_id)
+
+    unavailable_base = fresh_released_state.("-unavailable")
+
     assert {:blocked, unavailable_attempt_ledger_state, {:stale_in_flight_attempt_ledger_unavailable, ^work_item_id}} =
-             Orchestrator.clear_stale_in_flight_for_test(%{stale_state | attempt_ledger: nil}, work_item_id)
+             Orchestrator.clear_stale_in_flight_for_test(%{unavailable_base | attempt_ledger: nil}, work_item_id)
 
     assert MapSet.member?(unavailable_attempt_ledger_state.durable_in_flight, work_item_id)
 
-    assert {:ok, _in_flight_record} = AttemptLedger.fence_attempt(attempt_ledger, work_item_id)
-    failing_attempt_ledger = %{attempt_ledger | write_fun: fn _table, _records -> {:error, :disk_full} end}
+    assert {:ok, %{in_flight: true, authority_fence: %{state: :released}}} =
+             AttemptLedger.current(unavailable_base.attempt_ledger, work_item_id)
+
+    failed_clear_base = fresh_released_state.("-clear-failure")
+
+    failing_attempt_ledger = %{
+      failed_clear_base.attempt_ledger
+      | write_fun: fn _table, _records -> {:error, :disk_full} end
+    }
 
     assert {:blocked, clear_failed_state,
             {
@@ -2208,7 +2287,7 @@ defmodule SymphonyElixir.OrchestratorStartupReconciliationTest do
               {:ledger_write_failed, :disk_full}
             }} =
              Orchestrator.clear_stale_in_flight_for_test(
-               %{stale_state | attempt_ledger: failing_attempt_ledger},
+               %{failed_clear_base | attempt_ledger: failing_attempt_ledger},
                work_item_id
              )
 
@@ -2216,6 +2295,9 @@ defmodule SymphonyElixir.OrchestratorStartupReconciliationTest do
              {:blocked, {:attempt_ledger_unavailable, {:ledger_write_failed, :disk_full}}},
              clear_failed_state.attempt_ledger_status
            )
+
+    assert {:ok, %{in_flight: true, authority_fence: %{state: :released}}} =
+             AttemptLedger.current(failed_clear_base.attempt_ledger, work_item_id)
 
     assert {:unresolved, ^state} =
              Orchestrator.reconcile_startup_transition_candidate_for_test(state, :invalid, %{})
