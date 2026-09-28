@@ -377,6 +377,9 @@ defmodule SymphonyElixir.OrchestratorPlaneEpochTest do
   use SymphonyElixir.TestSupport
 
   alias SymphonyElixir.AgentRuntime.AttemptLedger
+  alias SymphonyElixir.AgentRuntime.Route
+  alias SymphonyElixir.AgentRuntime.RuntimeAttempt
+  alias SymphonyElixir.AgentRuntime.RuntimeAttempt.Identity
   alias SymphonyElixir.Dependency.Graph
   alias SymphonyElixir.OrchestratorPlaneEpochFakeTracker
   alias SymphonyElixir.Plane.WebhookDelivery.EventIdentity
@@ -1879,7 +1882,7 @@ defmodule SymphonyElixir.OrchestratorPlaneEpochTest do
     send(pid, :run_poll_cycle)
     assert_receive {:plane_project_snapshot, _opening_snapshot_task, _opening_snapshot_opts}, 1_000
     assert_receive {:plane_dependency_graph, _initial_graph_task, _initial_graph_opts}, 1_000
-    assert_receive {:plane_project_snapshot, _initial_closing_snapshot_task, _initial_closing_snapshot_opts}, 1_000
+    assert_receive {:plane_project_snapshot, _closing_snapshot_task, _initial_closing_snapshot_opts}, 1_000
     assert_receive {:fake_plane_agent_started, first_agent, ^issue_id}, 2_000
     assert eventually(fn -> Map.has_key?(:sys.get_state(pid).running, issue_id) end)
 
@@ -1937,6 +1940,53 @@ defmodule SymphonyElixir.OrchestratorPlaneEpochTest do
     assert :atomics.get(Application.fetch_env!(:symphony_elixir, :plane_epoch_graph_fetch_counter), 1) == 3
 
     send(second_agent, :release_agent)
+    stop_orchestrator(pid, task_supervisor)
+  end
+
+  @tag timeout: 15_000
+  test "a child start failure releases BOUND before scheduling a retry" do
+    issue = OrchestratorPlaneEpochFakeTracker.issue()
+    root = Path.join(System.tmp_dir!(), "symphony-plane-spawn-failure-#{System.unique_integer([:positive])}")
+    attempt_path = Path.join(root, "attempt-ledger.dets")
+    {:ok, no_child_supervisor} = Task.Supervisor.start_link(max_children: 0)
+    on_exit(fn -> if Process.alive?(no_child_supervisor), do: Process.exit(no_child_supervisor, :shutdown) end)
+
+    {pid, task_supervisor} =
+      start_orchestrator(
+        startup_ready: true,
+        work_control: %{issue.id => valid_work_item(issue)},
+        attempt_ledger_status: :ready,
+        attempt_ledger_opts: [path: attempt_path]
+      )
+
+    on_exit(fn -> File.rm_rf(root) end)
+    state = :sys.get_state(pid)
+    route = Route.legacy(issue)
+    assert {:ok, armed} = AttemptLedger.begin_attempt(state.attempt_ledger, issue.id, route_fingerprint: route.fingerprint)
+    assert armed.authority_fence == %{state: :armed}
+
+    runtime_identity = Identity.allocate(issue.id, route, armed.lineage_id)
+    runtime_attempt = RuntimeAttempt.new(runtime_identity, :starting)
+
+    state = %{
+      state
+      | task_supervisor: no_child_supervisor,
+        durable_in_flight: MapSet.put(state.durable_in_flight, issue.id),
+        claimed: MapSet.put(state.claimed, issue.id)
+    }
+
+    state = Orchestrator.spawn_prepared_issue_for_test(state, issue, route, 0, self(), nil, runtime_attempt)
+
+    assert Map.has_key?(state.retry_attempts, issue.id)
+    assert state.running == %{}
+    assert state.retry_attempts[issue.id].attempt == 1
+    refute MapSet.member?(state.durable_in_flight, issue.id)
+
+    assert {:ok, %{in_flight: false, authority_fence: %{state: :released}}} =
+             AttemptLedger.current(state.attempt_ledger, issue.id)
+
+    refute_receive {:fake_plane_agent_started, _agent, _issue_id}, 50
+
     stop_orchestrator(pid, task_supervisor)
   end
 
@@ -2021,7 +2071,10 @@ defmodule SymphonyElixir.OrchestratorPlaneEpochTest do
     assert_receive {:plane_project_snapshot, _reappearing_snapshot_task, _reappearing_snapshot_opts}, 1_000
     assert_receive {:plane_dependency_graph, _reappearing_graph_task, _reappearing_graph_opts}, 1_000
     assert_receive {:plane_project_snapshot, _reappearing_closing_task, _reappearing_closing_opts}, 1_000
-    assert_receive {:fake_plane_agent_started, reappearing_agent, "plane-epoch-issue"}, 2_000
+
+    assert_receive {:fake_plane_agent_started, reappearing_agent, "plane-epoch-issue"},
+                   2_000,
+                   "reappearance state: #{inspect({Map.take(:sys.get_state(pid), [:attempt_ledger_status, :running, :retry_attempts, :blocked, :claimed, :durable_in_flight, :durable_blocked]), AttemptLedger.current(:sys.get_state(pid).attempt_ledger, issue.id)})}"
 
     assert eventually(fn -> Map.has_key?(:sys.get_state(pid).running, issue.id) end)
     reappearing_state = :sys.get_state(pid)
@@ -2034,7 +2087,186 @@ defmodule SymphonyElixir.OrchestratorPlaneEpochTest do
   end
 
   @tag timeout: 15_000
-  test "Plane dependency block keeps its durable fence when clearing it fails" do
+  test "current runtime dependency block releases its clean durable fence" do
+    issue = OrchestratorPlaneEpochFakeTracker.issue()
+    Application.put_env(:symphony_elixir, :plane_epoch_test_graph_issues, [issue])
+
+    root = Path.join(System.tmp_dir!(), "symphony-plane-runtime-dependency-block-#{System.unique_integer([:positive])}")
+    attempt_path = Path.join(root, "attempt-ledger.dets")
+
+    {pid, task_supervisor} =
+      start_orchestrator(
+        startup_ready: true,
+        work_control: %{issue.id => valid_work_item(issue)},
+        attempt_ledger_status: :ready,
+        attempt_ledger_opts: [path: attempt_path]
+      )
+
+    on_exit(fn -> File.rm_rf(root) end)
+    send(pid, :run_poll_cycle)
+
+    assert_receive {:plane_project_snapshot, _snapshot_task, _snapshot_opts}, 1_000
+    assert_receive {:plane_dependency_graph, _graph_task, _graph_opts}, 1_000
+    assert_receive {:plane_project_snapshot, _closing_snapshot_task, _closing_snapshot_opts}, 1_000
+    assert_receive {:fake_plane_agent_started, agent_pid, issue_id}, 2_000
+    assert issue_id == issue.id
+    assert eventually(fn -> Map.has_key?(:sys.get_state(pid).running, issue.id) end)
+
+    state = :sys.get_state(pid)
+    identity = state.running[issue.id].runtime_attempt.identity
+
+    assert {:ok, %{in_flight: true, authority_fence: %{state: :bound, runtime_attempt: ^identity}}} =
+             AttemptLedger.current(state.attempt_ledger, issue.id)
+
+    send(pid, {:runtime_attempt_session_started, issue.id, identity})
+    assert eventually(fn -> :sys.get_state(pid).running[issue.id].runtime_attempt.state == :running end)
+
+    send(pid, {:agent_dependency_blocked, issue.id, identity, %{allowed?: false, reason: :blocked}})
+
+    assert eventually(fn ->
+             next = :sys.get_state(pid)
+
+             not Map.has_key?(next.running, issue.id) and Map.has_key?(next.blocked, issue.id) and
+               not Process.alive?(agent_pid)
+           end),
+           "dependency block state: #{inspect(Map.take(:sys.get_state(pid), [:attempt_ledger_status, :running, :blocked, :durable_in_flight, :durable_blocked]))}"
+
+    blocked = :sys.get_state(pid)
+    assert blocked.attempt_ledger_status == :ready
+    assert not MapSet.member?(blocked.durable_in_flight, issue.id)
+
+    assert {:ok, %{in_flight: false, authority_fence: %{state: :released, runtime_attempt: ^identity}}} =
+             AttemptLedger.current(blocked.attempt_ledger, issue.id)
+
+    stop_orchestrator(pid, task_supervisor)
+  end
+
+  @tag timeout: 15_000
+  test "current runtime dependency block keeps its fence when release persistence fails" do
+    issue = OrchestratorPlaneEpochFakeTracker.issue()
+    Application.put_env(:symphony_elixir, :plane_epoch_test_graph_issues, [issue])
+
+    root = Path.join(System.tmp_dir!(), "symphony-plane-runtime-dependency-release-failure-#{System.unique_integer([:positive])}")
+    attempt_path = Path.join(root, "attempt-ledger.dets")
+
+    {pid, task_supervisor} =
+      start_orchestrator(
+        startup_ready: true,
+        work_control: %{issue.id => valid_work_item(issue)},
+        attempt_ledger_status: :ready,
+        attempt_ledger_opts: [path: attempt_path]
+      )
+
+    on_exit(fn -> File.rm_rf(root) end)
+    send(pid, :run_poll_cycle)
+
+    assert_receive {:plane_project_snapshot, _snapshot_task, _snapshot_opts}, 1_000
+    assert_receive {:plane_dependency_graph, _graph_task, _graph_opts}, 1_000
+    assert_receive {:plane_project_snapshot, _closing_snapshot_task, _closing_snapshot_opts}, 1_000
+    assert_receive {:fake_plane_agent_started, agent_pid, issue_id}, 2_000
+    assert issue_id == issue.id
+    assert eventually(fn -> Map.has_key?(:sys.get_state(pid).running, issue.id) end)
+
+    state = :sys.get_state(pid)
+    identity = state.running[issue.id].runtime_attempt.identity
+
+    :sys.replace_state(pid, fn current ->
+      failing_ledger = %{current.attempt_ledger | write_fun: fn _table, _records -> {:error, :disk_full} end}
+      %{current | attempt_ledger: failing_ledger}
+    end)
+
+    send(pid, {:runtime_attempt_session_started, issue.id, identity})
+    assert eventually(fn -> :sys.get_state(pid).running[issue.id].runtime_attempt.state == :running end)
+    send(pid, {:agent_dependency_blocked, issue.id, identity, %{allowed?: false, reason: :blocked}})
+
+    assert eventually(fn ->
+             next = :sys.get_state(pid)
+
+             not Map.has_key?(next.running, issue.id) and Map.has_key?(next.blocked, issue.id) and
+               not Process.alive?(agent_pid)
+           end)
+
+    blocked = :sys.get_state(pid)
+    assert blocked.attempt_ledger_status == blocked_authority_fence_release({:ledger_write_failed, :disk_full})
+    assert MapSet.member?(blocked.durable_in_flight, issue.id)
+
+    assert {:ok, %{in_flight: true, authority_fence: %{state: :bound, runtime_attempt: ^identity}}} =
+             AttemptLedger.current(blocked.attempt_ledger, issue.id)
+
+    refute Orchestrator.autonomous_dispatch_allowed_for_test?(blocked)
+
+    stop_orchestrator(pid, task_supervisor)
+  end
+
+  @tag timeout: 15_000
+  test "a released fence remains in flight when the later clear write fails" do
+    issue = OrchestratorPlaneEpochFakeTracker.issue()
+    Application.put_env(:symphony_elixir, :plane_epoch_test_graph_issues, [issue])
+
+    root = Path.join(System.tmp_dir!(), "symphony-plane-runtime-clear-failure-#{System.unique_integer([:positive])}")
+    attempt_path = Path.join(root, "attempt-ledger.dets")
+
+    {pid, task_supervisor} =
+      start_orchestrator(
+        startup_ready: true,
+        work_control: %{issue.id => valid_work_item(issue)},
+        attempt_ledger_status: :ready,
+        attempt_ledger_opts: [path: attempt_path]
+      )
+
+    on_exit(fn -> File.rm_rf(root) end)
+    send(pid, :run_poll_cycle)
+
+    assert_receive {:plane_project_snapshot, _snapshot_task, _snapshot_opts}, 1_000
+    assert_receive {:plane_dependency_graph, _graph_task, _graph_opts}, 1_000
+    assert_receive {:plane_project_snapshot, _closing_snapshot_task, _closing_snapshot_opts}, 1_000
+    assert_receive {:fake_plane_agent_started, agent_pid, issue_id}, 2_000
+    assert issue_id == issue.id
+    assert eventually(fn -> Map.has_key?(:sys.get_state(pid).running, issue.id) end)
+
+    state = :sys.get_state(pid)
+    identity = state.running[issue.id].runtime_attempt.identity
+
+    :sys.replace_state(pid, fn current ->
+      write_fun = fn table, records ->
+        if Enum.any?(records, fn
+             {{:current, _issue_id}, %{in_flight: false}} -> true
+             _other -> false
+           end) do
+          {:error, :clear_disk_full}
+        else
+          :dets.insert(table, records)
+        end
+      end
+
+      %{current | attempt_ledger: %{current.attempt_ledger | write_fun: write_fun}}
+    end)
+
+    send(agent_pid, :fail_agent)
+
+    assert eventually(fn ->
+             next = :sys.get_state(pid)
+
+             not Map.has_key?(next.running, issue.id) and Map.has_key?(next.blocked, issue.id) and
+               match?({:blocked, _}, next.attempt_ledger_status)
+           end)
+
+    blocked = :sys.get_state(pid)
+
+    assert blocked.attempt_ledger_status ==
+             {:blocked, {:attempt_ledger_unavailable, {:ledger_write_failed, :clear_disk_full}}}
+
+    assert MapSet.member?(blocked.durable_in_flight, issue.id)
+
+    assert {:ok, %{in_flight: true, authority_fence: %{state: :released, runtime_attempt: ^identity}}} =
+             AttemptLedger.current(blocked.attempt_ledger, issue.id)
+
+    refute Orchestrator.autonomous_dispatch_allowed_for_test?(blocked)
+    stop_orchestrator(pid, task_supervisor)
+  end
+
+  @tag timeout: 15_000
+  test "Plane dependency block keeps its durable fence when release persistence fails" do
     issue = OrchestratorPlaneEpochFakeTracker.issue()
     blocker = %{hd(OrchestratorPlaneEpochFakeTracker.active_issues(1)) | id: "plane-blocker", identifier: "PLANE-BLOCKER", dispatchable: false}
     Application.put_env(:symphony_elixir, :plane_epoch_test_graph_issues, [issue, blocker])
@@ -2079,13 +2311,20 @@ defmodule SymphonyElixir.OrchestratorPlaneEpochTest do
     assert eventually(fn ->
              state = :sys.get_state(pid)
              not Map.has_key?(state.running, issue.id) and match?({:blocked, _}, state.attempt_ledger_status)
-           end)
+           end),
+           "failed teardown state: #{inspect({Map.take(:sys.get_state(pid), [:attempt_ledger_status, :running, :retry_attempts, :blocked, :claimed, :durable_in_flight, :durable_blocked]), AttemptLedger.current(:sys.get_state(pid).attempt_ledger, issue.id)})}"
 
     state = :sys.get_state(pid)
-    assert state.attempt_ledger_status == {:blocked, {:attempt_ledger_unavailable, {:ledger_write_failed, :disk_full}}}
+
+    assert state.attempt_ledger_status ==
+             blocked_authority_fence_release({:ledger_write_failed, :disk_full})
+
     assert MapSet.member?(state.durable_in_flight, issue.id)
-    assert Map.get(state.blocked[issue.id], :attempt_ledger_recovery_pending?, false)
-    assert {:ok, %{in_flight: true}} = AttemptLedger.current(state.attempt_ledger, issue.id)
+    refute match?(%{attempt_ledger_recovery_pending?: true}, Map.get(state.blocked, issue.id))
+
+    assert {:ok, %{in_flight: true, authority_fence: %{state: :bound}}} =
+             AttemptLedger.current(state.attempt_ledger, issue.id)
+
     assert eventually(fn -> not Process.alive?(agent_pid) end)
     refute Orchestrator.autonomous_dispatch_allowed_for_test?(state)
     assert :atomics.get(Application.fetch_env!(:symphony_elixir, :plane_epoch_issue_read_counter), 1) == 0
@@ -2094,7 +2333,7 @@ defmodule SymphonyElixir.OrchestratorPlaneEpochTest do
   end
 
   @tag timeout: 15_000
-  test "missing running Plane issue keeps its durable fence when the AttemptLedger clear fails" do
+  test "missing running Plane issue keeps its durable fence when release persistence fails" do
     issue = OrchestratorPlaneEpochFakeTracker.issue()
     issue_id = issue.id
     Application.put_env(:symphony_elixir, :plane_epoch_test_graph_issues, [issue])
@@ -2131,12 +2370,20 @@ defmodule SymphonyElixir.OrchestratorPlaneEpochTest do
     assert eventually(fn ->
              state = :sys.get_state(pid)
              not Map.has_key?(state.running, issue.id) and match?({:blocked, _}, state.attempt_ledger_status)
-           end)
+           end),
+           "missing Plane issue teardown state: #{inspect({Map.take(:sys.get_state(pid), [:attempt_ledger_status, :running, :retry_attempts, :blocked, :claimed, :durable_in_flight, :durable_blocked]), AttemptLedger.current(:sys.get_state(pid).attempt_ledger, issue.id)})}"
 
     state = :sys.get_state(pid)
-    assert state.attempt_ledger_status == {:blocked, {:attempt_ledger_unavailable, {:ledger_write_failed, :disk_full}}}
+
+    assert state.attempt_ledger_status ==
+             blocked_authority_fence_release({:ledger_write_failed, :disk_full})
+
     assert MapSet.member?(state.durable_in_flight, issue.id)
-    assert {:ok, %{in_flight: true}} = AttemptLedger.current(state.attempt_ledger, issue.id)
+    refute match?(%{attempt_ledger_recovery_pending?: true}, Map.get(state.blocked, issue.id))
+
+    assert {:ok, %{in_flight: true, authority_fence: %{state: :bound}}} =
+             AttemptLedger.current(state.attempt_ledger, issue.id)
+
     assert eventually(fn -> not Process.alive?(agent_pid) end)
     refute Orchestrator.autonomous_dispatch_allowed_for_test?(state)
     assert :atomics.get(Application.fetch_env!(:symphony_elixir, :plane_epoch_issue_read_counter), 1) == 0
@@ -2701,6 +2948,7 @@ defmodule SymphonyElixir.OrchestratorPlaneEpochTest do
     root = Path.join(System.tmp_dir!(), "symphony-plane-partial-ledger-#{System.unique_integer([:positive])}")
     path = Path.join(root, "attempt-ledger.dets")
     records_before = seed_in_flight_attempt_records!(path, all_issue_ids)
+    assert Enum.all?(records_before, fn {_issue_id, record} -> record.authority_fence == %{state: :armed} end)
 
     {pid, task_supervisor} =
       start_orchestrator(
@@ -2724,14 +2972,31 @@ defmodule SymphonyElixir.OrchestratorPlaneEpochTest do
            "partial Plane ledger state: #{inspect(Map.take(:sys.get_state(pid), [:plane_epoch_status, :attempt_ledger_status, :durable_blocked, :durable_in_flight]))}"
 
     state = :sys.get_state(pid)
-    assert state.durable_blocked[missing_issue_id] == {:attempt_ledger_issue_missing, missing_issue_id}
+    assert {:ok, missing_record} = AttemptLedger.current(state.attempt_ledger, missing_issue_id)
+    refute Map.has_key?(state.durable_blocked, missing_issue_id)
 
     for issue <- visible_issues do
       assert not Map.has_key?(state.durable_blocked, issue.id)
-      assert MapSet.member?(state.durable_in_flight, issue.id)
-      assert {:ok, %{lineage_id: lineage_id, in_flight: true}} = AttemptLedger.current(state.attempt_ledger, issue.id)
-      assert lineage_id == records_before[issue.id].lineage_id
+      assert {:ok, record} = AttemptLedger.current(state.attempt_ledger, issue.id)
+      assert record.lineage_id == records_before[issue.id].lineage_id
+
+      case Map.get(state.running, issue.id) do
+        %{runtime_attempt: %RuntimeAttempt{identity: identity}} ->
+          assert record.in_flight
+          assert record.authority_fence.state == :bound
+          assert record.authority_fence.runtime_attempt == identity
+          assert identity.lineage_generation == record.lineage_id
+          assert MapSet.member?(state.durable_in_flight, issue.id)
+
+        nil ->
+          assert record.in_flight == false
+          assert record.authority_fence.state == :released
+          refute MapSet.member?(state.durable_in_flight, issue.id)
+      end
     end
+
+    assert missing_record.in_flight == false
+    assert missing_record.authority_fence.state == :released
 
     assert :atomics.get(Application.fetch_env!(:symphony_elixir, :plane_epoch_issue_read_counter), 1) == 0
     assert :atomics.get(Application.fetch_env!(:symphony_elixir, :plane_epoch_graph_fetch_counter), 1) == 1
@@ -2740,7 +3005,7 @@ defmodule SymphonyElixir.OrchestratorPlaneEpochTest do
   end
 
   @tag timeout: 20_000
-  test "Plane startup missing lineage reappears through stale in-flight recovery before dispatch" do
+  test "Plane startup safely retires ARMED lineage before reappearance dispatch" do
     issue = OrchestratorPlaneEpochFakeTracker.issue()
     issue_id = issue.id
     Application.put_env(:symphony_elixir, :plane_epoch_test_graph_issues, [])
@@ -2749,6 +3014,7 @@ defmodule SymphonyElixir.OrchestratorPlaneEpochTest do
     path = Path.join(root, "attempt-ledger.dets")
     plane_workflow!("project-1", "", workspace_root: workspace_root)
     records_before = seed_in_flight_attempt_records!(path, [issue.id])
+    assert records_before[issue.id].authority_fence == %{state: :armed}
     sync_count = :atomics.new(1, [])
     recovery_root = Path.join(root, "recovery")
     seed_plane_epoch_recovery_checkpoint!(recovery_root, issue)
@@ -2776,8 +3042,11 @@ defmodule SymphonyElixir.OrchestratorPlaneEpochTest do
            "startup recovery state: #{inspect(Map.take(:sys.get_state(pid), [:startup_reconciliation, :attempt_ledger_status, :startup_cleanup_error, :work_control, :durable_in_flight, :durable_blocked, :dependency_diagnostics, :dependency_graph, :plane_epoch_status]))}"
 
     initial_state = :sys.get_state(pid)
-    assert initial_state.durable_blocked[issue.id] == {:attempt_ledger_issue_missing, issue.id}
-    assert MapSet.member?(initial_state.durable_in_flight, issue.id)
+    refute Map.has_key?(initial_state.durable_blocked, issue.id)
+    refute MapSet.member?(initial_state.durable_in_flight, issue.id)
+
+    assert {:ok, %{in_flight: false, authority_fence: %{state: :released}}} =
+             AttemptLedger.current(initial_state.attempt_ledger, issue.id)
 
     :sys.replace_state(pid, fn state ->
       %{state | durable_blocked: Map.put(state.durable_blocked, "plane-unrelated-hold", :operator_hold)}
@@ -2814,6 +3083,134 @@ defmodule SymphonyElixir.OrchestratorPlaneEpochTest do
 
     send(agent_pid, :release_agent)
     stop_orchestrator(pid, task_supervisor)
+  end
+
+  @tag timeout: 15_000
+  test "startup keeps an ARMED reservation when RELEASED persistence fails" do
+    issue = OrchestratorPlaneEpochFakeTracker.issue()
+    Application.put_env(:symphony_elixir, :plane_epoch_test_graph_issues, [])
+    root = Path.join(System.tmp_dir!(), "symphony-plane-armed-release-failure-#{System.unique_integer([:positive])}")
+    workspace_root = Path.join(root, "workspaces")
+    path = Path.join(root, "attempt-ledger.dets")
+    recovery_root = Path.join(root, "recovery")
+    plane_workflow!("project-1", "", workspace_root: workspace_root)
+    seed_plane_epoch_recovery_checkpoint!(recovery_root, issue)
+    records = seed_in_flight_attempt_records!(path, [issue.id])
+    assert records[issue.id].authority_fence == %{state: :armed}
+    {:ok, coordinator} = SymphonyElixir.OrchestratorPlaneEpochStartupCoordinator.start_link()
+    on_exit(fn -> if Process.alive?(coordinator), do: GenServer.stop(coordinator) end)
+
+    {pid, task_supervisor} =
+      start_orchestrator(
+        work_control: %{issue.id => valid_work_item(issue)},
+        attempt_ledger_status: :ready,
+        recovery_ledger_status: :ready,
+        recovery_ledger_opts: [root: recovery_root],
+        transition_coordinator: coordinator,
+        attempt_ledger_opts: [path: path]
+      )
+
+    on_exit(fn -> File.rm_rf(root) end)
+
+    :sys.replace_state(pid, fn state ->
+      failing_ledger = %{state.attempt_ledger | write_fun: fn _table, _records -> {:error, :disk_full} end}
+      %{state | attempt_ledger: failing_ledger}
+    end)
+
+    send(pid, :run_poll_cycle)
+    assert_receive {:plane_project_snapshot, _snapshot_task, _snapshot_opts}, 1_000
+    assert_receive {:plane_dependency_graph, _graph_task, _graph_opts}, 1_000
+    assert_receive {:plane_project_snapshot, _closing_snapshot_task, _closing_snapshot_opts}, 1_000
+
+    assert eventually(fn -> match?({:blocked, _}, :sys.get_state(pid).attempt_ledger_status) end),
+           "ARMED retirement state: #{inspect({Map.take(:sys.get_state(pid), [:startup_reconciliation, :attempt_ledger_status, :durable_in_flight, :durable_blocked, :running, :blocked]), AttemptLedger.current(:sys.get_state(pid).attempt_ledger, issue.id)})}"
+
+    state = :sys.get_state(pid)
+    assert MapSet.member?(state.durable_in_flight, issue.id)
+    assert state.attempt_ledger_status == {:blocked, {:attempt_ledger_unavailable, {:ledger_write_failed, :disk_full}}}
+
+    assert {:ok, %{in_flight: true, authority_fence: %{state: :armed}}} =
+             AttemptLedger.current(state.attempt_ledger, issue.id)
+
+    refute_receive {:fake_plane_agent_started, _agent_pid, _issue_id}, 50
+    stop_orchestrator(pid, task_supervisor)
+  end
+
+  @tag timeout: 15_000
+  test "startup re-sync failure keeps a RELEASED reservation in flight" do
+    issue = OrchestratorPlaneEpochFakeTracker.issue()
+    Application.put_env(:symphony_elixir, :plane_epoch_test_graph_issues, [])
+    root = Path.join(System.tmp_dir!(), "symphony-plane-released-sync-failure-#{System.unique_integer([:positive])}")
+    workspace_root = Path.join(root, "workspaces")
+    path = Path.join(root, "attempt-ledger.dets")
+    recovery_root = Path.join(root, "recovery")
+    plane_workflow!("project-1", "", workspace_root: workspace_root)
+    seed_plane_epoch_recovery_checkpoint!(recovery_root, issue)
+    {:ok, coordinator} = SymphonyElixir.OrchestratorPlaneEpochStartupCoordinator.start_link()
+    on_exit(fn -> if Process.alive?(coordinator), do: GenServer.stop(coordinator) end)
+
+    {:ok, ledger} = AttemptLedger.open(Config.settings!().symphony.project_id, Tracker.identity(Config.settings!().tracker), path: path)
+    assert {:ok, armed} = AttemptLedger.begin_attempt(ledger, issue.id)
+
+    identity = %Identity{
+      runtime_attempt_id: "startup-released-#{System.unique_integer([:positive])}",
+      work_item_id: issue.id,
+      lineage_generation: armed.lineage_id,
+      responsibility: "implementation",
+      runtime_profile: "implementation"
+    }
+
+    assert {:ok, _bound} = AttemptLedger.bind_runtime_attempt(ledger, issue.id, identity)
+    assert :ok = AttemptLedger.release_authority_fence(ledger, issue.id, identity)
+    assert :ok = AttemptLedger.close(ledger)
+
+    {pid, task_supervisor} =
+      start_orchestrator(
+        work_control: %{issue.id => valid_work_item(issue)},
+        attempt_ledger_status: :ready,
+        recovery_ledger_status: :ready,
+        recovery_ledger_opts: [root: recovery_root],
+        transition_coordinator: coordinator,
+        attempt_ledger_opts: [path: path, sync_fun: fn _table -> {:error, :startup_sync_failed} end]
+      )
+
+    on_exit(fn -> File.rm_rf(root) end)
+    send(pid, :run_poll_cycle)
+    assert_receive {:plane_project_snapshot, _snapshot_task, _snapshot_opts}, 1_000
+    assert_receive {:plane_dependency_graph, _graph_task, _graph_opts}, 1_000
+    assert_receive {:plane_project_snapshot, _closing_snapshot_task, _closing_snapshot_opts}, 1_000
+
+    assert eventually(fn -> match?({:blocked, _}, :sys.get_state(pid).attempt_ledger_status) end),
+           "RELEASED re-sync state: #{inspect(released_sync_failure_state(pid, issue.id))}"
+
+    state = :sys.get_state(pid)
+
+    assert state.attempt_ledger_status ==
+             {:blocked, {:attempt_ledger_unavailable, {:ledger_sync_failed, :startup_sync_failed}}}
+
+    assert MapSet.member?(state.durable_in_flight, issue.id)
+
+    assert {:ok, %{in_flight: true, authority_fence: %{state: :released, runtime_attempt: ^identity}}} =
+             AttemptLedger.current(state.attempt_ledger, issue.id)
+
+    refute_receive {:fake_plane_agent_started, _agent_pid, _issue_id}, 50
+    stop_orchestrator(pid, task_supervisor)
+  end
+
+  defp released_sync_failure_state(pid, issue_id) do
+    state = :sys.get_state(pid)
+
+    {
+      Map.take(state, [
+        :startup_reconciliation,
+        :attempt_ledger_status,
+        :durable_in_flight,
+        :durable_blocked,
+        :running,
+        :blocked
+      ]),
+      AttemptLedger.current(state.attempt_ledger, issue_id)
+    }
   end
 
   @tag timeout: 15_000
@@ -2854,22 +3251,42 @@ defmodule SymphonyElixir.OrchestratorPlaneEpochTest do
                map_size(state.running) == 1 and state.attempt_ledger_status == :ready
            end)
 
+    companion_before_failure = :sys.get_state(pid)
+    assert {:ok, companion_reserved} = AttemptLedger.begin_attempt(companion_before_failure.attempt_ledger, companion_issue.id)
+
+    companion_identity = %Identity{
+      runtime_attempt_id: "plane-recovery-companion",
+      work_item_id: companion_issue.id,
+      lineage_generation: companion_reserved.lineage_id,
+      responsibility: "implementation",
+      runtime_profile: "implementation"
+    }
+
+    assert {:ok, %{authority_fence: %{state: :bound}}} =
+             AttemptLedger.bind_runtime_attempt(
+               companion_before_failure.attempt_ledger,
+               companion_issue.id,
+               companion_identity
+             )
+
     :atomics.put(fail_sync, 1, 1)
     send(first_agent, :fail_agent)
 
     assert eventually(fn ->
              state = :sys.get_state(pid)
 
-             match?(
-               {:blocked, {:attempt_ledger_unavailable, {:ledger_sync_failed, :injected_sync_failure}}},
-               state.attempt_ledger_status
-             ) and Map.has_key?(state.blocked, issue.id) and map_size(state.running) == 0
+             state.attempt_ledger_status ==
+               blocked_authority_fence_release({:ledger_sync_failed, :injected_sync_failure}) and
+               Map.has_key?(state.blocked, issue.id) and map_size(state.running) == 0
            end),
            "post-failure state: #{inspect(Map.take(:sys.get_state(pid), [:attempt_ledger_status, :startup_reconciliation, :plane_epoch_status, :running, :blocked]))}"
 
     blocked_state = :sys.get_state(pid)
     assert blocked_state.startup_reconciliation == :ready
     assert blocked_state.plane_epoch_status == :current
+
+    assert {:ok, %{in_flight: true, authority_fence: %{state: :released}}} =
+             AttemptLedger.current(blocked_state.attempt_ledger, issue.id)
 
     parent = self()
 
@@ -2908,6 +3325,7 @@ defmodule SymphonyElixir.OrchestratorPlaneEpochTest do
         ref: companion_ref,
         identifier: companion_issue.identifier,
         issue: companion_issue,
+        runtime_attempt: RuntimeAttempt.new(companion_identity, :running),
         started_at: DateTime.utc_now()
       }
 
@@ -2915,6 +3333,7 @@ defmodule SymphonyElixir.OrchestratorPlaneEpochTest do
         state
         | running: Map.put(state.running, companion_issue.id, running_entry),
           claimed: MapSet.put(claimed, companion_issue.id),
+          durable_in_flight: MapSet.put(state.durable_in_flight, companion_issue.id),
           blocked: blocked,
           work_control: Map.put(work_control, companion_issue.id, valid_work_item(companion_issue))
       }
@@ -2930,7 +3349,7 @@ defmodule SymphonyElixir.OrchestratorPlaneEpochTest do
 
     assert_receive {:fake_plane_agent_started, recovered_agent, "plane-epoch-issue"},
                    2_000,
-                   "recovery dispatch state: #{inspect(Map.take(:sys.get_state(pid), [:attempt_ledger_status, :startup_reconciliation, :plane_epoch_status, :plane_epoch_error, :dependency_graph, :work_control, :running, :blocked, :claimed, :durable_in_flight, :durable_blocked]))}"
+                   "recovery dispatch state: #{inspect(plane_recovery_dispatch_debug(pid, issue.id))}"
 
     assert recovered_agent != first_agent
 
@@ -3414,6 +3833,40 @@ defmodule SymphonyElixir.OrchestratorPlaneEpochTest do
   defp stop_orchestrator(pid, task_supervisor) do
     if Process.alive?(pid), do: GenServer.stop(pid)
     if Process.alive?(task_supervisor), do: GenServer.stop(task_supervisor)
+  end
+
+  defp plane_recovery_dispatch_debug(pid, issue_id) do
+    state = :sys.get_state(pid)
+
+    work_item =
+      case Map.get(state.work_control, issue_id) do
+        %{
+          lifecycle_assessment: assessment,
+          validated_lifecycle_state: lifecycle_state,
+          authority_disposition: disposition
+        } ->
+          {assessment.status, lifecycle_state, disposition.status}
+
+        _missing ->
+          nil
+      end
+
+    %{
+      ledger_status: state.attempt_ledger_status,
+      plane_status: state.plane_epoch_status,
+      durable_block: Map.get(state.durable_blocked, issue_id),
+      durable_in_flight?: MapSet.member?(state.durable_in_flight, issue_id),
+      running?: Map.has_key?(state.running, issue_id),
+      attempt_counter: Map.get(state.attempt_counters, issue_id),
+      exhausted: Map.get(state.durable_exhausted, issue_id),
+      dependency: Map.get(state.dependency_diagnostics, issue_id),
+      work_item: work_item,
+      record: AttemptLedger.current(state.attempt_ledger, issue_id)
+    }
+  end
+
+  defp blocked_authority_fence_release(reason) do
+    {:blocked, {:attempt_ledger_unavailable, {:authority_fence_release_failed, reason}}}
   end
 
   defp webhook_identity(event, sequence, entity_id, project_id) do

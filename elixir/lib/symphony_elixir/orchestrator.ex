@@ -1380,12 +1380,77 @@ defmodule SymphonyElixir.Orchestrator do
         state = record_session_completion_totals(state, running_entry)
         session_id = running_entry_session_id(running_entry)
 
-        state = handle_agent_down(reason, state, issue_id, running_entry, session_id)
+        state =
+          case release_runtime_fence_after_task_down(state, issue_id, running_entry) do
+            {:ok, released_state} ->
+              handle_agent_down(reason, released_state, issue_id, running_entry, session_id)
+
+            {:error, blocked_state, fence_reason} ->
+              error = attempt_ledger_error(fence_reason)
+              block_issue_from_entry(blocked_state, issue_id, running_entry, error)
+          end
 
         Logger.info("Agent task finished for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}")
 
         notify_dashboard()
         {:noreply, state}
+    end
+  end
+
+  defp release_runtime_fence_after_task_down(%State{attempt_ledger_status: :disabled} = state, _issue_id, _entry),
+    do: {:ok, state}
+
+  defp release_runtime_fence_after_task_down(state, _issue_id, %{lifecycle_suspension: suspension})
+       when not is_nil(suspension), do: {:ok, state}
+
+  defp release_runtime_fence_after_task_down(
+         %State{attempt_ledger_status: :ready, attempt_ledger: %AttemptLedger{} = ledger} = state,
+         issue_id,
+         %{runtime_attempt: %RuntimeAttempt{identity: identity}}
+       ) do
+    case AttemptLedger.release_authority_fence(ledger, issue_id, identity) do
+      :ok ->
+        released_state = restore_eligible_work_item_after_clean_release(state, issue_id)
+
+        case clear_attempt_in_flight(released_state, issue_id) do
+          {:ok, cleared} -> {:ok, cleared}
+          {:error, blocked, reason} -> {:error, blocked, reason}
+        end
+
+      {:error, reason} ->
+        release_runtime_fence_error(state, reason)
+    end
+  end
+
+  defp release_runtime_fence_after_task_down(
+         %State{attempt_ledger_status: :ready} = state,
+         _issue_id,
+         _entry
+       ) do
+    reason = :missing_runtime_attempt_identity
+    {:error, block_ledger(state, reason), {:attempt_ledger_unavailable, reason}}
+  end
+
+  defp release_runtime_fence_after_task_down(%State{} = state, _issue_id, _entry) do
+    {:error, state, {:attempt_ledger_unavailable, ledger_block_reason(state)}}
+  end
+
+  defp release_runtime_fence_error(state, reason) do
+    failure = {:authority_fence_release_failed, reason}
+    {:error, block_ledger(state, failure), {:attempt_ledger_unavailable, failure}}
+  end
+
+  defp restore_eligible_work_item_after_clean_release(%State{} = state, issue_id) do
+    case Map.get(state.work_control, issue_id) do
+      %WorkItem{
+        authority_disposition: %AuthorityDisposition{status: :active},
+        lifecycle_assessment: %LifecycleAssessment{status: :validated} = assessment
+      } = work_item ->
+        eligible_work_item = %{work_item | authority_disposition: AuthorityDisposition.derive(assessment)}
+        %{state | work_control: Map.put(state.work_control, issue_id, eligible_work_item)}
+
+      _other ->
+        state
     end
   end
 
@@ -1413,10 +1478,15 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp handle_agent_down(reason, state, issue_id, running_entry, session_id) do
-    if input_required_blocker?(running_entry) do
-      block_input_required_agent_down(state, issue_id, running_entry, session_id, reason)
-    else
-      retry_agent_down(state, issue_id, running_entry, session_id, reason)
+    cond do
+      not is_nil(Map.get(running_entry, :lifecycle_suspension)) ->
+        block_issue_from_entry(state, issue_id, running_entry, "agent exited while lifecycle suspension was unresolved")
+
+      input_required_blocker?(running_entry) ->
+        block_input_required_agent_down(state, issue_id, running_entry, session_id, reason)
+
+      true ->
+        retry_agent_down(state, issue_id, running_entry, session_id, reason)
     end
   end
 
@@ -2995,6 +3065,7 @@ defmodule SymphonyElixir.Orchestrator do
           state
           |> reconcile_plane_running_issues()
           |> reconcile_plane_blocked_issues()
+          |> reconcile_releasable_attempt_fences()
           |> dispatch_plane_graph()
         else
           state
@@ -3122,6 +3193,7 @@ defmodule SymphonyElixir.Orchestrator do
          state <- refresh_dependency_graph_epoch(%{state | transition_reconciliation_candidates: candidates}, graph),
          {:ok, state} <- startup_work_items_reconciled(state, graph),
          {:ok, state} <- reconcile_attempt_ledger_from_snapshot(state, graph.nodes |> Map.values()),
+         {:ok, state} <- restore_pending_authority_suspensions(state),
          {:ok, state} <- reconcile_startup_transition_candidates(state, candidates, graph),
          {:ok, state} <- clear_reconciled_stale_in_flight(state),
          {:ok, state} <- startup_durable_stores_ready(state) do
@@ -3779,24 +3851,103 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp clear_reconciled_stale_in_flight_for_issue(%State{} = state, issue_id) do
-    case Map.get(state.durable_blocked, issue_id) do
-      {:attempt_ledger_issue_missing, ^issue_id} ->
+    case current_attempt_record(state, issue_id) do
+      {:ok, %{in_flight: false}} ->
+        clear_reconciled_in_flight_record(state, issue_id)
+
+      {:ok, %{in_flight: true, authority_fence: %{state: :armed}}} ->
+        retire_unbound_attempt_reservation(state, issue_id)
+
+      {:ok, %{in_flight: true, authority_fence: %{state: :released}}} ->
+        retire_released_attempt_reservation(state, issue_id)
+
+      _other_record ->
+        clear_other_stale_in_flight_record(state, issue_id)
+    end
+  end
+
+  defp clear_other_stale_in_flight_record(state, issue_id) do
+    if Map.get(state.durable_blocked, issue_id) == {:attempt_ledger_issue_missing, issue_id} do
+      {:ok, state}
+    else
+      clear_when_stale_guards_pass(state, issue_id)
+    end
+  end
+
+  defp clear_when_stale_guards_pass(state, issue_id) do
+    case stale_in_flight_block_reason(state, issue_id) do
+      nil ->
+        clear_reconciled_in_flight_record(state, issue_id)
+
+      :running ->
         {:ok, state}
 
-      _other_reason ->
-        case stale_in_flight_block_reason(state, issue_id) do
-          nil ->
-            clear_reconciled_in_flight_record(state, issue_id)
+      :stale_in_flight_attempt_ledger_unavailable ->
+        {:blocked, state, {:stale_in_flight_attempt_ledger_unavailable, issue_id}}
 
-          :running ->
-            {:ok, state}
+      reason ->
+        {:ok, mark_durable_blocked(state, issue_id, reason)}
+    end
+  end
 
-          :stale_in_flight_attempt_ledger_unavailable ->
-            {:blocked, state, {:stale_in_flight_attempt_ledger_unavailable, issue_id}}
+  defp retire_unbound_attempt_reservation(state, issue_id) do
+    if Map.has_key?(state.running, issue_id) do
+      {:ok, mark_durable_blocked(state, issue_id, :stale_in_flight_authority_fence_unresolved)}
+    else
+      case AttemptLedger.release_armed_authority_fence(state.attempt_ledger, issue_id) do
+        :ok ->
+          clear_reconciled_in_flight_record(state, issue_id)
 
-          reason ->
-            {:ok, mark_durable_blocked(state, issue_id, reason)}
-        end
+        {:error, reason} ->
+          blocked = block_ledger(state, reason)
+          {:blocked, blocked, {:attempt_ledger_armed_fence_release_failed, issue_id, reason}}
+      end
+    end
+  end
+
+  defp retire_released_attempt_reservation(state, issue_id) do
+    if Map.has_key?(state.running, issue_id) do
+      {:ok, mark_durable_blocked(state, issue_id, :stale_in_flight_authority_fence_unresolved)}
+    else
+      sync_released_attempt_before_stale_clear(state, issue_id)
+    end
+  end
+
+  defp sync_released_attempt_before_stale_clear(state, issue_id) do
+    case AttemptLedger.sync(state.attempt_ledger) do
+      :ok ->
+        state
+        |> restore_eligible_work_item_after_clean_release(issue_id)
+        |> clear_when_stale_guards_pass(issue_id)
+
+      {:error, reason} ->
+        blocked = block_ledger(state, reason)
+        {:blocked, blocked, {:attempt_ledger_released_fence_sync_failed, issue_id, reason}}
+    end
+  end
+
+  defp reconcile_releasable_attempt_fences(%State{} = state) do
+    Enum.reduce_while(MapSet.to_list(state.durable_in_flight), state, &reconcile_releasable_attempt_fence/2)
+  end
+
+  defp reconcile_releasable_attempt_fence(issue_id, state) do
+    case current_attempt_record(state, issue_id) do
+      {:ok, %{in_flight: true, authority_fence: %{state: fence_state}}}
+      when fence_state in [:armed, :released] ->
+        finish_releasable_attempt_fence(state, issue_id)
+
+      _unresolved_or_clear ->
+        {:cont, state}
+    end
+  end
+
+  defp finish_releasable_attempt_fence(state, issue_id) do
+    case clear_reconciled_stale_in_flight_for_issue(state, issue_id) do
+      {:ok, next} ->
+        {:cont, next}
+
+      {:blocked, blocked, reason} ->
+        {:halt, %{blocked | attempt_ledger_status: {:blocked, reason}}}
     end
   end
 
@@ -3804,21 +3955,135 @@ defmodule SymphonyElixir.Orchestrator do
     work_item = Map.get(state.work_control, issue_id)
     dependency = Map.get(state.dependency_diagnostics, issue_id)
     checkpoint = Map.get(state.recovery_checkpoints, issue_id)
+    attempt = current_attempt_record(state, issue_id)
+    fence_released? = match?({:ok, %{in_flight: true, authority_fence: %{state: :released}}}, attempt)
 
     checks = [
       {Map.has_key?(state.running, issue_id), :running},
+      {not match?(%AttemptLedger{}, state.attempt_ledger), :stale_in_flight_attempt_ledger_unavailable},
       {Map.has_key?(state.durable_exhausted, issue_id), :stale_in_flight_lineage_exhausted},
       {transition_candidate_pending?(state, issue_id), :stale_in_flight_transition_unresolved},
-      {match?(%SuspensionContext{}, checkpoint_suspension_context(checkpoint)), :stale_in_flight_suspension_unresolved},
+      {unresolved_checkpoint_suspension?(checkpoint), :stale_in_flight_suspension_unresolved},
+      {not fence_released?, :stale_in_flight_authority_fence_unresolved},
       {not eligible_work_item?(work_item), :stale_in_flight_work_item_unavailable},
       {not validated_work_item?(work_item), :stale_in_flight_lifecycle_unvalidated},
       {not match?(%{allowed?: true}, dependency), :stale_in_flight_dependency_unavailable},
-      {not match?(%AttemptLedger{}, state.attempt_ledger), :stale_in_flight_attempt_ledger_unavailable}
+      {not fence_released?, :stale_in_flight_authority_fence_unresolved}
     ]
 
     case Enum.find(checks, &elem(&1, 0)) do
       {_blocked?, reason} -> reason
       nil -> nil
+    end
+  end
+
+  defp unresolved_checkpoint_suspension?(checkpoint) do
+    match?(
+      %SuspensionContext{status: status} when status in [:open, :resolving],
+      checkpoint_suspension_context(checkpoint)
+    )
+  end
+
+  defp current_attempt_record(%State{attempt_ledger: %AttemptLedger{} = ledger}, issue_id),
+    do: AttemptLedger.current(ledger, issue_id)
+
+  defp current_attempt_record(_state, _issue_id), do: :not_found
+
+  defp restore_pending_authority_suspensions(%State{attempt_ledger: %AttemptLedger{}} = state) do
+    Enum.reduce_while(MapSet.to_list(state.durable_in_flight), {:ok, state}, fn issue_id, {:ok, acc} ->
+      case current_attempt_record(acc, issue_id) do
+        {:ok, %{authority_fence: %{state: :suspension_pending, intent: intent}}} ->
+          restore_pending_authority_suspension_entry(acc, issue_id, intent)
+
+        _other ->
+          {:cont, {:ok, acc}}
+      end
+    end)
+  end
+
+  defp restore_pending_authority_suspensions(%State{} = state), do: {:ok, state}
+
+  defp restore_pending_authority_suspension_entry(state, issue_id, intent) do
+    case restore_pending_authority_suspension(state, issue_id, intent) do
+      {:ok, next} ->
+        {:cont, {:ok, next}}
+
+      {:error, next, reason} ->
+        blocked = mark_durable_blocked(next, issue_id, {:stale_in_flight_suspension_unresolved, reason})
+        {:cont, {:ok, blocked}}
+    end
+  end
+
+  defp restore_pending_authority_suspension(state, issue_id, intent) do
+    checkpoint = Map.get(state.recovery_checkpoints, issue_id)
+
+    case checkpoint do
+      %{
+        active_suspension_context: nil,
+        last_terminal_suspension_context: %SuspensionContext{status: status} = terminal
+      }
+      when status in [:resolved, :escalated] ->
+        release_terminal_pending_fence(state, issue_id, terminal)
+
+      _not_terminal ->
+        restore_pending_suspension_context(state, issue_id, intent, checkpoint)
+    end
+  end
+
+  defp release_terminal_pending_fence(state, issue_id, %SuspensionContext{} = terminal) do
+    case current_attempt_record(state, issue_id) do
+      {:ok,
+       %{
+         in_flight: true,
+         lineage_id: lineage,
+         authority_fence: %{state: :suspension_pending, runtime_attempt: identity}
+       }}
+      when terminal.work_item_id == issue_id and terminal.lineage_generation == lineage and
+             identity.work_item_id == issue_id and identity.lineage_generation == lineage ->
+        with :ok <- AttemptLedger.release_suspension_fence(state.attempt_ledger, issue_id, identity, terminal),
+             :ok <- AttemptLedger.clear_in_flight(state.attempt_ledger, issue_id) do
+          {:ok, clear_durable_in_flight(state, issue_id)}
+        else
+          {:error, reason} -> {:error, block_ledger(state, reason), reason}
+        end
+
+      _mismatch ->
+        {:error, state, :terminal_suspension_lineage_mismatch}
+    end
+  end
+
+  defp restore_pending_suspension_context(state, issue_id, intent, checkpoint) do
+    work_item = Map.get(state.work_control, issue_id)
+    observation = Map.get(intent, :provider_observation)
+
+    with %{last_validated_lifecycle_state: prior_state} = checkpoint when not is_nil(checkpoint) <- checkpoint,
+         true <- WorkflowLifecycle.canonical?(prior_state),
+         %ProviderObservation{work_item_id: ^issue_id} <- observation,
+         {:ok, context} <-
+           SuspensionContext.new(%{
+             work_item_id: issue_id,
+             last_validated_lifecycle_state: prior_state,
+             provider_observation: observation,
+             reason: Map.get(intent, :reason),
+             lineage_generation: Map.get(state.attempt_lineages, issue_id),
+             created_at: Map.get(intent, :created_at),
+             recovery_policy: :fresh_reconciliation,
+             required_evidence: Map.get(intent, :required_evidence, []),
+             resume_target: prior_state
+           }),
+         %WorkItem{} = work_item <- work_item,
+         {:ok, suspended} <- WorkItem.suspend(work_item, context.reason) do
+      suspended = %{suspended | suspension_context: context}
+      next = %{state | work_control: Map.put(state.work_control, issue_id, suspended)}
+
+      case persist_suspended_work_item(next, issue_id, suspended) do
+        {:ok, persisted, _suspended} -> {:ok, persisted}
+        {:error, blocked, reason} -> {:error, blocked, reason}
+      end
+    else
+      false -> {:error, state, :trusted_lifecycle_checkpoint_unavailable}
+      {:error, reason} -> {:error, state, reason}
+      _ -> {:error, state, :suspension_intent_incomplete}
     end
   end
 
@@ -3944,12 +4209,22 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp resync_sync_failed_ledger(
-         %State{
-           attempt_ledger_status: {:blocked, {:attempt_ledger_unavailable, {:ledger_sync_failed, _reason}}}
-         } = state,
-         %AttemptLedger{} = ledger
-       ) do
+  defp resync_sync_failed_ledger(%State{} = state, %AttemptLedger{} = ledger) do
+    if retryable_sync_failure?(state.attempt_ledger_status) do
+      resync_attempt_ledger_sync(state, ledger)
+    else
+      {:ok, state}
+    end
+  end
+
+  defp retryable_sync_failure?({:blocked, {:attempt_ledger_unavailable, {:ledger_sync_failed, _reason}}}), do: true
+
+  defp retryable_sync_failure?({:blocked, {:attempt_ledger_unavailable, {:authority_fence_release_failed, {:ledger_sync_failed, _reason}}}}),
+    do: true
+
+  defp retryable_sync_failure?(_status), do: false
+
+  defp resync_attempt_ledger_sync(state, ledger) do
     case AttemptLedger.sync(ledger) do
       :ok ->
         {:ok, state}
@@ -3959,8 +4234,6 @@ defmodule SymphonyElixir.Orchestrator do
         {:blocked, state}
     end
   end
-
-  defp resync_sync_failed_ledger(%State{} = state, %AttemptLedger{}), do: {:ok, state}
 
   defp blocked_ledger_state(%State{} = state, reason) do
     Logger.debug("Skipping autonomous dispatch while attempt ledger is blocked: #{inspect(reason)}")
@@ -4005,6 +4278,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp retryable_ledger_reconciliation_reason?({:attempt_ledger_unavailable, {:attempt_ledger_close_failed, _}}), do: true
   defp retryable_ledger_reconciliation_reason?({:attempt_ledger_unavailable, {:ledger_write_failed, _}}), do: true
   defp retryable_ledger_reconciliation_reason?({:attempt_ledger_unavailable, {:ledger_sync_failed, _}}), do: true
+  defp retryable_ledger_reconciliation_reason?({:attempt_ledger_unavailable, {:authority_fence_release_failed, {:ledger_sync_failed, _}}}), do: true
   defp retryable_ledger_reconciliation_reason?(_reason), do: false
 
   defp maybe_dispatch_ready(%State{} = state) do
@@ -4408,6 +4682,11 @@ defmodule SymphonyElixir.Orchestrator do
   def clear_stale_in_flight_for_test(%State{} = state, issue_id) when is_binary(issue_id) do
     clear_reconciled_stale_in_flight_for_issue(state, issue_id)
   end
+
+  @doc false
+  @spec restore_pending_authority_suspensions_for_test(State.t()) :: {:ok, State.t()}
+  def restore_pending_authority_suspensions_for_test(%State{} = state),
+    do: restore_pending_authority_suspensions(state)
 
   defp reconcile_blocked_ledger_without_dispatch(%State{attempt_ledger: %AttemptLedger{} = ledger} = state) do
     case resync_sync_failed_ledger(state, ledger) do
@@ -4855,7 +5134,7 @@ defmodule SymphonyElixir.Orchestrator do
           state,
           issue.id,
           %{running_entry | issue: issue},
-          attempt_ledger_error(reason)
+          attempt_ledger_error({:attempt_ledger_unavailable, reason})
         )
     end
   end
@@ -4936,19 +5215,19 @@ defmodule SymphonyElixir.Orchestrator do
 
     case transition_running_entry_attempt(running_entry, terminal_state) do
       {:ok, running_entry} ->
-        state =
-          complete_terminalized_running_removal(
-            state,
-            issue_id,
-            running_entry,
-            pid,
-            ref,
-            identifier,
-            cleanup_workspace,
-            termination_reason
-          )
-
-        {:ok, state}
+        case complete_terminalized_running_removal(
+               state,
+               issue_id,
+               running_entry,
+               pid,
+               ref,
+               identifier,
+               cleanup_workspace,
+               termination_reason
+             ) do
+          {:ok, state} -> {:ok, state}
+          {:error, state} -> {:error, state}
+        end
 
       {:error, :invalid_runtime_attempt_transition} ->
         {:error, state}
@@ -4974,12 +5253,19 @@ defmodule SymphonyElixir.Orchestrator do
     state = record_recent_attempt(state, issue_id, running_entry, termination_reason)
     stop_running_task(pid, ref, state.task_supervisor)
 
-    if cleanup_workspace and terminal_cleanup_termination?(termination_reason),
-      do: cleanup_terminalized_running_workspace(state, running_entry, issue_id)
+    case release_runtime_fence_after_task_down(state, issue_id, running_entry) do
+      {:ok, state} ->
+        if cleanup_workspace and terminal_cleanup_termination?(termination_reason),
+          do: cleanup_terminalized_running_workspace(state, running_entry, issue_id)
 
-    state = pop_running_issue_maps(state, issue_id)
+        state = pop_running_issue_maps(state, issue_id)
+        state = if cleanup_workspace, do: reset_attempt_counters(state, issue_id), else: state
+        {:ok, state}
 
-    if cleanup_workspace, do: reset_attempt_counters(state, issue_id), else: state
+      {:error, blocked_state, reason} ->
+        error = attempt_ledger_error(reason)
+        {:error, block_issue_from_entry(blocked_state, issue_id, running_entry, error)}
+    end
   end
 
   defp cleanup_terminalized_running_workspace(state, running_entry, issue_id) do
@@ -5190,8 +5476,6 @@ defmodule SymphonyElixir.Orchestrator do
       fallback
   end
 
-  defp blocker_error(_running_entry, fallback), do: fallback
-
   defp dependency_blocker_error(%{
          reason: reason,
          responsibility: responsibility,
@@ -5277,7 +5561,19 @@ defmodule SymphonyElixir.Orchestrator do
           state.task_supervisor
         )
 
-        do_block_issue_from_entry(state, issue_id, running_entry, error, dependency)
+        case finalize_terminated_attempt_authority(state, issue_id, running_entry) do
+          {:ok, state} ->
+            do_block_issue_from_entry(state, issue_id, running_entry, error, dependency)
+
+          {:error, state, reason} ->
+            do_block_issue_from_entry(
+              state,
+              issue_id,
+              running_entry,
+              attempt_ledger_error(reason),
+              dependency
+            )
+        end
 
       {:error, :invalid_runtime_attempt_transition} ->
         state
@@ -5293,7 +5589,7 @@ defmodule SymphonyElixir.Orchestrator do
           state.task_supervisor
         )
 
-        case clear_attempt_in_flight(state, issue_id) do
+        case finalize_terminated_attempt_authority(state, issue_id, running_entry) do
           {:ok, cleared_state} ->
             do_block_issue_from_entry(cleared_state, issue_id, running_entry, error, dependency)
 
@@ -5309,6 +5605,41 @@ defmodule SymphonyElixir.Orchestrator do
 
       {:error, :invalid_runtime_attempt_transition} ->
         state
+    end
+  end
+
+  defp finalize_terminated_attempt_authority(state, issue_id, running_entry) do
+    with {:ok, released_state} <- release_runtime_fence_after_task_down(state, issue_id, running_entry),
+         {:ok, cleared_state} <- persist_exhausted_attempt_or_clear(released_state, issue_id) do
+      {:ok, cleared_state}
+    else
+      {:error, state, {:attempt_ledger_unavailable, _reason} = reason} ->
+        {:error, state, reason}
+
+      {:error, state, reason} ->
+        {:error, state, {:attempt_ledger_unavailable, reason}}
+    end
+  end
+
+  defp persist_exhausted_attempt_or_clear(%State{} = state, issue_id) do
+    case Map.get(state.durable_exhausted, issue_id) do
+      %{safety_counters: counters, stop_reason: reason}
+      when is_map(counters) and is_atom(reason) and state.attempt_ledger_status == :ready ->
+        case AttemptLedger.persist_safety(state.attempt_ledger, issue_id, counters,
+               status: :exhausted,
+               stop_reason: reason,
+               in_flight: false,
+               route_fingerprint: route_fingerprint_for_issue(state, issue_id)
+             ) do
+          {:ok, _record} -> {:ok, clear_durable_in_flight(state, issue_id)}
+          {:error, error} -> {:error, block_ledger(state, error), error}
+        end
+
+      _no_durable_exhaustion ->
+        case clear_attempt_in_flight(state, issue_id) do
+          {:ok, cleared} -> {:ok, cleared}
+          {:error, blocked, reason} -> {:error, blocked, reason}
+        end
     end
   end
 
@@ -5919,12 +6250,42 @@ defmodule SymphonyElixir.Orchestrator do
          {:ok, state, resolved_checkpoint} <- persist_recovery_checkpoint(state, resolved_checkpoint) do
       disposition = AuthorityDisposition.derive(work_item.lifecycle_assessment)
 
-      {%{state | recovery_checkpoints: put_checkpoint(state.recovery_checkpoints, work_item.id, resolved_checkpoint)}, %{work_item | authority_disposition: disposition, suspension_context: nil}}
+      next_state = %{state | recovery_checkpoints: put_checkpoint(state.recovery_checkpoints, work_item.id, resolved_checkpoint)}
+
+      case release_resolved_suspension_authority(next_state, work_item.id, resolved) do
+        {:ok, released_state} ->
+          {released_state, %{work_item | authority_disposition: disposition, suspension_context: nil}}
+
+        {:error, blocked_state, _reason} ->
+          {blocked_state, %{work_item | suspension_context: resolved}}
+      end
     else
       {:error, blocked_state, _reason} -> {blocked_state, %{work_item | suspension_context: context}}
       {:error, _reason} -> {state, %{work_item | suspension_context: context}}
     end
   end
+
+  defp release_resolved_suspension_authority(
+         %State{attempt_ledger_status: :ready, attempt_ledger: %AttemptLedger{} = ledger} = state,
+         issue_id,
+         %SuspensionContext{status: status} = context
+       )
+       when status in [:resolved, :escalated] do
+    case AttemptLedger.current(ledger, issue_id) do
+      {:ok, %{in_flight: true, authority_fence: %{state: :suspension_pending, runtime_attempt: identity}}} ->
+        with :ok <- AttemptLedger.release_suspension_fence(ledger, issue_id, identity, context),
+             :ok <- AttemptLedger.clear_in_flight(ledger, issue_id) do
+          {:ok, clear_durable_in_flight(state, issue_id)}
+        else
+          {:error, reason} -> {:error, block_ledger(state, reason), reason}
+        end
+
+      _no_pending_runtime_suspension ->
+        {:ok, state}
+    end
+  end
+
+  defp release_resolved_suspension_authority(%State{} = state, _issue_id, _context), do: {:ok, state}
 
   defp suspension_recovery_facts(state, issue, context, work_item) do
     dependency = dependency_diagnostic_for_issue(issue, state.dependency_graph, state)
@@ -6098,10 +6459,10 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp checkpoint_record(_state, _work_item_id, nil, _evidence, _active, _terminal), do: nil
 
-  defp checkpoint_record(_state, work_item_id, lifecycle_state, evidence, active_context, terminal_context) do
+  defp checkpoint_record(state, work_item_id, lifecycle_state, evidence, active_context, terminal_context) do
     %{
       schema_version: RecoveryLedger.schema_version(),
-      project_namespace: Config.settings!().symphony.project_id,
+      project_namespace: recovery_project_namespace(state),
       work_item_id: work_item_id,
       last_validated_lifecycle_state: lifecycle_state,
       durable_guard_evidence: evidence,
@@ -6110,6 +6471,11 @@ defmodule SymphonyElixir.Orchestrator do
       updated_at: DateTime.utc_now()
     }
   end
+
+  defp recovery_project_namespace(%State{recovery_ledger: %RecoveryLedger{project_id: project_id}}),
+    do: project_id
+
+  defp recovery_project_namespace(_state), do: Config.settings!().symphony.project_id
 
   defp durable_mechanical_evidence(evidence) when is_list(evidence) do
     evidence
@@ -6831,6 +7197,68 @@ defmodule SymphonyElixir.Orchestrator do
          worker_host,
          runtime_attempt
        ) do
+    case bind_runtime_attempt_before_spawn(state, issue.id, runtime_attempt) do
+      {:ok, state} ->
+        do_spawn_prepared_issue_on_worker_host(state, issue, route, attempt, recipient, worker_host, runtime_attempt)
+
+      {:error, state, reason} ->
+        block_issue_from_entry(
+          state,
+          issue.id,
+          dispatch_entry(issue, route, attempt, worker_host),
+          attempt_ledger_error({:attempt_ledger_unavailable, reason})
+        )
+    end
+  end
+
+  @doc false
+  @spec spawn_prepared_issue_for_test(
+          State.t(),
+          Issue.t(),
+          Route.t(),
+          non_neg_integer() | nil,
+          pid() | nil,
+          String.t() | nil,
+          RuntimeAttempt.t()
+        ) :: State.t()
+  def spawn_prepared_issue_for_test(
+        %State{} = state,
+        %Issue{} = issue,
+        %Route{} = route,
+        attempt,
+        recipient,
+        worker_host,
+        %RuntimeAttempt{} = runtime_attempt
+      ) do
+    spawn_prepared_issue_on_worker_host(state, issue, route, attempt, recipient, worker_host, runtime_attempt)
+  end
+
+  defp bind_runtime_attempt_before_spawn(%State{attempt_ledger_status: :disabled} = state, _issue_id, _runtime_attempt),
+    do: {:ok, state}
+
+  defp bind_runtime_attempt_before_spawn(
+         %State{attempt_ledger_status: :ready, attempt_ledger: %AttemptLedger{} = ledger} = state,
+         issue_id,
+         %RuntimeAttempt{identity: identity}
+       ) do
+    case AttemptLedger.bind_runtime_attempt(ledger, issue_id, identity) do
+      {:ok, _record} -> {:ok, state}
+      {:error, reason} -> {:error, block_ledger(state, reason), {:authority_fence_bind_failed, reason}}
+    end
+  end
+
+  defp bind_runtime_attempt_before_spawn(%State{} = state, _issue_id, _runtime_attempt),
+    do: {:error, block_ledger(state, :missing_runtime_attempt_identity), :missing_runtime_attempt_identity}
+
+  defp do_spawn_prepared_issue_on_worker_host(
+         %State{} = state,
+         issue,
+         route,
+         attempt,
+         recipient,
+         worker_host,
+         runtime_attempt
+       ) do
     work_item = active_work_item_for_attempt(state, issue.id)
     runtime_attempt_identity = runtime_attempt_identity_from(runtime_attempt)
 
@@ -6899,7 +7327,6 @@ defmodule SymphonyElixir.Orchestrator do
 
       {:error, reason} ->
         Logger.error("Unable to spawn agent for #{issue_context(issue)}: #{inspect(reason)}")
-        next_attempt = if is_integer(attempt), do: attempt + 1, else: nil
 
         retry_metadata = %{
           identifier: issue.identifier,
@@ -6913,23 +7340,42 @@ defmodule SymphonyElixir.Orchestrator do
           route_fingerprint: route.fingerprint
         }
 
-        case record_attempt_event(state, issue.id, :ordinary_failure) do
+        case release_runtime_fence_after_task_down(state, issue.id, %{runtime_attempt: runtime_attempt}) do
           {:ok, state} ->
-            state
-            |> record_recent_attempt(issue.id, Map.put(retry_metadata, :issue, issue), :runtime_failure, retry_metadata.error)
-            |> schedule_issue_retry(issue.id, next_attempt, retry_metadata)
+            schedule_spawn_failure_retry(state, issue, attempt, retry_metadata)
 
-          {:stop, state, reason} ->
-            block_issue_after_attempt_limit(state, issue, attempt, retry_metadata, reason)
+          {:error, blocked_state, ledger_reason} ->
+            entry = Map.merge(retry_metadata, %{issue: issue, retry_attempt: attempt, runtime_attempt: runtime_attempt})
 
-          {:error, state, reason} ->
             block_issue_from_entry(
-              state,
+              blocked_state,
               issue.id,
-              Map.put(retry_metadata, :retry_attempt, attempt),
-              attempt_ledger_error(reason)
+              entry,
+              attempt_ledger_error(ledger_reason)
             )
         end
+    end
+  end
+
+  defp schedule_spawn_failure_retry(state, issue, attempt, retry_metadata) do
+    next_attempt = if is_integer(attempt), do: attempt + 1, else: nil
+
+    case record_attempt_event(state, issue.id, :ordinary_failure) do
+      {:ok, state} ->
+        state
+        |> record_recent_attempt(issue.id, Map.put(retry_metadata, :issue, issue), :runtime_failure, retry_metadata.error)
+        |> schedule_issue_retry(issue.id, next_attempt, retry_metadata)
+
+      {:stop, state, reason} ->
+        block_issue_after_attempt_limit(state, issue, attempt, retry_metadata, reason)
+
+      {:error, state, reason} ->
+        block_issue_from_entry(
+          state,
+          issue.id,
+          Map.put(retry_metadata, :retry_attempt, attempt),
+          attempt_ledger_error(reason)
+        )
     end
   end
 
@@ -6991,8 +7437,14 @@ defmodule SymphonyElixir.Orchestrator do
       {:ok, running_entry} ->
         stop_running_task(Map.get(running_entry, :pid), Map.get(running_entry, :ref), state.task_supervisor)
 
-        state = Map.update!(state, :running, &Map.delete(&1, issue.id))
-        schedule_poll_route_change_retry(state, issue, running_entry, next_attempt, route_change)
+        case release_runtime_fence_after_task_down(state, issue.id, running_entry) do
+          {:ok, state} ->
+            state = Map.update!(state, :running, &Map.delete(&1, issue.id))
+            schedule_poll_route_change_retry(state, issue, running_entry, next_attempt, route_change)
+
+          {:error, blocked, reason} ->
+            block_issue_from_entry(blocked, issue.id, running_entry, attempt_ledger_error(reason))
+        end
 
       {:error, :invalid_runtime_attempt_transition} ->
         state
@@ -7184,12 +7636,17 @@ defmodule SymphonyElixir.Orchestrator do
          stop_reason,
          opts
        ) do
-    persist_opts =
-      Keyword.put(opts, :in_flight, Keyword.get(opts, :in_flight, false) and status != :exhausted)
+    current_in_flight = current_attempt_in_flight(ledger, issue_id)
+
+    requested_in_flight = Keyword.get(opts, :in_flight, current_in_flight)
+    deferred_exhaustion? = status == :exhausted and requested_in_flight
+    persisted_status = if deferred_exhaustion?, do: :open, else: status
+    persisted_stop_reason = if deferred_exhaustion?, do: nil, else: stop_reason
+    persist_opts = Keyword.put(opts, :in_flight, requested_in_flight and (status != :exhausted or deferred_exhaustion?))
 
     case AttemptLedger.persist_safety(ledger, issue_id, counters,
-           status: status,
-           stop_reason: stop_reason,
+           status: persisted_status,
+           stop_reason: persisted_stop_reason,
            in_flight: Keyword.get(persist_opts, :in_flight),
            route_fingerprint: route_fingerprint_for_issue(state, issue_id)
          ) do
@@ -7205,6 +7662,13 @@ defmodule SymphonyElixir.Orchestrator do
     reason = :missing_ledger_handle
 
     {:error, block_ledger(state, reason), {:attempt_ledger_unavailable, reason}}
+  end
+
+  defp current_attempt_in_flight(ledger, issue_id) do
+    case AttemptLedger.current(ledger, issue_id) do
+      {:ok, %{in_flight: in_flight}} -> in_flight
+      _ -> false
+    end
   end
 
   defp clear_attempt_in_flight(%State{attempt_ledger_status: :disabled} = state, issue_id) do
@@ -8497,9 +8961,122 @@ defmodule SymphonyElixir.Orchestrator do
         inspect(assessment)
     )
 
-    updated_running_entry = Map.put(running_entry, :lifecycle_suspension, assessment)
+    {state, reason} = persist_runtime_suspension_authority(state, issue_id, running_entry, assessment)
+    updated_running_entry = Map.put(running_entry, :lifecycle_suspension, assessment || reason)
     notify_dashboard()
     {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+  end
+
+  defp persist_runtime_suspension_authority(
+         %State{attempt_ledger: %AttemptLedger{} = ledger, attempt_ledger_status: :ready} = state,
+         issue_id,
+         %{runtime_attempt: %RuntimeAttempt{identity: identity}} = _running_entry,
+         assessment
+       ) do
+    work_item = Map.get(state.work_control, issue_id)
+    intent = runtime_suspension_intent(work_item, assessment)
+    persist_runtime_suspension_intent(ledger, state, issue_id, identity, work_item, intent)
+  end
+
+  defp persist_runtime_suspension_authority(%State{} = state, _issue_id, _running_entry, _assessment),
+    do: {state, :authority_fence_unavailable}
+
+  defp runtime_suspension_intent(work_item, assessment) do
+    observation = assessment_provider_observation(assessment, work_item)
+    reason = lifecycle_assessment_reason(assessment)
+    evidence = lifecycle_assessment_evidence(assessment)
+
+    created_at =
+      case observation do
+        %ProviderObservation{observed_at: %DateTime{} = at} -> at
+        _ -> DateTime.utc_now()
+      end
+
+    %{reason: reason, provider_observation: observation, required_evidence: evidence, created_at: created_at}
+  end
+
+  defp assessment_provider_observation(assessment, work_item) do
+    observation =
+      if match?(%LifecycleAssessment{}, assessment), do: assessment.provider_observation, else: nil
+
+    if match?(%ProviderObservation{}, observation),
+      do: observation,
+      else: Map.get(work_item || %{}, :provider_observation)
+  end
+
+  defp lifecycle_assessment_reason(%LifecycleAssessment{reason: reason}) when is_atom(reason), do: reason
+  defp lifecycle_assessment_reason(_assessment), do: :lifecycle_assessment_unavailable
+
+  defp lifecycle_assessment_evidence(%LifecycleAssessment{missing_guards: evidence}) when is_list(evidence),
+    do: evidence
+
+  defp lifecycle_assessment_evidence(_assessment), do: []
+
+  defp persist_runtime_suspension_intent(ledger, state, issue_id, identity, work_item, intent) do
+    case AttemptLedger.mark_suspension_pending(ledger, issue_id, identity, intent) do
+      {:ok, _record} ->
+        persist_runtime_suspension_context(state, issue_id, work_item, intent)
+
+      {:error, fence_reason} ->
+        authority_fence_error = {:authority_fence_pending_failed, fence_reason}
+
+        {block_ledger(state, authority_fence_error), authority_fence_error}
+    end
+  end
+
+  defp persist_runtime_suspension_context(state, issue_id, work_item, intent) do
+    case durable_runtime_suspension_context(state, issue_id, work_item, intent) do
+      {:ok, next_state} ->
+        {next_state, intent.reason}
+
+      {:error, next_state, persistence_reason} ->
+        {next_state, {:suspension_persistence_failed, persistence_reason}}
+    end
+  end
+
+  defp durable_runtime_suspension_context(state, issue_id, %WorkItem{} = work_item, intent) do
+    checkpoint = Map.get(state.recovery_checkpoints, issue_id)
+
+    with %{last_validated_lifecycle_state: prior_state} when not is_nil(checkpoint) <- checkpoint,
+         true <- WorkflowLifecycle.canonical?(prior_state),
+         %ProviderObservation{work_item_id: ^issue_id} = observation <- intent.provider_observation,
+         {:ok, context} <-
+           SuspensionContext.new(%{
+             work_item_id: issue_id,
+             last_validated_lifecycle_state: prior_state,
+             provider_observation: observation,
+             reason: intent.reason,
+             lineage_generation: Map.get(state.attempt_lineages, issue_id),
+             created_at: intent.created_at,
+             recovery_policy: :fresh_reconciliation,
+             required_evidence: intent.required_evidence,
+             resume_target: prior_state
+           }),
+         {:ok, suspended} <- WorkItem.suspend(work_item, intent.reason) do
+      suspended = %{suspended | suspension_context: context}
+
+      next_checkpoint =
+        checkpoint_record(
+          state,
+          issue_id,
+          checkpoint.last_validated_lifecycle_state,
+          checkpoint.durable_guard_evidence,
+          context,
+          checkpoint.last_terminal_suspension_context
+        )
+
+      case persist_recovery_checkpoint(state, next_checkpoint) do
+        {:ok, persisted, _checkpoint} ->
+          {:ok, %{persisted | work_control: Map.put(persisted.work_control, issue_id, suspended)}}
+
+        {:error, blocked, reason} ->
+          {:error, blocked, reason}
+      end
+    else
+      false -> {:error, state, :trusted_lifecycle_checkpoint_unavailable}
+      {:error, reason} -> {:error, state, reason}
+      _ -> {:error, state, :suspension_context_unavailable}
+    end
   end
 
   defp apply_agent_dependency_blocked(state, issue_id, running_entry, decision) do
@@ -8516,9 +9093,25 @@ defmodule SymphonyElixir.Orchestrator do
       state.task_supervisor
     )
 
-    state = block_issue_from_entry(state, issue_id, running_entry, error, decision)
-    notify_dashboard()
-    {:noreply, state}
+    case release_runtime_fence_after_task_down(state, issue_id, running_entry) do
+      {:ok, state} ->
+        state = block_issue_from_entry(state, issue_id, running_entry, error, decision)
+        notify_dashboard()
+        {:noreply, state}
+
+      {:error, blocked_state, reason} ->
+        blocked_state =
+          block_issue_from_entry(
+            blocked_state,
+            issue_id,
+            running_entry,
+            attempt_ledger_error(reason),
+            decision
+          )
+
+        notify_dashboard()
+        {:noreply, blocked_state}
+    end
   end
 
   defp maybe_put_runtime_value(running_entry, _key, nil), do: running_entry

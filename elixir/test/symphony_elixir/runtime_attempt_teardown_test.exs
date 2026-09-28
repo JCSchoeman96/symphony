@@ -579,6 +579,11 @@ defmodule SymphonyElixir.RuntimeAttemptTeardownTest do
     }
 
     {ledger, _path, _project_id} = open_ledger_with_in_flight!()
+    {:ok, record} = AttemptLedger.current(ledger, @issue_id)
+    identity = %{identity | lineage_generation: record.lineage_id}
+    assert {:ok, _bound} = AttemptLedger.bind_runtime_attempt(ledger, @issue_id, identity)
+    assert :ok = AttemptLedger.release_authority_fence(ledger, @issue_id, identity)
+    running_entry = %{running_entry | runtime_attempt: RuntimeAttempt.new(identity, :retry_queued)}
 
     state = %Orchestrator.State{
       attempt_ledger: ledger,

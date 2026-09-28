@@ -1,7 +1,10 @@
 defmodule SymphonyElixir.OrchestratorStatusTest do
   use SymphonyElixir.TestSupport
 
+  alias SymphonyElixir.AgentRuntime.AttemptLedger
   alias SymphonyElixir.AgentRuntime.Router
+  alias SymphonyElixir.AgentRuntime.RuntimeAttempt
+  alias SymphonyElixir.AgentRuntime.RuntimeAttempt.Identity
   alias SymphonyElixir.Dependency.{Graph, Guard}
 
   test "snapshot returns :timeout when snapshot server is unresponsive" do
@@ -1000,6 +1003,20 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     stale_activity_at = DateTime.add(DateTime.utc_now(), -5, :second)
     initial_state = :sys.get_state(pid)
+    assert initial_state.attempt_ledger_status == :ready
+    assert {:ok, reserved} = AttemptLedger.begin_attempt(initial_state.attempt_ledger, issue_id)
+
+    runtime_identity = %Identity{
+      runtime_attempt_id: "stalled-#{issue_id}",
+      work_item_id: issue_id,
+      lineage_generation: reserved.lineage_id,
+      responsibility: "implementation",
+      runtime_profile: "implementation"
+    }
+
+    assert {:ok, bound} = AttemptLedger.bind_runtime_attempt(initial_state.attempt_ledger, issue_id, runtime_identity)
+    assert bound.authority_fence.state == :bound
+    assert bound.in_flight
 
     running_entry = %{
       pid: worker_pid,
@@ -1012,6 +1029,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
         url: "https://example.org/issues/MT-STALL"
       },
       session_id: "thread-stall-turn-stall",
+      runtime_attempt: RuntimeAttempt.new(runtime_identity, :running),
       last_codex_message: nil,
       last_codex_timestamp: stale_activity_at,
       last_codex_event: :notification,
@@ -1024,6 +1042,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       initial_state
       |> Map.put(:running, %{issue_id => running_entry})
       |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+      |> Map.put(:durable_in_flight, MapSet.put(initial_state.durable_in_flight, issue_id))
       |> Orchestrator.reconcile_stalled_running_issues_for_test()
 
     :sys.replace_state(pid, fn _ -> state end)
@@ -1033,13 +1052,21 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     refute Process.alive?(worker_pid)
     refute Map.has_key?(state.running, issue_id)
 
+    assert {:ok, %{authority_fence: %{state: :released}, in_flight: false}} =
+             AttemptLedger.current(initial_state.attempt_ledger, issue_id)
+
+    retry_entry = state.retry_attempts[issue_id]
+
+    assert not is_nil(retry_entry),
+           "stalled retry state: #{inspect(Map.take(state, [:attempt_ledger_status, :running, :retry_attempts, :blocked, :durable_in_flight, :durable_blocked]))}"
+
     assert %{
              attempt: 1,
              due_at_ms: due_at_ms,
              identifier: "MT-STALL",
              issue_url: "https://example.org/issues/MT-STALL",
              error: "stalled for " <> _
-           } = state.retry_attempts[issue_id]
+           } = retry_entry
 
     assert is_integer(due_at_ms)
     remaining_ms = due_at_ms - System.monotonic_time(:millisecond)
@@ -1073,7 +1100,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     worker_monitor = Process.monitor(worker_pid)
 
     stale_activity_at = DateTime.add(DateTime.utc_now(), -5, :second)
-    initial_state = :sys.get_state(pid)
+    {initial_state, runtime_attempt} = bind_runtime_attempt_fixture(:sys.get_state(pid), issue_id, "mcp-stall")
 
     running_entry = %{
       pid: worker_pid,
@@ -1089,6 +1116,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       worker_host: "dm-dev2",
       workspace_path: "/workspaces/MT-MCP",
       session_id: "thread-mcp-turn-mcp",
+      runtime_attempt: runtime_attempt,
       last_codex_message: %{
         event: :notification,
         message: %{"method" => "mcpServer/elicitation/request"},
@@ -1150,13 +1178,14 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     ref = make_ref()
     started_at = DateTime.utc_now()
-    initial_state = :sys.get_state(pid)
+    {initial_state, runtime_attempt} = bind_runtime_attempt_fixture(:sys.get_state(pid), issue_id, "input-required")
 
     running_entry = %{
       pid: self(),
       ref: ref,
       identifier: "MT-INPUT",
       issue: %Issue{id: issue_id, identifier: "MT-INPUT", state: "In Progress", dispatchable: true},
+      runtime_attempt: runtime_attempt,
       session_id: "thread-input-turn-input",
       last_codex_message: %{
         event: :turn_input_required,
@@ -1204,12 +1233,13 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     end)
 
     ref = make_ref()
-    initial_state = :sys.get_state(pid)
+    {initial_state, runtime_attempt} = bind_runtime_attempt_fixture(:sys.get_state(pid), issue_id, "input-required-normal")
 
     running_entry = %{
       pid: self(),
       ref: ref,
       identifier: "MT-INPUT-NORMAL",
+      runtime_attempt: runtime_attempt,
       issue: %Issue{
         id: issue_id,
         identifier: "MT-INPUT-NORMAL",
@@ -1944,6 +1974,29 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
   defp wait_for_snapshot(pid, predicate, timeout_ms \\ 200) when is_function(predicate, 1) do
     deadline_ms = System.monotonic_time(:millisecond) + timeout_ms
     do_wait_for_snapshot(pid, predicate, deadline_ms)
+  end
+
+  defp bind_runtime_attempt_fixture(state, issue_id, runtime_attempt_id) do
+    assert {:ok, reserved} = AttemptLedger.begin_attempt(state.attempt_ledger, issue_id)
+
+    identity = %Identity{
+      runtime_attempt_id: runtime_attempt_id,
+      work_item_id: issue_id,
+      lineage_generation: reserved.lineage_id,
+      responsibility: "implementation",
+      runtime_profile: "implementation"
+    }
+
+    assert {:ok, %{authority_fence: %{state: :bound}}} =
+             AttemptLedger.bind_runtime_attempt(state.attempt_ledger, issue_id, identity)
+
+    state = %{
+      state
+      | durable_in_flight: MapSet.put(state.durable_in_flight, issue_id),
+        attempt_lineages: Map.put(state.attempt_lineages, issue_id, reserved.lineage_id)
+    }
+
+    {state, RuntimeAttempt.new(identity, :running)}
   end
 
   defp do_wait_for_snapshot(pid, predicate, deadline_ms) do
