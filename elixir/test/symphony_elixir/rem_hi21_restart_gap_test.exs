@@ -349,7 +349,7 @@ defmodule SymphonyElixir.RemHi21RestartGapTest do
       created_at: now
     }
 
-    assert {:ok, _pending} =
+    assert {:ok, pending} =
              AttemptLedger.mark_suspension_pending(attempt_ledger, work_item_id, runtime_identity, intent)
 
     assert {:ok, terminal_context} =
@@ -363,6 +363,7 @@ defmodule SymphonyElixir.RemHi21RestartGapTest do
                recovery_policy: :fresh_reconciliation,
                required_evidence: [],
                resume_target: :in_progress,
+               suspension_id: pending.authority_fence.intent.suspension_id,
                status: :resolved
              })
 
@@ -387,6 +388,225 @@ defmodule SymphonyElixir.RemHi21RestartGapTest do
 
     assert {:ok, %{in_flight: true, authority_fence: %{state: :suspension_pending}}} =
              AttemptLedger.current(attempt_ledger, work_item_id)
+  end
+
+  test "an older terminal suspension in the same lineage cannot release a newer pending runtime after restart" do
+    for terminal_status <- [:resolved, :escalated] do
+      root = Path.join(System.tmp_dir!(), "rem-hi21-stale-terminal-#{System.unique_integer([:positive])}")
+      project_id = "rem-hi21-stale-terminal-#{System.unique_integer([:positive])}"
+      work_item_id = "work-hi21-stale-terminal"
+      tracker_identity = %{tracker_kind: "memory", provider_scope: %{}}
+      recovery_path = Path.join(root, "recovery.dets")
+      attempt_path = Path.join(root, "attempt.dets")
+      {:ok, recovery} = RecoveryLedger.open(project_id, tracker_identity, path: recovery_path)
+      {:ok, attempts} = AttemptLedger.open(project_id, tracker_identity, path: attempt_path)
+
+      on_exit(fn ->
+        for path <- [recovery_path, attempt_path], :dets.info(path) != :undefined do
+          :dets.close(path)
+        end
+
+        File.rm_rf(root)
+      end)
+
+      now = DateTime.utc_now()
+
+      observation = %ProviderObservation{
+        provider: :memory,
+        work_item_id: work_item_id,
+        provider_state_name: "In Progress",
+        observed_at: now
+      }
+
+      base_checkpoint = %{
+        schema_version: RecoveryLedger.schema_version(),
+        project_namespace: project_id,
+        work_item_id: work_item_id,
+        last_validated_lifecycle_state: :in_progress,
+        durable_guard_evidence: [],
+        active_suspension_context: nil,
+        last_terminal_suspension_context: nil,
+        updated_at: now
+      }
+
+      assert :ok = RecoveryLedger.put_sync(recovery, base_checkpoint)
+      assert {:ok, first_attempt} = AttemptLedger.begin_attempt(attempts, work_item_id)
+
+      first_identity = %Identity{
+        runtime_attempt_id: "runtime-s1",
+        work_item_id: work_item_id,
+        lineage_generation: first_attempt.lineage_id,
+        responsibility: "implementation",
+        runtime_profile: "implementation"
+      }
+
+      assert {:ok, _bound} = AttemptLedger.bind_runtime_attempt(attempts, work_item_id, first_identity)
+
+      first_intent = %{
+        reason: :provider_blocked,
+        provider_observation: observation,
+        required_evidence: [],
+        created_at: now
+      }
+
+      assert {:ok, first_pending} =
+               AttemptLedger.mark_suspension_pending(attempts, work_item_id, first_identity, first_intent)
+
+      assert {:ok, first_context} =
+               SuspensionContext.new(%{
+                 work_item_id: work_item_id,
+                 suspension_id: first_pending.authority_fence.intent.suspension_id,
+                 last_validated_lifecycle_state: :in_progress,
+                 provider_observation: observation,
+                 reason: :provider_blocked,
+                 lineage_generation: first_attempt.lineage_id,
+                 created_at: now,
+                 recovery_policy: :fresh_reconciliation,
+                 required_evidence: [],
+                 resume_target: :in_progress
+               })
+
+      assert {:ok, first_terminal} = terminalize_context(first_context, terminal_status)
+      assert first_terminal.suspension_id == first_pending.authority_fence.intent.suspension_id
+      assert :ok = AttemptLedger.release_suspension_fence(attempts, work_item_id, first_identity, first_terminal)
+      assert :ok = AttemptLedger.clear_in_flight(attempts, work_item_id)
+
+      first_terminal_checkpoint = %{base_checkpoint | last_terminal_suspension_context: first_terminal}
+      assert :ok = RecoveryLedger.put_sync(recovery, first_terminal_checkpoint)
+      assert :ok = RecoveryLedger.close(recovery)
+
+      {:ok, failing_recovery} =
+        RecoveryLedger.open(project_id, tracker_identity,
+          path: recovery_path,
+          write_fun: fn _table, _records -> {:error, :disk_full} end
+        )
+
+      assert {:ok, second_attempt} = AttemptLedger.begin_attempt(attempts, work_item_id)
+      assert second_attempt.lineage_id == first_attempt.lineage_id
+
+      second_identity = %Identity{
+        runtime_attempt_id: "runtime-s2",
+        work_item_id: work_item_id,
+        lineage_generation: second_attempt.lineage_id,
+        responsibility: "implementation",
+        runtime_profile: "implementation"
+      }
+
+      assert {:ok, _bound} = AttemptLedger.bind_runtime_attempt(attempts, work_item_id, second_identity)
+
+      work_item = %WorkItem{
+        id: work_item_id,
+        provider_observation: observation,
+        validated_lifecycle_state: :in_progress,
+        authority_disposition: %AuthorityDisposition{status: :eligible, lifecycle_state: :in_progress}
+      }
+
+      unsafe_assessment = %LifecycleAssessment{
+        work_item_id: work_item_id,
+        provider_observation: observation,
+        mapped_state: :blocked,
+        validated_state: :blocked,
+        status: :authority_reducing,
+        required_guards: [],
+        satisfied_guards: [],
+        missing_guards: [],
+        reason: :provider_blocked,
+        assessed_at: now
+      }
+
+      running_entry = %{
+        runtime_attempt: RuntimeAttempt.new(second_identity, :running),
+        identifier: "SYM-HI21-STALE-TERMINAL",
+        started_at: now
+      }
+
+      event_state = %State{
+        running: %{work_item_id => running_entry},
+        attempt_ledger: attempts,
+        attempt_ledger_status: :ready,
+        durable_in_flight: MapSet.new([work_item_id]),
+        attempt_lineages: %{work_item_id => second_attempt.lineage_id},
+        recovery_ledger: failing_recovery,
+        recovery_ledger_status: :ready,
+        recovery_checkpoints: %{work_item_id => first_terminal_checkpoint},
+        work_control: %{work_item_id => work_item}
+      }
+
+      assert {:noreply, after_suspension} =
+               Orchestrator.handle_info(
+                 {:agent_lifecycle_suspended, work_item_id, second_identity, unsafe_assessment},
+                 event_state
+               )
+
+      assert after_suspension.recovery_ledger_status != :ready
+
+      assert {:ok, %{authority_fence: %{state: :suspension_pending}, in_flight: true}} =
+               AttemptLedger.current(attempts, work_item_id)
+
+      assert {:ok, ^first_terminal_checkpoint} = RecoveryLedger.current(failing_recovery, work_item_id)
+
+      assert :ok = RecoveryLedger.close(failing_recovery)
+      assert :ok = AttemptLedger.close(attempts)
+
+      {:ok, restarted_recovery} = RecoveryLedger.open(project_id, tracker_identity, path: recovery_path)
+      {:ok, restarted_attempts} = AttemptLedger.open(project_id, tracker_identity, path: attempt_path)
+
+      assert {:ok, ^first_terminal_checkpoint} = RecoveryLedger.current(restarted_recovery, work_item_id)
+
+      assert {:ok, second_record} = AttemptLedger.current(restarted_attempts, work_item_id)
+      assert second_record.in_flight
+      assert second_record.authority_fence.state == :suspension_pending
+      assert second_record.authority_fence.runtime_attempt == second_identity
+
+      restarted_state = %State{
+        attempt_ledger: restarted_attempts,
+        attempt_ledger_status: :ready,
+        durable_in_flight: MapSet.new([work_item_id]),
+        attempt_lineages: %{work_item_id => second_attempt.lineage_id},
+        recovery_ledger: restarted_recovery,
+        recovery_ledger_status: :ready,
+        recovery_checkpoints: %{work_item_id => first_terminal_checkpoint},
+        work_control: %{work_item_id => work_item}
+      }
+
+      assert {:ok, recovered} = Orchestrator.restore_pending_authority_suspensions_for_test(restarted_state)
+      assert MapSet.member?(recovered.durable_in_flight, work_item_id)
+      assert not WorkItem.dispatchable?(recovered.work_control[work_item_id])
+
+      assert {:ok, second_record} = AttemptLedger.current(restarted_attempts, work_item_id)
+      assert second_record.in_flight
+      assert second_record.authority_fence.state == :suspension_pending
+      assert second_record.authority_fence.runtime_attempt == second_identity
+
+      restored_context = recovered.recovery_checkpoints[work_item_id].active_suspension_context
+      {:ok, durable_second_pending} = AttemptLedger.current(restarted_attempts, work_item_id)
+
+      assert Map.get(restored_context, :suspension_id) ==
+               durable_second_pending.authority_fence.intent.suspension_id
+
+      assert {:ok, second_terminal} = terminalize_context(restored_context, terminal_status)
+      assert second_terminal.suspension_id == restored_context.suspension_id
+
+      terminal_checkpoint = %{
+        recovered.recovery_checkpoints[work_item_id]
+        | active_suspension_context: nil,
+          last_terminal_suspension_context: second_terminal,
+          updated_at: DateTime.utc_now()
+      }
+
+      assert :ok = RecoveryLedger.put_sync(restarted_recovery, terminal_checkpoint)
+
+      terminal_state = %{
+        recovered
+        | recovery_checkpoints: Map.put(recovered.recovery_checkpoints, work_item_id, terminal_checkpoint)
+      }
+
+      assert {:ok, released} = Orchestrator.restore_pending_authority_suspensions_for_test(terminal_state)
+      refute MapSet.member?(released.durable_in_flight, work_item_id)
+
+      assert {:ok, %{in_flight: false, authority_fence: %{state: :released, runtime_attempt: ^second_identity}}} =
+               AttemptLedger.current(restarted_attempts, work_item_id)
+    end
   end
 
   test "RecoveryLedger write and sync failures remain fenced after a healthy restart" do
@@ -680,37 +900,6 @@ defmodule SymphonyElixir.RemHi21RestartGapTest do
         observed_at: now
       }
 
-      {:ok, context} =
-        SuspensionContext.new(%{
-          work_item_id: work_item_id,
-          last_validated_lifecycle_state: :in_progress,
-          provider_observation: observation,
-          reason: :provider_blocked,
-          lineage_generation: "pending",
-          created_at: now,
-          recovery_policy: :fresh_reconciliation,
-          required_evidence: [],
-          resume_target: :in_progress
-        })
-
-      {:ok, resolving} = SuspensionContext.begin_resolution(context)
-
-      terminal =
-        case terminal_status do
-          :resolved ->
-            elem(
-              SuspensionContext.resolve(resolving, %{
-                fresh_reconciliation: true,
-                resume_target: :in_progress,
-                required_evidence: []
-              }),
-              1
-            )
-
-          :escalated ->
-            elem(SuspensionContext.escalate(resolving, :operator_review), 1)
-        end
-
       {:ok, armed} = AttemptLedger.begin_attempt(attempts, work_item_id)
 
       identity = %Identity{
@@ -723,8 +912,23 @@ defmodule SymphonyElixir.RemHi21RestartGapTest do
 
       {:ok, _} = AttemptLedger.bind_runtime_attempt(attempts, work_item_id, identity)
       intent = %{reason: :provider_blocked, provider_observation: observation, required_evidence: [], created_at: now}
-      {:ok, _} = AttemptLedger.mark_suspension_pending(attempts, work_item_id, identity, intent)
-      terminal = %{terminal | lineage_generation: armed.lineage_id}
+      {:ok, pending} = AttemptLedger.mark_suspension_pending(attempts, work_item_id, identity, intent)
+
+      {:ok, context} =
+        SuspensionContext.new(%{
+          work_item_id: work_item_id,
+          suspension_id: pending.authority_fence.intent.suspension_id,
+          last_validated_lifecycle_state: :in_progress,
+          provider_observation: observation,
+          reason: :provider_blocked,
+          lineage_generation: armed.lineage_id,
+          created_at: now,
+          recovery_policy: :fresh_reconciliation,
+          required_evidence: [],
+          resume_target: :in_progress
+        })
+
+      {:ok, terminal} = terminalize_context(context, terminal_status)
 
       checkpoint = %{
         schema_version: RecoveryLedger.schema_version(),
@@ -753,6 +957,22 @@ defmodule SymphonyElixir.RemHi21RestartGapTest do
 
       assert {:ok, %{in_flight: false, authority_fence: %{state: :released, runtime_attempt: ^identity}}} =
                AttemptLedger.current(attempts, work_item_id)
+    end
+  end
+
+  defp terminalize_context(context, :resolved) do
+    with {:ok, resolving} <- SuspensionContext.begin_resolution(context) do
+      SuspensionContext.resolve(resolving, %{
+        fresh_reconciliation: true,
+        resume_target: context.resume_target,
+        required_evidence: context.required_evidence
+      })
+    end
+  end
+
+  defp terminalize_context(context, :escalated) do
+    with {:ok, resolving} <- SuspensionContext.begin_resolution(context) do
+      SuspensionContext.escalate(resolving, :operator_review)
     end
   end
 end

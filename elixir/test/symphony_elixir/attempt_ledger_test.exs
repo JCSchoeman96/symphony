@@ -380,6 +380,7 @@ defmodule SymphonyElixir.AttemptLedgerTest do
     {:ok, open_context} =
       SuspensionContext.new(%{
         work_item_id: "issue-a",
+        suspension_id: pending.authority_fence.intent.suspension_id,
         last_validated_lifecycle_state: :in_progress,
         provider_observation: observation,
         reason: :provider_blocked,
@@ -409,6 +410,74 @@ defmodule SymphonyElixir.AttemptLedgerTest do
 
     assert :ok = AttemptLedger.release_suspension_fence(ledger, "issue-a", identity, resolved_context)
 
+    assert :ok = AttemptLedger.close(ledger)
+  end
+
+  test "pending suspension fence rejects terminal context from another runtime in the same lineage", %{path: path} do
+    {:ok, ledger} = AttemptLedger.open("project-a", @identity, path: path)
+    assert {:ok, armed} = AttemptLedger.begin_attempt(ledger, "issue-a")
+
+    current_identity = %Identity{
+      runtime_attempt_id: "runtime-current",
+      work_item_id: "issue-a",
+      lineage_generation: armed.lineage_id,
+      responsibility: "implementation",
+      runtime_profile: "implementation"
+    }
+
+    assert {:ok, _bound} = AttemptLedger.bind_runtime_attempt(ledger, "issue-a", current_identity)
+
+    observed_at = ~U[2026-09-27 00:00:00Z]
+
+    observation = %ProviderObservation{
+      provider: :memory,
+      work_item_id: "issue-a",
+      provider_state_name: "In Progress",
+      observed_at: observed_at
+    }
+
+    intent = %{
+      reason: :provider_blocked,
+      provider_observation: observation,
+      required_evidence: [],
+      created_at: observed_at
+    }
+
+    assert {:ok, _pending} =
+             AttemptLedger.mark_suspension_pending(ledger, "issue-a", current_identity, intent)
+
+    assert {:ok, stale_terminal} =
+             SuspensionContext.new(%{
+               work_item_id: "issue-a",
+               last_validated_lifecycle_state: :in_progress,
+               provider_observation: observation,
+               reason: :provider_blocked,
+               lineage_generation: armed.lineage_id,
+               created_at: observed_at,
+               recovery_policy: :fresh_reconciliation,
+               required_evidence: [],
+               resume_target: :in_progress,
+               suspension_id: "suspension-stale",
+               status: :resolved
+             })
+
+    assert {:error, :suspension_context_mismatch} =
+             AttemptLedger.release_suspension_fence(ledger, "issue-a", current_identity, stale_terminal)
+
+    assert {:error, :suspension_context_mismatch} =
+             AttemptLedger.release_suspension_fence(
+               ledger,
+               "issue-a",
+               current_identity,
+               %{stale_terminal | suspension_id: nil}
+             )
+
+    assert {:ok, current_record} = AttemptLedger.current(ledger, "issue-a")
+    assert current_record.in_flight
+    assert current_record.authority_fence.state == :suspension_pending
+    assert current_record.authority_fence.runtime_attempt == current_identity
+
+    assert {:error, :authority_fence_unresolved} = AttemptLedger.clear_in_flight(ledger, "issue-a")
     assert :ok = AttemptLedger.close(ledger)
   end
 

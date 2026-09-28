@@ -39,6 +39,24 @@ defmodule SymphonyElixir.WorkControlRecoveryLedgerTest do
     assert :ok = RecoveryLedger.close(reopened)
   end
 
+  test "reads legacy suspension contexts without a correlation id", %{path: path} do
+    {:ok, ledger} = RecoveryLedger.open("project-a", @identity, path: path)
+    context = suspension_context("work-a", :open)
+
+    legacy_context =
+      context
+      |> Map.from_struct()
+      |> Map.delete(:suspension_id)
+      |> Map.put(:__struct__, SuspensionContext)
+
+    legacy_checkpoint = Map.put(checkpoint("work-a"), :active_suspension_context, legacy_context)
+
+    assert :ok = RecoveryLedger.put_sync(ledger, legacy_checkpoint)
+    assert {:ok, restored} = RecoveryLedger.current(ledger, "work-a")
+    assert Map.get(restored.active_suspension_context, :suspension_id) == nil
+    assert :ok = RecoveryLedger.close(ledger)
+  end
+
   test "uses the configured recovery root", %{root: root} do
     previous_root = Application.get_env(:symphony_elixir, :recovery_ledger_root)
     Application.put_env(:symphony_elixir, :recovery_ledger_root, root)

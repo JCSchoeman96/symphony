@@ -10,6 +10,7 @@ defmodule SymphonyElixir.WorkControl.SuspensionContext do
 
   defstruct [
     :work_item_id,
+    :suspension_id,
     :last_validated_lifecycle_state,
     :provider_observation,
     :reason,
@@ -24,6 +25,7 @@ defmodule SymphonyElixir.WorkControl.SuspensionContext do
   @type status :: :open | :resolving | :resolved | :escalated
   @type t :: %__MODULE__{
           work_item_id: String.t(),
+          suspension_id: String.t() | nil,
           last_validated_lifecycle_state: WorkflowLifecycle.state(),
           provider_observation: ProviderObservation.t(),
           reason: atom() | term(),
@@ -38,6 +40,7 @@ defmodule SymphonyElixir.WorkControl.SuspensionContext do
   @spec new(map()) :: {:ok, t()} | {:error, atom()}
   def new(attrs) when is_map(attrs) do
     with :ok <- validate_work_item_id(Map.get(attrs, :work_item_id)),
+         :ok <- validate_suspension_id(Map.get(attrs, :suspension_id)),
          :ok <- validate_last_state(Map.get(attrs, :last_validated_lifecycle_state)),
          :ok <- validate_observation(Map.get(attrs, :provider_observation)),
          :ok <- validate_reason(Map.get(attrs, :reason)),
@@ -51,6 +54,7 @@ defmodule SymphonyElixir.WorkControl.SuspensionContext do
       {:ok,
        %__MODULE__{
          work_item_id: Map.get(attrs, :work_item_id),
+         suspension_id: Map.get(attrs, :suspension_id),
          last_validated_lifecycle_state: Map.get(attrs, :last_validated_lifecycle_state),
          provider_observation: Map.get(attrs, :provider_observation),
          reason: Map.get(attrs, :reason),
@@ -119,6 +123,14 @@ defmodule SymphonyElixir.WorkControl.SuspensionContext do
   end
 
   defp validate_work_item_id(_value), do: {:error, :missing_work_item_id}
+
+  defp validate_suspension_id(nil), do: :ok
+
+  defp validate_suspension_id(value) when is_binary(value) do
+    if String.trim(value) == "", do: {:error, :invalid_suspension_id}, else: :ok
+  end
+
+  defp validate_suspension_id(_value), do: {:error, :invalid_suspension_id}
 
   defp validate_last_state(value) do
     if WorkflowLifecycle.canonical?(value), do: :ok, else: {:error, :invalid_last_validated_lifecycle_state}

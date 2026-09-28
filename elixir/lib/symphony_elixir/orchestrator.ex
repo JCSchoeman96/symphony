@@ -4023,7 +4023,16 @@ defmodule SymphonyElixir.Orchestrator do
         last_terminal_suspension_context: %SuspensionContext{status: status} = terminal
       }
       when status in [:resolved, :escalated] ->
-        release_terminal_pending_fence(state, issue_id, terminal)
+        case terminal_pending_relation(state, issue_id, terminal) do
+          :same_event ->
+            release_terminal_pending_fence(state, issue_id, terminal)
+
+          :older_same_lineage_event ->
+            restore_pending_suspension_context(state, issue_id, intent, checkpoint)
+
+          :different_lineage ->
+            release_terminal_pending_fence(state, issue_id, terminal)
+        end
 
       _not_terminal ->
         restore_pending_suspension_context(state, issue_id, intent, checkpoint)
@@ -4036,20 +4045,57 @@ defmodule SymphonyElixir.Orchestrator do
        %{
          in_flight: true,
          lineage_id: lineage,
-         authority_fence: %{state: :suspension_pending, runtime_attempt: identity}
+         authority_fence: %{state: :suspension_pending, runtime_attempt: identity, intent: intent}
        }}
       when terminal.work_item_id == issue_id and terminal.lineage_generation == lineage and
              identity.work_item_id == issue_id and identity.lineage_generation == lineage ->
-        with :ok <- AttemptLedger.release_suspension_fence(state.attempt_ledger, issue_id, identity, terminal),
+        with true <-
+               terminal_context_matches_pending_intent?(terminal, intent) ||
+                 {:error, :terminal_suspension_correlation_mismatch},
+             :ok <- AttemptLedger.release_suspension_fence(state.attempt_ledger, issue_id, identity, terminal),
              :ok <- AttemptLedger.clear_in_flight(state.attempt_ledger, issue_id) do
           {:ok, clear_durable_in_flight(state, issue_id)}
         else
-          {:error, reason} -> {:error, block_ledger(state, reason), reason}
+          {:error, :terminal_suspension_correlation_mismatch} ->
+            {:error, state, :terminal_suspension_correlation_mismatch}
+
+          {:error, reason} ->
+            {:error, block_ledger(state, reason), reason}
         end
 
       _mismatch ->
         {:error, state, :terminal_suspension_lineage_mismatch}
     end
+  end
+
+  defp terminal_pending_relation(state, issue_id, %SuspensionContext{} = terminal) do
+    case current_attempt_record(state, issue_id) do
+      {:ok,
+       %{
+         in_flight: true,
+         lineage_id: lineage,
+         authority_fence: %{
+           state: :suspension_pending,
+           runtime_attempt: %RuntimeAttemptIdentity{} = identity,
+           intent: intent
+         }
+       }}
+      when terminal.work_item_id == issue_id and terminal.lineage_generation == lineage and
+             identity.work_item_id == issue_id and identity.lineage_generation == lineage ->
+        if terminal_context_matches_pending_intent?(terminal, intent),
+          do: :same_event,
+          else: :older_same_lineage_event
+
+      _mismatch ->
+        :different_lineage
+    end
+  end
+
+  defp terminal_context_matches_pending_intent?(terminal, intent) do
+    suspension_id = Map.get(intent, :suspension_id)
+
+    is_binary(suspension_id) and String.trim(suspension_id) != "" and
+      Map.get(terminal, :suspension_id) == suspension_id
   end
 
   defp restore_pending_suspension_context(state, issue_id, intent, checkpoint) do
@@ -4059,9 +4105,11 @@ defmodule SymphonyElixir.Orchestrator do
     with %{last_validated_lifecycle_state: prior_state} = checkpoint when not is_nil(checkpoint) <- checkpoint,
          true <- WorkflowLifecycle.canonical?(prior_state),
          %ProviderObservation{work_item_id: ^issue_id} <- observation,
+         suspension_id when is_binary(suspension_id) <- Map.get(intent, :suspension_id),
          {:ok, context} <-
            SuspensionContext.new(%{
              work_item_id: issue_id,
+             suspension_id: suspension_id,
              last_validated_lifecycle_state: prior_state,
              provider_observation: observation,
              reason: Map.get(intent, :reason),
@@ -9014,8 +9062,8 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp persist_runtime_suspension_intent(ledger, state, issue_id, identity, work_item, intent) do
     case AttemptLedger.mark_suspension_pending(ledger, issue_id, identity, intent) do
-      {:ok, _record} ->
-        persist_runtime_suspension_context(state, issue_id, work_item, intent)
+      {:ok, %{authority_fence: %{intent: durable_intent}}} ->
+        persist_runtime_suspension_context(state, issue_id, work_item, durable_intent)
 
       {:error, fence_reason} ->
         authority_fence_error = {:authority_fence_pending_failed, fence_reason}
@@ -9043,6 +9091,7 @@ defmodule SymphonyElixir.Orchestrator do
          {:ok, context} <-
            SuspensionContext.new(%{
              work_item_id: issue_id,
+             suspension_id: Map.get(intent, :suspension_id),
              last_validated_lifecycle_state: prior_state,
              provider_observation: observation,
              reason: intent.reason,

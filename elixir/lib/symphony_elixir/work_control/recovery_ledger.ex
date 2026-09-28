@@ -41,6 +41,7 @@ defmodule SymphonyElixir.WorkControl.RecoveryLedger do
   @empty_scope_kinds ["memory", "linear"]
   @suspension_context_keys [
     :work_item_id,
+    :suspension_id,
     :last_validated_lifecycle_state,
     :provider_observation,
     :reason,
@@ -51,6 +52,7 @@ defmodule SymphonyElixir.WorkControl.RecoveryLedger do
     :resume_target,
     :status
   ]
+  @legacy_suspension_context_keys @suspension_context_keys -- [:suspension_id]
   @legacy_provider_observation_keys [
     :provider,
     :work_item_id,
@@ -380,8 +382,9 @@ defmodule SymphonyElixir.WorkControl.RecoveryLedger do
        ) do
     context_record = Map.from_struct(context)
 
-    with :ok <- validate_exact_keys(context_record, @suspension_context_keys),
+    with :ok <- validate_suspension_context_keys(context_record),
          :ok <- validate_matching_work_item_id(context.work_item_id, work_item_id),
+         :ok <- validate_non_empty_optional_string(Map.get(context_record, :suspension_id)),
          :ok <- validate_canonical_state(context.last_validated_lifecycle_state),
          :ok <- validate_context_state(context.last_validated_lifecycle_state, state, kind),
          :ok <- validate_provider_observation(context.provider_observation, work_item_id),
@@ -397,6 +400,15 @@ defmodule SymphonyElixir.WorkControl.RecoveryLedger do
 
   defp validate_suspension_context(_context, _kind, _work_item_id, _state),
     do: {:error, :invalid_suspension_context}
+
+  defp validate_suspension_context_keys(context_record) do
+    if validate_exact_keys(context_record, @suspension_context_keys) == :ok or
+         validate_exact_keys(context_record, @legacy_suspension_context_keys) == :ok do
+      :ok
+    else
+      {:error, :invalid_suspension_context}
+    end
+  end
 
   defp validate_context_state(_context_state, _checkpoint_state, :terminal), do: :ok
 

@@ -326,11 +326,14 @@ defmodule SymphonyElixir.AgentRuntime.AttemptLedger do
   def release_armed_authority_fence(_ledger, _issue_id), do: {:error, :invalid_attempt_arguments}
 
   @spec mark_suspension_pending(t(), String.t(), Identity.t(), map()) :: {:ok, record()} | {:error, term()}
-  def mark_suspension_pending(%__MODULE__{} = ledger, issue_id, %Identity{} = identity, intent) do
+  def mark_suspension_pending(%__MODULE__{} = ledger, issue_id, %Identity{} = identity, intent)
+      when is_map(intent) do
+    intent = Map.put_new(intent, :suspension_id, suspension_id_for(identity))
+
     with {:ok, record} <- current(ledger, issue_id),
          fence <- current_fence(record),
          :ok <- validate_fence_identity(fence, identity, issue_id, record.lineage_id),
-         :ok <- validate_suspension_intent(intent) do
+         :ok <- validate_suspension_intent_for_identity(intent, identity) do
       mark_suspension_pending_from_fence(ledger, issue_id, record, fence, intent)
     else
       :not_found -> {:error, :lineage_not_found}
@@ -387,21 +390,30 @@ defmodule SymphonyElixir.AgentRuntime.AttemptLedger do
     with {:ok, record} <- current(ledger, issue_id),
          fence <- current_fence(record),
          :ok <- validate_fence_identity(fence, identity, issue_id, record.lineage_id),
-         true <- context.status in [:resolved, :escalated] || {:error, :suspension_context_not_terminal},
-         true <-
-           (context.work_item_id == issue_id and context.lineage_generation == record.lineage_id) ||
-             {:error, :suspension_context_mismatch},
-         %{state: :suspension_pending} <- fence do
-      persist_released_fence(ledger, issue_id, record, fence)
+         :ok <- validate_terminal_suspension_context(context, issue_id, record.lineage_id) do
+      case fence do
+        %{state: :suspension_pending, intent: intent} ->
+          release_pending_suspension_fence(ledger, issue_id, record, fence, identity, intent, context)
+
+        %{state: :released} ->
+          :ok
+
+        _unresolved ->
+          {:error, :suspension_context_not_terminal}
+      end
     else
-      %{state: :released} -> :ok
       :not_found -> {:error, :lineage_not_found}
       {:error, reason} -> {:error, reason}
-      _ -> {:error, :suspension_context_not_terminal}
     end
   end
 
   def release_suspension_fence(_ledger, _issue_id, _identity, _context), do: {:error, :suspension_context_not_terminal}
+
+  defp release_pending_suspension_fence(ledger, issue_id, record, fence, identity, intent, context) do
+    with :ok <- validate_suspension_context_correlation(identity, intent, context) do
+      persist_released_fence(ledger, issue_id, record, fence)
+    end
+  end
 
   defp persist_released_fence(ledger, issue_id, record, fence) do
     released_fence = %{
@@ -436,18 +448,79 @@ defmodule SymphonyElixir.AgentRuntime.AttemptLedger do
   defp validate_fence_identity(_fence, _identity, _issue_id, _lineage_id),
     do: {:error, :runtime_attempt_identity_mismatch}
 
-  defp validate_suspension_intent(%{reason: reason, provider_observation: observation, required_evidence: evidence, created_at: %DateTime{}})
+  defp validate_suspension_intent(%{reason: reason, provider_observation: observation, required_evidence: evidence, created_at: %DateTime{}} = intent)
        when not is_nil(reason) and is_list(evidence) do
     valid_observation? = is_nil(observation) or match?(%ProviderObservation{}, observation)
     valid_evidence? = Enum.all?(evidence, &(is_atom(&1) or is_map(&1)))
-    if valid_observation? and valid_evidence?, do: :ok, else: {:error, :invalid_suspension_intent}
+    suspension_id = Map.get(intent, :suspension_id)
+    valid_suspension_id? = is_nil(suspension_id) or valid_suspension_id?(suspension_id)
+
+    if valid_observation? and valid_evidence? and valid_suspension_id?,
+      do: :ok,
+      else: {:error, :invalid_suspension_intent}
   end
 
   defp validate_suspension_intent(_intent), do: {:error, :invalid_suspension_intent}
 
+  defp validate_suspension_intent_for_identity(intent, identity) do
+    with :ok <- validate_suspension_intent(intent),
+         true <- Map.get(intent, :suspension_id) == suspension_id_for(identity) do
+      :ok
+    else
+      false -> {:error, :invalid_suspension_intent}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp validate_suspension_intent_for_fence(intent, identity) do
+    with :ok <- validate_suspension_intent(intent) do
+      validate_suspension_fence_correlation(Map.get(intent, :suspension_id), identity)
+    end
+  end
+
+  defp validate_suspension_fence_correlation(nil, _identity), do: :ok
+
+  defp validate_suspension_fence_correlation(suspension_id, identity) do
+    if suspension_id == suspension_id_for(identity), do: :ok, else: {:error, :invalid_record}
+  end
+
+  defp validate_terminal_suspension_context(%SuspensionContext{} = context, issue_id, lineage_id) do
+    cond do
+      context.status not in [:resolved, :escalated] ->
+        {:error, :suspension_context_not_terminal}
+
+      context.work_item_id != issue_id or context.lineage_generation != lineage_id ->
+        {:error, :suspension_context_mismatch}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_suspension_context_correlation(identity, intent, context) do
+    expected_id = suspension_id_for(identity)
+
+    if valid_suspension_id?(expected_id) and Map.get(intent, :suspension_id) == expected_id and
+         Map.get(context, :suspension_id) == expected_id do
+      :ok
+    else
+      {:error, :suspension_context_mismatch}
+    end
+  end
+
+  defp suspension_id_for(%Identity{runtime_attempt_id: runtime_attempt_id}) when is_binary(runtime_attempt_id) do
+    :crypto.hash(:sha256, runtime_attempt_id)
+    |> Base.encode16(case: :lower)
+  end
+
+  defp suspension_id_for(_identity), do: nil
+
+  defp valid_suspension_id?(value) when is_binary(value), do: String.trim(value) != ""
+  defp valid_suspension_id?(_value), do: false
+
   defp equivalent_suspension_intent?(left, right) do
-    Map.take(left, [:reason, :provider_observation, :required_evidence]) ==
-      Map.take(right, [:reason, :provider_observation, :required_evidence])
+    Map.take(left, [:reason, :provider_observation, :required_evidence, :suspension_id]) ==
+      Map.take(right, [:reason, :provider_observation, :required_evidence, :suspension_id])
   end
 
   defp current_fence(record) do
@@ -923,9 +996,17 @@ defmodule SymphonyElixir.AgentRuntime.AttemptLedger do
   defp validate_authority_fence(%{state: :bound, runtime_attempt: %Identity{}, route_fingerprint: route}, true)
        when is_binary(route) or is_nil(route), do: :ok
 
-  defp validate_authority_fence(%{state: :suspension_pending, runtime_attempt: %Identity{}, route_fingerprint: route, intent: intent}, true)
+  defp validate_authority_fence(
+         %{
+           state: :suspension_pending,
+           runtime_attempt: %Identity{} = identity,
+           route_fingerprint: route,
+           intent: intent
+         },
+         true
+       )
        when is_binary(route) or is_nil(route) do
-    validate_suspension_intent(intent)
+    validate_suspension_intent_for_fence(intent, identity)
   end
 
   defp validate_authority_fence(%{state: :released} = fence, in_flight) when is_boolean(in_flight) do
