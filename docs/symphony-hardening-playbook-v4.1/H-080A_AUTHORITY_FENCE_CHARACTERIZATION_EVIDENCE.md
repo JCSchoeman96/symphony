@@ -1,40 +1,117 @@
-# H-080A AuthorityFence characterization evidence
+# H-080A AuthorityFence lifecycle characterization
 
-This is a partial H-080A-FENCE-01 characterization record for accepted base `7ba76fccaacc5789443c685ed6f1d2bee7f04f9c`. It does not establish H-080A completion.
+This is a partial H-080A characterization record for accepted base `7ba76fccaacc5789443c685ed6f1d2bee7f04f9c`. It does not complete H-080A. PR #26 changes this evidence file and the H-080A test file only; no production source changed.
 
-The test tranche adds `elixir/test/symphony_elixir/h080a_authority_fence_characterization_test.exs`. It does not change production code.
+## Classification: Outcome B — constructed-case overstatement corrected
 
-## Characterized fence cuts
+The earlier test named `a mismatched DOWN process cannot release the live runtime fence` directly called `Orchestrator.handle_info/2` with a tuple built by the test. It used the running entry's monitor reference and the test process as the PID while the actual child stayed alive. The handler removed the entry and durably changed `BOUND, in_flight: true` to `RELEASED, in_flight: false`.
 
-The first six tests cover these paths:
+That observation demonstrated how the handler processes a constructed `:DOWN`-shaped tuple. It did not demonstrate that OTP generated a termination notification for a live child. The test now preserves and labels that observation, and a second test sends the constructed tuple to a live Orchestrator GenServer to characterize the production callback path.
 
-- A persisted ARMED reservation with no bound runtime can be retired after restart.
-- The runtime child observes a synced BOUND record before its first instruction. Killing the child and reopening the ledger leaves BOUND in flight and blocked.
-- A BOUND write failure leaves ARMED, which restart can retire. A BOUND sync error leaves BOUND in flight, which restart keeps blocked.
-- A task supervisor rejection occurs after BOUND. The child does not run, and the known start failure releases the exact runtime fence.
-- Suspension pending write and sync errors, and RecoveryLedger context write and sync errors, preserve the RuntimeAttempt and suspension ID. Restart retains the fence and reconstructs or retains the open suspension context.
-- A terminal recovery checkpoint is synced and reopened before release. RELEASED write and sync errors, and in-flight clear write and sync errors, leave the durable state at the corresponding boundary. Restart retries the authorized next step.
+OTP's monitor contract associates each monitor reference with the monitored process. When that process terminates, the monitoring process receives `{:DOWN, ref, :process, pid, reason}` for that process. The Orchestrator creates the monitor from the PID returned by `Task.Supervisor.start_child/2`, retains both values in the same running entry, and maps the reference back to that entry. Genuine monitor events captured from the live Orchestrator therefore establish that the exact monitored runtime child has terminated before teardown runs. See the [Erlang process monitor documentation](https://www.erlang.org/doc/system/ref_man_processes.html).
 
-Each injected sync error first calls `:dets.sync/1`, then returns an error. This models an ambiguous acknowledgment where the row may be present after restart. Write errors return before inserting the row. Closing and reopening DETS checks persisted-record recovery. It does not simulate device loss or a hard power failure.
+`handle_info/2` does not compare the event PID with the running entry PID or independently verify process liveness. It relies on the event being the VM-generated notification for the stored monitor. A test-sent tuple has the same structure but does not carry that OTP guarantee. The production source search found no application path that sends a `:DOWN` tuple; this characterization does not assess arbitrary BEAM message senders.
 
-## Stop finding: mismatched DOWN releases a live runtime
+The clean-teardown invariant established for the production monitor lifecycle is:
 
-The teardown probe in the new test file fails its required assertion. It starts and holds the child at its first instruction, then sends a `:DOWN` tuple with the child's actual monitor reference but the test process as the PID. The child is still alive when the event is handled. The ledger nevertheless changes from `BOUND` with `in_flight: true` to `RELEASED` with `in_flight: false`.
+```text
+Task.Supervisor.start_child returns child PID
+  -> AuthorityFence BOUND is already synced
+  -> Orchestrator monitors that exact child PID and stores PID + ref + RuntimeAttempt
+  -> OTP emits the matching DOWN only after that monitored child terminates
+  -> Orchestrator matches ref to the current running entry
+  -> AttemptLedger releases the entry's exact RuntimeAttempt identity and syncs RELEASED
+  -> clear_in_flight syncs the RELEASED record, persists in_flight: false, and syncs again
+```
 
-The probe first sends a tuple with an unrelated monitor reference. That event leaves the state unchanged. The reproducer therefore uses the exact current monitor reference and a mismatched process PID.
+The test observes the durable sync sequence for a clean normal exit as:
 
-The production path is `Orchestrator.handle_info/2` → `handle_running_task_down/3` → `release_runtime_fence_after_task_down/3` → `AttemptLedger.release_authority_fence/3` → in-flight clearing. The `:DOWN` handler matches the monitor reference but ignores the message PID. The release path then trusts the RuntimeAttempt identity from the running entry without confirming that the monitored child exited.
+```text
+{RELEASED, true}  # RELEASED persisted and synced
+{RELEASED, true}  # clear_in_flight's pre-clear sync
+{RELEASED, false} # in_flight clear persisted and synced
+```
 
-The reproduction test is `test "a mismatched DOWN process cannot release the live runtime fence"` in `elixir/test/symphony_elixir/h080a_authority_fence_characterization_test.exs`. Its current failing assertion expects the fence to remain BOUND while the child is alive. The observed record is RELEASED and not in flight.
+The resulting fence is `RELEASED` and `in_flight` is false. Reopening the ledger returns the same record. Abnormal termination follows the same fence release and in-flight ordering before the existing retry path records the failure. An unresolved suspension skips ordinary release and retains `SUSPENSION_PENDING`, `in_flight: true`, and its open RecoveryLedger context.
 
-This is a STOP condition from the supplied task. Do not treat the passing fence-cut tests as phase evidence or patch production as part of this characterization tranche. The smallest reproduced violation is premature release of the exact current runtime fence while its child remains alive. Master direction is required before H-080A-FENCE-01 proceeds.
+## Production path and ordering
 
-## Test record
+`spawn_prepared_issue_on_worker_host/7` first calls `bind_runtime_attempt_before_spawn/3`. `AttemptLedger.bind_runtime_attempt/3` validates the exact identity and persists and syncs the BOUND record before `do_spawn_prepared_issue_on_worker_host/7` calls `Task.Supervisor.start_child/2`. After start succeeds, `Process.monitor(pid)` creates a monitor and the running entry stores both `pid` and `ref`, alongside the `RuntimeAttempt` and its `Identity`.
 
-Before adding the teardown reproducer, the characterization file ran 6 tests with 0 failures. The related attempt ledger, restart gap, runtime production path, and runtime teardown tests ran 74 tests with 0 failures. The combined run reported an existing unused-default-argument warning in `runtime_attempt_production_path_test.exs`.
+The runtime `:DOWN` path is:
 
-After adding the teardown reproducer, `mix test test/symphony_elixir/h080a_authority_fence_characterization_test.exs` ran 7 tests and failed the mismatched-DOWN assertion described above. This failing result is the evidence for the stop finding.
+1. `Orchestrator.handle_info/2` routes a non-Plane monitor event to `handle_running_task_down/3`.
+2. `find_issue_id_for_ref/2` selects the running entry by monitor reference. The handler ignores the event PID.
+3. `pop_running_entry/2` removes the entry, then `record_session_completion_totals/2` updates volatile totals.
+4. `release_runtime_fence_after_task_down/3` skips release if the entry has an unresolved lifecycle suspension. Otherwise it passes the entry's exact `RuntimeAttempt.Identity` to `AttemptLedger.release_authority_fence/3`.
+5. The ledger checks work item, lineage generation, and full runtime identity against the BOUND fence. It persists and syncs RELEASED.
+6. `clear_attempt_in_flight/2` requires the released fence, syncs before clearing, then persists and syncs `in_flight: false`.
+7. `handle_agent_down/5` runs the normal continuation path for `:normal`; an abnormal reason records failure and queues the existing retry behavior.
+
+The running entry is removed before the ledger operation. For a genuine monitor event, the exact monitored process has already terminated when OTP delivers the message. If release or clear fails, the issue is blocked and the corresponding durable boundary remains available for restart reconciliation.
+
+## Identity model
+
+| Value | Classification | Clean-teardown role |
+|---|---|---|
+| `work_item_id` | Durable key and local correlation | Selects the ledger record and current running entry. |
+| `runtime_attempt_id` | Durable RuntimeAttempt identity field | Distinguishes one execution from every retry. |
+| `lineage_generation` | Durable lineage identity | Binds the attempt to the current retry lineage. |
+| `responsibility` | Durable identity field | Captures the routed responsibility bound to this attempt. |
+| `runtime_profile` | Durable identity field | Captures the routed profile bound to this attempt. |
+| `RuntimeAttempt` struct and state | Volatile runtime identity | Lives in the running entry; its `Identity` is separately stored in the BOUND fence. |
+| Child PID | Volatile runtime identity | Returned by Task.Supervisor and retained in the entry; not persisted. |
+| Monitor reference | Volatile monitor identity and terminal-event correlation | Created for the child PID and retained in the same entry; not persisted. |
+| Running entry | Volatile correlation record | Joins work item, child PID, monitor reference, route, and RuntimeAttempt. |
+| Genuine `:DOWN` PID and reason | Terminal-event correlation and outcome | OTP supplies the monitored PID and exit reason; PID is not part of the durable RuntimeAttempt identity. |
+
+The `RuntimeAttempt.Identity` contains `runtime_attempt_id`, `work_item_id`, `lineage_generation`, `responsibility`, and `runtime_profile`. That identity is stored in the AuthorityFence. The child PID, monitor reference, and running entry remain process-local and disappear on restart.
+
+## D01–D12 lifecycle matrix
+
+All genuine cases run through a live `Orchestrator` GenServer and its Task.Supervisor child. Trace events show the exact `:DOWN` tuple received by that GenServer. Constructed cases are marked as test-sent messages; they are not classified as OTP monitor events.
+
+| ID | Provenance and action | Result |
+|---|---|---|
+| D01 | Constructed event with unrelated ref and unrelated PID while current child is alive | Running entry, BOUND fence, and in-flight flag remain unchanged. |
+| D02 | Genuine `:normal` monitor event for the exact current child | Entry is removed after child death; normal continuation follows. Fence becomes RELEASED and in-flight clears. |
+| D03 | Genuine abnormal monitor event for the exact current child | Entry is removed after child death; RELEASED and in-flight clear precede the existing retry record. |
+| D04 | Constructed event with current ref and a different PID while child is alive | Live GenServer accepts the tuple; entry is removed and fence releases. The test labels the message constructed, not VM-generated. |
+| D05 | Constructed event with current child PID and unrelated ref | No teardown; the current entry and fence remain unchanged. |
+| D06 | Constructed replay of a previous attempt's ref/PID after a newer RuntimeAttempt is current | New entry, identity, BOUND fence, in-flight flag, and live child remain unchanged. |
+| D07 | Two constructed duplicate events after the previous exact attempt has already been torn down | Durable record and retry state remain unchanged; no second authority transition occurs. |
+| D08 | Genuine child termination while the current entry has an unresolved suspension | Entry is removed, but `SUSPENSION_PENDING`, in-flight true, and the open RecoveryLedger context remain. Reopening both ledgers preserves them. |
+| D09 | Old child information after Orchestrator restart, when the fresh running map is empty | Stale information does not release the reopened BOUND fence. The old child later terminates; the fresh Orchestrator still has no old running entry. |
+| D10 | Genuine clean exit with exact current identity | Sync snapshots prove RELEASED is durable before `in_flight: false`; reopening preserves both values. |
+| D11 | Unknown ref with a PID matching the current child | No teardown; PID equality cannot substitute for the monitor reference. |
+| D12 | Constructed mismatched-PID event processed while exact child remains alive | Captures the durable transition to RELEASED/in-flight false and continued child liveness, with constructed provenance recorded. |
+
+For D02, D03, D08, and D10, the precondition includes the current work item, full `RuntimeAttempt.Identity`, child PID, monitor reference, BOUND fence, and `in_flight: true`. The monitor trace includes the same reference and PID after the child has exited. Postconditions assert the running entry, durable fence, in-flight state, child liveness, and—where relevant—reopened ledger state. D04 and D12 assert the same identity and durable states but record the test-sent event and live child explicitly.
+
+## Harness cleanup and Plane startup failure
+
+The initial PR CI run had a second failure in `OrchestratorPlaneEpochTest`, “startup cleans up a thousand terminal Plane nodes without blocking on item GETs.” It passed when run alone on PR HEAD and on the accepted base, but failed after the original H-080A module in the ordered one-worker run.
+
+The H-080A fixture had two cleanup gaps: supervisor shutdown was asynchronous (`Process.exit/2` without waiting), and DETS handles reopened during restart cuts were not all tracked. The authorized test file now registers every temporary ledger handle, supervisor, child, and directory. Cleanup waits for supervisor termination, verifies children are gone, closes remaining DETS tables, checks those tables are closed, and removes temporary directories. The lifecycle tests also stop supervisors and Orchestrators deterministically, remove monitor tracing, restore application configuration, and verify registered names and child processes are gone.
+
+After that cleanup change, the ordered command containing the H-080A file followed by the 1,000-item Plane test passed: 15 tests, 0 failures. The Plane test also passed alone on the accepted base and PR HEAD. This classifies the earlier readiness failure as test-harness contamination from the H-080A suite; the cleanup is within this test file. The Plane test and production source remain unchanged.
+
+## Verification record
+
+Initial authorized pins were verified before edits: accepted main `7ba76fccaacc5789443c685ed6f1d2bee7f04f9c`, tree `ccce54196e30a8c0928feee5639a7e8662f4fa7d`; PR #26 base and head `c2cc3c29f12237ceb962c415ed4bc8d22ab010e4`; head tree `7c7806433c29fd435f1533676c6a9d0e9ba78db2`; and exactly the test and evidence files listed above. The roadmap and H-010/H-020/H-030 blob IDs matched the authorization.
+
+At the accepted base, the comparable full suite completed with 1,476 tests, 0 failures, and 6 skips (`--seed 202938 --max-cases 8`). The isolated 1,000-item Plane test passed on accepted base (424 ms) and PR HEAD (503 ms). Before cleanup, the ordered H-080A plus Plane run failed both the old mismatched assertion and Plane readiness. After cleanup and lifecycle characterization, the same ordered run completed with 15 tests, 0 failures.
+
+The final local verification completed on the PR candidate:
+
+- `mix format --check-formatted` passed.
+- The H-080A file passed: 14 tests, 0 failures.
+- AttemptLedger, RuntimeAttempt teardown/identity/production path, startup reconciliation, REM-HI21 restart, RecoveryLedger, and Orchestrator attempt-lineage suites passed: 167 tests, 0 failures.
+- The isolated 1,000-item Plane startup test passed: 1 test, 0 failures. The ordered H-080A-plus-Plane run passed: 15 tests, 0 failures.
+- `make -C elixir all` passed: 1,490 tests, 0 failures, 6 skips, and 90.03% total coverage. Build, format, Credo, and Dialyzer passed; Dialyzer reported 0 errors and 0 skips.
+
+The focused runtime command emits the existing unused optional argument warning in `runtime_attempt_production_path_test.exs`; it did not fail the command. The updated PR description is validated separately with `mix pr_body.check`. Final commit SHA/tree and GitHub check results are included in the completion report.
 
 ## Scope limits
 
-The remaining H-080A attack matrix is uncharacterized. This tranche does not cover provider and lifecycle authority, completion proof, dependency and project scope, H-040 mutation ambiguity, retry lineage, runtime roles, candidate and merge verification, webhook attacks, mixed legacy records, or workspace ownership. H-080B isolation, H-080C rerun, H-090 refactoring, H-100 live Plane webhook capture, H-110 soak, and production hardening remain outside this tranche.
+This tranche covers only runtime termination identity, AuthorityFence ordering, suspension interaction, restart behavior, and the associated test harness. It does not complete H-080A and does not start CompletionProof provenance or any other H-080A topic. No production source changed. PR #26 remains unmerged.

@@ -33,6 +33,18 @@ defmodule SymphonyElixir.H080AAuthorityFenceCharacterizationTest do
 
   @tracker_identity %{tracker_kind: "memory", provider_scope: %{}}
 
+  setup do
+    {:ok, registry} = Agent.start(fn -> %{} end)
+    Process.put({__MODULE__, :resource_registry}, registry)
+
+    on_exit(fn ->
+      cleanup_resources(registry)
+      Agent.stop(registry)
+    end)
+
+    :ok
+  end
+
   test "the first child instruction follows a synced BOUND record, and runtime loss keeps it fenced" do
     fixture = fixture!("bound-first-instruction")
     issue = issue("bound-first-instruction")
@@ -55,8 +67,7 @@ defmodule SymphonyElixir.H080AAuthorityFenceCharacterizationTest do
         end
     }
 
-    {:ok, supervisor} = Task.Supervisor.start_link()
-    on_exit(fn -> if Process.alive?(supervisor), do: Process.exit(supervisor, :kill) end)
+    supervisor = start_task_supervisor!()
 
     state =
       base_state(fixture, issue.id)
@@ -65,11 +76,13 @@ defmodule SymphonyElixir.H080AAuthorityFenceCharacterizationTest do
       |> Map.put(:agent_runner, SymphonyElixir.H080AAuthorityFenceProbeRunner)
       |> then(&struct(State, &1))
 
-    _started = Orchestrator.spawn_prepared_issue_for_test(state, issue, route, 0, self(), nil, runtime_attempt)
+    started = Orchestrator.spawn_prepared_issue_for_test(state, issue, route, 0, self(), nil, runtime_attempt)
+    track_running_entries!(started)
 
     assert_receive {:h080a_bound_synced, issue_id, ^identity}, 1_000
     assert_receive {:h080a_child_first_instruction, child, ^issue_id, ^identity}, 1_000
     assert Process.alive?(child)
+    running_ref = started.running[issue.id].ref
 
     assert {:ok, %{in_flight: true, authority_fence: %{state: :bound, runtime_attempt: ^identity}}} =
              AttemptLedger.current(attempts, issue.id)
@@ -78,9 +91,11 @@ defmodule SymphonyElixir.H080AAuthorityFenceCharacterizationTest do
     Process.exit(child, :kill)
     assert_receive {:DOWN, ^ref, :process, ^child, _reason}, 1_000
     Supervisor.stop(supervisor)
+    Process.demonitor(ref, [:flush])
+    Process.demonitor(running_ref, [:flush])
 
-    assert :ok = AttemptLedger.close(attempts)
-    {:ok, reopened} = AttemptLedger.open(fixture.project_id, @tracker_identity, path: fixture.attempt_path)
+    assert :ok = close_attempt_ledger(attempts)
+    reopened = open_attempt_ledger!(fixture.project_id, @tracker_identity, path: fixture.attempt_path)
 
     state =
       %State{
@@ -107,8 +122,7 @@ defmodule SymphonyElixir.H080AAuthorityFenceCharacterizationTest do
       identity = Identity.allocate(issue.id, route, armed.lineage_id)
       runtime_attempt = RuntimeAttempt.new(identity, :starting)
       failed_attempts = fail_fence_persistence(fixture.attempts, issue.id, :bound, failure)
-      {:ok, supervisor} = Task.Supervisor.start_link()
-      on_exit(fn -> if Process.alive?(supervisor), do: Process.exit(supervisor, :kill) end)
+      supervisor = start_task_supervisor!()
 
       state =
         base_state(fixture, issue.id)
@@ -120,8 +134,8 @@ defmodule SymphonyElixir.H080AAuthorityFenceCharacterizationTest do
       _blocked = Orchestrator.spawn_prepared_issue_for_test(state, issue, route, 0, self(), nil, runtime_attempt)
       refute_receive {:h080a_child_first_instruction, _child, _, _identity}, 50
 
-      assert :ok = AttemptLedger.close(failed_attempts)
-      {:ok, reopened} = AttemptLedger.open(fixture.project_id, @tracker_identity, path: fixture.attempt_path)
+      assert :ok = close_attempt_ledger(failed_attempts)
+      reopened = open_attempt_ledger!(fixture.project_id, @tracker_identity, path: fixture.attempt_path)
 
       case failure do
         :write ->
@@ -168,8 +182,8 @@ defmodule SymphonyElixir.H080AAuthorityFenceCharacterizationTest do
     {:ok, %{in_flight: true, authority_fence: %{state: :armed}}} =
       AttemptLedger.begin_attempt(fixture.attempts, issue.id)
 
-    assert :ok = AttemptLedger.close(fixture.attempts)
-    {:ok, reopened} = AttemptLedger.open(fixture.project_id, @tracker_identity, path: fixture.attempt_path)
+    assert :ok = close_attempt_ledger(fixture.attempts)
+    reopened = open_attempt_ledger!(fixture.project_id, @tracker_identity, path: fixture.attempt_path)
 
     state = %State{attempt_ledger: reopened, attempt_ledger_status: :ready, durable_in_flight: MapSet.new([issue.id])}
     assert {:ok, recovered} = Orchestrator.clear_stale_in_flight_for_test(state, issue.id)
@@ -200,8 +214,7 @@ defmodule SymphonyElixir.H080AAuthorityFenceCharacterizationTest do
         end
     }
 
-    {:ok, supervisor} = Task.Supervisor.start_link(max_children: 0)
-    on_exit(fn -> if Process.alive?(supervisor), do: Process.exit(supervisor, :kill) end)
+    supervisor = start_task_supervisor!(max_children: 0)
 
     state =
       base_state(fixture, issue.id)
@@ -222,7 +235,7 @@ defmodule SymphonyElixir.H080AAuthorityFenceCharacterizationTest do
              AttemptLedger.current(attempts, issue.id)
   end
 
-  test "a mismatched DOWN process cannot release the live runtime fence" do
+  test "a directly invoked handler accepts a constructed mismatched-PID DOWN tuple" do
     fixture = fixture!("mismatched-down")
     issue = issue("mismatched-down")
     route = Route.legacy(issue)
@@ -244,8 +257,7 @@ defmodule SymphonyElixir.H080AAuthorityFenceCharacterizationTest do
         end
     }
 
-    {:ok, supervisor} = Task.Supervisor.start_link()
-    on_exit(fn -> if Process.alive?(supervisor), do: Process.exit(supervisor, :kill) end)
+    supervisor = start_task_supervisor!()
 
     state =
       base_state(fixture, issue.id)
@@ -255,10 +267,14 @@ defmodule SymphonyElixir.H080AAuthorityFenceCharacterizationTest do
       |> then(&struct(State, &1))
 
     started = Orchestrator.spawn_prepared_issue_for_test(state, issue, route, 0, self(), nil, runtime_attempt)
+    track_running_entries!(started)
     issue_id = issue.id
     assert_receive {:h080a_bound_synced, ^issue_id, ^identity}, 1_000
     assert_receive {:h080a_child_first_instruction, child, ^issue_id, ^identity}, 1_000
     running = started.running[issue.id]
+
+    assert {:ok, %{in_flight: true, authority_fence: %{state: :bound, runtime_attempt: ^identity}}} =
+             AttemptLedger.current(attempts, issue.id)
 
     assert {:noreply, unchanged} =
              Orchestrator.handle_info({:DOWN, make_ref(), :process, self(), :normal}, started)
@@ -266,13 +282,17 @@ defmodule SymphonyElixir.H080AAuthorityFenceCharacterizationTest do
     assert unchanged == started
     assert Process.alive?(child)
 
-    assert {:noreply, _after_mismatched_down} =
+    # This tuple is supplied by the test and is not a VM-generated monitor event.
+    assert {:noreply, after_mismatched_down} =
              Orchestrator.handle_info({:DOWN, running.ref, :process, self(), :normal}, started)
 
     assert Process.alive?(child)
+    refute Map.has_key?(after_mismatched_down.running, issue.id)
 
-    assert {:ok, %{in_flight: true, authority_fence: %{state: :bound, runtime_attempt: ^identity}}} =
+    assert {:ok, %{in_flight: false, authority_fence: %{state: :released, runtime_attempt: ^identity}}} =
              AttemptLedger.current(attempts, issue.id)
+
+    Process.demonitor(running.ref, [:flush])
   end
 
   test "suspension fence and recovery checkpoint faults preserve the exact runtime across restart" do
@@ -331,10 +351,10 @@ defmodule SymphonyElixir.H080AAuthorityFenceCharacterizationTest do
         assert checkpoint_after_event.active_suspension_context.suspension_id == suspension_id(identity)
       end
 
-      assert :ok = AttemptLedger.close(event_attempts)
-      assert :ok = RecoveryLedger.close(event_recovery)
-      {:ok, reopened_attempts} = AttemptLedger.open(fixture.project_id, @tracker_identity, path: fixture.attempt_path)
-      {:ok, reopened_recovery} = RecoveryLedger.open(fixture.project_id, @tracker_identity, path: fixture.recovery_path)
+      assert :ok = close_attempt_ledger(event_attempts)
+      assert :ok = close_recovery_ledger(event_recovery)
+      reopened_attempts = open_attempt_ledger!(fixture.project_id, @tracker_identity, path: fixture.attempt_path)
+      reopened_recovery = open_recovery_ledger!(fixture.project_id, @tracker_identity, path: fixture.recovery_path)
 
       assert {:ok, reopened_record} = AttemptLedger.current(reopened_attempts, issue.id)
       assert reopened_record.in_flight
@@ -390,10 +410,13 @@ defmodule SymphonyElixir.H080AAuthorityFenceCharacterizationTest do
       terminal_checkpoint = checkpoint(fixture.project_id, issue.id, now, nil, terminal)
       assert :ok = RecoveryLedger.put_sync(fixture.recovery, terminal_checkpoint)
 
-      assert :ok = AttemptLedger.close(fixture.attempts)
-      assert :ok = RecoveryLedger.close(fixture.recovery)
-      {:ok, attempts_after_terminal} = AttemptLedger.open(fixture.project_id, @tracker_identity, path: fixture.attempt_path)
-      {:ok, recovery_after_terminal} = RecoveryLedger.open(fixture.project_id, @tracker_identity, path: fixture.recovery_path)
+      assert :ok = close_attempt_ledger(fixture.attempts)
+      assert :ok = close_recovery_ledger(fixture.recovery)
+      attempts_after_terminal = open_attempt_ledger!(fixture.project_id, @tracker_identity, path: fixture.attempt_path)
+
+      recovery_after_terminal =
+        open_recovery_ledger!(fixture.project_id, @tracker_identity, path: fixture.recovery_path)
+
       attempts = recovery_cut_attempt_ledger(attempts_after_terminal, issue.id, cut)
 
       state = %State{
@@ -429,10 +452,10 @@ defmodule SymphonyElixir.H080AAuthorityFenceCharacterizationTest do
                    AttemptLedger.current(attempts, issue.id)
       end
 
-      assert :ok = AttemptLedger.close(attempts)
-      assert :ok = RecoveryLedger.close(recovery_after_terminal)
-      {:ok, reopened_attempts} = AttemptLedger.open(fixture.project_id, @tracker_identity, path: fixture.attempt_path)
-      {:ok, reopened_recovery} = RecoveryLedger.open(fixture.project_id, @tracker_identity, path: fixture.recovery_path)
+      assert :ok = close_attempt_ledger(attempts)
+      assert :ok = close_recovery_ledger(recovery_after_terminal)
+      reopened_attempts = open_attempt_ledger!(fixture.project_id, @tracker_identity, path: fixture.attempt_path)
+      reopened_recovery = open_recovery_ledger!(fixture.project_id, @tracker_identity, path: fixture.recovery_path)
 
       restarted_state = %State{
         attempt_ledger: reopened_attempts,
@@ -477,14 +500,9 @@ defmodule SymphonyElixir.H080AAuthorityFenceCharacterizationTest do
     project_id = "h080a-#{label}-#{System.unique_integer([:positive])}"
     attempt_path = Path.join(root, "attempts.dets")
     recovery_path = Path.join(root, "recovery.dets")
-    {:ok, attempts} = AttemptLedger.open(project_id, @tracker_identity, path: attempt_path)
-    {:ok, recovery} = RecoveryLedger.open(project_id, @tracker_identity, path: recovery_path)
-
-    on_exit(fn ->
-      safe_close(attempts)
-      safe_close(recovery)
-      File.rm_rf(root)
-    end)
+    register_resource({:root, root}, root)
+    attempts = open_attempt_ledger!(project_id, @tracker_identity, path: attempt_path)
+    recovery = open_recovery_ledger!(project_id, @tracker_identity, path: recovery_path)
 
     %{
       root: root,
@@ -495,6 +513,94 @@ defmodule SymphonyElixir.H080AAuthorityFenceCharacterizationTest do
       recovery: recovery
     }
   end
+
+  defp start_task_supervisor!(opts \\ []) do
+    {:ok, supervisor} = Task.Supervisor.start_link(opts)
+    Process.unlink(supervisor)
+    register_resource({:task_supervisor, supervisor}, supervisor)
+    supervisor
+  end
+
+  defp track_running_entries!(%State{running: running}) do
+    Enum.each(running, fn {_issue_id, entry} ->
+      register_resource({:task_child, entry.pid}, entry.pid)
+    end)
+  end
+
+  defp register_resource(key, value) do
+    registry = Process.get({__MODULE__, :resource_registry})
+    Agent.update(registry, &Map.put(&1, key, value))
+    value
+  end
+
+  defp open_attempt_ledger!(project_id, tracker_identity, opts) do
+    {:ok, ledger} = AttemptLedger.open(project_id, tracker_identity, opts)
+    register_resource({:attempt_ledger, ledger.table}, ledger)
+  end
+
+  defp close_attempt_ledger(ledger) do
+    result = AttemptLedger.close(ledger)
+    forget_resource({:attempt_ledger, ledger.table})
+    result
+  end
+
+  defp open_recovery_ledger!(project_id, tracker_identity, opts) do
+    {:ok, ledger} = RecoveryLedger.open(project_id, tracker_identity, opts)
+    register_resource({:recovery_ledger, ledger.table}, ledger)
+  end
+
+  defp close_recovery_ledger(ledger) do
+    result = RecoveryLedger.close(ledger)
+    forget_resource({:recovery_ledger, ledger.table})
+    result
+  end
+
+  defp forget_resource(key) do
+    registry = Process.get({__MODULE__, :resource_registry})
+    Agent.update(registry, &Map.delete(&1, key))
+  end
+
+  defp cleanup_resources(registry) do
+    resources = Agent.get(registry, & &1)
+
+    resources
+    |> Enum.filter(fn {key, _value} -> match?({:task_supervisor, _pid}, key) end)
+    |> Enum.each(fn {{:task_supervisor, pid}, _value} ->
+      if Process.alive?(pid) do
+        try do
+          Supervisor.stop(pid, :shutdown, 5_000)
+        catch
+          :exit, _reason -> :ok
+        end
+      end
+    end)
+
+    resources
+    |> Enum.filter(fn {key, _value} -> match?({:attempt_ledger, _table}, key) end)
+    |> Enum.each(fn {{:attempt_ledger, table}, ledger} ->
+      _ = safe_close(ledger)
+      unless table_closed?(table), do: raise("attempt DETS table remained open after cleanup: #{inspect(table)}")
+    end)
+
+    resources
+    |> Enum.filter(fn {key, _value} -> match?({:recovery_ledger, _table}, key) end)
+    |> Enum.each(fn {{:recovery_ledger, table}, ledger} ->
+      _ = safe_close(ledger)
+      unless table_closed?(table), do: raise("recovery DETS table remained open after cleanup: #{inspect(table)}")
+    end)
+
+    resources
+    |> Enum.filter(fn {key, _value} -> match?({:task_child, _pid}, key) end)
+    |> Enum.each(fn {{:task_child, pid}, _value} ->
+      if Process.alive?(pid), do: raise("Task.Supervisor child remained alive after cleanup: #{inspect(pid)}")
+    end)
+
+    resources
+    |> Enum.filter(fn {key, _value} -> match?({:root, _path}, key) end)
+    |> Enum.each(fn {{:root, root}, _value} -> File.rm_rf!(root) end)
+  end
+
+  defp table_closed?(table), do: not Enum.member?(:dets.all(), table)
 
   defp base_state(fixture, issue_id) do
     %{
@@ -791,4 +897,585 @@ defmodule SymphonyElixir.H080AAuthorityFenceCharacterizationTest do
   catch
     :exit, _reason -> :ok
   end
+end
+
+defmodule SymphonyElixir.H080ADownLifecycleRunner do
+  @moduledoc false
+
+  def run(issue, recipient, opts) do
+    identity = Keyword.fetch!(opts, :runtime_attempt_identity)
+    capture = Application.fetch_env!(:symphony_elixir, :h080a_down_lifecycle_capture)
+
+    if is_pid(recipient) do
+      send(recipient, {:runtime_attempt_session_started, issue.id, identity})
+    end
+
+    send(capture, {:h080a_runtime_child_started, issue.id, self(), identity})
+
+    receive do
+      {:h080a_exit, :normal} -> :ok
+      {:h080a_exit, reason} -> exit(reason)
+    end
+  end
+end
+
+defmodule SymphonyElixir.H080ADownLifecycleTest do
+  use SymphonyElixir.TestSupport
+
+  alias SymphonyElixir.AgentRuntime.AttemptLedger
+  alias SymphonyElixir.AgentRuntime.RuntimeAttempt
+  alias SymphonyElixir.AgentRuntime.RuntimeAttempt.Identity
+  alias SymphonyElixir.Orchestrator
+  alias SymphonyElixir.Tracker
+  alias SymphonyElixir.Tracker.Issue
+
+  alias SymphonyElixir.WorkControl.{
+    LifecycleAssessment,
+    ProviderObservation,
+    RecoveryLedger,
+    WorkItem
+  }
+
+  setup do
+    {:ok, resources} = Agent.start(fn -> %{orchestrators: [], supervisors: [], children: []} end)
+    Process.put({__MODULE__, :resources}, resources)
+
+    previous_capture = Application.get_env(:symphony_elixir, :h080a_down_lifecycle_capture)
+    Application.put_env(:symphony_elixir, :h080a_down_lifecycle_capture, self())
+
+    on_exit(fn ->
+      cleanup_resources(resources)
+      restore_capture(previous_capture)
+      Agent.stop(resources)
+    end)
+
+    :ok
+  end
+
+  test "D01 D05 D11 unknown monitor references preserve the live exact runtime" do
+    fixture = lifecycle_fixture!("unknown-ref")
+    {entry, before} = current_runtime!(fixture)
+
+    assert entry.pid != self()
+    assert %RuntimeAttempt{identity: %Identity{} = identity} = entry.runtime_attempt
+    assert identity.work_item_id == fixture.issue.id
+    assert before.authority_fence.state == :bound
+    assert before.in_flight
+    assert Process.alive?(entry.pid)
+
+    # D05 and D11: matching PID fields do not compensate for an unknown reference.
+    send(fixture.orchestrator, {:DOWN, make_ref(), :process, entry.pid, :normal})
+    send(fixture.orchestrator, {:DOWN, make_ref(), :process, self(), :normal})
+    # D01: unrelated reference and unrelated PID also leave the current entry alone.
+    send(fixture.orchestrator, {:DOWN, make_ref(), :process, self(), :normal})
+
+    after_state = :sys.get_state(fixture.orchestrator)
+    assert after_state.running[fixture.issue.id] == entry
+    assert after_state.durable_in_flight == MapSet.new([fixture.issue.id])
+    assert {:ok, after_record} = AttemptLedger.current(after_state.attempt_ledger, fixture.issue.id)
+    assert after_record.authority_fence == before.authority_fence
+    assert after_record.in_flight == before.in_flight
+    assert Process.alive?(entry.pid)
+  end
+
+  test "D04 D12 a constructed mismatched-PID tuple releases through the live Orchestrator path" do
+    fixture = lifecycle_fixture!("constructed-mismatch")
+    {entry, before} = current_runtime!(fixture)
+    identity = entry.runtime_attempt.identity
+    event = {:DOWN, entry.ref, :process, self(), :normal}
+
+    assert self() != entry.pid
+
+    assert before.authority_fence == %{
+             state: :bound,
+             runtime_attempt: identity,
+             route_fingerprint: entry.route_fingerprint
+           }
+
+    assert before.in_flight
+    assert Process.alive?(entry.pid)
+
+    # Provenance is constructed: the test sends this tuple to the live GenServer.
+    send(fixture.orchestrator, event)
+    after_state = :sys.get_state(fixture.orchestrator)
+
+    assert Map.get(after_state.running, fixture.issue.id) == nil
+    refute MapSet.member?(after_state.durable_in_flight, fixture.issue.id)
+    assert {:ok, after_record} = AttemptLedger.current(after_state.attempt_ledger, fixture.issue.id)
+    assert after_record.authority_fence.state == :released
+    assert after_record.authority_fence.runtime_attempt == identity
+    refute after_record.in_flight
+    # D12: the exact child remained alive after the application-delivered tuple.
+    assert Process.alive?(entry.pid)
+  end
+
+  test "D02 D10 a genuine normal monitor event releases the exact runtime in durable order" do
+    fixture = lifecycle_fixture!("normal-exit")
+    {entry, before} = current_runtime!(fixture)
+    identity = entry.runtime_attempt.identity
+    assert before.authority_fence.state == :bound
+    assert before.in_flight
+
+    instrument_attempt_sync!(fixture.orchestrator, fixture.issue.id)
+    trace_genuine_down!(fixture.orchestrator, entry, :normal)
+
+    after_state =
+      eventually_value(fn ->
+        state = :sys.get_state(fixture.orchestrator)
+
+        if not Map.has_key?(state.running, fixture.issue.id), do: state
+      end)
+
+    assert after_state
+    refute MapSet.member?(after_state.durable_in_flight, fixture.issue.id)
+    assert {:ok, after_record} = AttemptLedger.current(after_state.attempt_ledger, fixture.issue.id)
+    assert after_record.authority_fence.state == :released
+    assert after_record.authority_fence.runtime_attempt == identity
+    refute after_record.in_flight
+
+    sync_states = collect_sync_states([])
+    assert Enum.take(sync_states, 3) == [{:released, true}, {:released, true}, {:released, false}]
+    refute Process.alive?(entry.pid)
+
+    assert {:ok, reopened} = AttemptLedger.open(fixture.project_id, Tracker.identity(Config.settings!().tracker), path: fixture.attempt_path)
+    assert {:ok, reopened_record} = AttemptLedger.current(reopened, fixture.issue.id)
+    assert reopened_record.authority_fence.state == :released
+    assert reopened_record.authority_fence.runtime_attempt == identity
+    refute reopened_record.in_flight
+    assert :ok = AttemptLedger.close(reopened)
+  end
+
+  test "D03 a genuine abnormal monitor event tears down the exact current runtime" do
+    fixture = lifecycle_fixture!("abnormal-exit")
+    {entry, before} = current_runtime!(fixture)
+    identity = entry.runtime_attempt.identity
+    assert before.authority_fence.state == :bound
+    assert before.in_flight
+
+    trace_genuine_down!(fixture.orchestrator, entry, :h080a_runner_failure)
+
+    after_state =
+      eventually_value(fn ->
+        state = :sys.get_state(fixture.orchestrator)
+
+        if not Map.has_key?(state.running, fixture.issue.id), do: state
+      end)
+
+    assert after_state
+    assert after_state.retry_attempts[fixture.issue.id]
+    assert {:ok, after_record} = AttemptLedger.current(after_state.attempt_ledger, fixture.issue.id)
+    assert after_record.authority_fence.state == :released
+    assert after_record.authority_fence.runtime_attempt == identity
+    refute after_record.in_flight
+    refute Process.alive?(entry.pid)
+  end
+
+  test "D06 D07 a prior RuntimeAttempt DOWN cannot affect a newer one and duplicate information is inert" do
+    fixture = lifecycle_fixture!("stale-runtime")
+    {entry_a, before_a} = current_runtime!(fixture)
+    identity_a = entry_a.runtime_attempt.identity
+    assert before_a.authority_fence.state == :bound
+    trace_genuine_down!(fixture.orchestrator, entry_a, :h080a_first_attempt_failure)
+
+    state_after_a =
+      eventually_value(fn ->
+        state = :sys.get_state(fixture.orchestrator)
+
+        if not Map.has_key?(state.running, fixture.issue.id) and Map.has_key?(state.retry_attempts, fixture.issue.id),
+          do: state
+      end)
+
+    assert state_after_a
+    {:ok, record_after_a} = AttemptLedger.current(state_after_a.attempt_ledger, fixture.issue.id)
+    assert record_after_a.authority_fence.state == :released
+    refute record_after_a.in_flight
+
+    # D07: the exact attempt is already gone; replayed termination information cannot transition it again.
+    send(fixture.orchestrator, {:DOWN, entry_a.ref, :process, entry_a.pid, :h080a_first_attempt_failure})
+    send(fixture.orchestrator, {:DOWN, entry_a.ref, :process, entry_a.pid, :h080a_first_attempt_failure})
+    after_duplicate = :sys.get_state(fixture.orchestrator)
+    assert {:ok, duplicate_record} = AttemptLedger.current(after_duplicate.attempt_ledger, fixture.issue.id)
+    assert duplicate_record == record_after_a
+    assert after_duplicate.retry_attempts == state_after_a.retry_attempts
+    refute Map.has_key?(after_duplicate.running, fixture.issue.id)
+
+    retry = after_duplicate.retry_attempts[fixture.issue.id]
+    send(fixture.orchestrator, {:retry_issue, fixture.issue.id, retry.retry_token})
+    {entry_b, _identity_b} = await_runtime!(fixture, identity_a.runtime_attempt_id)
+    identity_b = entry_b.runtime_attempt.identity
+    state_b = :sys.get_state(fixture.orchestrator)
+    {:ok, before_b} = AttemptLedger.current(state_b.attempt_ledger, fixture.issue.id)
+
+    assert identity_b.runtime_attempt_id != identity_a.runtime_attempt_id
+    assert identity_b.lineage_generation == identity_a.lineage_generation
+    assert before_b.authority_fence.state == :bound
+    assert before_b.authority_fence.runtime_attempt == identity_b
+    assert before_b.in_flight
+    assert Process.alive?(entry_b.pid)
+
+    # D06: the old monitor reference and old child PID are stale for RuntimeAttempt B.
+    send(fixture.orchestrator, {:DOWN, entry_a.ref, :process, entry_a.pid, :normal})
+    after_stale = :sys.get_state(fixture.orchestrator)
+    assert after_stale.running[fixture.issue.id] == entry_b
+    assert {:ok, current_record} = AttemptLedger.current(after_stale.attempt_ledger, fixture.issue.id)
+    assert current_record.authority_fence.state == :bound
+    assert current_record.authority_fence.runtime_attempt == identity_b
+    assert current_record.in_flight
+    assert Process.alive?(entry_b.pid)
+  end
+
+  test "D08 genuine termination preserves an unresolved suspension fence" do
+    fixture = lifecycle_fixture!("suspended-exit")
+    {entry, before} = current_runtime!(fixture)
+    identity = entry.runtime_attempt.identity
+    now = DateTime.utc_now()
+    assessment = blocked_assessment(fixture.issue.id, now)
+
+    assert before.authority_fence.state == :bound
+    send(fixture.orchestrator, {:agent_lifecycle_suspended, fixture.issue.id, identity, assessment})
+
+    suspended =
+      eventually_value(fn ->
+        state = :sys.get_state(fixture.orchestrator)
+        {:ok, record} = AttemptLedger.current(state.attempt_ledger, fixture.issue.id)
+
+        if record.authority_fence.state == :suspension_pending, do: {state, record}
+      end)
+
+    assert suspended
+    {suspended_state, pending_record} = suspended
+    assert pending_record.in_flight
+    assert suspended_state.running[fixture.issue.id].lifecycle_suspension == assessment
+
+    assert {:ok, %{active_suspension_context: %{status: :open}}} =
+             RecoveryLedger.current(suspended_state.recovery_ledger, fixture.issue.id)
+
+    trace_genuine_down!(fixture.orchestrator, entry, :normal)
+
+    after_down =
+      eventually_value(fn ->
+        state = :sys.get_state(fixture.orchestrator)
+        if not Map.has_key?(state.running, fixture.issue.id), do: state
+      end)
+
+    assert after_down
+    assert MapSet.member?(after_down.durable_in_flight, fixture.issue.id)
+    assert {:ok, record_after_down} = AttemptLedger.current(after_down.attempt_ledger, fixture.issue.id)
+    assert record_after_down.authority_fence.state == :suspension_pending
+    assert record_after_down.authority_fence.runtime_attempt == identity
+    assert record_after_down.in_flight
+
+    assert {:ok, %{active_suspension_context: %{status: :open}}} =
+             RecoveryLedger.current(after_down.recovery_ledger, fixture.issue.id)
+
+    refute Process.alive?(entry.pid)
+
+    attempt_path = after_down.attempt_ledger.path
+    recovery_path = after_down.recovery_ledger.path
+    assert :ok = GenServer.stop(fixture.orchestrator)
+
+    tracker_identity = Tracker.identity(Config.settings!().tracker)
+    assert {:ok, reopened_attempts} = AttemptLedger.open(fixture.project_id, tracker_identity, path: attempt_path)
+    assert {:ok, reopened_recovery} = RecoveryLedger.open(fixture.project_id, tracker_identity, path: recovery_path)
+    assert {:ok, reopened_record} = AttemptLedger.current(reopened_attempts, fixture.issue.id)
+    assert reopened_record.authority_fence.state == :suspension_pending
+    assert reopened_record.authority_fence.runtime_attempt == identity
+    assert reopened_record.in_flight
+
+    assert {:ok, %{active_suspension_context: %{status: :open}}} =
+             RecoveryLedger.current(reopened_recovery, fixture.issue.id)
+
+    assert :ok = AttemptLedger.close(reopened_attempts)
+    assert :ok = RecoveryLedger.close(reopened_recovery)
+  end
+
+  test "D09 restart drops the old running entry and cannot release its durable fence" do
+    fixture = lifecycle_fixture!("restart-old-child")
+    {old_entry, before} = current_runtime!(fixture)
+    identity = old_entry.runtime_attempt.identity
+    external_ref = Process.monitor(old_entry.pid)
+    assert before.authority_fence.state == :bound
+    assert before.in_flight
+
+    assert :ok = GenServer.stop(fixture.orchestrator)
+    refute Process.alive?(fixture.orchestrator)
+
+    fresh_orchestrator = start_orchestrator!(fixture, true)
+    fresh_state = :sys.get_state(fresh_orchestrator)
+    assert fresh_state.running == %{}
+    assert MapSet.member?(fresh_state.durable_in_flight, fixture.issue.id)
+    assert Process.alive?(old_entry.pid)
+    assert {:ok, reopened_before} = AttemptLedger.current(fresh_state.attempt_ledger, fixture.issue.id)
+    assert reopened_before.authority_fence.state == :bound
+    assert reopened_before.authority_fence.runtime_attempt == identity
+    assert reopened_before.in_flight
+
+    # Constructed stale tuple delivered after restart; the fresh server has no matching running entry.
+    send(fresh_orchestrator, {:DOWN, old_entry.ref, :process, old_entry.pid, :normal})
+    after_stale = :sys.get_state(fresh_orchestrator)
+    assert after_stale.running == %{}
+    assert {:ok, still_bound} = AttemptLedger.current(after_stale.attempt_ledger, fixture.issue.id)
+    assert still_bound.authority_fence.state == :bound
+    assert still_bound.authority_fence.runtime_attempt == identity
+    assert still_bound.in_flight
+
+    send(old_entry.pid, {:h080a_exit, :normal})
+    assert_receive {:DOWN, ^external_ref, :process, pid, :normal}, 5_000
+    assert pid == old_entry.pid
+    refute Process.alive?(old_entry.pid)
+
+    # The real old monitor belonged to the stopped Orchestrator. The new process receives no such VM event.
+    send(fresh_orchestrator, {:DOWN, old_entry.ref, :process, old_entry.pid, :normal})
+    after_termination = :sys.get_state(fresh_orchestrator)
+    assert after_termination.running == %{}
+    assert {:ok, still_fenced} = AttemptLedger.current(after_termination.attempt_ledger, fixture.issue.id)
+    assert still_fenced.authority_fence.state == :bound
+    assert still_fenced.in_flight
+  end
+
+  defp lifecycle_fixture!(label) do
+    suffix = System.unique_integer([:positive])
+    project_id = "h080a-down-#{label}-#{suffix}"
+    issue_id = "h080a-down-item-#{label}-#{suffix}"
+    issue = %Issue{id: issue_id, identifier: String.upcase(issue_id), title: "H-080A DOWN lifecycle", state: "In Progress", dispatchable: true}
+    attempt_root = Application.fetch_env!(:symphony_elixir, :attempt_ledger_root)
+    attempt_path = AttemptLedger.path_for(project_id, root: attempt_root)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      symphony_project_id: project_id,
+      tracker_active_states: ["In Progress"],
+      poll_interval_ms: 60_000
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+    seed_recovery_checkpoint!(issue)
+
+    {:ok, supervisor} = Task.Supervisor.start_link()
+    Process.unlink(supervisor)
+    remember_resource(:supervisors, supervisor)
+
+    fixture = %{
+      project_id: project_id,
+      issue: issue,
+      attempt_path: attempt_path,
+      task_supervisor: supervisor,
+      work_control: %{issue_id => eligible_work_item(issue)}
+    }
+
+    orchestrator = start_orchestrator!(fixture, false)
+    Map.put(fixture, :orchestrator, orchestrator)
+  end
+
+  defp start_orchestrator!(fixture, start_quiesced) do
+    name = Module.concat(__MODULE__, "Lifecycle#{System.unique_integer([:positive])}")
+
+    {:ok, orchestrator} =
+      Orchestrator.start_link(
+        name: name,
+        task_supervisor: fixture.task_supervisor,
+        agent_runner: SymphonyElixir.H080ADownLifecycleRunner,
+        work_control: fixture.work_control,
+        attempt_ledger_opts: [path: fixture.attempt_path],
+        start_quiesced: start_quiesced
+      )
+
+    Process.unlink(orchestrator)
+    remember_resource(:orchestrators, {name, orchestrator})
+    orchestrator
+  end
+
+  defp current_runtime!(fixture) do
+    {entry, _identity} = await_runtime!(fixture, nil)
+    state = :sys.get_state(fixture.orchestrator)
+    {:ok, record} = AttemptLedger.current(state.attempt_ledger, fixture.issue.id)
+    assert entry.pid == state.running[fixture.issue.id].pid
+    {entry, record}
+  end
+
+  defp await_runtime!(fixture, prior_runtime_attempt_id) do
+    issue_id = fixture.issue.id
+
+    assert_receive {:h080a_runtime_child_started, ^issue_id, child, %Identity{} = identity}, 5_000
+    remember_resource(:children, child)
+    refute identity.runtime_attempt_id == prior_runtime_attempt_id
+
+    entry =
+      eventually_value(fn ->
+        state = :sys.get_state(fixture.orchestrator)
+
+        case Map.get(state.running, issue_id) do
+          %{pid: ^child, ref: ref, runtime_attempt: %RuntimeAttempt{identity: ^identity, state: :running}} = entry
+          when is_reference(ref) ->
+            entry
+
+          _other ->
+            nil
+        end
+      end)
+
+    assert entry
+    {entry, identity}
+  end
+
+  defp trace_genuine_down!(orchestrator, entry, reason) do
+    1 = :erlang.trace(orchestrator, true, [:receive, {:tracer, self()}])
+    send(entry.pid, {:h080a_exit, reason})
+
+    assert_receive {:trace, ^orchestrator, :receive, {:DOWN, ref, :process, pid, ^reason}}, 5_000
+    assert ref == entry.ref
+    assert pid == entry.pid
+    refute Process.alive?(entry.pid)
+    :erlang.trace(orchestrator, false, [:receive])
+    :ok
+  end
+
+  defp instrument_attempt_sync!(orchestrator, issue_id) do
+    owner = self()
+
+    :sys.replace_state(orchestrator, fn state ->
+      ledger = state.attempt_ledger
+
+      sync_fun = fn table -> sync_and_report(table, owner, issue_id) end
+
+      %{state | attempt_ledger: %{ledger | sync_fun: sync_fun}}
+    end)
+  end
+
+  defp collect_sync_states(acc) do
+    receive do
+      {:h080a_authority_sync, state, in_flight} -> collect_sync_states([{state, in_flight} | acc])
+    after
+      25 -> Enum.reverse(acc)
+    end
+  end
+
+  defp sync_and_report(table, owner, issue_id) do
+    case :dets.sync(table) do
+      :ok = result ->
+        report_sync_snapshot(table, owner, issue_id)
+        result
+
+      result ->
+        result
+    end
+  end
+
+  defp report_sync_snapshot(table, owner, issue_id) do
+    case :dets.lookup(table, {:current, issue_id}) do
+      [{{:current, ^issue_id}, record}] ->
+        send(owner, {:h080a_authority_sync, record.authority_fence.state, record.in_flight})
+
+      _other ->
+        :ok
+    end
+  end
+
+  defp blocked_assessment(issue_id, now) do
+    observation = %ProviderObservation{
+      provider: :memory,
+      work_item_id: issue_id,
+      provider_state_name: "Blocked",
+      observed_at: now
+    }
+
+    %LifecycleAssessment{
+      work_item_id: issue_id,
+      provider_observation: observation,
+      mapped_state: :blocked,
+      validated_state: :blocked,
+      status: :authority_reducing,
+      required_guards: [],
+      satisfied_guards: [],
+      missing_guards: [],
+      reason: :provider_blocked,
+      assessed_at: now
+    }
+  end
+
+  defp eligible_work_item(issue) do
+    {:ok, work_item} =
+      WorkItem.from_issue(issue, %{
+        provider: :memory,
+        observed_at: DateTime.utc_now(),
+        prior_validated_lifecycle_state: :in_progress
+      })
+
+    work_item
+  end
+
+  defp eventually_value(fun, attempts \\ 250)
+
+  defp eventually_value(fun, attempts) when attempts > 0 do
+    case fun.() do
+      nil ->
+        Process.sleep(20)
+        eventually_value(fun, attempts - 1)
+
+      value ->
+        value
+    end
+  end
+
+  defp eventually_value(_fun, 0), do: nil
+
+  defp remember_resource(key, value) do
+    resources = Process.get({__MODULE__, :resources})
+    Agent.update(resources, &Map.update!(&1, key, fn items -> [value | items] end))
+    value
+  end
+
+  defp cleanup_resources(resources) do
+    tracked = Agent.get(resources, & &1)
+    disable_orchestrator_traces(tracked.orchestrators)
+    stop_supervisors(tracked.supervisors)
+    stop_orchestrators(tracked.orchestrators)
+    assert_children_stopped(tracked.children)
+  end
+
+  defp disable_orchestrator_traces(orchestrators) do
+    Enum.each(orchestrators, fn {_name, pid} ->
+      if Process.alive?(pid), do: :erlang.trace(pid, false, [:receive])
+    end)
+  end
+
+  defp stop_supervisors(supervisors) do
+    Enum.each(supervisors, fn pid ->
+      if Process.alive?(pid) do
+        try do
+          Supervisor.stop(pid, :shutdown, 5_000)
+        catch
+          :exit, _reason -> :ok
+        end
+      end
+
+      if Process.alive?(pid), do: raise("H-080A Task.Supervisor remained alive after cleanup")
+    end)
+  end
+
+  defp stop_orchestrators(orchestrators) do
+    Enum.each(orchestrators, fn {name, pid} ->
+      if Process.alive?(pid) do
+        try do
+          GenServer.stop(pid, :shutdown, 5_000)
+        catch
+          :exit, _reason -> :ok
+        end
+      end
+
+      if Process.alive?(pid), do: raise("H-080A Orchestrator remained alive after cleanup")
+      if Process.whereis(name), do: raise("H-080A Orchestrator name remained registered: #{inspect(name)}")
+    end)
+  end
+
+  defp assert_children_stopped(children) do
+    Enum.each(children, fn pid ->
+      if Process.alive?(pid), do: raise("H-080A runtime child remained alive after cleanup")
+    end)
+  end
+
+  defp restore_capture(nil), do: Application.delete_env(:symphony_elixir, :h080a_down_lifecycle_capture)
+
+  defp restore_capture(value),
+    do: Application.put_env(:symphony_elixir, :h080a_down_lifecycle_capture, value)
 end
