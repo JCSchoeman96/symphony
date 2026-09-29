@@ -24,7 +24,7 @@ Task.Supervisor.start_child returns child PID
   -> clear_in_flight syncs the RELEASED record, persists in_flight: false, and syncs again
 ```
 
-The test observes the durable sync sequence for a clean normal exit as:
+The test captures the first three durable sync observations for a clean normal exit as:
 
 ```text
 {RELEASED, true}  # RELEASED persisted and synced
@@ -69,7 +69,7 @@ The `RuntimeAttempt.Identity` contains `runtime_attempt_id`, `work_item_id`, `li
 
 ## D01–D12 lifecycle matrix
 
-All genuine cases run through a live `Orchestrator` GenServer and its Task.Supervisor child. Trace events show the exact `:DOWN` tuple received by that GenServer. Constructed cases are marked as test-sent messages; they are not classified as OTP monitor events.
+D02, D03, D08, and D10 run through a live `Orchestrator` GenServer and its Task.Supervisor child. Trace events show the exact `:DOWN` tuple received by that GenServer. D09 stops the original Orchestrator, then uses a test-owned monitor to observe the old child terminate; stale tuples sent to the fresh Orchestrator are constructed messages, and the old Orchestrator's monitor event is not delivered to it. Constructed cases are marked as test-sent messages; they are not classified as OTP monitor events.
 
 | ID | Provenance and action | Result |
 |---|---|---|
@@ -81,20 +81,20 @@ All genuine cases run through a live `Orchestrator` GenServer and its Task.Super
 | D06 | Constructed replay of a previous attempt's ref/PID after a newer RuntimeAttempt is current | New entry, identity, BOUND fence, in-flight flag, and live child remain unchanged. |
 | D07 | Two constructed duplicate events after the previous exact attempt has already been torn down | Durable record and retry state remain unchanged; no second authority transition occurs. |
 | D08 | Genuine child termination while the current entry has an unresolved suspension | Entry is removed, but `SUSPENSION_PENDING`, in-flight true, and the open RecoveryLedger context remain. Reopening both ledgers preserves them. |
-| D09 | Old child information after Orchestrator restart, when the fresh running map is empty | Stale information does not release the reopened BOUND fence. The old child later terminates; the fresh Orchestrator still has no old running entry. |
+| D09 | After restart, constructed stale tuples are sent to the fresh Orchestrator; a test-owned monitor observes the old child terminate | The old Orchestrator's genuine event is not delivered to the fresh process. The fresh running map stays empty and the reopened BOUND fence remains unchanged. |
 | D10 | Genuine clean exit with exact current identity | Sync snapshots prove RELEASED is durable before `in_flight: false`; reopening preserves both values. |
 | D11 | Unknown ref with a PID matching the current child | No teardown; PID equality cannot substitute for the monitor reference. |
 | D12 | Constructed mismatched-PID event processed while exact child remains alive | Captures the durable transition to RELEASED/in-flight false and continued child liveness, with constructed provenance recorded. |
 
-For D02, D03, D08, and D10, the precondition includes the current work item, full `RuntimeAttempt.Identity`, child PID, monitor reference, BOUND fence, and `in_flight: true`. The monitor trace includes the same reference and PID after the child has exited. Postconditions assert the running entry, durable fence, in-flight state, child liveness, and—where relevant—reopened ledger state. D04 and D12 assert the same identity and durable states but record the test-sent event and live child explicitly.
+For D02, D03, D08, and D10, the precondition includes the current work item, full `RuntimeAttempt.Identity`, child PID, monitor reference, BOUND fence, and `in_flight: true`. The monitor trace includes the same reference and PID after the child has exited. Postconditions assert the running entry, durable fence, in-flight state, child liveness, and—where relevant—reopened ledger state. D09 separately asserts the fresh Orchestrator has no old running entry and that the old child's termination leaves the reopened fence unchanged. D04 and D12 assert the same identity and durable states but record the test-sent event and live child explicitly.
 
 ## Harness cleanup and Plane startup failure
 
 The initial PR CI run had a second failure in `OrchestratorPlaneEpochTest`, “startup cleans up a thousand terminal Plane nodes without blocking on item GETs.” It passed when run alone on PR HEAD and on the accepted base, but failed after the original H-080A module in the ordered one-worker run.
 
-The H-080A fixture had two cleanup gaps: supervisor shutdown was asynchronous (`Process.exit/2` without waiting), and DETS handles reopened during restart cuts were not all tracked. The authorized test file now registers every temporary ledger handle, supervisor, child, and directory. Cleanup waits for supervisor termination, verifies children are gone, closes remaining DETS tables, checks those tables are closed, and removes temporary directories. The lifecycle tests also stop supervisors and Orchestrators deterministically, remove monitor tracing, restore application configuration, and verify registered names and child processes are gone.
+The H-080A fixtures had two cleanup gaps: supervisor shutdown was asynchronous (`Process.exit/2` without waiting), and DETS handles reopened during restart cuts were not all tracked. The ledger fixture registry tracks its temporary roots, Task.Supervisors, runtime children, and opened AttemptLedger and RecoveryLedger tables. Cleanup waits for supervisor termination, checks child liveness, closes remaining tracked tables, verifies those tables are closed, and removes the temporary roots. The live-lifecycle fixture separately tracks Orchestrator PIDs, Task.Supervisor PIDs, and runtime child PIDs; its cleanup removes receive tracing, stops those processes, checks registered names and child liveness, and restores the application capture configuration. Test-owned monitor references are demonitor'ed or consumed by their matching `:DOWN` assertion.
 
-After that cleanup change, the ordered command containing the H-080A file followed by the 1,000-item Plane test passed: 15 tests, 0 failures. The Plane test also passed alone on the accepted base and PR HEAD. This classifies the earlier readiness failure as test-harness contamination from the H-080A suite; the cleanup is within this test file. The Plane test and production source remain unchanged.
+After that cleanup change, the ordered command containing the H-080A file followed by the 1,000-item Plane test passed in four observed runs: the initial post-cleanup run and three repetitions, each with 15 tests and 0 failures. The full PR candidate suite also passed with this cleanup in place. The Plane test passed alone on the accepted base and PR HEAD. This evidence supports classifying the earlier readiness failure as H-080A test-harness contamination; timing sensitivity cannot be excluded from these finite runs. The cleanup is within this test file. The Plane test and production source remain unchanged.
 
 ## Verification record
 
@@ -102,13 +102,14 @@ Initial authorized pins were verified before edits: accepted main `7ba76fccaacc5
 
 At the accepted base, the comparable full suite completed with 1,476 tests, 0 failures, and 6 skips (`--seed 202938 --max-cases 8`). The isolated 1,000-item Plane test passed on accepted base (424 ms) and PR HEAD (503 ms). Before cleanup, the ordered H-080A plus Plane run failed both the old mismatched assertion and Plane readiness. After cleanup and lifecycle characterization, the same ordered run completed with 15 tests, 0 failures.
 
-The final local verification completed on the PR candidate:
+The local full-suite verification completed on commit `6aa1bd5eb83bfdc9abe9172d676e57b71ce84bc1` (tree `338233eb674f97c009014206734fb8f36a99db3d`), before the evidence-only precision edits in this follow-up:
 
 - `mix format --check-formatted` passed.
 - The H-080A file passed: 14 tests, 0 failures.
 - AttemptLedger, RuntimeAttempt teardown/identity/production path, startup reconciliation, REM-HI21 restart, RecoveryLedger, and Orchestrator attempt-lineage suites passed: 167 tests, 0 failures.
 - The isolated 1,000-item Plane startup test passed: 1 test, 0 failures. The ordered H-080A-plus-Plane run passed: 15 tests, 0 failures.
-- `make -C elixir all` passed: 1,490 tests, 0 failures, 6 skips, and 90.03% total coverage. Build, format, Credo, and Dialyzer passed; Dialyzer reported 0 errors and 0 skips.
+- `make -C elixir all` passed: 1,490 tests, 0 failures, 6 skips, and 90.01% total coverage. Build, format, Credo, and Dialyzer passed; Dialyzer reported 0 errors and 0 skips.
+- The H-080A-plus-Plane ordered run passed three additional consecutive repetitions: each 15 tests, 0 failures.
 
 The focused runtime command emits the existing unused optional argument warning in `runtime_attempt_production_path_test.exs`; it did not fail the command. The updated PR description is validated separately with `mix pr_body.check`. Final commit SHA/tree and GitHub check results are included in the completion report.
 
