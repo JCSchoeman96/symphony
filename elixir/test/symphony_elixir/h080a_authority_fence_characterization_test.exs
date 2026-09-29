@@ -175,7 +175,7 @@ defmodule SymphonyElixir.H080AAuthorityFenceCharacterizationTest do
     stop_fixture_processes(orchestrator, task_supervisor)
   end
 
-  test "BOUND write and sync failures block child start and preserve the reopened durable fence" do
+  test "BOUND write failures and post-sync errors block child start and preserve the reopened durable fence" do
     for failure <- [:write_before, :write_after, :sync_after] do
       issue = active_issue("h080a-bound-#{failure}")
       expected_issue_id = issue.id
@@ -276,6 +276,171 @@ defmodule SymphonyElixir.H080AAuthorityFenceCharacterizationTest do
 
       stop_fixture_processes(restarted_orchestrator, restarted_task_supervisor)
     end
+  end
+
+  test "a BOUND sync error before DETS sync remains fenced after process restart" do
+    issue = active_issue("h080a-bound-sync-before-dets-sync")
+    fixture = fixture!(issue, "bound-sync-before-dets-sync")
+    sequence = Application.fetch_env!(:symphony_elixir, :h080a_event_sequence)
+    observer = Application.fetch_env!(:symphony_elixir, :h080a_event_observer)
+
+    {orchestrator, task_supervisor} =
+      start_orchestrator!(fixture,
+        start_quiesced: true,
+        attempt_sync_fun: failing_attempt_sync_without_dets_sync_fun(observer, issue.id, sequence, :bound, true)
+      )
+
+    orchestrator_monitor = Process.monitor(orchestrator)
+    send(orchestrator, :tick)
+
+    assert_receive(
+      {:h080a_attempt_sync_failed_without_dets_sync, issue_id, _event, sync_record}
+      when issue_id == issue.id and sync_record.in_flight and
+             sync_record.authority_fence.state == :bound,
+      5_000
+    )
+
+    identity = sync_record.authority_fence.runtime_attempt
+    _barrier = GenServer.call(orchestrator, :snapshot)
+    refute_receive {:h080a_child_first_instruction, _, _, _, _}, 0
+
+    Process.exit(orchestrator, :kill)
+    assert_receive {:DOWN, ^orchestrator_monitor, :process, ^orchestrator, :killed}, 5_000
+
+    {:ok, reopened} = open_attempt!(fixture)
+
+    assert {:ok,
+            %{
+              in_flight: true,
+              authority_fence: %{state: reopened_fence_state, runtime_attempt: ^identity}
+            }} =
+             AttemptLedger.current(reopened, issue.id)
+
+    assert reopened_fence_state in [:armed, :bound]
+    assert :ok = AttemptLedger.close(reopened)
+
+    {restarted_orchestrator, restarted_task_supervisor} =
+      start_orchestrator!(fixture, start_quiesced: true, max_children: 0)
+
+    send(restarted_orchestrator, :run_poll_cycle)
+    _restart_barrier = GenServer.call(restarted_orchestrator, :snapshot)
+    recovered_state = :sys.get_state(restarted_orchestrator)
+
+    assert recovered_state.startup_reconciliation == :ready
+    refute_receive {:h080a_child_first_instruction, _, _, ^issue_id, _}, 0
+
+    if reopened_fence_state == :bound do
+      assert recovered_state.durable_blocked[issue.id] == :stale_in_flight_authority_fence_unresolved
+
+      assert {:ok, %{in_flight: true, authority_fence: %{state: :bound, runtime_attempt: ^identity}}} =
+               AttemptLedger.current(recovered_state.attempt_ledger, issue.id)
+    else
+      refute MapSet.member?(recovered_state.durable_in_flight, issue.id)
+
+      assert {:ok, %{in_flight: false, authority_fence: %{state: :released}}} =
+               AttemptLedger.current(recovered_state.attempt_ledger, issue.id)
+    end
+
+    stop_fixture_processes(restarted_orchestrator, restarted_task_supervisor)
+    stop_fixture_processes(orchestrator, task_supervisor)
+  end
+
+  test "ARMED, pending, and recovery sync failures before DETS sync remain constrained after restart" do
+    for boundary <- [:armed, :pending_fence, :recovery_context] do
+      assert_restart_recovers_after_sync_failure(boundary)
+    end
+  end
+
+  test "RELEASED and clear sync failures before DETS sync recover safely after restart" do
+    for boundary <- [:released, :clear] do
+      assert_restart_recovers_after_release_sync_failure(boundary)
+    end
+  end
+
+  test "ARMED write failures cannot start a child and retain the actual reopened row" do
+    for mode <- [:before, :after] do
+      issue = active_issue("h080a-armed-write-#{mode}")
+      fixture = fixture!(issue, "armed-write-#{mode}")
+
+      {orchestrator, task_supervisor} =
+        start_orchestrator!(fixture,
+          start_quiesced: true,
+          attempt_write_fun: failing_attempt_write_fun(self(), issue.id, :armed, mode)
+        )
+
+      orchestrator_monitor = Process.monitor(orchestrator)
+      send(orchestrator, :tick)
+
+      assert_receive(
+        {:h080a_attempt_write_failure, issue_id, :armed, ^mode},
+        5_000
+      )
+
+      assert issue_id == issue.id
+      _barrier = GenServer.call(orchestrator, :snapshot)
+      refute_receive {:h080a_child_first_instruction, _, _, _, _}, 0
+
+      assert {:ok, %{in_flight: true, authority_fence: %{state: :armed}}} =
+               AttemptLedger.current(:sys.get_state(orchestrator).attempt_ledger, issue.id)
+
+      Process.exit(orchestrator, :kill)
+      assert_receive {:DOWN, ^orchestrator_monitor, :process, ^orchestrator, :killed}, 5_000
+
+      {:ok, reopened} = open_attempt!(fixture)
+
+      assert {:ok, %{in_flight: true, authority_fence: %{state: :armed}}} =
+               AttemptLedger.current(reopened, issue.id)
+
+      assert :ok = AttemptLedger.close(reopened)
+      stop_fixture_processes(orchestrator, task_supervisor)
+    end
+  end
+
+  test "restart after successful ARMED sync retires the unbound reservation" do
+    issue = active_issue("h080a-armed-sync-restart")
+    fixture = fixture!(issue, "armed-sync-restart")
+    sequence = Application.fetch_env!(:symphony_elixir, :h080a_event_sequence)
+    observer = Application.fetch_env!(:symphony_elixir, :h080a_event_observer)
+
+    {orchestrator, task_supervisor} =
+      start_orchestrator!(fixture,
+        start_quiesced: true,
+        attempt_sync_fun: crashing_attempt_sync_fun(observer, issue.id, sequence, :armed)
+      )
+
+    orchestrator_monitor = Process.monitor(orchestrator)
+    send(orchestrator, :tick)
+
+    assert_receive(
+      {:h080a_attempt_sync, issue_id, _event, %{state: :armed, in_flight: true, result: :ok}},
+      5_000
+    )
+
+    assert issue_id == issue.id
+    assert_receive {:DOWN, ^orchestrator_monitor, :process, ^orchestrator, :killed}, 5_000
+    refute_receive {:h080a_child_first_instruction, _, _, _, _}, 0
+
+    {:ok, attempts} = open_attempt!(fixture)
+    assert {:ok, %{in_flight: true, authority_fence: %{state: :armed}}} = AttemptLedger.current(attempts, issue.id)
+    assert :ok = AttemptLedger.close(attempts)
+
+    {restarted_orchestrator, restarted_task_supervisor} =
+      start_orchestrator!(fixture, start_quiesced: true, max_children: 0)
+
+    send(restarted_orchestrator, :run_poll_cycle)
+    _restart_barrier = GenServer.call(restarted_orchestrator, :snapshot)
+    recovered_state = :sys.get_state(restarted_orchestrator)
+
+    assert recovered_state.startup_reconciliation == :ready
+    refute MapSet.member?(recovered_state.durable_in_flight, issue.id)
+
+    assert {:ok, %{in_flight: false, authority_fence: %{state: :released}}} =
+             AttemptLedger.current(recovered_state.attempt_ledger, issue.id)
+
+    refute_receive {:h080a_child_first_instruction, _, _, ^issue_id, _}, 0
+
+    stop_fixture_processes(restarted_orchestrator, restarted_task_supervisor)
+    stop_fixture_processes(orchestrator, task_supervisor)
   end
 
   test "restart after successful BOUND sync before child instruction preserves unresolved authority" do
@@ -514,7 +679,7 @@ defmodule SymphonyElixir.H080AAuthorityFenceCharacterizationTest do
     assert :ok = AttemptLedger.close(reopened_attempts)
   end
 
-  test "pending-fence write and sync failures retain the actual reopened ledger state" do
+  test "pending-fence write failures and post-sync errors retain the actual reopened ledger state" do
     for failure <- [:write_before, :write_after, :sync_after] do
       issue = active_issue("h080a-pending-#{failure}")
       expected_issue_id = issue.id
@@ -615,7 +780,7 @@ defmodule SymphonyElixir.H080AAuthorityFenceCharacterizationTest do
     end
   end
 
-  test "RecoveryLedger write and sync failures are judged from reopened durable records" do
+  test "RecoveryLedger write failures and post-sync errors are judged from reopened durable records" do
     for failure <- [:write_before, :write_after, :sync_after] do
       issue = active_issue("h080a-recovery-#{failure}")
       expected_issue_id = issue.id
@@ -758,8 +923,14 @@ defmodule SymphonyElixir.H080AAuthorityFenceCharacterizationTest do
     end
   end
 
-  test "older, id-less, or wrong-lineage terminal context cannot release the current suspension" do
-    for terminal_case <- [:older_terminal, :legacy_without_id, :different_lineage] do
+  test "older, id-less, wrong-ID, wrong-lineage, and escalated terminal contexts cannot release the current suspension" do
+    for terminal_case <- [
+          :older_terminal,
+          :older_escalated_terminal,
+          :legacy_without_id,
+          :wrong_suspension_id,
+          :different_lineage
+        ] do
       issue = active_issue("h080a-terminal-separation-#{terminal_case}")
       issue_id = issue.id
       fixture = fixture!(issue, "terminal-separation-#{terminal_case}")
@@ -771,8 +942,15 @@ defmodule SymphonyElixir.H080AAuthorityFenceCharacterizationTest do
       {:ok, first_pending} =
         AttemptLedger.mark_suspension_pending(attempts, issue.id, first_identity, suspension_intent(issue.id))
 
+      first_terminal_status = if terminal_case == :older_escalated_terminal, do: :escalated, else: :resolved
+
       first_terminal =
-        terminal_context(issue.id, first_identity.lineage_generation, first_pending.authority_fence.intent)
+        terminal_context(
+          issue.id,
+          first_identity.lineage_generation,
+          first_pending.authority_fence.intent,
+          first_terminal_status
+        )
 
       assert :ok = AttemptLedger.release_suspension_fence(attempts, issue.id, first_identity, first_terminal)
       assert :ok = AttemptLedger.clear_in_flight(attempts, issue.id)
@@ -801,6 +979,9 @@ defmodule SymphonyElixir.H080AAuthorityFenceCharacterizationTest do
           :older_terminal ->
             first_terminal
 
+          :older_escalated_terminal ->
+            first_terminal
+
           :legacy_without_id ->
             first_terminal
             |> Map.from_struct()
@@ -813,7 +994,29 @@ defmodule SymphonyElixir.H080AAuthorityFenceCharacterizationTest do
               first_identity.lineage_generation,
               second_pending.authority_fence.intent
             )
+
+          :wrong_suspension_id ->
+            wrong_terminal =
+              terminal_context(
+                issue.id,
+                second_identity.lineage_generation,
+                second_pending.authority_fence.intent
+              )
+
+            %{wrong_terminal | suspension_id: "stale-#{wrong_terminal.suspension_id}"}
         end
+
+      if terminal_case == :wrong_suspension_id do
+        assert old_terminal.lineage_generation == second_identity.lineage_generation
+
+        assert {:ok,
+                %{
+                  authority_fence: %{state: :suspension_pending, runtime_attempt: ^second_identity}
+                }} = AttemptLedger.current(attempts, issue.id)
+
+        assert {:error, :suspension_context_mismatch} =
+                 AttemptLedger.release_suspension_fence(attempts, issue.id, second_identity, old_terminal)
+      end
 
       checkpoint = %{
         first_checkpoint
@@ -843,11 +1046,19 @@ defmodule SymphonyElixir.H080AAuthorityFenceCharacterizationTest do
       if terminal_case == :different_lineage do
         assert Map.has_key?(restored.durable_blocked, issue.id)
       else
-        assert restored.work_control[issue.id].suspension_context.suspension_id ==
-                 second_pending.authority_fence.intent.suspension_id
+        if terminal_case == :older_escalated_terminal do
+          assert restored.work_control[issue.id].suspension_context.status == :escalated
+          assert restored.work_control[issue.id].suspension_context.suspension_id == first_terminal.suspension_id
+          refute WorkItem.dispatchable?(restored.work_control[issue.id])
+        else
+          actual_suspension_id = restored.work_control[issue.id].suspension_context.suspension_id
+          expected_suspension_id = second_pending.authority_fence.intent.suspension_id
 
-        assert restored.work_control[issue.id].suspension_context.suspension_id !=
-                 first_pending.authority_fence.intent.suspension_id
+          assert actual_suspension_id == expected_suspension_id,
+                 "terminal case: #{terminal_case}, actual: #{actual_suspension_id}, expected: #{expected_suspension_id}"
+
+          assert actual_suspension_id != first_pending.authority_fence.intent.suspension_id
+        end
       end
 
       assert {:ok,
@@ -856,6 +1067,8 @@ defmodule SymphonyElixir.H080AAuthorityFenceCharacterizationTest do
                 authority_fence: %{state: :suspension_pending, runtime_attempt: ^second_identity}
               }} =
                AttemptLedger.current(restored.attempt_ledger, issue.id)
+
+      refute WorkItem.dispatchable?(restored.work_control[issue.id])
 
       refute_receive {:h080a_child_first_instruction, _, _, ^issue_id, _}, 0
       stop_fixture_processes(orchestrator, task_supervisor)
@@ -1009,16 +1222,16 @@ defmodule SymphonyElixir.H080AAuthorityFenceCharacterizationTest do
     stop_fixture_processes(orchestrator, task_supervisor)
   end
 
-  test "release and clear write or sync cuts retain the actual durable fence state" do
+  test "release and clear write failures or post-sync errors retain the actual durable fence state" do
     for failure <- [
           :none,
           :release_write_before,
           :release_write_after,
-          :release_sync,
-          :pre_clear_sync,
+          :release_sync_after,
+          :pre_clear_sync_after,
           :clear_write_before,
           :clear_write_after,
-          :clear_sync
+          :clear_sync_after
         ] do
       issue = active_issue("h080a-release-cut-#{failure}")
       fixture = fixture!(issue, "release-cut-#{failure}")
@@ -1033,10 +1246,10 @@ defmodule SymphonyElixir.H080AAuthorityFenceCharacterizationTest do
           :release_write_after ->
             {failing_attempt_write_fun(observer, issue.id, {:released, true}, :after), nil}
 
-          :release_sync ->
+          :release_sync_after ->
             {nil, attempt_sync_fun(observer, issue.id, sequence, {:released, true, 1})}
 
-          :pre_clear_sync ->
+          :pre_clear_sync_after ->
             {nil, attempt_sync_fun(observer, issue.id, sequence, {:released, true, 2})}
 
           :clear_write_before ->
@@ -1045,7 +1258,7 @@ defmodule SymphonyElixir.H080AAuthorityFenceCharacterizationTest do
           :clear_write_after ->
             {failing_attempt_write_fun(observer, issue.id, {:released, false}, :after), nil}
 
-          :clear_sync ->
+          :clear_sync_after ->
             {nil, attempt_sync_fun(observer, issue.id, sequence, {:released, false, 1})}
 
           :none ->
@@ -1073,11 +1286,11 @@ defmodule SymphonyElixir.H080AAuthorityFenceCharacterizationTest do
           :none -> {:released, false}
           :release_write_before -> {:suspension_pending, true}
           :release_write_after -> {:released, true}
-          :release_sync -> {:released, true}
-          :pre_clear_sync -> {:released, true}
+          :release_sync_after -> {:released, true}
+          :pre_clear_sync_after -> {:released, true}
           :clear_write_before -> {:released, true}
           :clear_write_after -> {:released, false}
-          :clear_sync -> {:released, false}
+          :clear_sync_after -> {:released, false}
         end
 
       {expected_fence, expected_in_flight} = expected
@@ -1391,6 +1604,35 @@ defmodule SymphonyElixir.H080AAuthorityFenceCharacterizationTest do
     end
   end
 
+  defp failing_attempt_sync_without_dets_sync_fun(
+         observer,
+         issue_id,
+         sequence,
+         target_state,
+         target_in_flight
+       ) do
+    normal_sync = attempt_sync_fun(observer, issue_id, sequence)
+
+    fn table ->
+      case record_for_table(table, issue_id) do
+        %{authority_fence: %{state: ^target_state}, in_flight: ^target_in_flight} = record ->
+          event = :atomics.add_get(sequence, 1, 1)
+
+          send(observer, {
+            :h080a_attempt_sync_failed_without_dets_sync,
+            issue_id,
+            event,
+            Map.take(record, [:in_flight, :authority_fence])
+          })
+
+          {:error, :injected_sync_failure}
+
+        _other ->
+          normal_sync.(table)
+      end
+    end
+  end
+
   defp report_attempt_sync(table, observer, issue_id, sequence, fail_state, failed, actual_result) do
     case :dets.lookup(table, {:current, issue_id}) do
       [{{:current, ^issue_id}, %{authority_fence: fence, in_flight: in_flight} = record}]
@@ -1466,6 +1708,29 @@ defmodule SymphonyElixir.H080AAuthorityFenceCharacterizationTest do
     })
 
     if failed_sync?, do: {:error, :injected_sync_failure}, else: result
+  end
+
+  defp failing_recovery_sync_without_dets_sync_fun(observer, issue_id, sequence) do
+    normal_sync = recovery_sync_fun(observer, issue_id, sequence)
+
+    fn table ->
+      case record_for_table(table, issue_id) do
+        %{active_suspension_context: %{status: :open} = context} ->
+          event = :atomics.add_get(sequence, 1, 1)
+
+          send(observer, {
+            :h080a_recovery_sync_failed_without_dets_sync,
+            issue_id,
+            event,
+            %{active_suspension_context: context}
+          })
+
+          {:error, :injected_sync_failure}
+
+        _other ->
+          normal_sync.(table)
+      end
+    end
   end
 
   defp failing_recovery_write_fun(observer, issue_id, mode) do
@@ -1544,6 +1809,250 @@ defmodule SymphonyElixir.H080AAuthorityFenceCharacterizationTest do
         _other -> result
       end
     end
+  end
+
+  defp assert_restart_recovers_after_sync_failure(boundary) do
+    issue = active_issue("h080a-sync-failure-#{boundary}")
+    issue_id = issue.id
+    fixture = fixture!(issue, "sync-failure-#{boundary}")
+    sequence = Application.fetch_env!(:symphony_elixir, :h080a_event_sequence)
+    observer = Application.fetch_env!(:symphony_elixir, :h080a_event_observer)
+    assessment = blocked_assessment(issue.id)
+
+    if boundary in [:pending_fence, :recovery_context] do
+      Application.put_env(:symphony_elixir, :h080a_runner_action, {:suspend, assessment})
+    end
+
+    opts = sync_failure_options(boundary, observer, issue.id, sequence)
+    {orchestrator, task_supervisor} = start_orchestrator!(fixture, opts)
+    orchestrator_monitor = Process.monitor(orchestrator)
+    send(orchestrator, :tick)
+    child = await_sync_failure_boundary(boundary, issue.id)
+    _barrier = GenServer.call(orchestrator, :snapshot)
+    if is_pid(child), do: assert(Process.alive?(child))
+    Process.exit(orchestrator, :kill)
+    assert_receive {:DOWN, ^orchestrator_monitor, :process, ^orchestrator, :killed}, 5_000
+
+    {:ok, attempts} = open_attempt!(fixture)
+    {:ok, recovery} = open_recovery!(fixture)
+    assert_reopened_sync_failure_records(boundary, attempts, recovery, issue.id)
+    assert :ok = RecoveryLedger.close(recovery)
+    assert :ok = AttemptLedger.close(attempts)
+
+    {restarted_orchestrator, restarted_task_supervisor} =
+      start_orchestrator!(fixture, start_quiesced: true, max_children: 0)
+
+    send(restarted_orchestrator, :run_poll_cycle)
+    _restart_barrier = GenServer.call(restarted_orchestrator, :snapshot)
+    recovered_state = :sys.get_state(restarted_orchestrator)
+    assert recovered_state.startup_reconciliation == :ready
+    refute_receive {:h080a_child_first_instruction, _, _, ^issue_id, _}, 0
+    assert_restarted_sync_failure_state(boundary, recovered_state, issue_id)
+    stop_fixture_processes(restarted_orchestrator, restarted_task_supervisor)
+    stop_fixture_processes(orchestrator, task_supervisor)
+  end
+
+  defp sync_failure_options(:armed, observer, issue_id, sequence) do
+    [
+      start_quiesced: true,
+      attempt_sync_fun: failing_attempt_sync_without_dets_sync_fun(observer, issue_id, sequence, :armed, true)
+    ]
+  end
+
+  defp sync_failure_options(:pending_fence, observer, issue_id, sequence) do
+    sync_fun = failing_attempt_sync_without_dets_sync_fun(observer, issue_id, sequence, :suspension_pending, true)
+
+    [
+      start_quiesced: true,
+      attempt_sync_fun: sync_fun
+    ]
+  end
+
+  defp sync_failure_options(:recovery_context, observer, issue_id, sequence) do
+    [
+      start_quiesced: true,
+      recovery_ledger_opts: [sync_fun: failing_recovery_sync_without_dets_sync_fun(observer, issue_id, sequence)]
+    ]
+  end
+
+  defp await_sync_failure_boundary(:armed, issue_id) do
+    assert_receive(
+      {:h080a_attempt_sync_failed_without_dets_sync, ^issue_id, _event, sync_record}
+      when sync_record.authority_fence.state == :armed and sync_record.in_flight,
+      5_000
+    )
+
+    refute_receive {:h080a_child_first_instruction, _, _, ^issue_id, _}, 0
+    nil
+  end
+
+  defp await_sync_failure_boundary(:pending_fence, issue_id) do
+    assert_receive({:h080a_child_first_instruction, _event, child, ^issue_id, %Identity{} = identity}, 5_000)
+    assert_receive {:h080a_suspension_event_sent, ^issue_id, ^identity}, 5_000
+
+    assert_receive(
+      {:h080a_attempt_sync_failed_without_dets_sync, ^issue_id, _sync_event, sync_record}
+      when sync_record.authority_fence.state == :suspension_pending and sync_record.in_flight and
+             sync_record.authority_fence.runtime_attempt == identity,
+      5_000
+    )
+
+    child
+  end
+
+  defp await_sync_failure_boundary(:recovery_context, issue_id) do
+    assert_receive({:h080a_child_first_instruction, _event, child, ^issue_id, %Identity{} = identity}, 5_000)
+    assert_receive {:h080a_suspension_event_sent, ^issue_id, ^identity}, 5_000
+
+    assert_receive(
+      {
+        :h080a_recovery_sync_failed_without_dets_sync,
+        ^issue_id,
+        _sync_event,
+        %{active_suspension_context: %{status: :open}}
+      },
+      5_000
+    )
+
+    child
+  end
+
+  defp assert_reopened_sync_failure_records(boundary, attempts, recovery, issue_id) do
+    assert {:ok, attempt_record} = AttemptLedger.current(attempts, issue_id)
+    assert {:ok, checkpoint} = RecoveryLedger.current(recovery, issue_id)
+
+    case boundary do
+      :armed ->
+        assert attempt_record.in_flight
+        assert attempt_record.authority_fence.state == :armed
+        assert is_nil(checkpoint.active_suspension_context)
+
+      :pending_fence ->
+        assert attempt_record.in_flight
+        assert attempt_record.authority_fence.state in [:bound, :suspension_pending]
+        assert is_nil(checkpoint.active_suspension_context)
+
+      :recovery_context ->
+        assert attempt_record.in_flight
+        assert attempt_record.authority_fence.state == :suspension_pending
+
+        assert checkpoint.active_suspension_context == nil or
+                 checkpoint.active_suspension_context.status == :open
+    end
+  end
+
+  defp assert_restarted_sync_failure_state(:armed, state, issue_id) do
+    refute MapSet.member?(state.durable_in_flight, issue_id)
+
+    assert {:ok, %{in_flight: false, authority_fence: %{state: :released}}} =
+             AttemptLedger.current(state.attempt_ledger, issue_id)
+  end
+
+  defp assert_restarted_sync_failure_state(_suspension_boundary, state, issue_id) do
+    assert MapSet.member?(state.durable_in_flight, issue_id)
+    assert {:ok, current} = AttemptLedger.current(state.attempt_ledger, issue_id)
+
+    case current.authority_fence do
+      %{state: :bound} ->
+        assert state.durable_blocked[issue_id] == :stale_in_flight_authority_fence_unresolved
+
+      %{state: :suspension_pending, intent: intent} ->
+        refute WorkItem.dispatchable?(state.work_control[issue_id])
+        assert state.work_control[issue_id].suspension_context.suspension_id == intent.suspension_id
+    end
+  end
+
+  defp assert_restart_recovers_after_release_sync_failure(boundary) do
+    issue = active_issue("h080a-#{boundary}-sync-failure")
+    expected_issue_id = issue.id
+    fixture = fixture!(issue, "#{boundary}-sync-failure")
+    sequence = Application.fetch_env!(:symphony_elixir, :h080a_event_sequence)
+    observer = Application.fetch_env!(:symphony_elixir, :h080a_event_observer)
+    {:ok, attempts} = open_attempt!(fixture)
+    {:ok, recovery} = open_recovery!(fixture)
+    {_running_state, identity, checkpoint} = bound_runtime_state(fixture, attempts, recovery)
+
+    {:ok, pending} =
+      AttemptLedger.mark_suspension_pending(attempts, issue.id, identity, suspension_intent(issue.id))
+
+    terminal = terminal_context(issue.id, identity.lineage_generation, pending.authority_fence.intent)
+
+    terminal_checkpoint = %{
+      checkpoint
+      | last_terminal_suspension_context: terminal,
+        updated_at: DateTime.utc_now()
+    }
+
+    assert :ok = RecoveryLedger.put_sync(recovery, terminal_checkpoint)
+    assert :ok = RecoveryLedger.close(recovery)
+    assert :ok = AttemptLedger.close(attempts)
+
+    target_state = :released
+    target_in_flight = boundary == :released
+
+    {orchestrator, task_supervisor} =
+      start_orchestrator!(fixture,
+        start_quiesced: true,
+        attempt_sync_fun:
+          failing_attempt_sync_without_dets_sync_fun(
+            observer,
+            issue.id,
+            sequence,
+            target_state,
+            target_in_flight
+          )
+      )
+
+    orchestrator_monitor = Process.monitor(orchestrator)
+    send(orchestrator, :run_poll_cycle)
+
+    assert_receive(
+      {:h080a_attempt_sync_failed_without_dets_sync, issue_id, _event, sync_record}
+      when issue_id == expected_issue_id and sync_record.authority_fence.state == :released and
+             sync_record.in_flight == target_in_flight,
+      5_000
+    )
+
+    _barrier = GenServer.call(orchestrator, :snapshot)
+    refute_receive {:h080a_child_first_instruction, _, _, ^expected_issue_id, _}, 0
+    Process.exit(orchestrator, :kill)
+    assert_receive {:DOWN, ^orchestrator_monitor, :process, ^orchestrator, :killed}, 5_000
+
+    {:ok, reopened_attempts} = open_attempt!(fixture)
+    {:ok, reopened_recovery} = open_recovery!(fixture)
+    assert {:ok, reopened_record} = AttemptLedger.current(reopened_attempts, issue.id)
+    assert {:ok, reopened_checkpoint} = RecoveryLedger.current(reopened_recovery, issue.id)
+    assert reopened_checkpoint.last_terminal_suspension_context.suspension_id == terminal.suspension_id
+
+    case boundary do
+      :released ->
+        assert reopened_record.in_flight
+        assert reopened_record.authority_fence.state in [:suspension_pending, :released]
+
+      :clear ->
+        assert reopened_record.authority_fence.state == :released
+        assert reopened_record.in_flight in [true, false]
+    end
+
+    assert :ok = RecoveryLedger.close(reopened_recovery)
+    assert :ok = AttemptLedger.close(reopened_attempts)
+
+    {restarted_orchestrator, restarted_task_supervisor} =
+      start_orchestrator!(fixture, start_quiesced: true, max_children: 0)
+
+    send(restarted_orchestrator, :run_poll_cycle)
+    _restart_barrier = GenServer.call(restarted_orchestrator, :snapshot)
+    recovered_state = :sys.get_state(restarted_orchestrator)
+
+    assert recovered_state.startup_reconciliation == :ready
+    refute MapSet.member?(recovered_state.durable_in_flight, issue.id)
+
+    assert {:ok, %{in_flight: false, authority_fence: %{state: :released}}} =
+             AttemptLedger.current(recovered_state.attempt_ledger, issue.id)
+
+    refute_receive {:h080a_child_first_instruction, _, _, ^expected_issue_id, _}, 0
+    stop_fixture_processes(restarted_orchestrator, restarted_task_supervisor)
+    stop_fixture_processes(orchestrator, task_supervisor)
   end
 
   defp assert_restart_recovers_after_crash(boundary) do
