@@ -1,6 +1,12 @@
 # H-080A AuthorityFence lifecycle characterization
 
-This is a partial H-080A characterization record for accepted base `7ba76fccaacc5789443c685ed6f1d2bee7f04f9c`. It does not complete H-080A. PR #26 changes this evidence file and the H-080A test file only; no production source changed.
+This is a partial H-080A characterization record for accepted base `7ba76fccaacc5789443c685ed6f1d2bee7f04f9c`. It does not complete H-080A. The current PR candidate changes this evidence file, the H-080A test file, and the status ledger; no production source changed.
+
+## Governance and candidate provenance
+
+The current review direction authorizes fresh H-080A planning. On 2026-09-29, the user confirmed that no pre-existing Master Plan Gate decision authorized implementation against this base. The bounded DOWN-01 task authorization, this candidate's tests, and its passing CI do not substitute for that Master decision. PR #26's implementation provenance therefore cannot be established, and this evidence does not authorize or retroactively approve the candidate.
+
+This candidate characterizes the H-I21 AuthorityFence lifecycle. H-080A remains incomplete: the provider, lifecycle/manual Plane transition, fake completion, project-scope, dependency, configuration, retry-reset, suspension-clearing, GitHub authority, CandidateRef substitution, and wrong-candidate human-merge attack families remain outstanding in the roadmap.
 
 ## Classification: Outcome B — constructed-case overstatement corrected
 
