@@ -145,6 +145,7 @@ defmodule SymphonyElixir.WorkControl.CompletionProof do
 
     with true <- proof.stage == :merge_verified,
          true <- valid_evidence?(proof),
+         true <- ProviderObservation.valid_tracker_read?(observation),
          true <- provider_closure_matches?(completed, observation, contract),
          {:ok, completed} <- sign_proof(completed),
          true <- valid_evidence?(completed) do
@@ -195,7 +196,11 @@ defmodule SymphonyElixir.WorkControl.CompletionProof do
         %__MODULE__{stage: :completed, closure_observation: closed} = proof,
         %ProviderObservation{} = observed
       ) do
-    is_map(closed) and valid_evidence?(proof) and observation_identity(closed) == observation_identity(observed)
+    is_map(closed) and ProviderObservation.valid_tracker_read?(closed) and
+      ProviderObservation.valid_tracker_read?(observed) and ProviderObservation.fresh_tracker_read?(observed) and
+      valid_evidence?(proof) and
+      observation_after_merge_verification?(proof, observed) and
+      observation_identity(closed) == observation_identity(observed)
   end
 
   def closes_observation?(
@@ -203,7 +208,11 @@ defmodule SymphonyElixir.WorkControl.CompletionProof do
         observed
       )
       when is_map(observed) do
-    is_map(closed) and valid_evidence?(proof) and observation_identity(closed) == observation_identity(observed)
+    is_map(closed) and ProviderObservation.valid_tracker_read?(closed) and
+      ProviderObservation.valid_tracker_read?(observed) and ProviderObservation.fresh_tracker_read?(observed) and
+      valid_evidence?(proof) and
+      observation_after_merge_verification?(proof, observed) and
+      observation_identity(closed) == observation_identity(observed)
   end
 
   def closes_observation?(_proof, _observed), do: false
@@ -274,6 +283,7 @@ defmodule SymphonyElixir.WorkControl.CompletionProof do
 
   defp stage_evidence_valid?(%__MODULE__{stage: :completed} = proof) do
     is_map(proof.closure_observation) and
+      ProviderObservation.valid_tracker_read?(proof.closure_observation) and
       stage_evidence_valid?(%{
         proof
         | stage: :merge_verified,
@@ -291,12 +301,15 @@ defmodule SymphonyElixir.WorkControl.CompletionProof do
 
   defp provider_closure_matches?(proof, observation, contract) do
     with true <- contract.provider == :plane,
+         true <- ProviderObservation.valid_tracker_read?(observation),
          true <- proof.provider_project_fingerprint == ProviderProjectContract.fingerprint(contract),
          true <- proof.workspace_id == contract.workspace_id,
          true <- proof.project_id == contract.project_id,
          true <- proof.work_item_id == observation.work_item_id,
          true <- observation.provider == :plane,
          true <- observation.presence == :present,
+         true <- ProviderObservation.fresh_tracker_read?(observation),
+         true <- observation_after_merge_verification?(proof, observation),
          true <- observation.workspace_id == contract.workspace_id,
          true <- observation.project_id == contract.project_id,
          {:ok, :done} <- ProviderObservation.map_state(observation, contract) do
@@ -305,6 +318,17 @@ defmodule SymphonyElixir.WorkControl.CompletionProof do
       _failure -> false
     end
   end
+
+  defp observation_after_merge_verification?(
+         %__MODULE__{merge_verification: %{observed_at: %DateTime{} = verified_at}},
+         %{observed_at: %DateTime{} = observed_at}
+       ) do
+    DateTime.compare(observed_at, verified_at) == :gt
+  rescue
+    _error -> false
+  end
+
+  defp observation_after_merge_verification?(_proof, _observation), do: false
 
   defp context_identity_matches?(proof, context) do
     context_subject_matches?(proof, Map.get(context, :subject)) and
@@ -492,7 +516,8 @@ defmodule SymphonyElixir.WorkControl.CompletionProof do
       :provider_state_group,
       :provider_state_name,
       :provider_updated_at,
-      :observed_at
+      :observed_at,
+      :tracker_read_signature
     ])
   end
 

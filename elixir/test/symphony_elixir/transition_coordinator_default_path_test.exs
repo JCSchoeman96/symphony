@@ -47,6 +47,7 @@ defmodule SymphonyElixir.TransitionCoordinatorDefaultPathTest do
   alias SymphonyElixir.WorkControl.{
     CompletionProof,
     GuardClass,
+    ProviderObservation,
     ProviderProjectContract,
     SemanticTransitionIntent,
     WorkflowLifecycle,
@@ -138,7 +139,7 @@ defmodule SymphonyElixir.TransitionCoordinatorDefaultPathTest do
         orchestrator: orchestrator,
         refresh_contract: fn _context -> {:ok, contract} end,
         submit: fn _attempt, _context ->
-          Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue("Done", "state-done")])
+          Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue_with_tracker_read("Done", "state-done")])
           :ok
         end,
         require_durable?: false
@@ -156,9 +157,17 @@ defmodule SymphonyElixir.TransitionCoordinatorDefaultPathTest do
     assert {:ok, %{state: :verified}} = TransitionCoordinator.request_transition(coordinator, completion_intent)
     assert_received {:applied, %WorkItem{validated_lifecycle_state: :done} = completed}
     assert WorkItem.dependency_satisfying?(completed)
+    assert ProviderObservation.valid_tracker_read?(completed.provider_observation)
 
     assert %CompletionProof{stage: :completed, closure_observation: %{provider_state_id: "state-done"}} =
+             completed_proof =
              Enum.find(completed.lifecycle_assessment.satisfied_guards, &match?(%CompletionProof{stage: :completed}, &1))
+
+    assert CompletionProof.closes_observation?(completed_proof, completed.provider_observation)
+
+    forged_observation = %{completed.provider_observation | provider_state_name: "In Progress"}
+    refute ProviderObservation.valid_tracker_read?(forged_observation)
+    refute CompletionProof.closes_observation?(completed_proof, forged_observation)
   end
 
   test "failed SourceControl merge verification does not submit provider Done" do
@@ -567,6 +576,15 @@ defmodule SymphonyElixir.TransitionCoordinatorDefaultPathTest do
       url: "https://memory.local/work-1",
       updated_at: @now
     }
+  end
+
+  defp issue_with_tracker_read(state, state_id) do
+    issue = issue(state, state_id)
+
+    {:ok, observation} =
+      ProviderObservation.from_issue(issue, %{provider: :plane, observed_at: DateTime.utc_now()})
+
+    %{issue | tracker_read_observation: sign_provider_observation_for_test(observation)}
   end
 
   defp group_for_state("Ready"), do: :unstarted

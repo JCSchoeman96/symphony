@@ -1,12 +1,10 @@
 defmodule SymphonyElixir.SourceControl.MergeVerificationTest do
   use ExUnit.Case, async: true
 
-  alias SymphonyElixir.Dependency.Policy
   alias SymphonyElixir.GitHub.SourceControl, as: GitHubSourceControl
   alias SymphonyElixir.SourceControl
   alias SymphonyElixir.SourceControl.CandidateRef
   alias SymphonyElixir.SourceControl.MergeVerification
-  alias SymphonyElixir.Tracker.Issue
 
   alias SymphonyElixir.WorkControl.{
     CompletionProof,
@@ -15,8 +13,7 @@ defmodule SymphonyElixir.SourceControl.MergeVerificationTest do
     ProviderObservation,
     ProviderProjectContract,
     SemanticTransitionIntent,
-    WorkflowLifecycle,
-    WorkItem
+    WorkflowLifecycle
   }
 
   @sha_a String.duplicate("a", 40)
@@ -225,7 +222,24 @@ defmodule SymphonyElixir.SourceControl.MergeVerificationTest do
     assert {:error, :provider_closure_mismatch} = CompletionProof.close(nil, nil, nil)
   end
 
-  test "completion proof binds source-control merge verification to a fresh Plane Done observation" do
+  test "caller-built Done observation cannot mint completion or satisfy a dependency" do
+    contract = provider_contract()
+    merge_verified = SymphonyElixir.TestSupport.completion_proof_fixture("issue-1", contract)
+    forged_observation = provider_observation(:done, "issue-1", contract)
+
+    assert {:error, :provider_closure_mismatch} =
+             CompletionProof.close(merge_verified, forged_observation, contract)
+
+    assessment =
+      LifecycleAssessment.assess(forged_observation, :merging, [merge_verified], %{
+        provider_project_contract: contract
+      })
+
+    assert assessment.status == :validation_required
+    refute LifecycleAssessment.dependency_satisfying?(assessment)
+  end
+
+  test "SourceControl merge verification does not authorize a caller-built Done observation" do
     settings = %{symphony: %{project_id: "project-1"}}
     config = @config
     contract = provider_contract()
@@ -384,90 +398,18 @@ defmodule SymphonyElixir.SourceControl.MergeVerificationTest do
     done_observation = provider_observation(:done, "issue-1", contract)
 
     assert CompletionProof.valid_evidence?(merge_verified)
-    assert {:ok, _completed} = CompletionProof.close(merge_verified, done_observation, contract)
+    refute ProviderObservation.valid_tracker_read?(done_observation)
+
+    assert {:error, :provider_closure_mismatch} =
+             CompletionProof.close(merge_verified, done_observation, contract)
 
     assessment =
       LifecycleAssessment.assess(done_observation, :merging, merge_verified_evidence, %{
         provider_project_contract: contract
       })
 
-    assert assessment.status == :validated, inspect(assessment)
-    assert LifecycleAssessment.dependency_satisfying?(assessment)
-
-    assert %CompletionProof{stage: :completed} =
-             Enum.find(assessment.satisfied_guards, &match?(%CompletionProof{stage: :completed}, &1))
-
-    [completed_proof] = assessment.satisfied_guards
-    assert CompletionProof.closes_observation?(completed_proof, Map.from_struct(done_observation))
-
-    assert {:error, :invalid_merge_verification} =
-             CompletionProof.with_merge_verification(completed_proof, completed_proof.merge_verification)
-
-    forged_proof = %{
-      completed_proof
-      | issuance_signature: "sha256:" <> Base.encode16(<<0::256>>, case: :lower)
-    }
-
-    refute CompletionProof.valid_evidence?(forged_proof)
-    refute GuardClass.satisfied?(GuardClass.requirement(:mechanical_guard, :completion_proof_verified), forged_proof)
-
-    forged_source_control_proof = %{
-      completed_proof
-      | source_control_signature: "sha256:" <> Base.encode16(<<0::256>>, case: :lower)
-    }
-
-    refute CompletionProof.valid_evidence?(forged_source_control_proof)
-
-    malformed_closure_signature = %{completed_proof | issuance_signature: "sha256:invalid"}
-    refute CompletionProof.valid_evidence?(malformed_closure_signature)
-
-    missing_closure_signature = %{completed_proof | issuance_signature: nil}
-    refute CompletionProof.valid_evidence?(missing_closure_signature)
-
-    later_observation = %{done_observation | observed_at: DateTime.add(done_observation.observed_at, 1, :second)}
-
-    unchanged_done =
-      LifecycleAssessment.assess(later_observation, :done, [completed_proof], %{
-        provider_project_contract: contract
-      })
-
-    assert LifecycleAssessment.dependency_satisfying?(unchanged_done)
-
-    renamed_state = %{later_observation | provider_state_name: "Finished"}
-
-    rebound_done =
-      LifecycleAssessment.assess(renamed_state, :done, [completed_proof], %{
-        provider_project_contract: contract
-      })
-
-    assert rebound_done.status == :validation_required
-    refute LifecycleAssessment.dependency_satisfying?(rebound_done)
-
-    done_issue = %Issue{
-      id: "issue-1",
-      identifier: "SYM-1",
-      state: "Done",
-      workspace_id: contract.workspace_id,
-      project_id: contract.project_id,
-      provider_state_id: "state-done",
-      provider_state_group: :completed
-    }
-
-    assert {:ok, done_work_item} =
-             WorkItem.from_issue(done_issue, %{
-               provider: :plane,
-               prior_validated_lifecycle_state: :done,
-               evidence: assessment.satisfied_guards,
-               provider_project_contract: contract
-             })
-
-    assert WorkItem.dependency_satisfying?(done_work_item)
-    assert {:ok, %{status: :satisfied}} = Policy.classify_blocker(done_work_item)
-
-    wrong_item = provider_observation(:done, "another-issue", contract)
-    rejected = LifecycleAssessment.assess(wrong_item, :merging, merge_verified_evidence, %{provider_project_contract: contract})
-    assert rejected.status == :validation_required
-    refute LifecycleAssessment.dependency_satisfying?(rejected)
+    assert assessment.status == :validation_required
+    refute LifecycleAssessment.dependency_satisfying?(assessment)
   end
 
   defp intent(from, to, evidence) do

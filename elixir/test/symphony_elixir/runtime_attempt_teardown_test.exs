@@ -106,6 +106,7 @@ defmodule SymphonyElixir.RuntimeAttemptTeardownTest do
 
   defp completion_validated_assessment(display_name) do
     {:ok, contract} = ProviderProjectContract.new(plane_contract_config())
+    proof = completion_proof_fixture(@issue_id, contract)
 
     {:ok, observation} =
       ProviderObservation.new(%{
@@ -119,10 +120,10 @@ defmodule SymphonyElixir.RuntimeAttemptTeardownTest do
         observed_at: DateTime.utc_now()
       })
 
+    observation = sign_provider_observation_for_test(observation)
+
     assessment =
-      LifecycleAssessment.assess(observation, :merging, [completion_proof_fixture(@issue_id, contract)], %{
-        provider_project_contract: contract
-      })
+      LifecycleAssessment.assess(observation, :merging, [proof], %{provider_project_contract: contract})
 
     assessment
   end
@@ -151,6 +152,11 @@ defmodule SymphonyElixir.RuntimeAttemptTeardownTest do
       provider_state_id: "state-done",
       provider_state_group: :completed
     }
+  end
+
+  defp signed_issue_observation(%Issue{} = issue) do
+    {:ok, observation} = ProviderObservation.from_issue(issue, %{provider: :plane})
+    sign_provider_observation_for_test(observation)
   end
 
   defp configure_plane_routed_workflow! do
@@ -433,6 +439,7 @@ defmodule SymphonyElixir.RuntimeAttemptTeardownTest do
     assert {:ok, previous} =
              WorkItem.from_issue(issue_done, %{
                provider: :plane,
+               provider_observation: signed_issue_observation(issue_done),
                prior_validated_lifecycle_state: :merging,
                evidence: [proof],
                provider_project_contract: contract
@@ -471,6 +478,7 @@ defmodule SymphonyElixir.RuntimeAttemptTeardownTest do
     assert {:ok, previous} =
              WorkItem.from_issue(issue_done, %{
                provider: :plane,
+               provider_observation: signed_issue_observation(issue_done),
                prior_validated_lifecycle_state: :merging,
                evidence: [proof],
                provider_project_contract: contract

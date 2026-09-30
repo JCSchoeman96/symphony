@@ -13,11 +13,12 @@
 ## File map
 
 - Create `elixir/lib/symphony_elixir/work_control/completion_proof.ex` for typed proof stages and their binding checks.
+- Modify `elixir/lib/symphony_elixir/tracker.ex`, `elixir/lib/symphony_elixir/tracker/issue.ex`, and `elixir/lib/symphony_elixir/work_control/provider_observation.ex` so fresh Tracker reads carry verifiable provenance into lifecycle refreshes.
 - Modify `elixir/lib/symphony_elixir/work_control/guard_class.ex` so completion and merge-closure guards accept only the matching typed proof stage.
 - Modify `elixir/lib/symphony_elixir/work_control/workflow_lifecycle.ex` so the pre-submit `Merging → Done` guard means merge closure is verified; final completion remains a LifecycleAssessment requirement.
 - Modify `elixir/lib/symphony_elixir/source_control.ex` to create merge-authorization evidence from the approved candidate, review evidence, and fresh checks, then verify exact merge and checks.
-- Modify `elixir/lib/symphony_elixir/work_control/lifecycle_assessment.ex` to close merge proof against the fresh provider observation and contract.
-- Modify `elixir/lib/symphony_elixir/transition_coordinator.ex` to build the accepted WorkItem from post-verification satisfied evidence, including the closed proof.
+- Modify `elixir/lib/symphony_elixir/work_control/lifecycle_assessment.ex` to close merge proof against a Tracker-attested provider observation and contract.
+- Modify `elixir/lib/symphony_elixir/transition_coordinator.ex` to require a fresh Tracker read before building the accepted WorkItem from post-verification satisfied evidence, including the closed proof.
 - Modify `elixir/lib/symphony_elixir/orchestrator.ex` and `elixir/lib/symphony_elixir/work_control/recovery_ledger.ex` so typed completion evidence can be retained and rechecked after restart while legacy name-only records remain readable but unauthoritative.
 - Update `elixir/test/symphony_elixir/guard_class_source_control_test.exs`, `work_control_assessment_test.exs`, `work_control_work_item_test.exs`, `source_control_merge_verification_test.exs`, `transition_coordinator_default_path_test.exs`, and recovery tests.
 
@@ -57,8 +58,10 @@ mix test test/symphony_elixir/source_control_merge_verification_test.exs test/sy
 - [x] Add a positive test using the existing GitHub request seam, an exact verified merge, and a fresh Plane `Done` observation.
 - [x] Run the tests and confirm the positive and negative assertions fail before implementation.
 - [x] Close the typed proof in LifecycleAssessment only after the fresh observation maps to configured `Done`.
+- [x] Require the Tracker boundary to attest Plane reads and preserve the receipt through subsequent routed lifecycle refreshes.
 - [x] Feed post-verification `assessment.satisfied_guards` into the WorkItem created after a verified transition.
 - [x] Verify `WorkItem.dependency_satisfying?/1` returns true only for the fully closed proof.
+- [x] Reject stale or pre-merge Tracker receipts and confirm a later fresh Tracker read revalidates the completed dependency.
 - [x] Run completion, transition default-path, and dependency tests.
 
 Run from `elixir/`:

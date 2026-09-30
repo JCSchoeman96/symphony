@@ -23,7 +23,7 @@ defmodule SymphonyElixir.AgentRouterOrchestratorTest do
 
   alias SymphonyElixir.AgentRuntime.Router
   alias SymphonyElixir.Dependency.Graph
-  alias SymphonyElixir.WorkControl.{ProviderProjectContract, WorkflowLifecycle, WorkItem}
+  alias SymphonyElixir.WorkControl.{ProviderObservation, ProviderProjectContract, WorkflowLifecycle, WorkItem}
   alias SymphonyElixir.Workspace.OwnershipLedger
 
   @now ~U[2026-09-16 00:00:00Z]
@@ -53,12 +53,19 @@ defmodule SymphonyElixir.AgentRouterOrchestratorTest do
       provider_state_group: :completed
     }
 
+    proof = completion_proof_fixture(id, contract)
+    observed_at = DateTime.utc_now()
+
+    {:ok, provider_observation} =
+      ProviderObservation.from_issue(issue, %{provider: :plane, observed_at: observed_at})
+
     {:ok, work_item} =
       WorkItem.from_issue(issue, %{
         provider: :plane,
-        observed_at: @now,
+        provider_observation: sign_provider_observation_for_test(provider_observation),
+        observed_at: observed_at,
         prior_validated_lifecycle_state: "Merging",
-        evidence: [completion_proof_fixture(id, contract)],
+        evidence: [proof],
         provider_project_contract: contract
       })
 

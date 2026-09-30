@@ -4,14 +4,16 @@ defmodule SymphonyElixir.Tracker do
 
   The orchestrator only depends on the read callbacks. Agent-side mutations stay
   behind optional provider-native tools so tracker-specific capabilities do not
-  leak into scheduler policy.
+  leak into scheduler policy. Plane issue reads carry a signed observation from
+  this boundary so later lifecycle refreshes can verify the provider provenance.
   """
 
   alias SymphonyElixir.Config
+  alias SymphonyElixir.Dependency.Graph
   alias SymphonyElixir.Tracker.Capabilities
   alias SymphonyElixir.Tracker.Issue
   alias SymphonyElixir.TransitionCoordinator
-  alias SymphonyElixir.WorkControl.{SemanticTransitionIntent, WorkflowLifecycle}
+  alias SymphonyElixir.WorkControl.{ProviderObservation, SemanticTransitionIntent, WorkflowLifecycle}
 
   @adapters %{
     "asana" => SymphonyElixir.Asana.Adapter,
@@ -48,7 +50,11 @@ defmodule SymphonyElixir.Tracker do
 
   @spec fetch_issues_by_states([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_issues_by_states(states) do
-    adapter().fetch_issues_by_states(states)
+    tracker_settings = Config.settings!().tracker
+    adapter = adapter_for_settings!(tracker_settings)
+
+    adapter.fetch_issues_by_states(states)
+    |> attest_tracker_read_result(tracker_settings)
   end
 
   @spec fetch_issues_by_ids([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
@@ -57,16 +63,19 @@ defmodule SymphonyElixir.Tracker do
   @spec fetch_issues_by_ids([String.t()], keyword()) :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_issues_by_ids(issue_ids, opts) when is_list(issue_ids) and is_list(opts) do
     with {:ok, adapter} <- adapter_for_opts(opts) do
-      cond do
-        Code.ensure_loaded?(adapter) and function_exported?(adapter, :fetch_issues_by_ids, 2) ->
-          adapter.fetch_issues_by_ids(issue_ids, opts)
+      result =
+        cond do
+          Code.ensure_loaded?(adapter) and function_exported?(adapter, :fetch_issues_by_ids, 2) ->
+            adapter.fetch_issues_by_ids(issue_ids, opts)
 
-        Code.ensure_loaded?(adapter) and function_exported?(adapter, :fetch_issues_by_ids, 1) ->
-          adapter.fetch_issues_by_ids(issue_ids)
+          Code.ensure_loaded?(adapter) and function_exported?(adapter, :fetch_issues_by_ids, 1) ->
+            adapter.fetch_issues_by_ids(issue_ids)
 
-        true ->
-          {:error, :current_issue_refresh_unsupported}
-      end
+          true ->
+            {:error, :current_issue_refresh_unsupported}
+        end
+
+      attest_tracker_read_result(result, tracker_settings_for_opts(opts))
     end
   end
 
@@ -78,16 +87,19 @@ defmodule SymphonyElixir.Tracker do
   @spec fetch_dependency_graph(keyword()) :: {:ok, term()} | {:error, term()}
   def fetch_dependency_graph(opts) when is_list(opts) do
     with {:ok, adapter} <- adapter_for_opts(opts) do
-      cond do
-        Code.ensure_loaded?(adapter) and function_exported?(adapter, :fetch_dependency_graph, 1) ->
-          adapter.fetch_dependency_graph(opts)
+      result =
+        cond do
+          Code.ensure_loaded?(adapter) and function_exported?(adapter, :fetch_dependency_graph, 1) ->
+            adapter.fetch_dependency_graph(opts)
 
-        Code.ensure_loaded?(adapter) and function_exported?(adapter, :fetch_dependency_graph, 0) ->
-          adapter.fetch_dependency_graph()
+          Code.ensure_loaded?(adapter) and function_exported?(adapter, :fetch_dependency_graph, 0) ->
+            adapter.fetch_dependency_graph()
 
-        true ->
-          {:error, :dependency_graph_unsupported}
-      end
+          true ->
+            {:error, :dependency_graph_unsupported}
+        end
+
+      attest_tracker_read_result(result, tracker_settings_for_opts(opts))
     end
   end
 
@@ -268,6 +280,76 @@ defmodule SymphonyElixir.Tracker do
     end
   end
 
+  defp tracker_settings_for_opts(opts) do
+    Keyword.get_lazy(opts, :tracker_settings, fn -> Config.settings!().tracker end)
+  end
+
+  defp attest_tracker_read_result({:ok, issues}, %{kind: kind} = tracker_settings)
+       when is_list(issues) do
+    if plane_tracker_kind?(kind) do
+      {:ok, Enum.map(issues, &attest_tracker_issue(&1, tracker_settings))}
+    else
+      {:ok, issues}
+    end
+  end
+
+  defp attest_tracker_read_result({:ok, %Graph{} = graph}, %{kind: kind} = tracker_settings)
+       when kind in [:plane, "plane"] do
+    nodes =
+      Map.new(graph.nodes, fn {issue_id, issue} ->
+        {issue_id, attest_tracker_issue(issue, tracker_settings)}
+      end)
+
+    {:ok, %{graph | nodes: nodes}}
+  end
+
+  defp attest_tracker_read_result(result, _tracker_settings), do: result
+
+  defp attest_tracker_issue(%Issue{} = issue, tracker_settings) do
+    with {:ok, key} <- tracker_read_signing_key(tracker_settings),
+         {:ok, observation} <-
+           ProviderObservation.from_issue(%{issue | tracker_read_observation: nil}, %{
+             provider: :plane,
+             observed_at: DateTime.utc_now()
+           }) do
+      signature =
+        :crypto.mac(:hmac, :sha256, key, ProviderObservation.tracker_read_payload(observation))
+
+      signed_observation = %{
+        observation
+        | tracker_read_signature: "sha256:" <> Base.encode16(signature, case: :lower)
+      }
+
+      %{issue | tracker_read_observation: signed_observation}
+    else
+      _unavailable -> issue
+    end
+  end
+
+  defp attest_tracker_issue(issue, _tracker_settings), do: issue
+
+  defp tracker_read_signing_key(tracker_settings) do
+    case Application.get_env(:symphony_elixir, :completion_proof_signing_key) do
+      key when is_binary(key) and byte_size(key) >= 32 ->
+        {:ok, derive_tracker_read_signing_key(key)}
+
+      _missing ->
+        case Map.get(tracker_settings, :api_key) do
+          api_key when is_binary(api_key) and api_key != "" ->
+            {:ok, derive_tracker_read_signing_key(api_key)}
+
+          _missing_api_key ->
+            {:error, :tracker_read_signing_key_required}
+        end
+    end
+  end
+
+  defp derive_tracker_read_signing_key(key) do
+    :crypto.hash(:sha256, "symphony-tracker-read-v1:" <> key)
+  end
+
+  defp plane_tracker_kind?(kind), do: kind in [:plane, "plane"]
+
   @spec adapter_for_kind(String.t()) :: {:ok, module()} | {:error, term()}
   def adapter_for_kind(kind) do
     case Map.fetch(@adapters, kind) do
@@ -325,7 +407,8 @@ defmodule SymphonyElixir.Tracker do
   end
 
   defp provider_scope("plane", tracker_settings) do
-    provider = Map.get(tracker_settings, :provider) || Map.get(tracker_settings, "provider") || %{}
+    provider =
+      Map.get(tracker_settings, :provider) || Map.get(tracker_settings, "provider") || %{}
 
     compact_scope(%{
       workspace_slug: plane_workspace_scope(provider, tracker_settings),

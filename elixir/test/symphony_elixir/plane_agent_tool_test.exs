@@ -42,6 +42,7 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
     CompletionProof,
     GuardClass,
     ProjectContractEvidence,
+    ProviderObservation,
     ProviderProjectContract,
     WorkflowLifecycle,
     WorkItem
@@ -1606,6 +1607,10 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
   end
 
   defp blocker_work_item(:done) do
+    project_contract = contract()
+    proof = completion_merge_proof("blocker-1", project_contract)
+    observed_at = DateTime.utc_now()
+
     issue = %Issue{
       id: "blocker-1",
       identifier: "SYM-BLOCKER",
@@ -1618,12 +1623,15 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
       updated_at: ~U[2026-09-20 00:00:00Z]
     }
 
+    {:ok, observation} = ProviderObservation.from_issue(issue, %{provider: :plane, observed_at: observed_at})
+
     WorkItem.from_issue(issue, %{
       provider: :plane,
-      observed_at: ~U[2026-09-20 00:00:00Z],
+      provider_observation: TestSupport.sign_provider_observation_for_test(observation),
+      observed_at: observed_at,
       prior_validated_lifecycle_state: :merging,
-      evidence: [completion_merge_proof("blocker-1", contract())],
-      provider_project_contract: contract()
+      evidence: [proof],
+      provider_project_contract: project_contract
     })
     |> elem(1)
   end

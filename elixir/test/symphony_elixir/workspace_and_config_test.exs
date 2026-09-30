@@ -5,7 +5,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
   alias SymphonyElixir.Config.Schema.{Codex, StringOrMap}
   alias SymphonyElixir.Dependency.Graph
   alias SymphonyElixir.Linear.Client
-  alias SymphonyElixir.WorkControl.{ProviderProjectContract, WorkflowLifecycle, WorkItem}
+  alias SymphonyElixir.WorkControl.{ProviderObservation, ProviderProjectContract, WorkflowLifecycle, WorkItem}
   alias SymphonyElixir.Workspace.OwnershipLedger
 
   test "workspace creation records the exact durable ownership binding" do
@@ -1446,25 +1446,28 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     contract = completion_contract()
 
+    blocker_issue = %Issue{
+      id: "blocker-2",
+      identifier: "MT-1004",
+      title: "Blocker",
+      state: "Done",
+      workspace_id: contract.workspace_id,
+      project_id: contract.project_id,
+      provider_state_id: "state-done",
+      provider_state_group: :completed
+    }
+
+    proof = completion_proof_fixture("blocker-2", contract)
+    {:ok, blocker_observation} = ProviderObservation.from_issue(blocker_issue, %{provider: :plane})
+
     {:ok, completed_blocker} =
-      WorkItem.from_issue(
-        %Issue{
-          id: "blocker-2",
-          identifier: "MT-1004",
-          title: "Blocker",
-          state: "Done",
-          workspace_id: contract.workspace_id,
-          project_id: contract.project_id,
-          provider_state_id: "state-done",
-          provider_state_group: :completed
-        },
-        %{
-          provider: :plane,
-          prior_validated_lifecycle_state: :merging,
-          evidence: [completion_proof_fixture("blocker-2", contract)],
-          provider_project_contract: contract
-        }
-      )
+      WorkItem.from_issue(blocker_issue, %{
+        provider: :plane,
+        provider_observation: sign_provider_observation_for_test(blocker_observation),
+        prior_validated_lifecycle_state: :merging,
+        evidence: [proof],
+        provider_project_contract: contract
+      })
 
     state = %{state | work_control: %{"blocker-2" => completed_blocker}}
     assert Orchestrator.should_dispatch_issue_for_test(issue, state)

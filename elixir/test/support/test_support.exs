@@ -7,6 +7,7 @@ defmodule SymphonyElixir.TestSupport do
   alias SymphonyElixir.WorkControl.{
     CompletionProof,
     GuardClass,
+    ProviderObservation,
     ProviderProjectContract,
     RecoveryLedger,
     WorkflowLifecycle
@@ -50,7 +51,8 @@ defmodule SymphonyElixir.TestSupport do
           workspace_ownership_state: 0,
           stop_default_http_server: 0,
           completion_proof_fixture: 2,
-          sign_completion_proof_for_test: 1
+          sign_completion_proof_for_test: 1,
+          sign_provider_observation_for_test: 1
         ]
 
       setup do
@@ -203,6 +205,18 @@ defmodule SymphonyElixir.TestSupport do
     %{
       proof
       | source_control_signature: "sha256:" <> Base.encode16(signature, case: :lower)
+    }
+  end
+
+  def sign_provider_observation_for_test(%ProviderObservation{} = observation) do
+    key = Application.fetch_env!(:symphony_elixir, :completion_proof_signing_key)
+    signing_key = :crypto.hash(:sha256, "symphony-tracker-read-v1:" <> key)
+
+    signature = :crypto.mac(:hmac, :sha256, signing_key, ProviderObservation.tracker_read_payload(observation))
+
+    %{
+      observation
+      | tracker_read_signature: "sha256:" <> Base.encode16(signature, case: :lower)
     }
   end
 

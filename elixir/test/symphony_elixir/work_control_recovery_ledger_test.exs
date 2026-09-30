@@ -378,6 +378,7 @@ defmodule SymphonyElixir.WorkControlRecoveryLedgerTest do
       present_observation
       |> Map.from_struct()
       |> Map.delete(:presence)
+      |> Map.delete(:tracker_read_signature)
       |> Map.put(:__struct__, ProviderObservation)
 
     legacy_context = %{
@@ -713,10 +714,10 @@ defmodule SymphonyElixir.WorkControlRecoveryLedgerTest do
         provider_state_id: "state-done",
         provider_state_group: :completed,
         provider_state_name: "Done",
-        observed_at: ~U[2026-09-30 00:00:00Z]
+        observed_at: DateTime.utc_now()
       })
 
-    observation
+    TestSupport.sign_provider_observation_for_test(observation)
   end
 
   defp merge_verified_proof(work_item_id, contract) do
