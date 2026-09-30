@@ -530,8 +530,15 @@ defmodule SymphonyElixir.PlaneReadSchedulerTest do
   end
 
   test "paces queued reads after the per-window start limit is reached" do
+    start_window_ms = 100
+
     {:ok, scheduler} =
-      ReadScheduler.start_link(max_concurrency: 1, queue_limit: 2, start_limit: 1, start_window_ms: 100)
+      ReadScheduler.start_link(
+        max_concurrency: 1,
+        queue_limit: 2,
+        start_limit: 1,
+        start_window_ms: start_window_ms
+      )
 
     parent = self()
     {:ok, gate} = Agent.start_link(fn -> false end)
@@ -546,6 +553,7 @@ defmodule SymphonyElixir.PlaneReadSchedulerTest do
       end)
 
     assert_receive :first_paced_read_started
+    %{starts: [first_started_at]} = :sys.get_state(scheduler)
 
     second =
       Task.async(fn ->
@@ -556,11 +564,10 @@ defmodule SymphonyElixir.PlaneReadSchedulerTest do
       end)
 
     eventually(fn -> ReadScheduler.stats(scheduler).queue_length == 1 end)
-    released_at = System.monotonic_time(:millisecond)
     Agent.update(gate, fn _ -> true end)
 
     assert_receive {:second_paced_read_started, started_at}, 1_000
-    assert started_at - released_at >= 80
+    assert started_at >= first_started_at + start_window_ms
     assert {:ok, :first} = Task.await(first, 1_000)
     assert {:ok, :second} = Task.await(second, 1_000)
   end
