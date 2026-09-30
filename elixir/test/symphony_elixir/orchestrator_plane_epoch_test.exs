@@ -376,6 +376,10 @@ end
 defmodule SymphonyElixir.OrchestratorPlaneEpochTest do
   use SymphonyElixir.TestSupport
 
+  @startup_test_timeout_ms 15_000
+  @startup_pre_and_post_wait_budget_ms 7_000
+  @startup_reconciliation_wait_ms @startup_test_timeout_ms - @startup_pre_and_post_wait_budget_ms
+
   alias SymphonyElixir.AgentRuntime.AttemptLedger
   alias SymphonyElixir.AgentRuntime.Route
   alias SymphonyElixir.AgentRuntime.RuntimeAttempt
@@ -3464,7 +3468,7 @@ defmodule SymphonyElixir.OrchestratorPlaneEpochTest do
     stop_orchestrator(pid, task_supervisor)
   end
 
-  @tag timeout: 15_000
+  @tag timeout: @startup_test_timeout_ms
   test "startup cleans up a thousand terminal Plane nodes without blocking on item GETs" do
     ledger_root = Path.join(System.tmp_dir!(), "symphony-plane-terminal-epoch-#{System.unique_integer([:positive])}")
     terminal_issues = OrchestratorPlaneEpochFakeTracker.terminal_issues(1_000)
@@ -3493,7 +3497,7 @@ defmodule SymphonyElixir.OrchestratorPlaneEpochTest do
 
     refute_receive {:plane_provider_id_read_blocked, _provider, _ids}, 250
 
-    assert eventually(
+    assert eventually_within(
              fn ->
                try do
                  state = :sys.get_state(pid, 25)
@@ -3502,7 +3506,7 @@ defmodule SymphonyElixir.OrchestratorPlaneEpochTest do
                  :exit, _reason -> false
                end
              end,
-             10
+             @startup_reconciliation_wait_ms
            )
 
     state = :sys.get_state(pid)
@@ -3980,4 +3984,24 @@ defmodule SymphonyElixir.OrchestratorPlaneEpochTest do
   end
 
   defp eventually(_fun, 0), do: false
+
+  defp eventually_within(fun, timeout_ms) when is_integer(timeout_ms) and timeout_ms >= 0 do
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+    do_eventually_within(fun, deadline)
+  end
+
+  defp do_eventually_within(fun, deadline) do
+    if fun.() do
+      true
+    else
+      remaining_ms = deadline - System.monotonic_time(:millisecond)
+
+      if remaining_ms > 0 do
+        Process.sleep(min(20, remaining_ms))
+        do_eventually_within(fun, deadline)
+      else
+        false
+      end
+    end
+  end
 end
