@@ -2735,6 +2735,17 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp tracker_fetch_dependency_graph(Tracker, opts) do
+    if Keyword.get(opts, :scheduler) == SymphonyElixir.Plane.ReadScheduler do
+      Tracker.fetch_dependency_graph_for_epoch(
+        Keyword.get(opts, :epoch_id),
+        Keyword.get(opts, :request_metrics)
+      )
+    else
+      Tracker.fetch_dependency_graph(opts)
+    end
+  end
+
   defp tracker_fetch_dependency_graph(tracker, opts) do
     cond do
       function_exported?(tracker, :fetch_dependency_graph, 1) -> tracker.fetch_dependency_graph(opts)

@@ -96,7 +96,7 @@ defmodule SymphonyElixir.PlaneAdapterTest do
     assert_receive {:request, _}
   end
 
-  test "Tracker attaches a signed observation to each fresh Plane issue read" do
+  test "caller-supplied Tracker reads cannot mint completion authority" do
     done_response = fn _request ->
       {:ok,
        %{
@@ -121,78 +121,37 @@ defmodule SymphonyElixir.PlaneAdapterTest do
                request_fun: done_response
              )
 
-    assert %ProviderObservation{} = observation = issue.tracker_read_observation
-    assert observation.provider == :plane
-    assert observation.work_item_id == "item-1"
-    assert ProviderObservation.valid_tracker_read?(observation)
+    assert issue.tracker_read_observation == nil
 
-    assert {:ok, ^observation} =
-             ProviderObservation.from_issue(issue, %{provider: "plane", observed_at: DateTime.utc_now()})
+    assert {:ok, observation} =
+             ProviderObservation.from_issue(issue, %{provider: :plane, observed_at: DateTime.utc_now()})
 
-    assert {:ok, %CompletionProof{stage: :completed} = completed_proof} =
-             CompletionProof.close(merge_verified, observation, project_contract)
-
-    stale_observation = %{
-      observation
-      | observed_at: DateTime.add(DateTime.utc_now(), -301, :second),
-        tracker_read_signature: nil
-    }
-
-    stale_observation = TestSupport.sign_provider_observation_for_test(stale_observation)
-    refute ProviderObservation.fresh_tracker_read?(stale_observation)
+    refute ProviderObservation.valid_tracker_read?(observation)
 
     assert {:error, :provider_closure_mismatch} =
-             CompletionProof.close(merge_verified, stale_observation, project_contract)
+             CompletionProof.close(merge_verified, observation, project_contract)
 
-    refute CompletionProof.closes_observation?(completed_proof, stale_observation)
-
-    assessment =
-      LifecycleAssessment.assess(observation, :merging, [merge_verified], %{
-        provider_project_contract: project_contract
-      })
-
-    assert assessment.status == :validated
-    assert completed_proof in assessment.satisfied_guards
-
-    assert {:ok, completed_work_item} =
+    assert {:ok, work_item} =
              WorkItem.from_issue(issue, %{
                provider: :plane,
-               provider_observation: observation,
                prior_validated_lifecycle_state: :merging,
                evidence: [merge_verified],
                provider_project_contract: project_contract
              })
 
-    assert WorkItem.dependency_satisfying?(completed_work_item)
+    refute WorkItem.dependency_satisfying?(work_item)
 
-    assert {:ok, [%Issue{} = reread_issue]} =
-             Tracker.fetch_issues_by_ids(["item-1"],
-               tracker_settings: @settings,
-               request_fun: done_response
+    assert {:error, :provider_observation_mismatch} =
+             ProviderObservation.from_issue(
+               %{issue | state: "In Progress", tracker_read_observation: observation},
+               %{provider: :plane}
              )
 
-    {:ok, reread_observation} =
-      ProviderObservation.from_issue(reread_issue, %{provider: :plane, observed_at: DateTime.utc_now()})
-
-    assert ProviderObservation.valid_tracker_read?(reread_observation)
-
-    assert {:ok, reread_work_item} =
-             WorkItem.from_issue(reread_issue, %{
-               provider: :plane,
-               provider_observation: reread_observation,
-               prior_validated_lifecycle_state: :done,
-               evidence: [completed_proof],
-               provider_project_contract: project_contract
-             })
-
-    assert WorkItem.dependency_satisfying?(reread_work_item)
-    assert CompletionProof.closes_observation?(completed_proof, Map.from_struct(reread_observation))
-
     assert {:error, :provider_observation_mismatch} =
-             ProviderObservation.from_issue(%{issue | state: "In Progress"}, %{provider: :plane})
-
-    assert {:error, :provider_observation_mismatch} =
-             ProviderObservation.from_issue(issue, %{provider: :memory})
+             ProviderObservation.from_issue(
+               %{issue | tracker_read_observation: observation},
+               %{provider: :memory}
+             )
 
     refute ProviderObservation.valid_tracker_read?(:forged)
     refute ProviderObservation.fresh_tracker_read?(:forged)
@@ -222,11 +181,16 @@ defmodule SymphonyElixir.PlaneAdapterTest do
                request_fun: done_response
              )
 
-    assert %ProviderObservation{} = pre_merge_observation = pre_merge_issue.tracker_read_observation
-    assert ProviderObservation.valid_tracker_read?(pre_merge_observation)
-
     merge_verified = TestSupport.completion_proof_fixture("item-1", project_contract)
     merge_verified_at = merge_verified.merge_verification.observed_at
+
+    {:ok, unsigned_pre_merge_observation} =
+      ProviderObservation.from_issue(pre_merge_issue, %{
+        provider: :plane,
+        observed_at: DateTime.add(merge_verified_at, -1, :second)
+      })
+
+    pre_merge_observation = TestSupport.sign_provider_observation_for_test(unsigned_pre_merge_observation)
     assert DateTime.compare(pre_merge_observation.observed_at, merge_verified_at) == :lt
 
     same_time_observation = %{
@@ -246,7 +210,13 @@ defmodule SymphonyElixir.PlaneAdapterTest do
                request_fun: done_response
              )
 
-    assert %ProviderObservation{} = post_merge_observation = post_merge_issue.tracker_read_observation
+    {:ok, unsigned_post_merge_observation} =
+      ProviderObservation.from_issue(post_merge_issue, %{
+        provider: :plane,
+        observed_at: DateTime.utc_now()
+      })
+
+    post_merge_observation = TestSupport.sign_provider_observation_for_test(unsigned_post_merge_observation)
     assert DateTime.compare(post_merge_observation.observed_at, merge_verified_at) == :gt
 
     assert {:ok, %CompletionProof{stage: :completed} = completed_proof} =
@@ -290,11 +260,16 @@ defmodule SymphonyElixir.PlaneAdapterTest do
 
     project_contract = contract()
 
-    assert {:ok, [%Issue{tracker_read_observation: %ProviderObservation{} = observation}]} =
+    assert {:ok, [%Issue{} = issue]} =
              Tracker.fetch_issues_by_ids(["item-1"],
                tracker_settings: @settings,
                request_fun: done_response
              )
+
+    {:ok, unsigned_observation} =
+      ProviderObservation.from_issue(issue, %{provider: :plane, observed_at: DateTime.utc_now()})
+
+    observation = TestSupport.sign_provider_observation_for_test(unsigned_observation)
 
     merge_verified = TestSupport.completion_proof_fixture("item-1", project_contract)
     malformed_timestamp = %{merge_verified.merge_verification.observed_at | year: nil}
@@ -311,7 +286,7 @@ defmodule SymphonyElixir.PlaneAdapterTest do
     end
   end
 
-  test "Tracker attests Plane graph nodes from the acquired dependency epoch" do
+  test "caller-supplied dependency graph reads do not attest Plane nodes" do
     work_item = %{
       "id" => "item-1",
       "name" => "Work",
@@ -353,8 +328,7 @@ defmodule SymphonyElixir.PlaneAdapterTest do
     assert {:ok, %Graph{} = graph} =
              Tracker.fetch_dependency_graph(tracker_settings: @settings, request_fun: request_fun)
 
-    assert %ProviderObservation{} = observation = graph.nodes["item-1"].tracker_read_observation
-    assert ProviderObservation.valid_tracker_read?(observation)
+    assert graph.nodes["item-1"].tracker_read_observation == nil
   end
 
   test "lists the complete project and locally filters descriptive provider states" do

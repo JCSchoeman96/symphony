@@ -4,8 +4,9 @@ defmodule SymphonyElixir.Tracker do
 
   The orchestrator only depends on the read callbacks. Agent-side mutations stay
   behind optional provider-native tools so tracker-specific capabilities do not
-  leak into scheduler policy. Plane issue reads carry a signed observation from
-  this boundary so later lifecycle refreshes can verify the provider provenance.
+  leak into scheduler policy. Plane reads through the configured no-options
+  callbacks carry signed observations so later lifecycle refreshes can verify
+  their provider provenance. Reads with caller-supplied options remain unsigned.
   """
 
   alias SymphonyElixir.Config
@@ -58,7 +59,15 @@ defmodule SymphonyElixir.Tracker do
   end
 
   @spec fetch_issues_by_ids([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
-  def fetch_issues_by_ids(issue_ids), do: fetch_issues_by_ids(issue_ids, [])
+  def fetch_issues_by_ids(issue_ids) when is_list(issue_ids) do
+    tracker_settings = Config.settings!().tracker
+    adapter = adapter_for_settings!(tracker_settings)
+
+    adapter.fetch_issues_by_ids(issue_ids)
+    |> attest_tracker_read_result(tracker_settings)
+  end
+
+  def fetch_issues_by_ids(_issue_ids), do: {:error, :current_issue_refresh_unsupported}
 
   @spec fetch_issues_by_ids([String.t()], keyword()) :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_issues_by_ids(issue_ids, opts) when is_list(issue_ids) and is_list(opts) do
@@ -75,31 +84,40 @@ defmodule SymphonyElixir.Tracker do
             {:error, :current_issue_refresh_unsupported}
         end
 
-      attest_tracker_read_result(result, tracker_settings_for_opts(opts))
+      result
     end
   end
 
   def fetch_issues_by_ids(_issue_ids, _opts), do: {:error, :current_issue_refresh_unsupported}
 
   @spec fetch_dependency_graph() :: {:ok, term()} | {:error, term()}
-  def fetch_dependency_graph, do: fetch_dependency_graph([])
+  def fetch_dependency_graph do
+    tracker_settings = Config.settings!().tracker
+    adapter = adapter_for_settings!(tracker_settings)
+
+    adapter
+    |> fetch_dependency_graph_from_adapter([])
+    |> attest_tracker_read_result(tracker_settings)
+  end
+
+  @doc false
+  @spec fetch_dependency_graph_for_epoch(reference(), :atomics.atomics_ref()) ::
+          {:ok, term()} | {:error, term()}
+  def fetch_dependency_graph_for_epoch(epoch_id, request_metrics)
+      when is_reference(epoch_id) do
+    case valid_dependency_epoch_metrics?(request_metrics) do
+      true -> fetch_trusted_dependency_graph_for_epoch(epoch_id, request_metrics)
+      false -> {:error, :invalid_dependency_epoch_context}
+    end
+  end
+
+  def fetch_dependency_graph_for_epoch(_epoch_id, _request_metrics),
+    do: {:error, :invalid_dependency_epoch_context}
 
   @spec fetch_dependency_graph(keyword()) :: {:ok, term()} | {:error, term()}
   def fetch_dependency_graph(opts) when is_list(opts) do
     with {:ok, adapter} <- adapter_for_opts(opts) do
-      result =
-        cond do
-          Code.ensure_loaded?(adapter) and function_exported?(adapter, :fetch_dependency_graph, 1) ->
-            adapter.fetch_dependency_graph(opts)
-
-          Code.ensure_loaded?(adapter) and function_exported?(adapter, :fetch_dependency_graph, 0) ->
-            adapter.fetch_dependency_graph()
-
-          true ->
-            {:error, :dependency_graph_unsupported}
-        end
-
-      attest_tracker_read_result(result, tracker_settings_for_opts(opts))
+      fetch_dependency_graph_from_adapter(adapter, opts)
     end
   end
 
@@ -280,8 +298,59 @@ defmodule SymphonyElixir.Tracker do
     end
   end
 
-  defp tracker_settings_for_opts(opts) do
-    Keyword.get_lazy(opts, :tracker_settings, fn -> Config.settings!().tracker end)
+  defp fetch_dependency_graph_from_adapter(adapter, opts) do
+    cond do
+      Code.ensure_loaded?(adapter) and function_exported?(adapter, :fetch_dependency_graph, 1) ->
+        adapter.fetch_dependency_graph(opts)
+
+      Code.ensure_loaded?(adapter) and function_exported?(adapter, :fetch_dependency_graph, 0) ->
+        adapter.fetch_dependency_graph()
+
+      true ->
+        {:error, :dependency_graph_unsupported}
+    end
+  end
+
+  @spec fetch_trusted_dependency_graph_for_epoch(reference(), :atomics.atomics_ref()) ::
+          {:ok, term()} | {:error, term()}
+  defp fetch_trusted_dependency_graph_for_epoch(epoch_id, request_metrics) do
+    tracker_settings = Config.settings!().tracker
+
+    case plane_tracker_kind?(tracker_settings.kind) do
+      true -> read_trusted_dependency_graph_for_epoch(epoch_id, request_metrics, tracker_settings)
+      false -> {:error, :dependency_graph_unsupported}
+    end
+  end
+
+  @spec read_trusted_dependency_graph_for_epoch(reference(), :atomics.atomics_ref(), map()) ::
+          {:ok, term()} | {:error, term()}
+  defp read_trusted_dependency_graph_for_epoch(epoch_id, request_metrics, tracker_settings) do
+    on_scc = fn _graph, _cycles -> :atomics.add(request_metrics, 5, 1) end
+
+    opts = [
+      tracker_settings: tracker_settings,
+      epoch_id: epoch_id,
+      request_metrics: request_metrics,
+      scheduler: SymphonyElixir.Plane.ReadScheduler,
+      on_scc: on_scc
+    ]
+
+    tracker_settings
+    |> adapter_for_settings!()
+    |> fetch_dependency_graph_from_adapter(opts)
+    |> attest_tracker_read_result(tracker_settings)
+  end
+
+  @spec valid_dependency_epoch_metrics?(:atomics.atomics_ref()) :: boolean()
+  defp valid_dependency_epoch_metrics?(request_metrics) do
+    case :atomics.info(request_metrics) do
+      %{size: size} when size >= 8 -> true
+      _invalid -> false
+    end
+  rescue
+    _error -> false
+  catch
+    _kind, _reason -> false
   end
 
   defp attest_tracker_read_result({:ok, issues}, %{kind: kind} = tracker_settings)
