@@ -618,7 +618,9 @@ defmodule SymphonyElixir.WorkControl.RecoveryLedger do
     do: true
 
   defp contains_forbidden_term?(term) when is_map(term) do
-    Enum.any?(term, fn {key, value} ->
+    term
+    |> Map.to_list()
+    |> Enum.any?(fn {key, value} ->
       forbidden_key?(key) or contains_forbidden_term?(key) or contains_forbidden_term?(value)
     end)
   end

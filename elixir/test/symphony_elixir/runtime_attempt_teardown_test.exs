@@ -13,7 +13,6 @@ defmodule SymphonyElixir.RuntimeAttemptTeardownTest do
   alias SymphonyElixir.WorkflowStore
 
   alias SymphonyElixir.WorkControl.{
-    GuardClass,
     LifecycleAssessment,
     ProviderObservation,
     ProviderProjectContract,
@@ -106,13 +105,26 @@ defmodule SymphonyElixir.RuntimeAttemptTeardownTest do
   end
 
   defp completion_validated_assessment(display_name) do
-    proof = GuardClass.requirement(:mechanical_guard, :completion_proof_verified)
+    {:ok, contract} = ProviderProjectContract.new(plane_contract_config())
+
+    {:ok, observation} =
+      ProviderObservation.new(%{
+        provider: :plane,
+        work_item_id: @issue_id,
+        workspace_id: contract.workspace_id,
+        project_id: contract.project_id,
+        provider_state_id: "state-done",
+        provider_state_group: :completed,
+        provider_state_name: display_name,
+        observed_at: DateTime.utc_now()
+      })
 
     assessment =
-      LifecycleAssessment.assess(provider_observation("Done"), :done, proof)
+      LifecycleAssessment.assess(observation, :merging, [completion_proof_fixture(@issue_id, contract)], %{
+        provider_project_contract: contract
+      })
 
-    observation = %{assessment.provider_observation | provider_state_name: display_name}
-    %{assessment | provider_observation: observation}
+    assessment
   end
 
   defp plane_contract_config do
@@ -412,15 +424,15 @@ defmodule SymphonyElixir.RuntimeAttemptTeardownTest do
     assert Orchestrator.tracker_terminal_teardown_reason_for_test(issue, state) == :terminal_completed
   end
 
-  test "reconcile refresh retains completion proof when only Plane display name changes" do
+  test "reconcile refresh rejects Plane completion proof on a memory observation" do
     configure_plane_routed_workflow!()
     contract = Config.settings!().provider_project_contract
-    proof = GuardClass.requirement(:mechanical_guard, :completion_proof_verified)
+    proof = completion_proof_fixture(@issue_id, contract)
     issue_done = plane_done_issue("Done")
 
     assert {:ok, previous} =
              WorkItem.from_issue(issue_done, %{
-               provider: :memory,
+               provider: :plane,
                prior_validated_lifecycle_state: :merging,
                evidence: [proof],
                provider_project_contract: contract
@@ -446,19 +458,19 @@ defmodule SymphonyElixir.RuntimeAttemptTeardownTest do
 
     refreshed = updated.work_control[@issue_id]
     assert refreshed.provider_observation.provider_state_name == "Shipped"
-    assert LifecycleAssessment.completion_validated?(refreshed.lifecycle_assessment)
-    assert Orchestrator.tracker_terminal_teardown_reason_for_test(issue_shipped, updated) == :terminal_completed
+    refute LifecycleAssessment.completion_validated?(refreshed.lifecycle_assessment)
+    assert Orchestrator.tracker_terminal_teardown_reason_for_test(issue_shipped, updated) == :terminal_cancelled
   end
 
   test "reconcile refresh drops completion proof when provider state UUID changes" do
     configure_plane_routed_workflow!()
     contract = Config.settings!().provider_project_contract
-    proof = GuardClass.requirement(:mechanical_guard, :completion_proof_verified)
+    proof = completion_proof_fixture(@issue_id, contract)
     issue_done = plane_done_issue("Done")
 
     assert {:ok, previous} =
              WorkItem.from_issue(issue_done, %{
-               provider: :memory,
+               provider: :plane,
                prior_validated_lifecycle_state: :merging,
                evidence: [proof],
                provider_project_contract: contract

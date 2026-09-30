@@ -23,4 +23,16 @@ defmodule SymphonyElixir.GuardClassSourceControlTest do
              %{class: :mechanical_guard, name: :review_acceptance_verified, outcome: :verified}
            ])
   end
+
+  test "completion guard rejects caller-built structural evidence" do
+    completion_guard = GuardClass.requirement(:mechanical_guard, :completion_proof_verified)
+
+    refute GuardClass.satisfied?(completion_guard, [
+             %{class: :mechanical_guard, name: :completion_proof_verified}
+           ])
+
+    refute GuardClass.satisfied?(completion_guard, [
+             %{class: :mechanical_guard, name: :completion_proof_verified, outcome: :verified}
+           ])
+  end
 end

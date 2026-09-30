@@ -1,9 +1,17 @@
 defmodule SymphonyElixir.TestSupport do
   alias SymphonyElixir.Config
+  alias SymphonyElixir.SourceControl.{CandidateRef, CandidateVerification, MergeVerification}
   alias SymphonyElixir.Tracker
   alias SymphonyElixir.Tracker.Issue
-  alias SymphonyElixir.WorkControl.RecoveryLedger
-  alias SymphonyElixir.WorkControl.WorkflowLifecycle
+
+  alias SymphonyElixir.WorkControl.{
+    CompletionProof,
+    GuardClass,
+    ProviderProjectContract,
+    RecoveryLedger,
+    WorkflowLifecycle
+  }
+
   alias SymphonyElixir.Workspace.OwnershipLedger
 
   @workflow_prompt "You are an agent for this repository."
@@ -40,7 +48,9 @@ defmodule SymphonyElixir.TestSupport do
           workspace_ownership_ledger: 0,
           workspace_ownership_ledger_opts: 0,
           workspace_ownership_state: 0,
-          stop_default_http_server: 0
+          stop_default_http_server: 0,
+          completion_proof_fixture: 2,
+          sign_completion_proof_for_test: 1
         ]
 
       setup do
@@ -114,6 +124,87 @@ defmodule SymphonyElixir.TestSupport do
 
   def restore_env(key, nil), do: System.delete_env(key)
   def restore_env(key, value), do: System.put_env(key, value)
+
+  def completion_proof_fixture(work_item_id, contract) when is_binary(work_item_id) and is_struct(contract, SymphonyElixir.WorkControl.ProviderProjectContract) do
+    {:ok, candidate_ref} =
+      CandidateRef.new(%{
+        repository_identity: "github:repository:1368436395",
+        base_sha: String.duplicate("a", 40),
+        candidate_sha: String.duplicate("b", 40),
+        pr_identity: "15",
+        observed_pr_head_sha: String.duplicate("b", 40)
+      })
+
+    tree_sha = String.duplicate("c", 40)
+    policy_fingerprint = "sha256:test-fixture"
+
+    {:ok, review_attestation} =
+      GuardClass.semantic_attestation(:review_accepted, %{
+        responsibility: "review",
+        runtime_attempt_id: "review-attempt-fixture",
+        lineage_generation: 1,
+        subject: {:work_item, work_item_id},
+        timestamp: DateTime.utc_now()
+      })
+
+    {:ok, unsigned_authorized} =
+      CompletionProof.new_merge_authorized(%{
+        work_item_id: work_item_id,
+        provider_project_fingerprint: ProviderProjectContract.fingerprint(contract),
+        workspace_id: contract.workspace_id,
+        project_id: contract.project_id,
+        candidate_ref: candidate_ref,
+        candidate_tree_sha: tree_sha,
+        policy_fingerprint: policy_fingerprint,
+        review_acceptance_evidence: %{
+          class: :mechanical_guard,
+          name: :review_acceptance_verified,
+          outcome: :verified,
+          candidate_ref: Map.from_struct(candidate_ref),
+          candidate_tree_sha: tree_sha,
+          policy_fingerprint: policy_fingerprint
+        },
+        review_attestation: review_attestation,
+        candidate_verification:
+          CandidateVerification.new(%{
+            status: :verified,
+            candidate_ref: candidate_ref,
+            candidate_tree_sha: tree_sha,
+            policy_fingerprint: policy_fingerprint
+          })
+      })
+
+    authorized = sign_completion_proof_for_test(unsigned_authorized)
+
+    {:ok, unsigned_proof} =
+      CompletionProof.with_merge_verification(
+        authorized,
+        MergeVerification.new(%{
+          status: :verified,
+          candidate_ref: candidate_ref,
+          merge_strategy: :ordinary,
+          merge_sha: String.duplicate("d", 40),
+          merge_tree_sha: tree_sha,
+          current_main_sha: String.duplicate("d", 40),
+          main_contains_merge?: true
+        })
+      )
+
+    sign_completion_proof_for_test(unsigned_proof)
+  end
+
+  def completion_proof_fixture(_work_item_id, _contract), do: raise(ArgumentError, "invalid completion proof fixture")
+
+  def sign_completion_proof_for_test(%CompletionProof{} = proof) do
+    key = Application.fetch_env!(:symphony_elixir, :completion_proof_signing_key)
+    signing_key = :crypto.hash(:sha256, "symphony-source-control-completion-proof-v1:" <> key)
+    signature = :crypto.mac(:hmac, :sha256, signing_key, CompletionProof.source_control_payload(proof))
+
+    %{
+      proof
+      | source_control_signature: "sha256:" <> Base.encode16(signature, case: :lower)
+    }
+  end
 
   def workspace_ownership_ledger do
     case Process.get(:symphony_test_workspace_ownership_ledger) do

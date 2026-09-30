@@ -1,7 +1,19 @@
 defmodule SymphonyElixir.WorkControlRecoveryLedgerTest do
   use ExUnit.Case
 
-  alias SymphonyElixir.WorkControl.{ProviderObservation, RecoveryLedger, SuspensionContext}
+  alias SymphonyElixir.SourceControl.{CandidateRef, CandidateVerification, MergeVerification}
+  alias SymphonyElixir.TestSupport
+
+  alias SymphonyElixir.WorkControl.{
+    CompletionProof,
+    GuardClass,
+    LifecycleAssessment,
+    ProviderObservation,
+    ProviderProjectContract,
+    RecoveryLedger,
+    SuspensionContext,
+    WorkflowLifecycle
+  }
 
   @identity %{
     tracker_kind: "plane",
@@ -36,6 +48,72 @@ defmodule SymphonyElixir.WorkControlRecoveryLedgerTest do
 
     {:ok, reopened} = RecoveryLedger.open("project-a", @identity, path: path)
     assert {:ok, ^checkpoint} = RecoveryLedger.current(reopened, "work-a")
+    assert :ok = RecoveryLedger.close(reopened)
+  end
+
+  test "retains typed completion evidence across restart and rechecks it against fresh Done" do
+    root = Path.join(System.tmp_dir!(), "symphony-completion-proof-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(root)
+    path = Path.join(root, "recovery.dets")
+    on_exit(fn -> File.rm_rf(root) end)
+
+    contract = provider_contract()
+    proof = merge_verified_proof("work-a", contract)
+    assert CompletionProof.valid_evidence?(proof)
+
+    typed_checkpoint =
+      checkpoint("work-a")
+      |> Map.put(:last_validated_lifecycle_state, :merging)
+      |> Map.put(:durable_guard_evidence, [proof])
+
+    legacy_evidence = [%{class: :mechanical_guard, name: :completion_proof_verified}]
+
+    legacy_checkpoint =
+      checkpoint("work-legacy")
+      |> Map.put(:last_validated_lifecycle_state, :merging)
+      |> Map.put(:durable_guard_evidence, legacy_evidence)
+
+    {:ok, ledger} = RecoveryLedger.open("project-a", @identity, path: path)
+    assert :ok = RecoveryLedger.put_sync(ledger, typed_checkpoint)
+    assert :ok = RecoveryLedger.put_sync(ledger, legacy_checkpoint)
+    assert :ok = RecoveryLedger.close(ledger)
+
+    {:ok, reopened} = RecoveryLedger.open("project-a", @identity, path: path)
+    assert {:ok, restored} = RecoveryLedger.current(reopened, "work-a")
+    assert %CompletionProof{stage: :merge_verified} = hd(restored.durable_guard_evidence)
+
+    observation = done_observation("work-a", contract)
+
+    assessment =
+      LifecycleAssessment.assess(observation, :merging, restored.durable_guard_evidence, %{
+        provider_project_contract: contract
+      })
+
+    assert LifecycleAssessment.dependency_satisfying?(assessment)
+
+    wrong_item_assessment =
+      LifecycleAssessment.assess(done_observation("other-work", contract), :merging, restored.durable_guard_evidence, %{
+        provider_project_contract: contract
+      })
+
+    refute LifecycleAssessment.dependency_satisfying?(wrong_item_assessment)
+
+    assert {:ok, legacy} = RecoveryLedger.current(reopened, "work-legacy")
+    assert legacy.durable_guard_evidence == legacy_evidence
+
+    legacy_assessment =
+      LifecycleAssessment.assess(done_observation("work-legacy", contract), :merging, legacy.durable_guard_evidence, %{
+        provider_project_contract: contract
+      })
+
+    assert legacy_assessment.status == :validation_required
+    refute LifecycleAssessment.dependency_satisfying?(legacy_assessment)
+
+    refute GuardClass.satisfied?(
+             GuardClass.requirement(:mechanical_guard, :completion_proof_verified),
+             legacy.durable_guard_evidence
+           )
+
     assert :ok = RecoveryLedger.close(reopened)
   end
 
@@ -605,6 +683,107 @@ defmodule SymphonyElixir.WorkControlRecoveryLedgerTest do
       last_terminal_suspension_context: nil,
       updated_at: ~U[2026-09-23 00:00:00Z]
     }
+  end
+
+  defp provider_contract do
+    state_mappings =
+      Map.new(WorkflowLifecycle.states(), fn state ->
+        {state, %{state_id: "state-#{state}", name: WorkflowLifecycle.display(state)}}
+      end)
+
+    {:ok, contract} =
+      ProviderProjectContract.new(%{
+        schema_version: 1,
+        provider: :plane,
+        workspace_id: "workspace-a-id",
+        project_id: "project-a",
+        state_mappings: state_mappings
+      })
+
+    contract
+  end
+
+  defp done_observation(work_item_id, contract) do
+    {:ok, observation} =
+      ProviderObservation.new(%{
+        provider: :plane,
+        work_item_id: work_item_id,
+        workspace_id: contract.workspace_id,
+        project_id: contract.project_id,
+        provider_state_id: "state-done",
+        provider_state_group: :completed,
+        provider_state_name: "Done",
+        observed_at: ~U[2026-09-30 00:00:00Z]
+      })
+
+    observation
+  end
+
+  defp merge_verified_proof(work_item_id, contract) do
+    {:ok, candidate_ref} =
+      CandidateRef.new(%{
+        repository_identity: "github:repository:1368436395",
+        base_sha: String.duplicate("a", 40),
+        candidate_sha: String.duplicate("b", 40),
+        pr_identity: "15",
+        observed_pr_head_sha: String.duplicate("b", 40)
+      })
+
+    policy_fingerprint = "sha256:recovery-test"
+
+    {:ok, review_attestation} =
+      GuardClass.semantic_attestation(:review_accepted, %{
+        responsibility: "review",
+        runtime_attempt_id: "review-attempt",
+        lineage_generation: 1,
+        subject: {:work_item, work_item_id},
+        timestamp: ~U[2026-09-30 00:00:00Z]
+      })
+
+    candidate_verification =
+      CandidateVerification.new(%{
+        status: :verified,
+        candidate_ref: candidate_ref,
+        candidate_tree_sha: String.duplicate("c", 40),
+        policy_fingerprint: policy_fingerprint
+      })
+
+    {:ok, unsigned_authorized} =
+      CompletionProof.new_merge_authorized(%{
+        work_item_id: work_item_id,
+        provider_project_fingerprint: ProviderProjectContract.fingerprint(contract),
+        workspace_id: contract.workspace_id,
+        project_id: contract.project_id,
+        candidate_ref: candidate_ref,
+        candidate_tree_sha: String.duplicate("c", 40),
+        policy_fingerprint: policy_fingerprint,
+        review_acceptance_evidence: %{
+          class: :mechanical_guard,
+          name: :review_acceptance_verified,
+          outcome: :verified,
+          candidate_ref: Map.from_struct(candidate_ref),
+          candidate_tree_sha: String.duplicate("c", 40),
+          policy_fingerprint: policy_fingerprint
+        },
+        review_attestation: review_attestation,
+        candidate_verification: candidate_verification
+      })
+
+    authorized = TestSupport.sign_completion_proof_for_test(unsigned_authorized)
+
+    verification =
+      MergeVerification.new(%{
+        status: :verified,
+        candidate_ref: candidate_ref,
+        merge_strategy: :ordinary,
+        merge_sha: String.duplicate("d", 40),
+        merge_tree_sha: String.duplicate("c", 40),
+        current_main_sha: String.duplicate("d", 40),
+        main_contains_merge?: true
+      })
+
+    {:ok, unsigned_proof} = CompletionProof.with_merge_verification(authorized, verification)
+    TestSupport.sign_completion_proof_for_test(unsigned_proof)
   end
 
   defp suspension_context(work_item_id, status) do

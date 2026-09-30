@@ -264,7 +264,7 @@ defmodule SymphonyElixir.AgentRouterDependencyProofTest do
     end
   end
 
-  test "SYM-15 proves the dependency frontier, unlocks, cancellation safety, and cycle refusal" do
+  test "SYM-15 does not unlock the dependency frontier from provider Done alone" do
     test_pid = self()
     Process.register(test_pid, @dag_capture)
 
@@ -314,130 +314,23 @@ defmodule SymphonyElixir.AgentRouterDependencyProofTest do
     finish_dispatched!(pid, initial)
     trigger_poll!(pid)
 
-    second = receive_dispatches(2)
-    assert Enum.map(second, &elem(&1, 0)) == ["dag-b", "dag-c"]
-
-    updated_issues =
-      put_dag_issues(
-        issues,
-        a: "Done",
-        independent: "Done",
-        b: "Done",
-        c: "Done",
-        a_blocker: "Done",
-        b_blocker: "Done",
-        c_blocker: "Done"
-      )
-
-    put_completed_work_items!(pid, updated_issues)
-
-    finish_dispatched!(pid, second)
-    trigger_poll!(pid)
-
-    third = receive_dispatches(4)
-    assert Enum.map(third, &elem(&1, 0)) == ["dag-d", "dag-e", "dag-f", "dag-g"]
-
-    updated_issues =
-      put_dag_issues(
-        issues,
-        a: "Done",
-        independent: "Done",
-        b: "Done",
-        c: "Done",
-        d: "Done",
-        e: "Done",
-        f: "Done",
-        a_blocker: "Done",
-        b_blocker: "Done",
-        c_blocker: "Done",
-        f_blocker: "Done"
-      )
-
-    put_completed_work_items!(pid, updated_issues)
-
-    finish_dispatched!(pid, Enum.take(third, 3))
-    trigger_poll!(pid)
-
-    refute_receive {:dag_started, "dag-h", _identifier, _state, _opts, _worker_pid}, 100
-
-    updated_issues =
-      put_dag_issues(
-        issues,
-        a: "Done",
-        independent: "Done",
-        b: "Done",
-        c: "Done",
-        d: "Done",
-        e: "Done",
-        f: "Done",
-        g: "Done",
-        a_blocker: "Done",
-        b_blocker: "Done",
-        c_blocker: "Done",
-        f_blocker: "Done",
-        g_blocker: "Done"
-      )
-
-    put_completed_work_items!(pid, updated_issues)
-
-    finish_dispatched!(pid, [List.last(third)])
-    trigger_poll!(pid)
-
-    [final] = receive_dispatches(1)
-    assert elem(final, 0) == "dag-h"
-
-    updated_issues =
-      put_dag_issues(
-        issues,
-        a: "Done",
-        independent: "Done",
-        b: "Done",
-        c: "Done",
-        d: "Done",
-        e: "Done",
-        f: "Done",
-        g: "Done",
-        h: "Done",
-        a_blocker: "Done",
-        b_blocker: "Done",
-        c_blocker: "Done",
-        f_blocker: "Done",
-        g_blocker: "Done"
-      )
-
-    put_completed_work_items!(pid, updated_issues)
-
-    finish_dispatched!(pid, [final])
-
     assert_eventually(fn ->
       snapshot = GenServer.call(pid, :snapshot, 100)
-      snapshot.running == [] and snapshot.retrying == []
+      Enum.any?(snapshot.dependency_diagnostics, &(&1.identifier == "SYM-B"))
     end)
+
+    refute_receive {:dag_started, "dag-b", _identifier, _state, _opts, _worker_pid}, 100
+    refute_receive {:dag_started, "dag-c", _identifier, _state, _opts, _worker_pid}, 100
 
     snapshot = GenServer.call(pid, :snapshot, 100)
     assert snapshot.dependency_graph.cycles == [["dag-cycle-a", "dag-cycle-b", "dag-cycle-c"]]
 
     diagnostics = Map.new(snapshot.dependency_diagnostics, &{&1.identifier, &1})
+    assert diagnostics["SYM-B"].reason == :unresolved_hard_dependency
     assert diagnostics["SYM-CANCELED-DEPENDENT"].reason == :invalidated_dependency
     assert diagnostics["SYM-CYCLE-A"].reason == :dependency_cycle
     assert diagnostics["SYM-CYCLE-B"].reason == :dependency_cycle
     assert diagnostics["SYM-CYCLE-C"].reason == :dependency_cycle
-
-    all_dispatches = initial ++ second ++ third ++ [final]
-    dispatch_ids = Enum.map(all_dispatches, &elem(&1, 0))
-    assert dispatch_ids == Enum.uniq(dispatch_ids)
-
-    assert dispatch_ids == [
-             "dag-a",
-             "dag-independent",
-             "dag-b",
-             "dag-c",
-             "dag-d",
-             "dag-e",
-             "dag-f",
-             "dag-g",
-             "dag-h"
-           ]
 
     assert Guard.evaluate(
              %Issue{
@@ -543,7 +436,7 @@ defmodule SymphonyElixir.AgentRouterDependencyProofTest do
         provider: :memory,
         observed_at: DateTime.utc_now(),
         prior_validated_lifecycle_state: "Merging",
-        evidence: [GuardClass.requirement(:mechanical_guard, :completion_proof_verified)]
+        evidence: []
       })
 
     work_item

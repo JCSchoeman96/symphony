@@ -37,11 +37,36 @@ end
 defmodule SymphonyElixir.TransitionCoordinatorDefaultPathTest do
   use SymphonyElixir.TestSupport
 
+  alias SymphonyElixir.SourceControl
+  alias SymphonyElixir.SourceControl.CandidateRef
+  alias SymphonyElixir.SourceControl.CandidateVerification
   alias SymphonyElixir.Tracker.Issue
   alias SymphonyElixir.TransitionCoordinator
-  alias SymphonyElixir.WorkControl.{ProviderProjectContract, SemanticTransitionIntent, WorkflowLifecycle, WorkItem}
+  alias SymphonyElixir.TransitionCoordinatorDefaultPathOrchestrator, as: DefaultPathOrchestrator
+
+  alias SymphonyElixir.WorkControl.{
+    CompletionProof,
+    GuardClass,
+    ProviderProjectContract,
+    SemanticTransitionIntent,
+    WorkflowLifecycle,
+    WorkItem
+  }
 
   @now ~U[2026-09-18 00:00:00Z]
+  @sha_a String.duplicate("a", 40)
+  @sha_b String.duplicate("b", 40)
+  @sha_m String.duplicate("d", 40)
+  @tree String.duplicate("c", 40)
+
+  @source_control_config %{
+    kind: :github,
+    repository: "JCSchoeman96/symphony",
+    repository_id: 1_368_436_395,
+    base_branch: "main",
+    token_env: "GITHUB_TOKEN",
+    required_checks: [%{context: "make-all", app_id: 15_368, subject: "head"}]
+  }
 
   test "the default path performs fresh reads and verifies the target state" do
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory", symphony_project_id: "project-1")
@@ -74,6 +99,124 @@ defmodule SymphonyElixir.TransitionCoordinatorDefaultPathTest do
 
     assert {:ok, %{state: :verified}} = TransitionCoordinator.request_transition(coordinator, intent())
     assert_received {:applied, %WorkItem{validated_lifecycle_state: :in_progress}}
+  end
+
+  test "Done submission requires SourceControl merge verification and closes against the fresh Done read" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory", symphony_project_id: "project-1")
+    contract = contract()
+    current_issue = issue("Merging", "state-merging")
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [current_issue])
+    proof = merge_authorized_proof(contract)
+
+    assert {:ok, merging_work_item} =
+             WorkItem.from_issue(current_issue, %{
+               provider: :plane,
+               observed_at: @now,
+               prior_validated_lifecycle_state: :merging,
+               evidence: [proof],
+               provider_project_contract: contract
+             })
+
+    transition_context =
+      context()
+      |> Map.merge(%{
+        work_item: merging_work_item,
+        guard_evidence: [proof],
+        github_opts: completion_github_opts()
+      })
+
+    {:ok, orchestrator} =
+      SymphonyElixir.TransitionCoordinatorDefaultPathOrchestrator.start_link(
+        transition_context: {:ok, transition_context},
+        apply_recipient: self()
+      )
+
+    {:ok, coordinator} =
+      TransitionCoordinator.start_link(
+        name: nil,
+        ledger: nil,
+        orchestrator: orchestrator,
+        refresh_contract: fn _context -> {:ok, contract} end,
+        submit: fn _attempt, _context ->
+          Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue("Done", "state-done")])
+          :ok
+        end,
+        require_durable?: false
+      )
+
+    completion_intent = %SemanticTransitionIntent{
+      work_item_id: "work-1",
+      requested_from: :merging,
+      requested_to: :done,
+      responsibility: "system",
+      guard_evidence: [proof],
+      requested_at: @now
+    }
+
+    assert {:ok, %{state: :verified}} = TransitionCoordinator.request_transition(coordinator, completion_intent)
+    assert_received {:applied, %WorkItem{validated_lifecycle_state: :done} = completed}
+    assert WorkItem.dependency_satisfying?(completed)
+
+    assert %CompletionProof{stage: :completed, closure_observation: %{provider_state_id: "state-done"}} =
+             Enum.find(completed.lifecycle_assessment.satisfied_guards, &match?(%CompletionProof{stage: :completed}, &1))
+  end
+
+  test "failed SourceControl merge verification does not submit provider Done" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory", symphony_project_id: "project-1")
+    contract = contract()
+    current_issue = issue("Merging", "state-merging")
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [current_issue])
+    proof = merge_authorized_proof(contract)
+
+    {:ok, merging_work_item} =
+      WorkItem.from_issue(current_issue, %{
+        provider: :plane,
+        observed_at: @now,
+        prior_validated_lifecycle_state: :merging,
+        evidence: [proof],
+        provider_project_contract: contract
+      })
+
+    transition_context =
+      context()
+      |> Map.merge(%{
+        work_item: merging_work_item,
+        guard_evidence: [proof],
+        github_opts:
+          Keyword.put(completion_github_opts(), :request_fun, fn _token, _path, _params, _opts ->
+            {:ok, %{"merged" => false}}
+          end)
+      })
+
+    {:ok, orchestrator} =
+      DefaultPathOrchestrator.start_link(transition_context: {:ok, transition_context})
+
+    parent = self()
+
+    {:ok, coordinator} =
+      TransitionCoordinator.start_link(
+        name: nil,
+        ledger: nil,
+        orchestrator: orchestrator,
+        refresh_contract: fn _context -> {:ok, contract} end,
+        submit: fn _attempt, _context ->
+          send(parent, :provider_done_submitted)
+          :ok
+        end,
+        require_durable?: false
+      )
+
+    completion_intent = %SemanticTransitionIntent{
+      work_item_id: "work-1",
+      requested_from: :merging,
+      requested_to: :done,
+      responsibility: "system",
+      guard_evidence: [proof],
+      requested_at: @now
+    }
+
+    assert {:ok, %{state: :provider_failed}} = TransitionCoordinator.request_transition(coordinator, completion_intent)
+    refute_received :provider_done_submitted
   end
 
   test "the default submission seam remains provider-transport only" do
@@ -428,8 +571,113 @@ defmodule SymphonyElixir.TransitionCoordinatorDefaultPathTest do
 
   defp group_for_state("Ready"), do: :unstarted
   defp group_for_state("In Progress"), do: :started
+  defp group_for_state("Merging"), do: :started
   defp group_for_state("Canceled"), do: :cancelled
   defp group_for_state("Done"), do: :completed
+
+  defp merge_authorized_proof(contract) do
+    settings = %{symphony: %{project_id: contract.project_id}}
+
+    {:ok, candidate_ref} =
+      CandidateRef.new(%{
+        repository_identity: "github:repository:1368436395",
+        base_sha: @sha_a,
+        candidate_sha: @sha_b,
+        pr_identity: "15",
+        observed_pr_head_sha: @sha_b
+      })
+
+    policy_fingerprint = SourceControl.policy_fingerprint_for(@source_control_config, settings)
+
+    {:ok, review_attestation} =
+      GuardClass.semantic_attestation(:review_accepted, %{
+        responsibility: "review",
+        runtime_attempt_id: "review-attempt",
+        lineage_generation: 1,
+        subject: {:work_item, "work-1"},
+        timestamp: @now
+      })
+
+    review_evidence = %{
+      class: :mechanical_guard,
+      name: :review_acceptance_verified,
+      outcome: :verified,
+      candidate_ref: Map.from_struct(candidate_ref),
+      candidate_tree_sha: @tree,
+      policy_fingerprint: policy_fingerprint
+    }
+
+    candidate_verification =
+      CandidateVerification.new(%{
+        status: :verified,
+        candidate_ref: candidate_ref,
+        candidate_tree_sha: @tree,
+        policy_fingerprint: policy_fingerprint
+      })
+
+    {:ok, unsigned_proof} =
+      CompletionProof.new_merge_authorized(%{
+        work_item_id: "work-1",
+        provider_project_fingerprint: ProviderProjectContract.fingerprint(contract),
+        workspace_id: contract.workspace_id,
+        project_id: contract.project_id,
+        candidate_ref: candidate_ref,
+        candidate_tree_sha: @tree,
+        policy_fingerprint: policy_fingerprint,
+        review_acceptance_evidence: review_evidence,
+        review_attestation: review_attestation,
+        candidate_verification: candidate_verification
+      })
+
+    sign_completion_proof_for_test(unsigned_proof)
+  end
+
+  defp completion_github_opts do
+    settings = %{symphony: %{project_id: "project-1"}}
+
+    [
+      source_control_config: @source_control_config,
+      settings: settings,
+      token: "token",
+      request_fun: fn _token, path, _params, _opts ->
+        {:ok,
+         cond do
+           String.ends_with?(path, "/repos/JCSchoeman96/symphony") ->
+             %{"id" => 1_368_436_395}
+
+           String.contains?(path, "/pulls/15") ->
+             %{"number" => 15, "merged" => true, "head" => %{"sha" => @sha_b}, "merge_commit_sha" => @sha_m}
+
+           String.contains?(path, "/git/commits/" <> @sha_m) ->
+             %{
+               "sha" => @sha_m,
+               "tree" => %{"sha" => @tree},
+               "parents" => [%{"sha" => @sha_a}, %{"sha" => @sha_b}]
+             }
+
+           String.contains?(path, "/git/ref/heads/main") ->
+             %{"object" => %{"sha" => @sha_m}}
+
+           String.contains?(path, "/check-runs") ->
+             %{
+               "total_count" => 1,
+               "check_runs" => [
+                 %{
+                   "name" => "make-all",
+                   "head_sha" => @sha_b,
+                   "status" => "completed",
+                   "conclusion" => "success",
+                   "app" => %{"id" => 15_368}
+                 }
+               ]
+             }
+
+           true ->
+             %{}
+         end}
+      end
+    ]
+  end
 
   defp context do
     %{

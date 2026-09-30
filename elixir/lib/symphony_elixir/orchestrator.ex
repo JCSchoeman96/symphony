@@ -35,6 +35,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   alias SymphonyElixir.WorkControl.{
     AuthorityDisposition,
+    CompletionProof,
     GuardClass,
     LifecycleAssessment,
     ProjectContractEvidence,
@@ -6527,11 +6528,16 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp durable_mechanical_evidence(evidence) when is_list(evidence) do
     evidence
-    |> Enum.filter(fn
-      %{class: :mechanical_guard} = item -> GuardClass.valid_evidence?(item)
-      _other -> false
+    |> Enum.flat_map(fn
+      %CompletionProof{} = proof ->
+        if CompletionProof.valid_evidence?(proof), do: [proof], else: []
+
+      %{class: :mechanical_guard} = item ->
+        if GuardClass.valid_evidence?(item), do: [Map.take(item, [:class, :name, :outcome])], else: []
+
+      _other ->
+        []
     end)
-    |> Enum.map(&Map.take(&1, [:class, :name, :outcome]))
   end
 
   defp durable_mechanical_evidence(_evidence), do: []

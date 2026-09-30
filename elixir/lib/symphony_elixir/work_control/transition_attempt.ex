@@ -7,7 +7,7 @@ defmodule SymphonyElixir.WorkControl.TransitionAttempt do
   synced before the provider request starts.
   """
 
-  alias SymphonyElixir.WorkControl.{GuardClass, SemanticTransitionIntent, WorkflowLifecycle}
+  alias SymphonyElixir.WorkControl.{CompletionProof, GuardClass, SemanticTransitionIntent, WorkflowLifecycle}
 
   @schema_version 1
   @states [
@@ -337,6 +337,7 @@ defmodule SymphonyElixir.WorkControl.TransitionAttempt do
     with true <- valid_assessment?(assessment, attempt),
          true <- valid_post_observation?(observation, attempt),
          true <- fingerprint == attempt.provider_contract_fingerprint,
+         true <- valid_completion_assessment?(assessment, observation, attempt),
          outcome <- Map.get(context, :outcome) || inferred_outcome(assessment, observation, context, attempt),
          true <- valid_outcome?(outcome, assessment, observation, context, attempt) do
       {:ok, outcome}
@@ -369,6 +370,33 @@ defmodule SymphonyElixir.WorkControl.TransitionAttempt do
   end
 
   defp valid_assessment?(_assessment, _attempt), do: false
+
+  defp valid_completion_assessment?(
+         assessment,
+         observation,
+         %__MODULE__{
+           requested_from: :merging,
+           requested_to: :done
+         } = attempt
+       ) do
+    case Map.get(assessment, :satisfied_guards, []) do
+      guards when is_list(guards) ->
+        Enum.any?(guards, fn
+          %CompletionProof{stage: :completed} = proof ->
+            CompletionProof.valid_evidence?(proof) and proof.work_item_id == attempt.work_item_id and
+              proof.provider_project_fingerprint == attempt.provider_contract_fingerprint and
+              CompletionProof.closes_observation?(proof, observation)
+
+          _other ->
+            false
+        end)
+
+      _invalid ->
+        false
+    end
+  end
+
+  defp valid_completion_assessment?(_assessment, _observation, _attempt), do: true
 
   defp inferred_outcome(assessment, observation, context, attempt) do
     cond do

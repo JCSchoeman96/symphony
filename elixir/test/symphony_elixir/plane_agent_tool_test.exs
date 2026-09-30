@@ -32,11 +32,14 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
   alias SymphonyElixir.Plane.AgentTool
   alias SymphonyElixir.PlaneAgentToolTest.CoordinatorStub
   alias SymphonyElixir.PlaneAgentToolTest.ThrowingContextStub
+  alias SymphonyElixir.SourceControl.{CandidateRef, CandidateVerification, MergeVerification}
+  alias SymphonyElixir.TestSupport
   alias SymphonyElixir.Tracker.Issue
   alias SymphonyElixir.TransitionCoordinator
 
   alias SymphonyElixir.WorkControl.{
     AuthorityDisposition,
+    CompletionProof,
     GuardClass,
     ProjectContractEvidence,
     ProviderProjectContract,
@@ -1576,13 +1579,18 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
       workspace_id: "workspace-1",
       project_id: "project-1",
       provider_state_id: "state-#{state}",
-      provider_state_group: if(state in [:done, :canceled], do: :completed, else: :started),
+      provider_state_group:
+        case state do
+          :done -> :completed
+          :canceled -> :cancelled
+          _other -> :started
+        end,
       updated_at: ~U[2026-09-20 00:00:00Z]
     }
 
     evidence =
       if state == :done,
-        do: [GuardClass.requirement(:mechanical_guard, :completion_proof_verified)],
+        do: [completion_merge_proof("work-1", contract())],
         else: []
 
     {:ok, item} =
@@ -1590,7 +1598,8 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
         provider: :plane,
         observed_at: ~U[2026-09-20 00:00:00Z],
         prior_validated_lifecycle_state: state,
-        evidence: evidence
+        evidence: evidence,
+        provider_project_contract: contract()
       })
 
     item
@@ -1613,9 +1622,81 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
       provider: :plane,
       observed_at: ~U[2026-09-20 00:00:00Z],
       prior_validated_lifecycle_state: :merging,
-      evidence: [GuardClass.requirement(:mechanical_guard, :completion_proof_verified)]
+      evidence: [completion_merge_proof("blocker-1", contract())],
+      provider_project_contract: contract()
     })
     |> elem(1)
+  end
+
+  defp completion_merge_proof(work_item_id, contract) do
+    {:ok, candidate_ref} =
+      CandidateRef.new(%{
+        repository_identity: "github:repository:1368436395",
+        base_sha: String.duplicate("a", 40),
+        candidate_sha: String.duplicate("b", 40),
+        pr_identity: "15",
+        observed_pr_head_sha: String.duplicate("b", 40)
+      })
+
+    policy_fingerprint = "sha256:plane-agent-test"
+
+    {:ok, review_attestation} =
+      GuardClass.semantic_attestation(:review_accepted, %{
+        responsibility: "review",
+        runtime_attempt_id: "review-attempt",
+        lineage_generation: 1,
+        subject: {:work_item, work_item_id},
+        timestamp: ~U[2026-09-20 00:00:00Z]
+      })
+
+    tree_sha = String.duplicate("c", 40)
+
+    candidate_verification =
+      CandidateVerification.new(%{
+        status: :verified,
+        candidate_ref: candidate_ref,
+        candidate_tree_sha: tree_sha,
+        policy_fingerprint: policy_fingerprint
+      })
+
+    {:ok, unsigned_authorized} =
+      CompletionProof.new_merge_authorized(%{
+        work_item_id: work_item_id,
+        provider_project_fingerprint: ProviderProjectContract.fingerprint(contract),
+        workspace_id: contract.workspace_id,
+        project_id: contract.project_id,
+        candidate_ref: candidate_ref,
+        candidate_tree_sha: tree_sha,
+        policy_fingerprint: policy_fingerprint,
+        review_acceptance_evidence: %{
+          class: :mechanical_guard,
+          name: :review_acceptance_verified,
+          outcome: :verified,
+          candidate_ref: Map.from_struct(candidate_ref),
+          candidate_tree_sha: tree_sha,
+          policy_fingerprint: policy_fingerprint
+        },
+        review_attestation: review_attestation,
+        candidate_verification: candidate_verification
+      })
+
+    authorized = TestSupport.sign_completion_proof_for_test(unsigned_authorized)
+
+    {:ok, unsigned_proof} =
+      CompletionProof.with_merge_verification(
+        authorized,
+        MergeVerification.new(%{
+          status: :verified,
+          candidate_ref: candidate_ref,
+          merge_strategy: :ordinary,
+          merge_sha: String.duplicate("d", 40),
+          merge_tree_sha: tree_sha,
+          current_main_sha: String.duplicate("d", 40),
+          main_contains_merge?: true
+        })
+      )
+
+    TestSupport.sign_completion_proof_for_test(unsigned_proof)
   end
 
   defp contract do

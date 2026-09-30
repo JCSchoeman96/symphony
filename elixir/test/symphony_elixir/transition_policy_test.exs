@@ -63,7 +63,7 @@ defmodule SymphonyElixir.Tracker.TransitionPolicyTest do
     assert metadata.source == :merging
     assert metadata.target == :done
     assert metadata.guard_classes == [:mechanical_guard]
-    assert Enum.any?(metadata.guard_requirements, &(&1.name == :completion_proof_verified))
+    assert Enum.any?(metadata.guard_requirements, &(&1.name == :completion_merge_verified))
 
     assert {:error, %{code: :unauthorized_transition}} =
              TransitionPolicy.authorize(%{

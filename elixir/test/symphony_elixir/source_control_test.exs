@@ -20,7 +20,7 @@ defmodule SymphonyElixir.SourceControlTest do
   }
 
   test "enrich leaves unrelated transitions unchanged" do
-    intent = intent(:merging, :done)
+    intent = intent(:ready, :in_progress)
 
     assert {:ok, evidence} =
              SourceControl.enrich_guard_evidence(intent, %{}, [

@@ -601,7 +601,8 @@ defmodule SymphonyElixir.TransitionCoordinator do
       subject: {:work_item, intent.work_item_id},
       responsibility: intent.responsibility,
       runtime_attempt_id: intent.runtime_attempt_id || :transition_coordinator,
-      lineage_generation: intent.lineage_generation || 0
+      lineage_generation: intent.lineage_generation || 0,
+      provider_project_contract: Map.get(context, :provider_project_contract)
     }
 
     if GuardClass.all_satisfied?(requirements, evidence, guard_context) do
@@ -1242,17 +1243,19 @@ defmodule SymphonyElixir.TransitionCoordinator do
              Map.put(context, :responsibility, canonical_transition_responsibility(intent))
            ),
          true <- LifecycleAssessment.validated?(assessment),
+         source_context <-
+           context
+           |> Map.put(:provider_observation, observation)
+           |> Map.put(:pre_observation_evidence, observation)
+           |> Map.put(:current_state, canonical_state),
          {:ok, guard_evidence} <-
            SourceControl.enrich_guard_evidence(
              intent,
-             context,
-             transition_guard_evidence(context, intent, assessment)
+             source_context,
+             transition_guard_evidence(source_context, intent, assessment)
            ) do
       {:ok,
-       context
-       |> Map.put(:provider_observation, observation)
-       |> Map.put(:pre_observation_evidence, observation)
-       |> Map.put(:current_state, canonical_state)
+       source_context
        |> Map.put(:pre_assessment_evidence, assessment)
        |> Map.put(:guard_evidence, guard_evidence)
        |> Map.put(:fresh_read_at, observation.observed_at)}
@@ -1452,7 +1455,7 @@ defmodule SymphonyElixir.TransitionCoordinator do
   defp build_verified_work_item(
          %TransitionAttempt{} = attempt,
          %{
-           assessment: %LifecycleAssessment{},
+           assessment: %LifecycleAssessment{} = assessment,
            post_observation_evidence: %ProviderObservation{} = observation,
            provider_project_contract: %ProviderProjectContract{} = contract,
            work_item: %WorkItem{} = prior
@@ -1481,12 +1484,19 @@ defmodule SymphonyElixir.TransitionCoordinator do
       updated_at: observation.provider_updated_at || prior.updated_at
     }
 
+    projected_evidence =
+      if attempt.requested_to == :done do
+        assessment.satisfied_guards
+      else
+        attempt.guard_evidence
+      end
+
     WorkItem.from_issue(issue, %{
       provider: :plane,
       observed_at: observation.observed_at,
       prior_validated_lifecycle_state: attempt.requested_from,
       prior_authority_disposition: prior.authority_disposition,
-      evidence: attempt.guard_evidence,
+      evidence: projected_evidence,
       provider_project_contract: contract
     })
   end
