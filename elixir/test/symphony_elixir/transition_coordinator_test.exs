@@ -366,16 +366,38 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
     refute_received :submitted
   end
 
-  test "rejects a delayed old runtime intent without releasing the new runtime fence" do
+  test "rejects stale runtime intent through the live orchestrator before another provider submission" do
     root = Path.join(System.tmp_dir!(), "symphony-transition-runtime-boundary-#{System.unique_integer([:positive])}")
     File.mkdir_p!(root)
+    workflow_path = Path.join(root, "WORKFLOW.md")
+    attempt_root = Path.join(root, "attempt-ledgers")
     transition_path = Path.join(root, "transitions.dets")
     runtime_path = Path.join(root, "runtime.dets")
+    recovery_path = Path.join(root, "recovery.dets")
+    ownership_path = Path.join(root, "ownership.dets")
+    workspace_root = Path.join(root, "workspaces")
+    previous_workflow_path = Application.get_env(:symphony_elixir, :workflow_file_path)
+    previous_attempt_root = Application.get_env(:symphony_elixir, :attempt_ledger_root)
+    previous_memory_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+
     on_exit(fn -> File.rm_rf(root) end)
 
-    tracker_identity = %{tracker_kind: "plane", provider_scope: %{project_id: "project-a"}}
-    {:ok, transition_ledger} = TransitionAttemptLedger.open("project-a", tracker_identity, path: transition_path)
-    {:ok, runtime_ledger} = AttemptLedger.open("project-a", tracker_identity, path: runtime_path)
+    :ok = SymphonyElixir.Workflow.set_workflow_file_path(workflow_path)
+
+    :ok =
+      SymphonyElixir.TestSupport.write_workflow_file!(workflow_path,
+        tracker_kind: "memory",
+        symphony_project_id: "project-a",
+        workspace_root: workspace_root
+      )
+
+    Application.put_env(:symphony_elixir, :attempt_ledger_root, attempt_root)
+
+    on_exit(fn ->
+      restore_application_env(:workflow_file_path, previous_workflow_path)
+      restore_application_env(:attempt_ledger_root, previous_attempt_root)
+      restore_application_env(:memory_tracker_issues, previous_memory_issues)
+    end)
 
     issue = %Issue{
       id: "work-1",
@@ -401,39 +423,42 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
         evidence: [%{class: :mechanical_guard, name: :dispatch_guard}]
       })
 
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+    tracker_identity = SymphonyElixir.Tracker.identity(SymphonyElixir.Config.settings!().tracker)
+
+    {:ok, orchestrator} =
+      Orchestrator.start_link(
+        name: nil,
+        start_quiesced: true,
+        attempt_ledger_opts: [path: runtime_path],
+        recovery_ledger_opts: [path: recovery_path],
+        workspace_ownership_ledger_opts: [path: ownership_path]
+      )
+
+    on_exit(fn ->
+      if Process.alive?(orchestrator), do: GenServer.stop(orchestrator)
+    end)
+
+    runtime_ledger = :sys.get_state(orchestrator).attempt_ledger
+    assert %AttemptLedger{} = runtime_ledger
+
     {:ok, old_runtime_record} = AttemptLedger.begin_attempt(runtime_ledger, issue.id)
     old_identity = runtime_identity("runtime-old", old_runtime_record.lineage_id)
     {:ok, _old_runtime_record} = AttemptLedger.bind_runtime_attempt(runtime_ledger, issue.id, old_identity)
 
-    {:ok, context_state} =
-      Agent.start_link(fn -> runtime_context_state(issue, work_item, provider_contract, old_identity) end)
+    replace_runtime_context(orchestrator, issue, work_item, provider_contract, old_identity)
 
     {:ok, submissions} = Agent.start_link(fn -> 0 end)
-
-    load_context = fn %SemanticTransitionIntent{} = request ->
-      expected_identity = %{
-        runtime_attempt_id: request.runtime_attempt_id,
-        lineage_generation: request.lineage_generation,
-        work_item_id: request.work_item_id,
-        responsibility: request.responsibility
-      }
-
-      state = Agent.get(context_state, & &1)
-
-      case Orchestrator.handle_call(
-             {:transition_context, request.work_item_id, [expected_runtime_identity: expected_identity]},
-             {self(), make_ref()},
-             state
-           ) do
-        {:reply, reply, _next_state} -> reply
-      end
-    end
+    on_exit(fn -> if Process.alive?(submissions), do: Agent.stop(submissions) end)
 
     {:ok, coordinator} =
       TransitionCoordinator.start_link(
         name: nil,
-        ledger: transition_ledger,
-        load_context: load_context,
+        project_id: "project-a",
+        tracker_identity: tracker_identity,
+        ledger_opts: [path: transition_path],
+        orchestrator: orchestrator,
+        refresh_contract: fn context -> {:ok, context.provider_project_contract} end,
         submit: fn _attempt, _context ->
           Agent.update(submissions, &(&1 + 1))
           {:error, :timeout}
@@ -444,10 +469,6 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
 
     on_exit(fn ->
       if Process.alive?(coordinator), do: GenServer.stop(coordinator)
-      if Process.alive?(context_state), do: Agent.stop(context_state)
-      if Process.alive?(submissions), do: Agent.stop(submissions)
-      TransitionAttemptLedger.close(transition_ledger)
-      AttemptLedger.close(runtime_ledger)
     end)
 
     {:ok, old_intent} =
@@ -474,9 +495,7 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
     new_identity = runtime_identity("runtime-new", new_runtime_record.lineage_id)
     {:ok, _new_runtime_record} = AttemptLedger.bind_runtime_attempt(runtime_ledger, issue.id, new_identity)
 
-    Agent.update(context_state, fn _state ->
-      runtime_context_state(issue, work_item, provider_contract, new_identity)
-    end)
+    replace_runtime_context(orchestrator, issue, work_item, provider_contract, new_identity)
 
     assert {:error, :transition_fenced} =
              TransitionCoordinator.request_transition(coordinator, old_intent, route: route)
@@ -496,6 +515,23 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
 
     assert stale_attempt.outcome_reason.reason == {:context_unavailable, :stale_runtime_attempt}
     assert Agent.get(submissions, & &1) == 1
+
+    assert {:ok, %{in_flight: true, authority_fence: %{state: :bound, runtime_attempt: ^new_identity}}} =
+             AttemptLedger.current(runtime_ledger, issue.id)
+
+    {:ok, current_intent} =
+      SemanticTransitionIntent.new(
+        Map.merge(intent_attrs(), %{
+          responsibility: "implementation",
+          runtime_attempt_id: new_identity.runtime_attempt_id,
+          lineage_generation: new_identity.lineage_generation
+        })
+      )
+
+    assert {:ok, %{state: :indeterminate}} =
+             TransitionCoordinator.request_transition(coordinator, current_intent, route: route)
+
+    assert Agent.get(submissions, & &1) == 2
 
     assert {:ok, %{in_flight: true, authority_fence: %{state: :bound, runtime_attempt: ^new_identity}}} =
              AttemptLedger.current(runtime_ledger, issue.id)
@@ -1374,31 +1410,50 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
     Route.new(issue, profile)
   end
 
-  defp runtime_context_state(%Issue{} = issue, %WorkItem{} = work_item, provider_contract, identity) do
-    %Orchestrator.State{
-      startup_reconciliation: :ready,
-      work_control: %{issue.id => work_item},
-      dependency_diagnostics: %{
-        issue.id => %{
-          allowed?: true,
-          dependency_completeness: :complete,
-          dependency_status: :none
-        }
-      },
-      dependency_graph: Graph.build([issue]),
-      project_contract_evidence: %ProjectContractEvidence{
-        contract: provider_contract,
-        reconciliation_required?: false,
-        configured_before?: true
-      },
-      running: %{
-        issue.id => %{
-          profile_name: "implementation",
-          runtime_attempt: RuntimeAttempt.new(identity, :running)
-        }
+  defp replace_runtime_context(orchestrator, %Issue{} = issue, %WorkItem{} = work_item, provider_contract, identity) do
+    :sys.replace_state(orchestrator, fn state ->
+      %{
+        state
+        | startup_reconciliation: :ready,
+          work_control: Map.put(state.work_control, issue.id, work_item),
+          dependency_diagnostics:
+            Map.put(state.dependency_diagnostics, issue.id, %{
+              allowed?: true,
+              dependency_completeness: :complete,
+              dependency_status: :none
+            }),
+          dependency_graph: Graph.build([issue]),
+          project_contract_evidence: %ProjectContractEvidence{
+            contract: provider_contract,
+            reconciliation_required?: false,
+            configured_before?: true
+          },
+          running:
+            Map.put(state.running, issue.id, %{
+              profile_name: "implementation",
+              runtime_attempt: RuntimeAttempt.new(identity, :running)
+            })
       }
-    }
+    end)
   end
+
+  defp restore_application_env(:workflow_file_path, previous_path) do
+    result =
+      case previous_path do
+        nil -> Application.delete_env(:symphony_elixir, :workflow_file_path)
+        path -> Application.put_env(:symphony_elixir, :workflow_file_path, path)
+      end
+
+    if Process.whereis(SymphonyElixir.WorkflowStore) do
+      SymphonyElixir.WorkflowStore.force_reload()
+    end
+
+    result
+  end
+
+  defp restore_application_env(key, nil), do: Application.delete_env(:symphony_elixir, key)
+
+  defp restore_application_env(key, value), do: Application.put_env(:symphony_elixir, key, value)
 
   defp prepared_attempt(intent) do
     {:ok, attempt} = TransitionAttempt.new(Map.from_struct(intent))
