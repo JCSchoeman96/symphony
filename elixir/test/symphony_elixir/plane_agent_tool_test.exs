@@ -570,6 +570,58 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
     GenServer.stop(coordinator)
   end
 
+  test "transition request rejects guard substitutions before provider submission" do
+    parent = self()
+    route = route(:in_progress, "implementation")
+    context = semantic_context(work_item(:in_progress), contract())
+
+    substitutions = [
+      {
+        :semantic_for_mechanical,
+        substitute_guard_class(
+          transition_guard_evidence(),
+          :implementation_checks_verified,
+          :semantic_attestation
+        )
+      },
+      {
+        :mechanical_for_semantic,
+        substitute_guard_class(
+          transition_guard_evidence(),
+          :implementation_attested,
+          :mechanical_guard
+        )
+      },
+      {
+        :human_for_mechanical,
+        substitute_guard_class(
+          transition_guard_evidence(),
+          :candidate_state_verified,
+          :human_decision
+        )
+      },
+      {:stale_context, stale_guard_context(transition_guard_evidence())}
+    ]
+
+    for {substitution, guard_evidence} <- substitutions do
+      coordinator = transition_coordinator(parent)
+
+      response =
+        AgentTool.execute(
+          "plane_request_lifecycle_transition",
+          %{"targetState" => "In Review"},
+          transition_opts(route, context, coordinator)
+          |> Keyword.put(:agent_tool_context, %{route: route, guard_evidence: guard_evidence})
+        )
+
+      refute response["success"], "accepted #{substitution} guard substitution"
+      assert Jason.decode!(response["output"])["error"]["code"] == "required_guard_missing"
+      refute_received :transition_submitted
+
+      GenServer.stop(coordinator)
+    end
+  end
+
   test "transition request does not invoke provider request callbacks" do
     parent = self()
     coordinator = transition_coordinator(parent)
@@ -1555,6 +1607,37 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
       %{class: :mechanical_guard, name: :implementation_checks_verified},
       %{class: :mechanical_guard, name: :candidate_state_verified, outcome: :verified}
     ]
+  end
+
+  defp substitute_guard_class(evidence, target_name, :semantic_attestation) do
+    semantic_attestation = Enum.find(evidence, &(&1[:class] == :semantic_attestation))
+
+    Enum.map(evidence, fn
+      %{name: ^target_name} -> %{semantic_attestation | name: target_name}
+      entry -> entry
+    end)
+  end
+
+  defp substitute_guard_class(evidence, target_name, class) when class in [:mechanical_guard, :human_decision] do
+    Enum.map(evidence, fn
+      %{name: ^target_name} -> verified_guard(%{class: class, name: target_name})
+      entry -> entry
+    end)
+  end
+
+  defp verified_guard(%{name: name} = guard) when name in [:candidate_state_verified, :review_acceptance_verified],
+    do: Map.put(guard, :outcome, :verified)
+
+  defp verified_guard(guard), do: guard
+
+  defp stale_guard_context(evidence) do
+    Enum.map(evidence, fn
+      %{class: :semantic_attestation, name: :implementation_attested} = attestation ->
+        %{attestation | runtime_attempt_id: :stale_runtime_attempt, lineage_generation: 1}
+
+      entry ->
+        entry
+    end)
   end
 
   defp route(state, responsibility) do

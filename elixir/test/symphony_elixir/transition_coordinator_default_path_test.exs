@@ -55,6 +55,7 @@ defmodule SymphonyElixir.TransitionCoordinatorDefaultPathTest do
   }
 
   @now ~U[2026-09-18 00:00:00Z]
+  @sha_base String.duplicate("0", 40)
   @sha_a String.duplicate("a", 40)
   @sha_b String.duplicate("b", 40)
   @sha_m String.duplicate("d", 40)
@@ -107,7 +108,7 @@ defmodule SymphonyElixir.TransitionCoordinatorDefaultPathTest do
     contract = contract()
     current_issue = issue("Merging", "state-merging")
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [current_issue])
-    proof = merge_authorized_proof(contract)
+    proof = merge_authorized_proof(contract, @sha_a, @sha_base)
 
     assert {:ok, merging_work_item} =
              WorkItem.from_issue(current_issue, %{
@@ -123,7 +124,7 @@ defmodule SymphonyElixir.TransitionCoordinatorDefaultPathTest do
       |> Map.merge(%{
         work_item: merging_work_item,
         guard_evidence: [proof],
-        github_opts: completion_github_opts()
+        github_opts: completion_github_opts(candidate_sha: @sha_a, base_sha: @sha_base)
       })
 
     {:ok, orchestrator} =
@@ -168,6 +169,70 @@ defmodule SymphonyElixir.TransitionCoordinatorDefaultPathTest do
     forged_observation = %{completed.provider_observation | provider_state_name: "In Progress"}
     refute ProviderObservation.valid_tracker_read?(forged_observation)
     refute CompletionProof.closes_observation?(completed_proof, forged_observation)
+  end
+
+  test "Done submission refuses approval for candidate A after the PR moves to merged candidate B" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory", symphony_project_id: "project-1")
+    contract = contract()
+    current_issue = issue("Merging", "state-merging")
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [current_issue])
+    proof = merge_authorized_proof(contract, @sha_a, @sha_base)
+    assert proof.candidate_ref.candidate_sha == @sha_a
+
+    {:ok, merging_work_item} =
+      WorkItem.from_issue(current_issue, %{
+        provider: :plane,
+        observed_at: @now,
+        prior_validated_lifecycle_state: :merging,
+        evidence: [proof],
+        provider_project_contract: contract
+      })
+
+    transition_context =
+      context()
+      |> Map.merge(%{
+        work_item: merging_work_item,
+        guard_evidence: [proof],
+        github_opts: completion_github_opts(candidate_sha: @sha_b, base_sha: @sha_base)
+      })
+
+    {:ok, orchestrator} =
+      DefaultPathOrchestrator.start_link(transition_context: {:ok, transition_context})
+
+    parent = self()
+
+    {:ok, coordinator} =
+      TransitionCoordinator.start_link(
+        name: nil,
+        ledger: nil,
+        orchestrator: orchestrator,
+        refresh_contract: fn _context -> {:ok, contract} end,
+        submit: fn _attempt, _context ->
+          send(parent, :provider_done_submitted)
+          Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue_with_tracker_read("Done", "state-done")])
+          :ok
+        end,
+        require_durable?: false
+      )
+
+    completion_intent = %SemanticTransitionIntent{
+      work_item_id: "work-1",
+      requested_from: :merging,
+      requested_to: :done,
+      responsibility: "system",
+      guard_evidence: [proof],
+      requested_at: @now
+    }
+
+    assert {:ok, %{state: :provider_failed} = failed_attempt} =
+             TransitionCoordinator.request_transition(coordinator, completion_intent)
+
+    assert failed_attempt.outcome_reason.reason ==
+             {:context_unavailable, {:fresh_context_unavailable, {:source_control, :merge_verification_failed}}}
+
+    refute_received :provider_done_submitted
+    refute_received {:applied, _work_item}
+    assert [^current_issue] = Application.get_env(:symphony_elixir, :memory_tracker_issues)
   end
 
   test "failed SourceControl merge verification does not submit provider Done" do
@@ -593,16 +658,16 @@ defmodule SymphonyElixir.TransitionCoordinatorDefaultPathTest do
   defp group_for_state("Canceled"), do: :cancelled
   defp group_for_state("Done"), do: :completed
 
-  defp merge_authorized_proof(contract) do
+  defp merge_authorized_proof(contract, candidate_sha \\ @sha_b, base_sha \\ @sha_a) do
     settings = %{symphony: %{project_id: contract.project_id}}
 
     {:ok, candidate_ref} =
       CandidateRef.new(%{
         repository_identity: "github:repository:1368436395",
-        base_sha: @sha_a,
-        candidate_sha: @sha_b,
+        base_sha: base_sha,
+        candidate_sha: candidate_sha,
         pr_identity: "15",
-        observed_pr_head_sha: @sha_b
+        observed_pr_head_sha: candidate_sha
       })
 
     policy_fingerprint = SourceControl.policy_fingerprint_for(@source_control_config, settings)
@@ -650,8 +715,11 @@ defmodule SymphonyElixir.TransitionCoordinatorDefaultPathTest do
     sign_completion_proof_for_test(unsigned_proof)
   end
 
-  defp completion_github_opts do
+  defp completion_github_opts(opts \\ []) do
     settings = %{symphony: %{project_id: "project-1"}}
+    base_sha = Keyword.get(opts, :base_sha, @sha_a)
+    candidate_sha = Keyword.get(opts, :candidate_sha, @sha_b)
+    merge_sha = Keyword.get(opts, :merge_sha, @sha_m)
 
     [
       source_control_config: @source_control_config,
@@ -664,17 +732,17 @@ defmodule SymphonyElixir.TransitionCoordinatorDefaultPathTest do
              %{"id" => 1_368_436_395}
 
            String.contains?(path, "/pulls/15") ->
-             %{"number" => 15, "merged" => true, "head" => %{"sha" => @sha_b}, "merge_commit_sha" => @sha_m}
+             %{"number" => 15, "merged" => true, "head" => %{"sha" => candidate_sha}, "merge_commit_sha" => merge_sha}
 
-           String.contains?(path, "/git/commits/" <> @sha_m) ->
+           String.contains?(path, "/git/commits/" <> merge_sha) ->
              %{
-               "sha" => @sha_m,
+               "sha" => merge_sha,
                "tree" => %{"sha" => @tree},
-               "parents" => [%{"sha" => @sha_a}, %{"sha" => @sha_b}]
+               "parents" => [%{"sha" => base_sha}, %{"sha" => candidate_sha}]
              }
 
            String.contains?(path, "/git/ref/heads/main") ->
-             %{"object" => %{"sha" => @sha_m}}
+             %{"object" => %{"sha" => merge_sha}}
 
            String.contains?(path, "/check-runs") ->
              %{
@@ -682,7 +750,7 @@ defmodule SymphonyElixir.TransitionCoordinatorDefaultPathTest do
                "check_runs" => [
                  %{
                    "name" => "make-all",
-                   "head_sha" => @sha_b,
+                   "head_sha" => candidate_sha,
                    "status" => "completed",
                    "conclusion" => "success",
                    "app" => %{"id" => 15_368}
