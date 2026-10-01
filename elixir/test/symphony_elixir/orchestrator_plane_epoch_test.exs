@@ -1000,6 +1000,87 @@ defmodule SymphonyElixir.OrchestratorPlaneEpochTest do
     stop_orchestrator(pid, task_supervisor)
   end
 
+  test "a legal forward Plane observation stays fenced until guards validate it" do
+    workspace_id = "workspace-stable-1"
+    project_id = "project-1"
+    work_item_id = uuid(139)
+    plane_workflow!(project_id, "", workspace_id: workspace_id)
+
+    prior_issue = %{
+      OrchestratorPlaneEpochFakeTracker.issue()
+      | id: work_item_id,
+        workspace_id: workspace_id,
+        project_id: project_id
+    }
+
+    forward_issue = %{
+      prior_issue
+      | state: "In Progress",
+        provider_state_id: "state-in_progress",
+        provider_state_group: :started,
+        dispatchable: false
+    }
+
+    Application.put_env(:symphony_elixir, :plane_epoch_test_graph_issues, [forward_issue])
+    Application.put_env(:symphony_elixir, :plane_epoch_test_mode, :block_graph)
+
+    {pid, task_supervisor} =
+      start_orchestrator(startup_ready: true, work_control: %{work_item_id => valid_work_item(prior_issue)})
+
+    prior = :sys.get_state(pid).work_control[work_item_id]
+    assert prior.validated_lifecycle_state == :ready
+    assert prior.authority_disposition.status == :eligible
+
+    assert {:ok, :scheduled} =
+             Orchestrator.accept_plane_webhook(
+               pid,
+               webhook_identity("workitem.updated", 140, work_item_id, project_id)
+             )
+
+    assert_receive {:plane_webhook_rest_read, _reader, [^work_item_id], _opts}
+    assert_receive {:plane_dependency_graph, epoch_pid, _opts}
+
+    state_while_refreshing = :sys.get_state(pid)
+    assert state_while_refreshing.plane_epoch_status == :refreshing
+    assert state_while_refreshing.work_control[work_item_id] == prior
+
+    send(pid, :run_poll_cycle)
+    _snapshot = GenServer.call(pid, :snapshot, 1_000)
+    assert :sys.get_state(pid).running == %{}
+    refute_receive {:fake_plane_agent_started, _agent_pid, ^work_item_id}, 0
+
+    Application.put_env(:symphony_elixir, :plane_epoch_test_mode, :normal)
+    send(epoch_pid, :release_graph)
+
+    assert eventually(fn ->
+             state = :sys.get_state(pid)
+             work_item = state.work_control[work_item_id]
+
+             state.plane_epoch_status == :current and
+               match?(%WorkItem{}, work_item) and
+               work_item.provider_observation.provider_state_name == "In Progress" and
+               work_item.lifecycle_assessment.status == :validation_required and
+               work_item.lifecycle_assessment.mapped_state == :in_progress and
+               work_item.lifecycle_assessment.validated_state == :ready and
+               work_item.validated_lifecycle_state == :ready and
+               work_item.authority_disposition.status == :suspended and
+               not WorkItem.dispatchable?(work_item)
+           end)
+
+    state = :sys.get_state(pid)
+    work_item = state.work_control[work_item_id]
+    assert work_item.lifecycle_assessment.missing_guards == [%{class: :mechanical_guard, name: :dispatch_guard}]
+    assert work_item.suspension_context.last_validated_lifecycle_state == :ready
+    assert state.plane_epoch_status == :current
+
+    send(pid, :run_poll_cycle)
+    _snapshot = GenServer.call(pid, :snapshot, 1_000)
+    assert :sys.get_state(pid).running == %{}
+    refute_receive {:fake_plane_agent_started, _agent_pid, ^work_item_id}, 0
+
+    stop_orchestrator(pid, task_supervisor)
+  end
+
   test "a preserving targeted webhook does not invalidate an in-flight full epoch" do
     workspace_id = "workspace-stable-1"
     project_id = "project-1"
@@ -2559,6 +2640,79 @@ defmodule SymphonyElixir.OrchestratorPlaneEpochTest do
     assert eventually(fn -> :sys.get_state(pid).plane_epoch_status == :failed end)
     assert :sys.get_state(pid).dependency_graph == old_graph
     assert :sys.get_state(pid).plane_epoch_error == :provider_contract_not_validated
+    stop_orchestrator(pid, task_supervisor)
+  end
+
+  @tag timeout: 15_000
+  test "H-080A Plane contract reconfiguration cancels a production retry and keeps work fenced" do
+    issue = %{
+      OrchestratorPlaneEpochFakeTracker.issue()
+      | id: uuid(141),
+        identifier: "PLANE-RETRY-DRIFT"
+    }
+
+    issue_id = issue.id
+
+    Application.put_env(:symphony_elixir, :plane_epoch_test_graph_issues, [issue])
+    plane_workflow!("project-1")
+
+    {pid, task_supervisor} =
+      start_orchestrator(startup_ready: true, work_control: %{issue.id => valid_work_item(issue)})
+
+    send(pid, :run_poll_cycle)
+    assert_receive {:plane_project_snapshot, _opening_snapshot_task, _opening_snapshot_opts}, 1_000
+    assert_receive {:plane_dependency_graph, _graph_task, _graph_opts}, 1_000
+    assert_receive {:plane_project_snapshot, _closing_snapshot_task, _closing_snapshot_opts}, 1_000
+    assert_receive {:fake_plane_agent_started, retry_agent_pid, ^issue_id}, 2_000
+    send(retry_agent_pid, :fail_agent)
+
+    assert eventually(fn ->
+             state = :sys.get_state(pid)
+             Map.has_key?(state.retry_attempts, issue.id) and not Map.has_key?(state.running, issue.id)
+           end)
+
+    retry = :sys.get_state(pid).retry_attempts[issue.id]
+    assert retry.attempt == 1
+    assert is_reference(retry.timer_ref)
+    assert is_integer(Process.read_timer(retry.timer_ref))
+
+    plane_workflow!("project-2")
+    send(pid, :run_poll_cycle)
+
+    assert eventually(fn ->
+             state = :sys.get_state(pid)
+             work_item = state.work_control[issue.id]
+
+             state.project_contract_evidence.reason == :provider_configuration_changed and
+               state.project_contract_evidence.reconciliation_required? and
+               state.running == %{} and
+               state.retry_attempts == %{} and
+               not MapSet.member?(state.claimed, issue.id) and
+               match?(%WorkItem{authority_disposition: %{status: :suspended}}, work_item) and
+               work_item.authority_disposition.reason == :provider_configuration_changed and
+               work_item.suspension_context.reason == :provider_configuration_changed
+           end)
+
+    assert {:ok, validation} =
+             Orchestrator.reconcile_project_contract(
+               pid,
+               OrchestratorPlaneEpochFakeTracker.project_snapshot()
+             )
+
+    assert validation.status == :drift_detected
+    assert Process.read_timer(retry.timer_ref) == false
+    send(pid, {:retry_issue, issue.id, retry.retry_token})
+    assert eventually(fn -> :sys.get_state(pid).project_contract_evidence.reason == :provider_configuration_drift end)
+    refute_receive {:fake_plane_agent_started, _new_agent_pid, ^issue_id}, 100
+    refute Process.alive?(retry_agent_pid)
+
+    state = :sys.get_state(pid)
+    assert state.running == %{}
+    assert state.retry_attempts == %{}
+    assert state.work_control[issue.id].authority_disposition.status == :suspended
+    refute MapSet.member?(state.claimed, issue.id)
+    refute WorkItem.authority_available?(state.work_control[issue.id])
+
     stop_orchestrator(pid, task_supervisor)
   end
 

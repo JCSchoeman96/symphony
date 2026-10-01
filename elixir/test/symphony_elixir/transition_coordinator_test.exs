@@ -1,15 +1,23 @@
 defmodule SymphonyElixir.TransitionCoordinatorTest do
   use ExUnit.Case, async: false
 
+  alias SymphonyElixir.AgentRuntime.{AttemptLedger, Profile, Route, RuntimeAttempt}
+  alias SymphonyElixir.AgentRuntime.RuntimeAttempt.Identity
+  alias SymphonyElixir.Dependency.Graph
+  alias SymphonyElixir.Orchestrator
+  alias SymphonyElixir.Tracker.Issue
   alias SymphonyElixir.TransitionCoordinator
 
   alias SymphonyElixir.WorkControl.{
+    ProjectContractEvidence,
     ProviderProjectContract,
     SemanticTransitionIntent,
     TransitionAttempt,
     TransitionAttemptLedger,
     WorkflowLifecycle
   }
+
+  alias SymphonyElixir.WorkControl.WorkItem
 
   test "executes one prepared transition and verifies it without resubmitting" do
     test_pid = self()
@@ -356,6 +364,141 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
 
     assert {:error, :transition_fenced} = TransitionCoordinator.request_transition(coordinator, intent)
     refute_received :submitted
+  end
+
+  test "rejects a delayed old runtime intent without releasing the new runtime fence" do
+    root = Path.join(System.tmp_dir!(), "symphony-transition-runtime-boundary-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(root)
+    transition_path = Path.join(root, "transitions.dets")
+    runtime_path = Path.join(root, "runtime.dets")
+    on_exit(fn -> File.rm_rf(root) end)
+
+    tracker_identity = %{tracker_kind: "plane", provider_scope: %{project_id: "project-a"}}
+    {:ok, transition_ledger} = TransitionAttemptLedger.open("project-a", tracker_identity, path: transition_path)
+    {:ok, runtime_ledger} = AttemptLedger.open("project-a", tracker_identity, path: runtime_path)
+
+    issue = %Issue{
+      id: "work-1",
+      identifier: "SYM-1",
+      title: "Runtime transition boundary",
+      state: "Ready",
+      workspace_id: "workspace-1",
+      project_id: "project-1",
+      provider_state_id: "state-ready",
+      provider_state_group: :unstarted,
+      dependency_completeness: :complete,
+      updated_at: DateTime.utc_now()
+    }
+
+    provider_contract = contract()
+
+    {:ok, work_item} =
+      WorkItem.from_issue(issue, %{
+        provider: :plane,
+        observed_at: DateTime.utc_now(),
+        prior_validated_lifecycle_state: :ready,
+        provider_project_contract: provider_contract,
+        evidence: [%{class: :mechanical_guard, name: :dispatch_guard}]
+      })
+
+    {:ok, old_runtime_record} = AttemptLedger.begin_attempt(runtime_ledger, issue.id)
+    old_identity = runtime_identity("runtime-old", old_runtime_record.lineage_id)
+    {:ok, _old_runtime_record} = AttemptLedger.bind_runtime_attempt(runtime_ledger, issue.id, old_identity)
+
+    {:ok, context_state} =
+      Agent.start_link(fn -> runtime_context_state(issue, work_item, provider_contract, old_identity) end)
+
+    {:ok, submissions} = Agent.start_link(fn -> 0 end)
+
+    load_context = fn %SemanticTransitionIntent{} = request ->
+      expected_identity = %{
+        runtime_attempt_id: request.runtime_attempt_id,
+        lineage_generation: request.lineage_generation,
+        work_item_id: request.work_item_id,
+        responsibility: request.responsibility
+      }
+
+      state = Agent.get(context_state, & &1)
+
+      case Orchestrator.handle_call(
+             {:transition_context, request.work_item_id, [expected_runtime_identity: expected_identity]},
+             {self(), make_ref()},
+             state
+           ) do
+        {:reply, reply, _next_state} -> reply
+      end
+    end
+
+    {:ok, coordinator} =
+      TransitionCoordinator.start_link(
+        name: nil,
+        ledger: transition_ledger,
+        load_context: load_context,
+        submit: fn _attempt, _context ->
+          Agent.update(submissions, &(&1 + 1))
+          {:error, :timeout}
+        end,
+        verify: fn _attempt, _context -> {:error, :verification_unavailable} end,
+        suspend: fn _work_item_id, _reason, _attempt -> :ok end
+      )
+
+    on_exit(fn ->
+      if Process.alive?(coordinator), do: GenServer.stop(coordinator)
+      if Process.alive?(context_state), do: Agent.stop(context_state)
+      if Process.alive?(submissions), do: Agent.stop(submissions)
+      TransitionAttemptLedger.close(transition_ledger)
+      AttemptLedger.close(runtime_ledger)
+    end)
+
+    {:ok, old_intent} =
+      SemanticTransitionIntent.new(
+        Map.merge(intent_attrs(), %{
+          responsibility: "implementation",
+          runtime_attempt_id: old_identity.runtime_attempt_id,
+          lineage_generation: old_identity.lineage_generation
+        })
+      )
+
+    route = runtime_route(issue)
+
+    assert {:ok, %{state: :indeterminate} = old_attempt} =
+             TransitionCoordinator.request_transition(coordinator, old_intent, route: route)
+
+    assert Agent.get(submissions, & &1) == 1
+    assert {:ok, [candidate]} = TransitionCoordinator.list_reconciliation_candidates(coordinator)
+    assert candidate.attempt_id == old_attempt.attempt_id
+
+    assert :ok = AttemptLedger.release_authority_fence(runtime_ledger, issue.id, old_identity)
+    assert :ok = AttemptLedger.clear_in_flight(runtime_ledger, issue.id)
+    {:ok, new_runtime_record} = AttemptLedger.begin_attempt(runtime_ledger, issue.id)
+    new_identity = runtime_identity("runtime-new", new_runtime_record.lineage_id)
+    {:ok, _new_runtime_record} = AttemptLedger.bind_runtime_attempt(runtime_ledger, issue.id, new_identity)
+
+    Agent.update(context_state, fn _state ->
+      runtime_context_state(issue, work_item, provider_contract, new_identity)
+    end)
+
+    assert {:error, :transition_fenced} =
+             TransitionCoordinator.request_transition(coordinator, old_intent, route: route)
+
+    assert Agent.get(submissions, & &1) == 1
+
+    assert {:ok, _marker} =
+             TransitionCoordinator.reconcile_candidate(
+               coordinator,
+               candidate,
+               :conflict,
+               "old-runtime-reconciled"
+             )
+
+    assert {:ok, %{state: :provider_failed} = stale_attempt} =
+             TransitionCoordinator.request_transition(coordinator, old_intent, route: route)
+
+    assert stale_attempt.outcome_reason.reason == {:context_unavailable, :stale_runtime_attempt}
+    assert Agent.get(submissions, & &1) == 1
+
+    assert {:ok, %{in_flight: true, authority_fence: %{state: :bound, runtime_attempt: ^new_identity}}} =
+             AttemptLedger.current(runtime_ledger, issue.id)
   end
 
   test "reopening a ledger with a persisted ambiguous attempt blocks a second submission" do
@@ -1213,6 +1356,47 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
       provider_project_contract: contract(),
       dependency_decision: %{allowed?: true, dependency_completeness: :complete, dependency_status: :none},
       dependency_epoch_evidence: %{complete?: true}
+    }
+  end
+
+  defp runtime_identity(runtime_attempt_id, lineage_generation) do
+    %Identity{
+      runtime_attempt_id: runtime_attempt_id,
+      work_item_id: "work-1",
+      lineage_generation: lineage_generation,
+      responsibility: "implementation",
+      runtime_profile: "implementation"
+    }
+  end
+
+  defp runtime_route(%Issue{} = issue) do
+    profile = Profile.default_profiles("codex app-server", 20)["builder"]
+    Route.new(issue, profile)
+  end
+
+  defp runtime_context_state(%Issue{} = issue, %WorkItem{} = work_item, provider_contract, identity) do
+    %Orchestrator.State{
+      startup_reconciliation: :ready,
+      work_control: %{issue.id => work_item},
+      dependency_diagnostics: %{
+        issue.id => %{
+          allowed?: true,
+          dependency_completeness: :complete,
+          dependency_status: :none
+        }
+      },
+      dependency_graph: Graph.build([issue]),
+      project_contract_evidence: %ProjectContractEvidence{
+        contract: provider_contract,
+        reconciliation_required?: false,
+        configured_before?: true
+      },
+      running: %{
+        issue.id => %{
+          profile_name: "implementation",
+          runtime_attempt: RuntimeAttempt.new(identity, :running)
+        }
+      }
     }
   end
 

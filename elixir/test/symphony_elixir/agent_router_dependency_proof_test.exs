@@ -63,7 +63,14 @@ defmodule SymphonyElixir.AgentRouterDependencyProofTest do
 
   alias SymphonyElixir.AgentRuntime.Router
   alias SymphonyElixir.Dependency.{Graph, Guard}
-  alias SymphonyElixir.WorkControl.{GuardClass, WorkflowLifecycle, WorkItem}
+
+  alias SymphonyElixir.WorkControl.{
+    GuardClass,
+    ProviderObservation,
+    ProviderProjectContract,
+    WorkflowLifecycle,
+    WorkItem
+  }
 
   @dag_capture :symphony_full_proof_dag_capture
 
@@ -346,6 +353,191 @@ defmodule SymphonyElixir.AgentRouterDependencyProofTest do
     assert Graph.cycles(graph) == [["dag-cycle-a", "dag-cycle-b", "dag-cycle-c"]]
   end
 
+  test "SYM-15 unlocks a multi-hop dependency frontier after validated completion" do
+    test_pid = self()
+    Process.register(test_pid, @dag_capture)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      agent_routing: "legacy",
+      tracker_active_states: ["Ready"],
+      max_concurrent_agents: 10,
+      poll_interval_ms: 60_000
+    )
+
+    issues = dag_issues()
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, issues)
+
+    orchestrator_name =
+      Module.concat(__MODULE__, "DagOrchestrator#{System.unique_integer([:positive])}")
+
+    {:ok, pid} =
+      Orchestrator.start_link(
+        name: orchestrator_name,
+        agent_runner: SymphonyElixir.FullProofDagRunner,
+        work_control: trusted_work_control(issues)
+      )
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: GenServer.stop(pid)
+      if Process.whereis(@dag_capture) == test_pid, do: Process.unregister(@dag_capture)
+    end)
+
+    initial = receive_dispatches(2)
+    assert Enum.map(initial, &elem(&1, 0)) == ["dag-a", "dag-independent"]
+
+    assert Enum.all?(initial, fn {_id, _identifier, _state, opts, _worker_pid} ->
+             opts[:route].profile_name == "legacy"
+           end)
+
+    refute_receive {:dag_started, "dag-b", _identifier, _state, _opts, _worker_pid}, 100
+    refute_receive {:dag_started, "dag-c", _identifier, _state, _opts, _worker_pid}, 100
+
+    refute_receive {:dag_started, "dag-canceled-dependent", _identifier, _state, _opts, _worker_pid},
+                   100
+
+    refute_receive {:dag_started, "dag-cycle-a", _identifier, _state, _opts, _worker_pid}, 100
+
+    updated_issues = put_dag_issues(issues, a: "Done", independent: "Done", a_blocker: "Done")
+    put_verified_completed_work_items!(pid, updated_issues)
+    finish_dispatched!(pid, initial)
+    trigger_poll!(pid)
+
+    second = receive_dispatches(2)
+    assert Enum.map(second, &elem(&1, 0)) == ["dag-b", "dag-c"]
+
+    updated_issues =
+      put_dag_issues(
+        issues,
+        a: "Done",
+        independent: "Done",
+        b: "Done",
+        c: "Done",
+        a_blocker: "Done",
+        b_blocker: "Done",
+        c_blocker: "Done"
+      )
+
+    put_verified_completed_work_items!(pid, updated_issues)
+    finish_dispatched!(pid, second)
+    trigger_poll!(pid)
+
+    third = receive_dispatches(4)
+    assert Enum.map(third, &elem(&1, 0)) == ["dag-d", "dag-e", "dag-f", "dag-g"]
+
+    updated_issues =
+      put_dag_issues(
+        issues,
+        a: "Done",
+        independent: "Done",
+        b: "Done",
+        c: "Done",
+        d: "Done",
+        e: "Done",
+        f: "Done",
+        a_blocker: "Done",
+        b_blocker: "Done",
+        c_blocker: "Done",
+        f_blocker: "Done"
+      )
+
+    put_verified_completed_work_items!(pid, updated_issues)
+    finish_dispatched!(pid, Enum.take(third, 3))
+    trigger_poll!(pid)
+
+    refute_receive {:dag_started, "dag-h", _identifier, _state, _opts, _worker_pid}, 100
+
+    updated_issues =
+      put_dag_issues(
+        issues,
+        a: "Done",
+        independent: "Done",
+        b: "Done",
+        c: "Done",
+        d: "Done",
+        e: "Done",
+        f: "Done",
+        g: "Done",
+        a_blocker: "Done",
+        b_blocker: "Done",
+        c_blocker: "Done",
+        f_blocker: "Done",
+        g_blocker: "Done"
+      )
+
+    put_verified_completed_work_items!(pid, updated_issues)
+    finish_dispatched!(pid, [List.last(third)])
+    trigger_poll!(pid)
+
+    [final] = receive_dispatches(1)
+    assert elem(final, 0) == "dag-h"
+
+    updated_issues =
+      put_dag_issues(
+        issues,
+        a: "Done",
+        independent: "Done",
+        b: "Done",
+        c: "Done",
+        d: "Done",
+        e: "Done",
+        f: "Done",
+        g: "Done",
+        h: "Done",
+        a_blocker: "Done",
+        b_blocker: "Done",
+        c_blocker: "Done",
+        f_blocker: "Done",
+        g_blocker: "Done"
+      )
+
+    put_verified_completed_work_items!(pid, updated_issues)
+    finish_dispatched!(pid, [final])
+
+    assert_eventually(fn ->
+      snapshot = GenServer.call(pid, :snapshot, 100)
+      snapshot.running == [] and snapshot.retrying == []
+    end)
+
+    snapshot = GenServer.call(pid, :snapshot, 100)
+    assert snapshot.dependency_graph.cycles == [["dag-cycle-a", "dag-cycle-b", "dag-cycle-c"]]
+
+    diagnostics = Map.new(snapshot.dependency_diagnostics, &{&1.identifier, &1})
+    assert diagnostics["SYM-CANCELED-DEPENDENT"].reason == :invalidated_dependency
+    assert diagnostics["SYM-CYCLE-A"].reason == :dependency_cycle
+    assert diagnostics["SYM-CYCLE-B"].reason == :dependency_cycle
+    assert diagnostics["SYM-CYCLE-C"].reason == :dependency_cycle
+
+    all_dispatches = initial ++ second ++ third ++ [final]
+    dispatch_ids = Enum.map(all_dispatches, &elem(&1, 0))
+    assert dispatch_ids == Enum.uniq(dispatch_ids)
+
+    assert dispatch_ids == [
+             "dag-a",
+             "dag-independent",
+             "dag-b",
+             "dag-c",
+             "dag-d",
+             "dag-e",
+             "dag-f",
+             "dag-g",
+             "dag-h"
+           ]
+
+    assert Guard.evaluate(
+             %Issue{
+               id: "proof",
+               identifier: "SYM-PROOF",
+               state: "Ready",
+               blocked_by: [%{id: "canceled", state: "Canceled"}]
+             },
+             "implementation"
+           ).allowed? == false
+
+    graph = Graph.build(issues)
+    assert Graph.cycles(graph) == [["dag-cycle-a", "dag-cycle-b", "dag-cycle-c"]]
+  end
+
   defp sequence_fetcher(issue, states) do
     {:ok, agent} = Agent.start_link(fn -> states end)
 
@@ -410,24 +602,40 @@ defmodule SymphonyElixir.AgentRouterDependencyProofTest do
     work_item
   end
 
-  defp put_completed_work_items!(pid, issues) when is_pid(pid) and is_list(issues) do
+  defp put_completed_work_items!(pid, issues) do
+    store_completed_work_items!(pid, issues, &completed_work_item/1, true)
+  end
+
+  defp put_verified_completed_work_items!(pid, issues) do
+    store_completed_work_items!(pid, issues, &verified_completed_work_item/1, false)
+  end
+
+  defp store_completed_work_items!(pid, issues, completion_builder, persist_checkpoints?)
+       when is_pid(pid) and is_list(issues) and is_function(completion_builder, 1) and
+              is_boolean(persist_checkpoints?) do
     completed =
       issues
       |> Enum.filter(&(&1.state == "Done"))
-      |> Map.new(fn issue -> {issue.id, completed_work_item(issue)} end)
+      |> Map.new(fn issue -> {issue.id, completion_builder.(issue)} end)
 
-    Enum.each(completed, fn {work_item_id, work_item} ->
-      issue = Enum.find(issues, &(&1.id == work_item_id))
+    if persist_checkpoints? do
+      Enum.each(completed, fn {work_item_id, work_item} ->
+        issue = Enum.find(issues, &(&1.id == work_item_id))
 
-      seed_orchestrator_recovery_checkpoint!(pid, issue,
-        lifecycle_state: :done,
-        evidence: work_item.lifecycle_assessment.satisfied_guards
-      )
-    end)
+        seed_orchestrator_recovery_checkpoint!(pid, issue,
+          lifecycle_state: :done,
+          evidence: work_item.lifecycle_assessment.satisfied_guards
+        )
+      end)
 
-    :sys.replace_state(pid, fn state ->
-      %{state | work_control: Map.merge(state.work_control, completed)}
-    end)
+      :sys.replace_state(pid, fn state ->
+        %{state | work_control: Map.merge(state.work_control, completed)}
+      end)
+    else
+      Enum.each(completed, fn {work_item_id, work_item} ->
+        assert :ok = Orchestrator.apply_transition_result(pid, work_item_id, work_item)
+      end)
+    end
   end
 
   defp completed_work_item(%Issue{} = issue) do
@@ -440,6 +648,55 @@ defmodule SymphonyElixir.AgentRouterDependencyProofTest do
       })
 
     work_item
+  end
+
+  defp verified_completed_work_item(%Issue{} = issue) do
+    contract = completion_contract()
+
+    issue = %{
+      issue
+      | workspace_id: contract.workspace_id,
+        project_id: contract.project_id,
+        provider_state_id: "state-done",
+        provider_state_group: :completed
+    }
+
+    proof = completion_proof_fixture(issue.id, contract)
+    observed_at = DateTime.utc_now()
+
+    {:ok, observation} =
+      ProviderObservation.from_issue(issue, %{provider: :plane, observed_at: observed_at})
+
+    {:ok, work_item} =
+      WorkItem.from_issue(issue, %{
+        provider: :plane,
+        provider_observation: sign_provider_observation_for_test(observation),
+        observed_at: observed_at,
+        prior_validated_lifecycle_state: "Merging",
+        evidence: [proof],
+        provider_project_contract: contract
+      })
+
+    assert WorkItem.dependency_satisfying?(work_item)
+    work_item
+  end
+
+  defp completion_contract do
+    state_mappings =
+      Map.new(WorkflowLifecycle.states(), fn state ->
+        {state, %{state_id: "state-#{state}", name: WorkflowLifecycle.display(state)}}
+      end)
+
+    {:ok, contract} =
+      ProviderProjectContract.new(%{
+        schema_version: 1,
+        provider: :plane,
+        workspace_id: "workspace-1",
+        project_id: "project-1",
+        state_mappings: state_mappings
+      })
+
+    contract
   end
 
   defp dag_issues do
