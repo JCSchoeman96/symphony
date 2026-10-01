@@ -416,10 +416,10 @@ defmodule SymphonyElixir.WorkControlAssessmentTest do
 
     completion_proof = GuardClass.requirement(:mechanical_guard, :completion_proof_verified)
     done = LifecycleAssessment.assess(observation("Done"), :merging, [completion_proof])
-    assert done.status == :validated
-    assert done.validated_state == :done
-    assert LifecycleAssessment.completion_validated?(done)
-    assert LifecycleAssessment.dependency_satisfying?(done)
+    assert done.status == :validation_required
+    assert done.validated_state == :merging
+    refute LifecycleAssessment.completion_validated?(done)
+    refute LifecycleAssessment.dependency_satisfying?(done)
 
     canceled = LifecycleAssessment.assess(observation("Canceled"), :in_progress, [])
     assert canceled.status == :authority_reducing
@@ -450,6 +450,23 @@ defmodule SymphonyElixir.WorkControlAssessmentTest do
     refute LifecycleAssessment.dependency_satisfying?(invalid_done)
   end
 
+  test "caller-built completion guard maps cannot validate merging to done" do
+    completion_proofs = [
+      %{class: :mechanical_guard, name: :completion_proof_verified},
+      %{class: :mechanical_guard, name: :completion_proof_verified, outcome: :verified}
+    ]
+
+    for completion_proof <- completion_proofs do
+      done = LifecycleAssessment.assess(observation("Done"), :merging, [completion_proof])
+
+      assert done.status == :validation_required
+      assert done.validated_state == :merging
+      assert done.reason == :completion_proof_required
+      refute LifecycleAssessment.completion_validated?(done)
+      refute LifecycleAssessment.dependency_satisfying?(done)
+    end
+  end
+
   test "corroborated done still requires its completion proof" do
     proof = GuardClass.requirement(:mechanical_guard, :completion_proof_verified)
 
@@ -458,9 +475,9 @@ defmodule SymphonyElixir.WorkControlAssessmentTest do
     assert without_proof.reason == :completion_proof_required
 
     with_proof = LifecycleAssessment.assess(observation("Done"), :done, %{class: proof.class, name: proof.name})
-    assert with_proof.status == :validated
-    assert with_proof.reason == :corroborated_completion
-    assert LifecycleAssessment.completion_validated?(with_proof)
+    assert with_proof.status == :validation_required
+    assert with_proof.reason == :completion_proof_required
+    refute LifecycleAssessment.completion_validated?(with_proof)
   end
 
   test "impossible transitions become invalid rather than being inferred" do

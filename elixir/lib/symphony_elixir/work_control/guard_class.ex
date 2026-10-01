@@ -6,9 +6,16 @@ defmodule SymphonyElixir.WorkControl.GuardClass do
   cannot satisfy the requirement, even when its name is the same.
   """
 
+  alias SymphonyElixir.WorkControl.CompletionProof
+
   @classes [:mechanical_guard, :semantic_attestation, :human_decision]
 
   @verified_outcome_guards [:candidate_state_verified, :review_acceptance_verified]
+  @completion_proof_guards [
+    :merge_guard_verified,
+    :completion_merge_verified,
+    :completion_proof_verified
+  ]
 
   @type class :: :mechanical_guard | :semantic_attestation | :human_decision
   @type requirement :: %{class: class(), name: atom()}
@@ -49,6 +56,10 @@ defmodule SymphonyElixir.WorkControl.GuardClass do
   def semantic_attestation(_name, _attrs), do: {:error, :invalid_semantic_attestation}
 
   @spec valid_evidence?(term()) :: boolean()
+  def valid_evidence?(%CompletionProof{} = evidence) do
+    CompletionProof.valid_evidence?(evidence)
+  end
+
   def valid_evidence?(%{class: :semantic_attestation} = evidence) do
     match?({:ok, _evidence}, validate_semantic_attestation(evidence))
   end
@@ -117,6 +128,15 @@ defmodule SymphonyElixir.WorkControl.GuardClass do
     match?(%{class: :semantic_attestation, name: ^name}, evidence) and
       valid_evidence?(evidence, context)
   end
+
+  defp evidence_satisfies?(:mechanical_guard, name, %CompletionProof{} = evidence, context)
+       when name in @completion_proof_guards do
+    CompletionProof.satisfies_guard?(evidence, name, context)
+  end
+
+  defp evidence_satisfies?(:mechanical_guard, name, _evidence, _context)
+       when name in @completion_proof_guards,
+       do: false
 
   defp evidence_satisfies?(class, name, evidence, _context) do
     match?(%{class: ^class, name: ^name}, evidence) and valid_evidence?(evidence) and

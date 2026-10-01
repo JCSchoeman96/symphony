@@ -245,6 +245,57 @@ defmodule SymphonyElixir.WorkControlTransitionAttemptTest do
     end
   end
 
+  test "requires typed completion evidence for a verified Merging to Done result" do
+    {:ok, attempt} = verifying_attempt()
+
+    done_attempt = %{
+      attempt
+      | requested_from: :merging,
+        requested_to: :done,
+        responsibility: "completion",
+        target_provider_state_id: "state-done"
+    }
+
+    done_context = %{
+      verification_context()
+      | provider_state_id: "state-done",
+        post_observation_evidence: %{
+          workspace_id: "workspace-1",
+          project_id: "project-1",
+          work_item_id: "work-1",
+          provider_state_id: "state-done",
+          provider_state_group: :completed,
+          provider_state_name: "Done",
+          provider_updated_at: @now,
+          observed_at: @now,
+          presence: :present
+        },
+        assessment: %{
+          status: :validated,
+          work_item_id: "work-1",
+          mapped_state: :done,
+          validated_state: :done,
+          satisfied_guards: []
+        }
+    }
+
+    assert {:error, :invalid_verification_evidence} = TransitionAttempt.verify(done_attempt, done_context)
+
+    malformed_done_context = %{
+      done_context
+      | assessment: %{
+          status: :validated,
+          work_item_id: "work-1",
+          mapped_state: :done,
+          validated_state: :done,
+          satisfied_guards: :invalid
+        }
+    }
+
+    assert {:error, :invalid_verification_evidence} =
+             TransitionAttempt.verify(done_attempt, malformed_done_context)
+  end
+
   test "keeps persisted fences authoritative for map records" do
     assert TransitionAttempt.submission_fenced?(%{status: :prepared, submission_fenced_at: @now})
     assert TransitionAttempt.submission_fenced?(%{state: :mutation_submitted})

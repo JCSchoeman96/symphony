@@ -601,7 +601,8 @@ defmodule SymphonyElixir.TransitionCoordinator do
       subject: {:work_item, intent.work_item_id},
       responsibility: intent.responsibility,
       runtime_attempt_id: intent.runtime_attempt_id || :transition_coordinator,
-      lineage_generation: intent.lineage_generation || 0
+      lineage_generation: intent.lineage_generation || 0,
+      provider_project_contract: Map.get(context, :provider_project_contract)
     }
 
     if GuardClass.all_satisfied?(requirements, evidence, guard_context) do
@@ -1229,8 +1230,7 @@ defmodule SymphonyElixir.TransitionCoordinator do
   defp default_refresh_contract(_context), do: {:error, :provider_project_contract_required}
 
   defp fresh_pre_context(%SemanticTransitionIntent{} = intent, context) when is_map(context) do
-    with {:ok, [%Issue{} = issue]} <- Tracker.fetch_issues_by_ids([intent.work_item_id]),
-         {:ok, observation} <- ProviderObservation.from_issue(issue, provider_observation_opts(context)),
+    with {:ok, observation} <- fresh_tracker_observation(intent.work_item_id, context),
          :ok <- validate_observation_scope(observation, Map.get(context, :provider_project_contract)),
          {:ok, canonical_state} <- fresh_canonical_state(observation, context),
          true <- canonical_state == intent.requested_from,
@@ -1242,22 +1242,24 @@ defmodule SymphonyElixir.TransitionCoordinator do
              Map.put(context, :responsibility, canonical_transition_responsibility(intent))
            ),
          true <- LifecycleAssessment.validated?(assessment),
+         source_context <-
+           context
+           |> Map.put(:provider_observation, observation)
+           |> Map.put(:pre_observation_evidence, observation)
+           |> Map.put(:current_state, canonical_state),
          {:ok, guard_evidence} <-
            SourceControl.enrich_guard_evidence(
              intent,
-             context,
-             transition_guard_evidence(context, intent, assessment)
+             source_context,
+             transition_guard_evidence(source_context, intent, assessment)
            ) do
       {:ok,
-       context
-       |> Map.put(:provider_observation, observation)
-       |> Map.put(:pre_observation_evidence, observation)
-       |> Map.put(:current_state, canonical_state)
+       source_context
        |> Map.put(:pre_assessment_evidence, assessment)
        |> Map.put(:guard_evidence, guard_evidence)
        |> Map.put(:fresh_read_at, observation.observed_at)}
     else
-      {:ok, []} -> {:error, :work_item_not_found}
+      {:error, :work_item_not_found} -> {:error, :work_item_not_found}
       false -> {:error, :source_state_changed}
       {:error, reason} -> {:error, {:fresh_context_unavailable, reason}}
     end
@@ -1265,6 +1267,17 @@ defmodule SymphonyElixir.TransitionCoordinator do
 
   defp provider_observation_opts(_context) do
     %{provider: :plane, observed_at: DateTime.utc_now()}
+  end
+
+  defp fresh_tracker_observation(work_item_id, context) do
+    with {:ok, [%Issue{id: ^work_item_id} = issue]} <- Tracker.fetch_issues_by_ids([work_item_id]),
+         {:ok, observation} <- ProviderObservation.from_issue(issue, provider_observation_opts(context)) do
+      {:ok, observation}
+    else
+      {:ok, []} -> {:error, :work_item_not_found}
+      {:ok, _issues} -> {:error, :provider_observation_mismatch}
+      {:error, _reason} = error -> error
+    end
   end
 
   defp transition_guard_evidence(context, %SemanticTransitionIntent{} = intent, assessment) do
@@ -1335,8 +1348,7 @@ defmodule SymphonyElixir.TransitionCoordinator do
 
   defp default_verify(%TransitionAttempt{} = attempt, context, refresh_contract) do
     with {:ok, context} <- refresh_contract_context(context, refresh_contract),
-         {:ok, [%Issue{} = issue]} <- Tracker.fetch_issues_by_ids([attempt.work_item_id]),
-         {:ok, observation} <- ProviderObservation.from_issue(issue, provider_observation_opts(context)),
+         {:ok, observation} <- fresh_tracker_observation(attempt.work_item_id, context),
          :ok <- validate_observation_scope(observation, Map.get(context, :provider_project_contract)),
          {:ok, assessment} <-
            fresh_assessment(
@@ -1358,7 +1370,7 @@ defmodule SymphonyElixir.TransitionCoordinator do
       evidence = verification_evidence(assessment, observation, context)
       classify_default_verification(attempt, context, assessment, evidence)
     else
-      {:ok, []} -> verification_unavailable(attempt, context, :work_item_not_found)
+      {:error, :work_item_not_found} -> verification_unavailable(attempt, context, :work_item_not_found)
       {:error, reason} -> verification_unavailable(attempt, context, {:fresh_verification_unavailable, reason})
     end
   end
@@ -1452,7 +1464,7 @@ defmodule SymphonyElixir.TransitionCoordinator do
   defp build_verified_work_item(
          %TransitionAttempt{} = attempt,
          %{
-           assessment: %LifecycleAssessment{},
+           assessment: %LifecycleAssessment{} = assessment,
            post_observation_evidence: %ProviderObservation{} = observation,
            provider_project_contract: %ProviderProjectContract{} = contract,
            work_item: %WorkItem{} = prior
@@ -1481,12 +1493,20 @@ defmodule SymphonyElixir.TransitionCoordinator do
       updated_at: observation.provider_updated_at || prior.updated_at
     }
 
+    projected_evidence =
+      if attempt.requested_to == :done do
+        assessment.satisfied_guards
+      else
+        attempt.guard_evidence
+      end
+
     WorkItem.from_issue(issue, %{
       provider: :plane,
       observed_at: observation.observed_at,
+      provider_observation: observation,
       prior_validated_lifecycle_state: attempt.requested_from,
       prior_authority_disposition: prior.authority_disposition,
-      evidence: attempt.guard_evidence,
+      evidence: projected_evidence,
       provider_project_contract: contract
     })
   end

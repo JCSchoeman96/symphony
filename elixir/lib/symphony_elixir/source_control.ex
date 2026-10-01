@@ -14,7 +14,15 @@ defmodule SymphonyElixir.SourceControl do
     RepositoryProbe
   }
 
-  alias SymphonyElixir.WorkControl.{SemanticTransitionIntent, WorkflowLifecycle, WorkItem}
+  alias SymphonyElixir.WorkControl.{
+    CompletionProof,
+    GuardClass,
+    ProviderObservation,
+    ProviderProjectContract,
+    SemanticTransitionIntent,
+    WorkflowLifecycle,
+    WorkItem
+  }
 
   @capabilities [
     :repository_identity_read,
@@ -26,9 +34,25 @@ defmodule SymphonyElixir.SourceControl do
 
   @capture_transitions [{:in_progress, :in_review}, {:changes_requested, :in_review}]
   @review_acceptance_transition {:in_review, :ready_to_merge}
+  @merge_authorization_transition {:ready_to_merge, :merging}
+  @completion_transition {:merging, :done}
 
   @spec capabilities() :: [atom()]
   def capabilities, do: @capabilities
+
+  @spec valid_completion_proof_signature?(term()) :: boolean()
+  def valid_completion_proof_signature?(%CompletionProof{source_control_signature: signature} = proof)
+      when is_binary(signature) do
+    with {:ok, key} <- completion_proof_signing_key(),
+         {:ok, supplied} <- decode_completion_proof_signature(signature) do
+      expected = :crypto.mac(:hmac, :sha256, key, CompletionProof.source_control_payload(proof))
+      :crypto.hash_equals(supplied, expected)
+    else
+      _failure -> false
+    end
+  end
+
+  def valid_completion_proof_signature?(_proof), do: false
 
   @spec configured?() :: boolean()
   def configured? do
@@ -111,6 +135,12 @@ defmodule SymphonyElixir.SourceControl do
 
       transition == @review_acceptance_transition ->
         enrich_review_acceptance(intent, context, evidence)
+
+      transition == @merge_authorization_transition ->
+        enrich_merge_authorization(intent, context, evidence)
+
+      transition == @completion_transition ->
+        enrich_completion_merge(intent, context, evidence)
 
       true ->
         {:ok, evidence}
@@ -249,7 +279,7 @@ defmodule SymphonyElixir.SourceControl do
         with {:ok, candidate_evidence} <- find_candidate_state_evidence(context_evidence(context, intent)),
              {:ok, candidate_ref} <- decode_candidate_ref(candidate_evidence),
              :ok <- GitHubSourceControl.validate_candidate_ref_binding(config, candidate_ref),
-             {:ok, settings} <- Config.settings(),
+             {:ok, settings} <- settings_for_opts(github_opts(context)),
              :ok <- validate_policy_fingerprint(candidate_evidence, config, settings),
              {:ok, candidate_tree_sha} <-
                GitHubSourceControl.verify_candidate_unchanged(config, candidate_ref, github_opts(context)),
@@ -282,6 +312,168 @@ defmodule SymphonyElixir.SourceControl do
           {:error, reason} -> {:error, {:source_control, reason}}
         end
     end
+  end
+
+  defp enrich_merge_authorization(intent, context, evidence) do
+    opts = github_opts(context)
+
+    with {:ok, config} <- settings_config(opts),
+         {:ok, settings} <- settings_for_opts(opts),
+         {:ok, binding} <- completion_binding(intent, context),
+         {:ok, {source_evidence, review_attestation}} <-
+           merge_authorization_source_evidence(context, intent, evidence),
+         {:ok, candidate_ref} <- decode_candidate_ref(source_evidence),
+         :ok <- GitHubSourceControl.validate_candidate_ref_binding(config, candidate_ref),
+         :ok <- validate_policy_fingerprint(source_evidence, config, settings),
+         {:ok, candidate_tree_sha} <-
+           GitHubSourceControl.verify_candidate_unchanged(config, candidate_ref, opts),
+         true <- candidate_tree_sha == Map.get(source_evidence, :candidate_tree_sha),
+         :ok <- GitHubSourceControl.verify_required_checks(config, candidate_ref, candidate_tree_sha, opts),
+         policy_fingerprint = policy_fingerprint_for(config, settings),
+         candidate_verification =
+           CandidateVerification.new(%{
+             status: :verified,
+             candidate_ref: candidate_ref,
+             candidate_tree_sha: candidate_tree_sha,
+             policy_fingerprint: policy_fingerprint
+           }),
+         {:ok, unsigned_proof} <-
+           CompletionProof.new_merge_authorized(
+             Map.merge(binding, %{
+               candidate_ref: candidate_ref,
+               candidate_tree_sha: candidate_tree_sha,
+               policy_fingerprint: policy_fingerprint,
+               review_acceptance_evidence: source_evidence,
+               review_attestation: review_attestation,
+               candidate_verification: candidate_verification
+             })
+           ),
+         {:ok, proof} <- sign_completion_proof(unsigned_proof) do
+      {:ok, evidence ++ [proof]}
+    else
+      {:error, reason} -> {:error, {:source_control, reason}}
+      false -> {:error, {:source_control, :candidate_tree_mismatch}}
+    end
+  end
+
+  defp enrich_completion_merge(intent, context, evidence) do
+    opts = github_opts(context)
+
+    with {:ok, _config} <- settings_config(opts),
+         {:ok, settings} <- settings_for_opts(opts),
+         {:ok, binding} <- completion_binding(intent, context),
+         %CompletionProof{stage: stage} = authorization <- find_completion_revalidation_seed(evidence),
+         true <- stage in [:merge_authorized, :merge_verified],
+         true <- CompletionProof.valid_evidence?(authorization),
+         true <- proof_matches_binding?(authorization, binding),
+         {:ok, verification} <-
+           verify_merge_from_evidence(
+             [authorization.review_acceptance_evidence],
+             Keyword.put(opts, :settings, settings)
+           ),
+         true <- MergeVerification.verified?(verification),
+         {:ok, unsigned_proof} <- CompletionProof.with_merge_verification(authorization, verification),
+         {:ok, proof} <- sign_completion_proof(unsigned_proof) do
+      {:ok, evidence ++ [proof]}
+    else
+      {:error, reason} -> {:error, {:source_control, reason}}
+      false -> {:error, {:source_control, :merge_verification_failed}}
+      _missing -> {:error, {:source_control, :completion_merge_authorization_missing}}
+    end
+  end
+
+  defp completion_binding(intent, context) do
+    with {:ok, contract, observation} <- completion_provider_context(context, intent),
+         :ok <- validate_completion_source_state(observation, contract, intent.requested_from) do
+      {:ok,
+       %{
+         work_item_id: intent.work_item_id,
+         provider_project_fingerprint: ProviderProjectContract.fingerprint(contract),
+         workspace_id: contract.workspace_id,
+         project_id: contract.project_id
+       }}
+    end
+  end
+
+  defp completion_provider_context(context, intent) do
+    contract = Map.get(context, :provider_project_contract)
+    observation = Map.get(context, :provider_observation)
+
+    case {contract, observation} do
+      {%ProviderProjectContract{} = contract, %ProviderObservation{} = observation} ->
+        validate_completion_provider_context(contract, observation, intent.work_item_id)
+
+      _missing ->
+        {:error, :provider_project_contract_required}
+    end
+  end
+
+  defp validate_completion_provider_context(contract, observation, work_item_id) do
+    cond do
+      contract.provider != :plane or observation.provider != :plane or observation.presence != :present ->
+        {:error, :provider_observation_mismatch}
+
+      observation.work_item_id != work_item_id ->
+        {:error, :provider_work_item_mismatch}
+
+      observation.workspace_id != contract.workspace_id or observation.project_id != contract.project_id ->
+        {:error, :provider_project_mismatch}
+
+      true ->
+        {:ok, contract, observation}
+    end
+  end
+
+  defp validate_completion_source_state(observation, contract, expected_state) do
+    case ProviderObservation.map_state(observation, contract) do
+      {:ok, ^expected_state} -> :ok
+      {:ok, _other_state} -> {:error, :provider_state_mismatch}
+      {:error, reason} -> {:error, {:provider_state_mapping_failed, reason}}
+    end
+  end
+
+  defp merge_authorization_source_evidence(context, intent, evidence) do
+    source_evidence = context_evidence(context, intent)
+
+    with {:ok, review} <- extract_review_acceptance_evidence(source_evidence),
+         {:ok, attestation} <- review_attestation(evidence ++ source_evidence, intent.work_item_id),
+         true <- attestation.name == :review_accepted,
+         %{outcome: :verified} <- review do
+      {:ok, {review, attestation}}
+    else
+      _failure -> {:error, :verified_review_acceptance_required}
+    end
+  end
+
+  defp review_attestation(evidence, work_item_id) do
+    case Enum.find(normalize_evidence(evidence), &match?(%{class: :semantic_attestation, name: :review_accepted}, &1)) do
+      %{class: :semantic_attestation, name: :review_accepted} = attestation ->
+        if GuardClass.valid_evidence?(attestation) and attestation.subject == {:work_item, work_item_id} and
+             Map.get(attestation, :responsibility) in [:review, "review"] do
+          {:ok, attestation}
+        else
+          {:error, :review_attestation_mismatch}
+        end
+
+      _missing ->
+        {:error, :review_attestation_missing}
+    end
+  end
+
+  defp find_completion_revalidation_seed(evidence) do
+    Enum.find(normalize_evidence(evidence), fn
+      %CompletionProof{stage: stage} = proof when stage in [:merge_authorized, :merge_verified] ->
+        CompletionProof.valid_evidence?(proof)
+
+      _other ->
+        false
+    end)
+  end
+
+  defp proof_matches_binding?(%CompletionProof{} = proof, binding) do
+    proof.work_item_id == binding.work_item_id and
+      proof.provider_project_fingerprint == binding.provider_project_fingerprint and
+      proof.workspace_id == binding.workspace_id and proof.project_id == binding.project_id
   end
 
   defp candidate_state_evidence(outcome, candidate_ref, candidate_tree_sha, policy_fingerprint) do
@@ -568,6 +760,13 @@ defmodule SymphonyElixir.SourceControl do
     end
   end
 
+  defp settings_for_opts(opts) do
+    case Keyword.get(opts, :settings) do
+      settings when is_map(settings) -> {:ok, settings}
+      _missing -> Config.settings()
+    end
+  end
+
   defp normalize_config(%{kind: "github"} = config) do
     %{
       kind: :github,
@@ -623,4 +822,54 @@ defmodule SymphonyElixir.SourceControl do
 
   defp symphony_project_id(%{symphony: %{project_id: project_id}}), do: project_id
   defp symphony_project_id(_settings), do: nil
+
+  defp sign_completion_proof(%CompletionProof{} = proof) do
+    with true <- CompletionProof.valid_revalidation_seed?(proof),
+         {:ok, key} <- completion_proof_signing_key() do
+      signature = :crypto.mac(:hmac, :sha256, key, CompletionProof.source_control_payload(proof))
+
+      {:ok,
+       %{
+         proof
+         | source_control_signature: "sha256:" <> Base.encode16(signature, case: :lower)
+       }}
+    else
+      false -> {:error, :invalid_completion_proof}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp completion_proof_signing_key do
+    case Application.get_env(:symphony_elixir, :completion_proof_signing_key) do
+      key when is_binary(key) and byte_size(key) >= 32 ->
+        {:ok, derive_completion_proof_signing_key(key)}
+
+      _missing ->
+        plane_api_key_signing_key()
+    end
+  end
+
+  defp plane_api_key_signing_key do
+    case Config.settings() do
+      {:ok, %{tracker: %{kind: kind, api_key: api_key}}}
+      when kind in [:plane, "plane"] and is_binary(api_key) and api_key != "" ->
+        {:ok, derive_completion_proof_signing_key(api_key)}
+
+      _missing ->
+        {:error, :completion_proof_signing_key_required}
+    end
+  end
+
+  defp derive_completion_proof_signing_key(key) do
+    :crypto.hash(:sha256, "symphony-source-control-completion-proof-v1:" <> key)
+  end
+
+  defp decode_completion_proof_signature("sha256:" <> encoded) do
+    case Base.decode16(encoded, case: :lower) do
+      {:ok, signature} when byte_size(signature) == 32 -> {:ok, signature}
+      _ -> :error
+    end
+  end
+
+  defp decode_completion_proof_signature(_signature), do: :error
 end

@@ -2,11 +2,22 @@ defmodule SymphonyElixir.PlaneAdapterTest do
   use ExUnit.Case, async: true
 
   alias SymphonyElixir.AgentRuntime.{Profile, Route}
+  alias SymphonyElixir.Dependency.Graph
   alias SymphonyElixir.Plane.Adapter
   alias SymphonyElixir.Plane.AgentTool
+  alias SymphonyElixir.TestSupport
+  alias SymphonyElixir.Tracker
   alias SymphonyElixir.Tracker.Capabilities
   alias SymphonyElixir.Tracker.Issue
-  alias SymphonyElixir.WorkControl.{ProviderProjectContract, WorkflowLifecycle}
+
+  alias SymphonyElixir.WorkControl.{
+    CompletionProof,
+    LifecycleAssessment,
+    ProviderObservation,
+    ProviderProjectContract,
+    WorkflowLifecycle,
+    WorkItem
+  }
 
   @settings %{
     kind: "plane",
@@ -83,6 +94,241 @@ defmodule SymphonyElixir.PlaneAdapterTest do
     assert first.updated_at == ~U[2026-09-17 08:09:10Z]
     assert_receive {:request, _}
     assert_receive {:request, _}
+  end
+
+  test "caller-supplied Tracker reads cannot mint completion authority" do
+    done_response = fn _request ->
+      {:ok,
+       %{
+         status: 200,
+         body: %{
+           "id" => "item-1",
+           "name" => "Work",
+           "state" => %{"id" => "state-done", "name" => "Done", "group" => "completed"},
+           "project" => "project-1",
+           "workspace" => "workspace-stable-1",
+           "updated_at" => "2026-09-17T08:09:10Z"
+         }
+       }}
+    end
+
+    project_contract = contract()
+    merge_verified = TestSupport.completion_proof_fixture("item-1", project_contract)
+
+    assert {:ok, [%Issue{} = issue]} =
+             Tracker.fetch_issues_by_ids(["item-1"],
+               tracker_settings: @settings,
+               request_fun: done_response
+             )
+
+    assert issue.tracker_read_observation == nil
+
+    assert {:ok, observation} =
+             ProviderObservation.from_issue(issue, %{provider: :plane, observed_at: DateTime.utc_now()})
+
+    refute ProviderObservation.valid_tracker_read?(observation)
+
+    assert {:error, :provider_closure_mismatch} =
+             CompletionProof.close(merge_verified, observation, project_contract)
+
+    assert {:ok, work_item} =
+             WorkItem.from_issue(issue, %{
+               provider: :plane,
+               prior_validated_lifecycle_state: :merging,
+               evidence: [merge_verified],
+               provider_project_contract: project_contract
+             })
+
+    refute WorkItem.dependency_satisfying?(work_item)
+
+    assert {:error, :provider_observation_mismatch} =
+             ProviderObservation.from_issue(
+               %{issue | state: "In Progress", tracker_read_observation: observation},
+               %{provider: :plane}
+             )
+
+    assert {:error, :provider_observation_mismatch} =
+             ProviderObservation.from_issue(
+               %{issue | tracker_read_observation: observation},
+               %{provider: :memory}
+             )
+
+    refute ProviderObservation.valid_tracker_read?(:forged)
+    refute ProviderObservation.fresh_tracker_read?(:forged)
+  end
+
+  test "a pre-merge Tracker Done receipt cannot revalidate completed work" do
+    done_response = fn _request ->
+      {:ok,
+       %{
+         status: 200,
+         body: %{
+           "id" => "item-1",
+           "name" => "Work",
+           "state" => %{"id" => "state-done", "name" => "Done", "group" => "completed"},
+           "project" => "project-1",
+           "workspace" => "workspace-stable-1",
+           "updated_at" => "2026-09-17T08:09:10Z"
+         }
+       }}
+    end
+
+    project_contract = contract()
+
+    assert {:ok, [%Issue{} = pre_merge_issue]} =
+             Tracker.fetch_issues_by_ids(["item-1"],
+               tracker_settings: @settings,
+               request_fun: done_response
+             )
+
+    merge_verified = TestSupport.completion_proof_fixture("item-1", project_contract)
+    merge_verified_at = merge_verified.merge_verification.observed_at
+
+    {:ok, unsigned_pre_merge_observation} =
+      ProviderObservation.from_issue(pre_merge_issue, %{
+        provider: :plane,
+        observed_at: DateTime.add(merge_verified_at, -1, :second)
+      })
+
+    pre_merge_observation = TestSupport.sign_provider_observation_for_test(unsigned_pre_merge_observation)
+    assert DateTime.compare(pre_merge_observation.observed_at, merge_verified_at) == :lt
+
+    same_time_observation = %{
+      pre_merge_observation
+      | observed_at: merge_verified_at,
+        tracker_read_signature: nil
+    }
+
+    same_time_observation = TestSupport.sign_provider_observation_for_test(same_time_observation)
+
+    assert {:error, :provider_closure_mismatch} =
+             CompletionProof.close(merge_verified, same_time_observation, project_contract)
+
+    assert {:ok, [%Issue{} = post_merge_issue]} =
+             Tracker.fetch_issues_by_ids(["item-1"],
+               tracker_settings: @settings,
+               request_fun: done_response
+             )
+
+    {:ok, unsigned_post_merge_observation} =
+      ProviderObservation.from_issue(post_merge_issue, %{
+        provider: :plane,
+        observed_at: DateTime.utc_now()
+      })
+
+    post_merge_observation = TestSupport.sign_provider_observation_for_test(unsigned_post_merge_observation)
+    assert DateTime.compare(post_merge_observation.observed_at, merge_verified_at) == :gt
+
+    assert {:ok, %CompletionProof{stage: :completed} = completed_proof} =
+             CompletionProof.close(merge_verified, post_merge_observation, project_contract)
+
+    assessment =
+      LifecycleAssessment.assess(pre_merge_observation, :done, [completed_proof], %{
+        provider_project_contract: project_contract
+      })
+
+    assert assessment.status == :validation_required
+    refute LifecycleAssessment.dependency_satisfying?(assessment)
+
+    assert {:ok, stale_work_item} =
+             WorkItem.from_issue(pre_merge_issue, %{
+               provider: :plane,
+               provider_observation: pre_merge_observation,
+               prior_validated_lifecycle_state: :done,
+               evidence: [completed_proof],
+               provider_project_contract: project_contract
+             })
+
+    refute WorkItem.dependency_satisfying?(stale_work_item)
+  end
+
+  test "completion closure fails closed when merge verification time is absent or invalid" do
+    done_response = fn _request ->
+      {:ok,
+       %{
+         status: 200,
+         body: %{
+           "id" => "item-1",
+           "name" => "Work",
+           "state" => %{"id" => "state-done", "name" => "Done", "group" => "completed"},
+           "project" => "project-1",
+           "workspace" => "workspace-stable-1",
+           "updated_at" => "2026-09-17T08:09:10Z"
+         }
+       }}
+    end
+
+    project_contract = contract()
+
+    assert {:ok, [%Issue{} = issue]} =
+             Tracker.fetch_issues_by_ids(["item-1"],
+               tracker_settings: @settings,
+               request_fun: done_response
+             )
+
+    {:ok, unsigned_observation} =
+      ProviderObservation.from_issue(issue, %{provider: :plane, observed_at: DateTime.utc_now()})
+
+    observation = TestSupport.sign_provider_observation_for_test(unsigned_observation)
+
+    merge_verified = TestSupport.completion_proof_fixture("item-1", project_contract)
+    malformed_timestamp = %{merge_verified.merge_verification.observed_at | year: nil}
+
+    for observed_at <- [nil, malformed_timestamp] do
+      merge_verification = %{merge_verified.merge_verification | observed_at: observed_at}
+
+      invalid_timestamp_proof =
+        %{merge_verified | merge_verification: merge_verification, source_control_signature: nil}
+        |> TestSupport.sign_completion_proof_for_test()
+
+      assert {:error, :provider_closure_mismatch} =
+               CompletionProof.close(invalid_timestamp_proof, observation, project_contract)
+    end
+  end
+
+  test "caller-supplied dependency graph reads do not attest Plane nodes" do
+    work_item = %{
+      "id" => "item-1",
+      "name" => "Work",
+      "state" => %{"id" => "state-ready", "name" => "Ready", "group" => "unstarted"},
+      "project" => "project-1",
+      "workspace" => "workspace-stable-1",
+      "updated_at" => "2026-09-17T08:09:10Z"
+    }
+
+    request_fun = fn request ->
+      case request.path do
+        path when is_binary(path) ->
+          cond do
+            String.ends_with?(path, "/work-items/") ->
+              {:ok,
+               %{
+                 status: 200,
+                 body: %{
+                   "results" => [work_item],
+                   "count" => 1,
+                   "total_results" => 1,
+                   "next_page_results" => false,
+                   "next_cursor" => nil
+                 }
+               }}
+
+            String.ends_with?(path, "/relations/") ->
+              {:ok, %{status: 200, body: %{"blocked_by" => [], "blocking" => []}}}
+
+            true ->
+              flunk("unexpected Plane request path #{path}")
+          end
+
+        _invalid_path ->
+          flunk("Plane request path must be a string")
+      end
+    end
+
+    assert {:ok, %Graph{} = graph} =
+             Tracker.fetch_dependency_graph(tracker_settings: @settings, request_fun: request_fun)
+
+    assert graph.nodes["item-1"].tracker_read_observation == nil
   end
 
   test "lists the complete project and locally filters descriptive provider states" do

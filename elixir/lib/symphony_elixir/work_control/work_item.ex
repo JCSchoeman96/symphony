@@ -109,7 +109,7 @@ defmodule SymphonyElixir.WorkControl.WorkItem do
 
   @spec from_issue(Issue.t(), map()) :: {:ok, t()} | {:error, atom()}
   def from_issue(%Issue{} = issue, opts) when is_map(opts) do
-    with {:ok, observation} <- ProviderObservation.from_issue(issue, opts) do
+    with {:ok, observation} <- provider_observation_for_issue(issue, opts) do
       prior_state = Map.get(opts, :prior_validated_lifecycle_state)
       evidence = Map.get(opts, :evidence, [])
 
@@ -210,6 +210,33 @@ defmodule SymphonyElixir.WorkControl.WorkItem do
         :error -> context
       end
     end)
+  end
+
+  defp provider_observation_for_issue(issue, opts) do
+    case Map.fetch(opts, :provider_observation) do
+      {:ok, %ProviderObservation{} = observation} ->
+        if observation_matches_issue?(observation, issue) do
+          {:ok, observation}
+        else
+          {:error, :provider_observation_mismatch}
+        end
+
+      {:ok, _invalid_observation} ->
+        {:error, :invalid_provider_observation}
+
+      :error ->
+        ProviderObservation.from_issue(issue, opts)
+    end
+  end
+
+  defp observation_matches_issue?(observation, issue) do
+    observation.work_item_id == issue.id and
+      observation.workspace_id == issue.workspace_id and
+      observation.project_id == issue.project_id and
+      observation.provider_state_id == issue.provider_state_id and
+      observation.provider_state_group == issue.provider_state_group and
+      observation.provider_state_name == issue.state and
+      observation.provider_updated_at == issue.updated_at
   end
 
   defp suspension_context(%__MODULE__{} = work_item, reason) do

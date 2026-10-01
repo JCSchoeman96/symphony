@@ -14,7 +14,7 @@ defmodule SymphonyElixir.DependencyPolicyTest do
     assert Policy.classify_state("Duplicate") == :invalidated
   end
 
-  test "only validated canonical Done with a completion proof satisfies a blocker" do
+  test "caller-built completion guard evidence cannot satisfy a blocker" do
     proof = GuardClass.requirement(:mechanical_guard, :completion_proof_verified)
 
     {:ok, raw_done} =
@@ -23,7 +23,7 @@ defmodule SymphonyElixir.DependencyPolicyTest do
         observed_at: ~U[2026-09-16 00:00:00Z]
       })
 
-    {:ok, completed} =
+    {:ok, unproven_done} =
       WorkItem.from_issue(%Issue{id: "blocker", state: "Done"}, %{
         provider: :memory,
         observed_at: ~U[2026-09-16 00:00:00Z],
@@ -41,8 +41,8 @@ defmodule SymphonyElixir.DependencyPolicyTest do
     assert {:ok, %{status: :unresolved}} =
              Policy.classify_blocker(%{id: "blocker", state: "Done"}, work_control: %{"blocker" => raw_done})
 
-    assert {:ok, %{status: :satisfied}} =
-             Policy.classify_blocker(%{id: "blocker", state: "Done"}, work_control: %{"blocker" => completed})
+    assert {:ok, %{status: :unresolved}} =
+             Policy.classify_blocker(%{id: "blocker", state: "Done"}, work_control: %{"blocker" => unproven_done})
 
     assert {:ok, %{status: :invalidated}} =
              Policy.classify_blocker(
@@ -57,22 +57,22 @@ defmodule SymphonyElixir.DependencyPolicyTest do
         work_control: %{"blocker" => raw_done}
       )
 
-    completed_decision =
+    fabricated_decision =
       Guard.evaluate(
         %Issue{id: "dependent", state: "Ready", blocked_by: [%{id: "blocker", state: "Done"}]},
         "implementation",
-        work_control: %{"blocker" => completed}
+        work_control: %{"blocker" => unproven_done}
       )
 
     refute raw_decision.allowed?
     assert raw_decision.dependency_status == :unresolved
-    assert completed_decision.allowed?
-    assert completed_decision.dependency_status == :satisfied
+    refute fabricated_decision.allowed?
+    assert fabricated_decision.dependency_status == :unresolved
 
-    assert {:ok, %{status: :satisfied, blocker: %{state: "Done"}}} =
-             Policy.classify_blocker(completed)
+    assert {:ok, %{status: :unresolved, blocker: %{state: "Done"}}} =
+             Policy.classify_blocker(unproven_done)
 
-    synthetic_decision = Guard.evaluate(completed, "implementation", [])
+    synthetic_decision = Guard.evaluate(unproven_done, "implementation", [])
     assert synthetic_decision.allowed?
     assert synthetic_decision.dependency_status == :none
   end

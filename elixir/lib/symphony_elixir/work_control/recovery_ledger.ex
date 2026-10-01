@@ -65,7 +65,7 @@ defmodule SymphonyElixir.WorkControl.RecoveryLedger do
     :observed_at,
     :snapshot_identity
   ]
-  @provider_observation_keys @legacy_provider_observation_keys ++ [:presence]
+  @provider_observation_keys @legacy_provider_observation_keys ++ [:presence, :tracker_read_signature]
   @forbidden_keys [
     :api_key,
     :authority_disposition,
@@ -433,7 +433,8 @@ defmodule SymphonyElixir.WorkControl.RecoveryLedger do
          :ok <- validate_safe_term(observation.provider_state_group),
          :ok <- validate_provider_observation_state(observation_record, presence),
          :ok <- validate_datetime(observation.observed_at),
-         :ok <- validate_optional_datetime(observation.provider_updated_at) do
+         :ok <- validate_optional_datetime(observation.provider_updated_at),
+         :ok <- validate_non_empty_optional_string(Map.get(observation_record, :tracker_read_signature)) do
       validate_safe_term(observation.snapshot_identity)
     end
   end
@@ -618,7 +619,9 @@ defmodule SymphonyElixir.WorkControl.RecoveryLedger do
     do: true
 
   defp contains_forbidden_term?(term) when is_map(term) do
-    Enum.any?(term, fn {key, value} ->
+    term
+    |> Map.to_list()
+    |> Enum.any?(fn {key, value} ->
       forbidden_key?(key) or contains_forbidden_term?(key) or contains_forbidden_term?(value)
     end)
   end

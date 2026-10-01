@@ -23,7 +23,7 @@ defmodule SymphonyElixir.AgentRouterOrchestratorTest do
 
   alias SymphonyElixir.AgentRuntime.Router
   alias SymphonyElixir.Dependency.Graph
-  alias SymphonyElixir.WorkControl.{GuardClass, WorkItem}
+  alias SymphonyElixir.WorkControl.{ProviderObservation, ProviderProjectContract, WorkflowLifecycle, WorkItem}
   alias SymphonyElixir.Workspace.OwnershipLedger
 
   @now ~U[2026-09-16 00:00:00Z]
@@ -40,17 +40,54 @@ defmodule SymphonyElixir.AgentRouterOrchestratorTest do
   end
 
   defp validated_done_work_item(id) when is_binary(id) do
-    issue = %Issue{id: id, identifier: id, title: id, state: "Done"}
+    contract = completion_contract()
+
+    issue = %Issue{
+      id: id,
+      identifier: id,
+      title: id,
+      state: "Done",
+      workspace_id: contract.workspace_id,
+      project_id: contract.project_id,
+      provider_state_id: "state-done",
+      provider_state_group: :completed
+    }
+
+    proof = completion_proof_fixture(id, contract)
+    observed_at = DateTime.utc_now()
+
+    {:ok, provider_observation} =
+      ProviderObservation.from_issue(issue, %{provider: :plane, observed_at: observed_at})
 
     {:ok, work_item} =
       WorkItem.from_issue(issue, %{
-        provider: :memory,
-        observed_at: @now,
+        provider: :plane,
+        provider_observation: sign_provider_observation_for_test(provider_observation),
+        observed_at: observed_at,
         prior_validated_lifecycle_state: "Merging",
-        evidence: [GuardClass.requirement(:mechanical_guard, :completion_proof_verified)]
+        evidence: [proof],
+        provider_project_contract: contract
       })
 
     work_item
+  end
+
+  defp completion_contract do
+    state_mappings =
+      Map.new(WorkflowLifecycle.states(), fn state ->
+        {state, %{state_id: "state-#{state}", name: WorkflowLifecycle.display(state)}}
+      end)
+
+    {:ok, contract} =
+      ProviderProjectContract.new(%{
+        schema_version: 1,
+        provider: :plane,
+        workspace_id: "workspace-1",
+        project_id: "project-1",
+        state_mappings: state_mappings
+      })
+
+    contract
   end
 
   test "routed polling retains raw forward observations as suspended WorkItems" do

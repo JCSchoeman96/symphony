@@ -216,7 +216,7 @@ defmodule SymphonyElixir.WorkControlWorkflowLifecycleTest do
     assert {:ok, completion_metadata} = WorkflowLifecycle.transition(:merging, :done)
 
     assert completion_metadata.guard_requirements == [
-             GuardClass.requirement(:mechanical_guard, :completion_proof_verified)
+             GuardClass.requirement(:mechanical_guard, :completion_merge_verified)
            ]
 
     assert completion_metadata.side_effects.completion_proof_required
@@ -231,15 +231,15 @@ defmodule SymphonyElixir.WorkControlWorkflowLifecycleTest do
   end
 
   test "guard classes cannot substitute for one another" do
-    mechanical = GuardClass.requirement(:mechanical_guard, :completion_proof_verified)
-    semantic = GuardClass.requirement(:semantic_attestation, :completion_proof_verified)
-    human = GuardClass.requirement(:human_decision, :completion_proof_verified)
+    mechanical = GuardClass.requirement(:mechanical_guard, :planning_requirements_verified)
+    semantic = GuardClass.requirement(:semantic_attestation, :planning_requirements_verified)
+    human = GuardClass.requirement(:human_decision, :planning_requirements_verified)
 
     assert GuardClass.valid?(mechanical)
     assert GuardClass.valid?(semantic)
     assert GuardClass.valid?(human)
     refute GuardClass.satisfied?(mechanical, [semantic])
-    refute GuardClass.satisfied?(mechanical, [%{name: :completion_proof_verified}])
+    refute GuardClass.satisfied?(mechanical, [%{name: :planning_requirements_verified}])
     refute GuardClass.satisfied?(human, [mechanical])
     assert GuardClass.satisfied?(mechanical, [mechanical])
     assert GuardClass.all_satisfied?([mechanical], [mechanical])

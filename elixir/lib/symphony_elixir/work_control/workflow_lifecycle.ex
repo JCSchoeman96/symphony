@@ -208,7 +208,7 @@ defmodule SymphonyElixir.WorkControl.WorkflowLifecycle do
     {:merging, :done} => %{
       owner: :system,
       responsibility: "completion",
-      guard_requirements: [GuardClass.requirement(:mechanical_guard, :completion_proof_verified)],
+      guard_requirements: [GuardClass.requirement(:mechanical_guard, :completion_merge_verified)],
       side_effects: %{autonomous_merge: false, completion_proof_required: true}
     }
   }

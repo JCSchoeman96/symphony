@@ -8,7 +8,14 @@ defmodule SymphonyElixir.WorkControl.LifecycleAssessment do
   """
 
   alias SymphonyElixir.SourceControl
-  alias SymphonyElixir.WorkControl.{GuardClass, ProviderObservation, ProviderProjectContract, WorkflowLifecycle}
+
+  alias SymphonyElixir.WorkControl.{
+    CompletionProof,
+    GuardClass,
+    ProviderObservation,
+    ProviderProjectContract,
+    WorkflowLifecycle
+  }
 
   defstruct [
     :work_item_id,
@@ -20,7 +27,8 @@ defmodule SymphonyElixir.WorkControl.LifecycleAssessment do
     :satisfied_guards,
     :missing_guards,
     :reason,
-    :assessed_at
+    :assessed_at,
+    :provider_project_contract_fingerprint
   ]
 
   @type status ::
@@ -41,7 +49,8 @@ defmodule SymphonyElixir.WorkControl.LifecycleAssessment do
           satisfied_guards: [term()],
           missing_guards: [GuardClass.requirement()],
           reason: atom() | nil,
-          assessed_at: DateTime.t() | nil
+          assessed_at: DateTime.t() | nil,
+          provider_project_contract_fingerprint: String.t() | nil
         }
 
   @spec new(ProviderObservation.t()) :: t()
@@ -159,7 +168,16 @@ defmodule SymphonyElixir.WorkControl.LifecycleAssessment do
   @spec completion_validated?(t()) :: boolean()
   def completion_validated?(%__MODULE__{status: :validated, validated_state: :done} = assessment) do
     completion_guard = GuardClass.requirement(:mechanical_guard, :completion_proof_verified)
-    GuardClass.satisfied?(completion_guard, assessment.satisfied_guards)
+
+    case Enum.find(assessment.satisfied_guards, &match?(%CompletionProof{stage: :completed}, &1)) do
+      %CompletionProof{} = proof ->
+        GuardClass.satisfied?(completion_guard, proof, %{subject: {:work_item, assessment.work_item_id}}) and
+          proof.provider_project_fingerprint == assessment.provider_project_contract_fingerprint and
+          CompletionProof.closes_observation?(proof, assessment.provider_observation)
+
+      _missing ->
+        false
+    end
   end
 
   def completion_validated?(_assessment), do: false
@@ -287,30 +305,63 @@ defmodule SymphonyElixir.WorkControl.LifecycleAssessment do
 
   defp require_completion_proof(assessment, prior_state, evidence, context) do
     required_guards = [GuardClass.requirement(:mechanical_guard, :completion_proof_verified)]
-    missing_guards = GuardClass.missing(required_guards, evidence, context)
 
-    if missing_guards == [] do
-      finalize(
-        assessment,
-        :validated,
-        :done,
-        :done,
-        required_guards,
-        evidence,
-        if(prior_state == :done, do: :corroborated_completion, else: :completion_proof_verified),
-        context
-      )
-    else
-      finalize(
-        assessment,
-        :validation_required,
-        :done,
-        prior_state,
-        required_guards,
-        evidence,
-        :completion_proof_required,
-        context
-      )
+    case close_completion_proof(evidence, assessment.provider_observation, context) do
+      {:ok, proof} ->
+        finalize(
+          assessment,
+          :validated,
+          :done,
+          :done,
+          required_guards,
+          [proof],
+          if(prior_state == :done, do: :corroborated_completion, else: :completion_proof_verified),
+          context
+        )
+
+      :error ->
+        finalize(
+          assessment,
+          :validation_required,
+          :done,
+          prior_state,
+          required_guards,
+          evidence,
+          :completion_proof_required,
+          context
+        )
+    end
+  end
+
+  defp close_completion_proof(evidence, %ProviderObservation{} = observation, context) do
+    contract = Map.get(context, :provider_project_contract)
+    completion_guard = GuardClass.requirement(:mechanical_guard, :completion_proof_verified)
+
+    case Enum.find(
+           normalize_evidence(evidence),
+           &match?(%CompletionProof{stage: stage} when stage in [:merge_verified, :completed], &1)
+         ) do
+      %CompletionProof{stage: :merge_verified} = proof ->
+        case CompletionProof.close(proof, observation, contract) do
+          {:ok, completed} -> {:ok, completed}
+          {:error, _reason} -> :error
+        end
+
+      %CompletionProof{stage: :completed} = proof ->
+        context = %{
+          subject: {:work_item, proof.work_item_id},
+          provider_project_contract: contract
+        }
+
+        if CompletionProof.closes_observation?(proof, observation) and
+             GuardClass.satisfied?(completion_guard, proof, context) do
+          {:ok, proof}
+        else
+          :error
+        end
+
+      _missing ->
+        :error
     end
   end
 
@@ -333,13 +384,19 @@ defmodule SymphonyElixir.WorkControl.LifecycleAssessment do
         satisfied_guards: satisfied_evidence(required_guards, evidence, context),
         missing_guards: GuardClass.missing(required_guards, evidence, context),
         reason: reason,
-        assessed_at: DateTime.utc_now()
+        assessed_at: DateTime.utc_now(),
+        provider_project_contract_fingerprint: provider_project_contract_fingerprint(context)
     }
   end
 
   defp assessment_context(%__MODULE__{work_item_id: work_item_id}, context) do
     Map.put(context, :subject, {:work_item, work_item_id})
   end
+
+  defp provider_project_contract_fingerprint(%{provider_project_contract: %ProviderProjectContract{} = contract}),
+    do: ProviderProjectContract.fingerprint(contract)
+
+  defp provider_project_contract_fingerprint(_context), do: nil
 
   defp satisfied_evidence([], evidence, _context) do
     normalize_evidence(evidence)

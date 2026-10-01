@@ -189,7 +189,7 @@ defmodule SymphonyElixir.WorkControlWorkItemTest do
 
     proof = GuardClass.requirement(:mechanical_guard, :completion_proof_verified)
 
-    assert {:ok, completed} =
+    assert {:ok, unproven_done} =
              WorkItem.from_issue(issue("Done"), %{
                provider: :memory,
                observed_at: @now,
@@ -197,7 +197,19 @@ defmodule SymphonyElixir.WorkControlWorkItemTest do
                evidence: [proof]
              })
 
-    assert WorkItem.dependency_satisfying?(completed)
+    assert unproven_done.lifecycle_assessment.status == :validation_required
+    refute WorkItem.dependency_satisfying?(unproven_done)
+
+    assert {:ok, forged_done} =
+             WorkItem.from_issue(issue("Done"), %{
+               provider: :memory,
+               observed_at: @now,
+               prior_validated_lifecycle_state: :merging,
+               evidence: [Map.put(proof, :outcome, :verified)]
+             })
+
+    assert forged_done.lifecycle_assessment.status == :validation_required
+    refute WorkItem.dependency_satisfying?(forged_done)
 
     assert {:ok, canceled} =
              WorkItem.from_issue(issue("Canceled"), %{
