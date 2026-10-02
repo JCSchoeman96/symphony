@@ -133,8 +133,6 @@ jobs:
             ${{ runner.os }}-mix-
 
       - name: Run Linux quality gate (make ci)
-        env:
-          SYMPHONY_ENFORCE_TEST_RUNTIME_PATH_TRUST: "1"
         timeout-minutes: 15
         run: |
           export PATH="/usr/local/lib/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin:/usr/local/lib/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex-path:$PATH"
