@@ -43,7 +43,9 @@ jobs:
 
       - name: Verify Codex version
         run: |
+          export PATH="/opt/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin:/opt/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex-path:$PATH"
           codex_path="$(command -v codex)"
+          echo "Pinned Codex path: $codex_path"
           test "$(stat -c '%u' "$codex_path")" = "0"
           test "$(codex --version)" = "codex-cli 0.159.3"
 
@@ -63,7 +65,9 @@ jobs:
       - name: Run Linux isolation proof
         env:
           SYMPHONY_ENFORCE_TEST_RUNTIME_PATH_TRUST: "1"
-        run: make -C elixir isolation-proof
+        run: >-
+          PATH="/opt/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin:/opt/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex-path:$PATH"
+          make -C elixir isolation-proof
 
   linux-full-gate:
     name: linux-full-gate
@@ -99,7 +103,9 @@ jobs:
 
       - name: Verify Codex version
         run: |
+          export PATH="/opt/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin:/opt/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex-path:$PATH"
           codex_path="$(command -v codex)"
+          echo "Pinned Codex path: $codex_path"
           test "$(stat -c '%u' "$codex_path")" = "0"
           test "$(codex --version)" = "codex-cli 0.159.3"
 
@@ -116,7 +122,9 @@ jobs:
       - name: Verify make all
         env:
           SYMPHONY_ENFORCE_TEST_RUNTIME_PATH_TRUST: "1"
-        run: make -C elixir all
+        run: >-
+          PATH="/opt/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin:/opt/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex-path:$PATH"
+          make -C elixir all
 
   make-all:
     name: make-all
