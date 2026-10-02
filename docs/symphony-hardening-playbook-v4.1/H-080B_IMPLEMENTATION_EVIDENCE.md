@@ -136,8 +136,8 @@ the pinned actual-Codex test.
 | H-080B acceptance | Not granted |
 
 The repository workflow installs Codex 0.159.3 under `/usr/local/lib/symphony-codex-0.159.3` with
-root ownership and non-writable package ancestry. It runs the Linux actual-Codex proof and then the
-Linux full gate. The full gate runs `make ci` and `make isolation-proof` in separate steps because
-the hosted runner cancels a single step after about seven minutes; together they preserve the
-`make all` sequence. Protected `make-all` requires both Linux jobs to succeed; a skipped proof or
-gate fails `make-all`. macOS and iOS are unsupported and not certified, so no macOS proof runs.
+root ownership and non-writable package ancestry. Protected `make-all` requires the Linux
+`linux-isolation-proof` job (`make isolation-proof`, including path-trust enforcement) and the
+`linux-full-gate` job (`make ci`). Together they preserve the local `make all` sequence without
+duplicating the expensive actual-Codex proof in the full gate. A skipped proof or gate fails
+`make-all`. macOS and iOS are unsupported and not certified, so no macOS proof runs.

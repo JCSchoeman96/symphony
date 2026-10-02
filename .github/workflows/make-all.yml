@@ -83,7 +83,7 @@ jobs:
       - linux-isolation-proof
     if: ${{ needs.linux-isolation-proof.result == 'success' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
@@ -133,7 +133,7 @@ jobs:
             ${{ runner.os }}-mix-
 
       - name: Run Linux quality gate (make ci)
-        timeout-minutes: 15
+        timeout-minutes: 25
         run: |
           export PATH="/usr/local/lib/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin:/usr/local/lib/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex-path:$PATH"
           codex_path="$(command -v codex)"
@@ -141,12 +141,6 @@ jobs:
           stat -Lc 'Codex file: uid=%u mode=%a type=%F path=%n' "$codex_path"
           namei -l "$codex_path"
           make -C elixir ci
-
-      - name: Run Linux full-gate Codex regressions (make isolation-proof)
-        env:
-          SYMPHONY_ENFORCE_TEST_RUNTIME_PATH_TRUST: "1"
-        timeout-minutes: 15
-        run: make -C elixir isolation-proof
 
   make-all:
     name: make-all
