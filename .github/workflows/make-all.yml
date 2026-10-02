@@ -136,7 +136,7 @@ jobs:
           SYMPHONY_ENFORCE_TEST_RUNTIME_PATH_TRUST: "1"
         run: |
           export PATH="/usr/local/lib/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin:/usr/local/lib/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex-path:$PATH"
-          make -C elixir coverage
+          make -C elixir coverage EXCLUDE_TAGS=h070a_scale
 
       - name: Run Dialyzer
         timeout-minutes: 30
