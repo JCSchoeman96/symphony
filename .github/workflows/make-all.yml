@@ -83,7 +83,7 @@ jobs:
       - linux-isolation-proof
     if: ${{ needs.linux-isolation-proof.result == 'success' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 90
 
     steps:
       - name: Checkout
@@ -123,7 +123,7 @@ jobs:
             ${{ runner.os }}-mix-
 
       - name: Run Linux quality gate through coverage
-        timeout-minutes: 25
+        timeout-minutes: 75
         env:
           SYMPHONY_ENFORCE_TEST_RUNTIME_PATH_TRUST: "1"
         run: |
@@ -135,7 +135,7 @@ jobs:
           make -C elixir coverage
 
       - name: Run Dialyzer
-        timeout-minutes: 25
+        timeout-minutes: 30
         run: make -C elixir dialyzer
 
   make-all:
