@@ -33,6 +33,14 @@ jobs:
           echo "/opt/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin" >> "$GITHUB_PATH"
           echo "/opt/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex-path" >> "$GITHUB_PATH"
 
+      - name: Enable and verify unprivileged Linux namespaces
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          unshare --user --map-current-user --pid --fork --mount-proc \
+            /usr/bin/python3 -I -S -c 'import os; assert os.getpid() == 1'
+
       - name: Verify Codex version
         run: |
           codex_path="$(command -v codex)"
@@ -80,6 +88,14 @@ jobs:
           sudo npm install --prefix /opt/symphony-codex-0.159.3 --no-save --no-package-lock --no-audit --no-fund '@openai/codex-linux-x64@npm:@openai/codex@0.159.3-linux-x64'
           echo "/opt/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin" >> "$GITHUB_PATH"
           echo "/opt/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex-path" >> "$GITHUB_PATH"
+
+      - name: Enable and verify unprivileged Linux namespaces
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          unshare --user --map-current-user --pid --fork --mount-proc \
+            /usr/bin/python3 -I -S -c 'import os; assert os.getpid() == 1'
 
       - name: Verify Codex version
         run: |
