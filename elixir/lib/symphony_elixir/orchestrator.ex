@@ -85,6 +85,7 @@ defmodule SymphonyElixir.Orchestrator do
     {"review cycle limit", :review_cycle_exhausted},
     {"retry limit", :retry_exhausted},
     {"CI retry", :ci_retry_disabled},
+    {"runtime isolation", :runtime_isolation_blocked},
     {"runtime", :runtime_unavailable},
     {"operator input", :operator_input_required},
     {"approval", :operator_approval_required}
@@ -99,6 +100,7 @@ defmodule SymphonyElixir.Orchestrator do
     :capacity_wait,
     :runtime_failure,
     :runtime_unavailable,
+    :runtime_isolation_blocked,
     :runtime_stalled,
     :operator_input_required,
     :operator_approval_required,
@@ -1281,6 +1283,34 @@ defmodule SymphonyElixir.Orchestrator do
 
       :stale ->
         {:noreply, state}
+    end
+  end
+
+  def handle_info(
+        {:runtime_isolation_blocked, issue_id, %RuntimeAttemptIdentity{} = identity, reason},
+        state
+      )
+      when is_binary(issue_id) do
+    case validate_current_runtime_event(state, issue_id, identity, require_running: false) do
+      {:ok, validated_issue_id, running_entry} ->
+        apply_runtime_isolation_blocked(state, validated_issue_id, running_entry, reason)
+
+      :stale ->
+        {:noreply, state}
+    end
+  end
+
+  def handle_info({:runtime_isolation_blocked, issue_id, reason}, %{running: running} = state)
+      when is_binary(issue_id) do
+    case Map.get(running, issue_id) do
+      nil ->
+        {:noreply, state}
+
+      %{runtime_attempt: %RuntimeAttempt{}} ->
+        {:noreply, state}
+
+      running_entry ->
+        apply_runtime_isolation_blocked(state, issue_id, running_entry, reason)
     end
   end
 
@@ -9179,6 +9209,52 @@ defmodule SymphonyElixir.Orchestrator do
         {:noreply, blocked_state}
     end
   end
+
+  defp apply_runtime_isolation_blocked(state, issue_id, running_entry, reason) do
+    safe_reason = safe_runtime_isolation_reason(reason)
+    error = "runtime isolation blocked: #{safe_reason}"
+
+    Logger.warning("Runtime isolation blocked issue_id=#{issue_id} reason=#{safe_reason}")
+
+    stop_running_task(
+      Map.get(running_entry, :pid),
+      Map.get(running_entry, :ref),
+      state.task_supervisor
+    )
+
+    case release_runtime_fence_after_task_down(state, issue_id, running_entry) do
+      {:ok, state} ->
+        state = block_issue_from_entry(state, issue_id, running_entry, error)
+        notify_dashboard()
+        {:noreply, state}
+
+      {:error, blocked_state, fence_reason} ->
+        blocked_state =
+          block_issue_from_entry(
+            blocked_state,
+            issue_id,
+            running_entry,
+            attempt_ledger_error(fence_reason)
+          )
+
+        notify_dashboard()
+        {:noreply, blocked_state}
+    end
+  end
+
+  defp safe_runtime_isolation_reason({:runtime_isolation_unavailable, :remote_containment_unproven}),
+    do: "remote containment is unproven"
+
+  defp safe_runtime_isolation_reason({:runtime_isolation_failed, _detail}),
+    do: "Codex isolation proof failed"
+
+  defp safe_runtime_isolation_reason({:runtime_isolation_unavailable, :workspace_scm_boundary_unproven}),
+    do: "workspace SCM credential boundary is unproven"
+
+  defp safe_runtime_isolation_reason({:runtime_isolation_unavailable, _detail}),
+    do: "required runtime admission checks are unproven"
+
+  defp safe_runtime_isolation_reason(_reason), do: "required runtime admission checks are unproven"
 
   defp maybe_put_runtime_value(running_entry, _key, nil), do: running_entry
 

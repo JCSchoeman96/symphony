@@ -36,6 +36,27 @@ issue claimed and exposes it as blocked in the runtime state, JSON API, and dash
 entry itself is runtime state, but routed safety counters and exhaustion are durable in a
 project-scoped DETS ledger; restarting does not restore a Codex session or retry timer.
 
+### Routed runtime isolation
+
+Routed runtime isolation is certified for local Linux workers only. Before a session starts,
+Symphony resolves the direct Codex executable, verifies the actual sandbox, creates a session-local
+`HOME`, `CODEX_HOME`, and XDG state, and applies the role's permission profile to the exact issue
+workspace. `make all` runs this proof with `@openai/codex` `0.159.3`. A missing, incompatible, or
+unproven Codex runtime blocks the gate and the session. Unsupported platforms and platforms without
+a passing proof fail closed.
+
+macOS and iOS are unsupported and not certified for routed Codex sessions. The protected `make-all`
+check requires both the Linux actual-Codex proof and the Linux full gate; a skipped proof or gate
+fails the check.
+
+Routed Linux sessions also require Codex, `unshare`, and `python3` executables and every ancestor to
+be root-owned and not group/world-writable. User-owned or mutable installations fail closed before
+launch.
+
+Routed remote workers remain fail-closed. A configured `worker_host` is blocked before remote
+workspace provisioning or App Server launch until a separately verified containment boundary exists.
+The existing SSH path does not count as runtime isolation evidence.
+
 Automatic retry accounting is bounded per issue lineage: ordinary runtime or spawn failures receive
 at most three retries, capacity waits do not consume that failure budget, and reviewer-to-correction
 loops stop after three cycles. Normal continuations and route changes are tracked separately. CI
@@ -101,7 +122,7 @@ Symphony ships self-contained executables built with
 [Burrito](https://github.com/burrito-elixir/burrito). They embed Erlang/OTP, Elixir, and Symphony,
 but still expect `codex`, `git`, and the selected tracker credentials on the target machine.
 
-Supported release targets:
+Release build targets:
 
 - `macos_arm64`
 - `macos_x86_64`
@@ -109,13 +130,15 @@ Supported release targets:
 - `linux_x86_64`
 
 `v*` tags publish all four targets with checksums. A manual workflow run builds the same
-artifacts without creating a release.
+artifacts without creating a release. These build targets do not expand the routed runtime support
+contract: Linux is the only certified platform, and macOS and iOS are unsupported and not
+certified.
 
-After downloading the executable for your platform from a release:
+After downloading a Linux executable from a release:
 
 ```bash
-chmod +x ./symphony-v0.0.1-macos_arm64
-./symphony-v0.0.1-macos_arm64 ./WORKFLOW.md
+chmod +x ./symphony-v0.0.1-linux_x86_64
+./symphony-v0.0.1-linux_x86_64 ./WORKFLOW.md
 ```
 
 ## Configuration

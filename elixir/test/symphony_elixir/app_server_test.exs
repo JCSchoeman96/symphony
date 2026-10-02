@@ -1,6 +1,8 @@
 defmodule SymphonyElixir.AppServerTest do
   use SymphonyElixir.TestSupport
 
+  alias SymphonyElixir.AgentRuntime.{Profile, RuntimeIsolation}
+
   test "app server rejects the workspace root and paths outside workspace root" do
     test_root =
       Path.join(
@@ -235,7 +237,11 @@ defmodule SymphonyElixir.AppServerTest do
       policy_cases = [
         %{"type" => "dangerFullAccess"},
         %{"type" => "externalSandbox", "profile" => "remote-ci"},
-        %{"type" => "workspaceWrite", "writableRoots" => ["relative/path"], "networkAccess" => true},
+        %{
+          "type" => "workspaceWrite",
+          "writableRoots" => ["relative/path"],
+          "networkAccess" => true
+        },
         %{"type" => "futureSandbox", "nested" => %{"flag" => true}}
       ]
 
@@ -604,7 +610,8 @@ defmodule SymphonyElixir.AppServerTest do
                    |> String.trim_leading("JSON:")
                    |> Jason.decode!()
 
-                 payload["id"] == 99 and get_in(payload, ["result", "decision"]) == "acceptForSession"
+                 payload["id"] == 99 and
+                   get_in(payload, ["result", "decision"]) == "acceptForSession"
                else
                  false
                end
@@ -702,7 +709,12 @@ defmodule SymphonyElixir.AppServerTest do
                    |> Jason.decode!()
 
                  payload["id"] == 110 and
-                   get_in(payload, ["result", "answers", "mcp_tool_call_approval_call-717", "answers"]) ==
+                   get_in(payload, [
+                     "result",
+                     "answers",
+                     "mcp_tool_call_approval_call-717",
+                     "answers"
+                   ]) ==
                      ["Approve this Session"]
                else
                  false
@@ -1176,7 +1188,11 @@ defmodule SymphonyElixir.AppServerTest do
 
       assert_received {:tool_called, "linear_graphql", %{"query" => "query Viewer { viewer { id } }"}}
 
-      assert_received {:app_server_message, %{event: :tool_call_failed, payload: %{"params" => %{"tool" => "linear_graphql"}}}}
+      assert_received {:app_server_message,
+                       %{
+                         event: :tool_call_failed,
+                         payload: %{"params" => %{"tool" => "linear_graphql"}}
+                       }}
     after
       File.rm_rf(test_root)
     end
@@ -1240,7 +1256,8 @@ defmodule SymphonyElixir.AppServerTest do
         labels: ["backend"]
       }
 
-      assert {:ok, _result} = AppServer.run(workspace, "Validate newline-delimited buffering", issue)
+      assert {:ok, _result} =
+               AppServer.run(workspace, "Validate newline-delimited buffering", issue)
     after
       File.rm_rf(test_root)
     end
@@ -1386,6 +1403,7 @@ defmodule SymphonyElixir.AppServerTest do
                AppServer.run(workspace, "Capture malformed protocol line", issue, on_message: on_message)
 
       assert_received {:app_server_message, %{event: :malformed, payload: "{\"method\":\"turn/completed\""}}
+
       assert_received {:app_server_message, %{event: :turn_completed}}
     after
       File.rm_rf(test_root)
@@ -1527,7 +1545,7 @@ defmodule SymphonyElixir.AppServerTest do
 
       File.write!(codex_binary, """
       #!/bin/sh
-      trace_file="$SYMP_TEST_CODEx_TRACE"
+      trace_file=#{inspect(trace_file)}
       printf 'PROFILE_LOADED:%s\\n' "$#{profile_marker_env}" >> "$trace_file"
       printf 'HOME:%s\\n' "$HOME" >> "$trace_file"
       count=0
@@ -1569,6 +1587,1589 @@ defmodule SymphonyElixir.AppServerTest do
     after
       File.rm_rf(test_root)
     end
+  end
+
+  test "routed sessions launch the resolved executable with named profile protocol fields" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-routed-direct-#{System.unique_integer([:positive])}"
+      )
+
+    workspace_root = Path.join(test_root, "workspaces")
+    workspace = Path.join(workspace_root, "MT-ROUTED-DIRECT")
+    codex_binary = Path.join(test_root, "codex")
+    trace_file = Path.join(test_root, "codex-routed-direct.trace")
+    session_root = Path.join(test_root, "session")
+    File.mkdir_p!(workspace)
+
+    thread_result = %{
+      "thread" => %{"id" => "thread-routed-direct"},
+      "activePermissionProfile" => %{"id" => "symphony_builder_write"},
+      "runtimeWorkspaceRoots" => [Path.expand(workspace)],
+      "cwd" => Path.expand(workspace)
+    }
+
+    try do
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file=#{inspect(trace_file)}
+      printf 'ARGV0:%s\\n' "$0" >> "$trace_file"
+      printf 'HOME:%s\\n' "$HOME" >> "$trace_file"
+      printf 'CODEX_HOME:%s\\n' "$CODEX_HOME" >> "$trace_file"
+      count=0
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+
+        case "$count" in
+          1) printf '%s\\n' '#{Jason.encode!(%{"id" => 1, "result" => %{}})}' ;;
+          2) ;;
+          3) printf '%s\\n' '#{Jason.encode!(%{"id" => 2, "result" => thread_result})}' ;;
+          4)
+            printf '%s\\n' '#{Jason.encode!(%{"id" => 3, "result" => %{"turn" => %{"id" => "turn-routed-direct"}, "activePermissionProfile" => %{"id" => "symphony_builder_write"}, "runtimeWorkspaceRoots" => [Path.expand(workspace)], "cwd" => Path.expand(workspace)}})}'
+            printf '%s\\n' '#{Jason.encode!(%{"method" => "turn/completed"})}'
+            ;;
+          *) exit 0 ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: workspace_root,
+        agent_routing: "routed",
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      profile = Config.settings!().agent.profiles["builder"]
+
+      issue = %Issue{
+        id: "issue-routed-direct",
+        identifier: "MT-ROUTED-DIRECT",
+        title: "Direct launch"
+      }
+
+      admission = fn nil, executable, _opts ->
+        send(self(), {:routed_runtime_admitted, executable})
+        {:ok, :test_admitted}
+      end
+
+      assert {:ok, session} =
+               AppServer.start_session(
+                 workspace,
+                 Profile.runtime_options(profile) ++
+                   [
+                     runtime_session_root: session_root,
+                     test_runtime_workspace_admit: &admit_workspace_for_test/2,
+                     test_runtime_isolation_admit: admission
+                   ]
+               )
+
+      assert_received {:routed_runtime_admitted, ^codex_binary}
+      assert session.routed
+      assert session.permission_profile == "symphony_builder_write"
+      assert session.runtime_workspace_roots == [Path.expand(workspace)]
+      assert {:ok, %{result: :turn_completed}} = AppServer.run_turn(session, "Run direct", issue)
+      assert :ok = AppServer.stop_session(session)
+
+      trace = File.read!(trace_file)
+      assert trace =~ "ARGV0:#{codex_binary}"
+      assert trace =~ "HOME:#{Path.join(session_root, "home")}"
+      assert trace =~ "CODEX_HOME:#{Path.join(session_root, "codex")}"
+
+      payloads =
+        trace
+        |> String.split("\n", trim: true)
+        |> Enum.filter(&String.starts_with?(&1, "JSON:"))
+        |> Enum.map(&(&1 |> String.trim_leading("JSON:") |> Jason.decode!()))
+
+      thread_start = Enum.find(payloads, &(&1["method"] == "thread/start"))
+      assert thread_start["params"]["permissions"] == "symphony_builder_write"
+      assert thread_start["params"]["runtimeWorkspaceRoots"] == [Path.expand(workspace)]
+      assert thread_start["params"]["cwd"] == Path.expand(workspace)
+      refute Map.has_key?(thread_start["params"], "sandbox")
+
+      turn_start = Enum.find(payloads, &(&1["method"] == "turn/start"))
+      assert turn_start["params"]["permissions"] == "symphony_builder_write"
+      assert turn_start["params"]["runtimeWorkspaceRoots"] == [Path.expand(workspace)]
+      refute Map.has_key?(turn_start["params"], "sandboxPolicy")
+      refute File.exists?(session_root)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "routed admission checks workspace ownership before runtime proof and session-home setup" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-admission-order-#{System.unique_integer([:positive])}"
+      )
+
+    workspace_root = Path.join(test_root, "workspaces")
+    workspace = Path.join(workspace_root, "MT-ADMISSION-ORDER")
+    codex_binary = Path.join(test_root, "codex")
+    session_root = Path.join(test_root, "session")
+    File.mkdir_p!(workspace)
+
+    try do
+      File.write!(codex_binary, "#!/bin/sh\nexit 0\n")
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: workspace_root,
+        agent_routing: "routed",
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      profile = Config.settings!().agent.profiles["builder"]
+
+      workspace_admit = fn _issue, _workspace ->
+        send(self(), :workspace_admission_checked)
+        {:error, :stale_ownership}
+      end
+
+      runtime_admit = fn _issue, _executable, _opts ->
+        send(self(), :runtime_admission_started)
+        {:ok, :admitted}
+      end
+
+      assert {:error, {:runtime_isolation_unavailable, {:workspace_identity_unproven, :stale_ownership}}} =
+               AppServer.start_session(
+                 workspace,
+                 Profile.runtime_options(profile) ++
+                   [
+                     runtime_session_root: session_root,
+                     test_runtime_workspace_admit: workspace_admit,
+                     test_runtime_isolation_admit: runtime_admit
+                   ]
+               )
+
+      assert_received :workspace_admission_checked
+      refute_received :runtime_admission_started
+      refute File.exists?(session_root)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "routed admission revalidates the workspace before launch and cleans its prepared home" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-app-server-revalidation-race-#{System.unique_integer([:positive])}"
+      )
+
+    workspace_root = Path.join(test_root, "workspaces")
+    workspace = Path.join(workspace_root, "MT-REVALIDATION-RACE")
+    codex_binary = Path.join(test_root, "codex")
+    session_root = Path.join(test_root, "session")
+    launch_marker = Path.join(test_root, "codex-launched")
+    File.mkdir_p!(workspace)
+
+    try do
+      File.write!(codex_binary, "#!/bin/sh\ntouch #{launch_marker}\nexit 0\n")
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: workspace_root,
+        agent_routing: "routed",
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      profile = Config.settings!().agent.profiles["builder"]
+      admission_key = :h080b_workspace_revalidation_count
+      Process.put(admission_key, 0)
+
+      workspace_admit = fn _issue, _workspace ->
+        invocation = Process.get(admission_key, 0) + 1
+        Process.put(admission_key, invocation)
+
+        if invocation == 1 do
+          :ok
+        else
+          {:error, :workspace_changed_after_runtime_proof}
+        end
+      end
+
+      runtime_admit = fn _worker_host, _executable, _opts -> {:ok, :admitted} end
+
+      admission_reason = {:workspace_identity_unproven, :workspace_changed_after_runtime_proof}
+      expected_admission_error = {:error, {:runtime_isolation_unavailable, admission_reason}}
+
+      assert ^expected_admission_error =
+               AppServer.start_session(
+                 workspace,
+                 Profile.runtime_options(profile) ++
+                   [
+                     runtime_session_root: session_root,
+                     test_runtime_workspace_admit: workspace_admit,
+                     test_runtime_isolation_admit: runtime_admit
+                   ]
+               )
+
+      assert Process.get(admission_key) == 2
+      refute File.exists?(launch_marker)
+      refute File.exists?(session_root)
+    after
+      Process.delete(:h080b_workspace_revalidation_count)
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "routed admission returns a session-home cleanup failure after workspace revalidation fails" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-app-server-revalidation-cleanup-#{System.unique_integer([:positive])}"
+      )
+
+    workspace_root = Path.join(test_root, "workspaces")
+    workspace = Path.join(workspace_root, "MT-REVALIDATION-CLEANUP")
+    codex_binary = Path.join(test_root, "codex")
+    session_root = Path.join(test_root, "session")
+    File.mkdir_p!(workspace)
+
+    try do
+      File.write!(codex_binary, "#!/bin/sh\nexit 0\n")
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: workspace_root,
+        agent_routing: "routed",
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      profile = Config.settings!().agent.profiles["builder"]
+      admission_key = :h080b_workspace_cleanup_revalidation_count
+      Process.put(admission_key, 0)
+
+      workspace_admit = fn _issue, _workspace ->
+        invocation = Process.get(admission_key, 0) + 1
+        Process.put(admission_key, invocation)
+
+        if invocation == 1 do
+          :ok
+        else
+          File.chmod!(session_root, 0o000)
+          {:error, :workspace_changed_after_runtime_proof}
+        end
+      end
+
+      runtime_admit = fn _worker_host, _executable, _opts -> {:ok, :admitted} end
+
+      assert {:error, {:runtime_isolation_cleanup_failed, reason, "session"}} =
+               AppServer.start_session(
+                 workspace,
+                 Profile.runtime_options(profile) ++
+                   [
+                     runtime_session_root: session_root,
+                     test_runtime_workspace_admit: workspace_admit,
+                     test_runtime_isolation_admit: runtime_admit
+                   ]
+               )
+
+      assert reason in [:eacces, :eexist, :eperm, :enotempty]
+      assert Process.get(admission_key) == 2
+      assert File.dir?(session_root)
+    after
+      if File.dir?(session_root), do: File.chmod(session_root, 0o700)
+      Process.delete(:h080b_workspace_cleanup_revalidation_count)
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "routed launch cleans its prepared home when the admitted Codex executable disappears" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-app-server-executable-race-#{System.unique_integer([:positive])}"
+      )
+
+    workspace_root = Path.join(test_root, "workspaces")
+    workspace = Path.join(workspace_root, "MT-EXECUTABLE-RACE")
+    codex_binary = Path.join(test_root, "codex")
+    session_root = Path.join(test_root, "session")
+    File.mkdir_p!(workspace)
+
+    try do
+      File.write!(codex_binary, "#!/bin/sh\nexit 0\n")
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: workspace_root,
+        agent_routing: "routed",
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      profile = Config.settings!().agent.profiles["builder"]
+      admission_key = :h080b_workspace_executable_revalidation_count
+      Process.put(admission_key, 0)
+
+      workspace_admit = fn _issue, _workspace ->
+        invocation = Process.get(admission_key, 0) + 1
+        Process.put(admission_key, invocation)
+        if invocation == 2, do: File.rm!(codex_binary)
+        :ok
+      end
+
+      runtime_admit = fn _worker_host, _executable, _opts -> {:ok, :admitted} end
+
+      assert {:error, {:runtime_isolation_unavailable, :runtime_changed_after_admission}} =
+               AppServer.start_session(
+                 workspace,
+                 Profile.runtime_options(profile) ++
+                   [
+                     runtime_session_root: session_root,
+                     test_runtime_workspace_admit: workspace_admit,
+                     test_runtime_isolation_admit: runtime_admit
+                   ]
+               )
+
+      assert Process.get(admission_key) == 2
+      refute File.exists?(codex_binary)
+      refute File.exists?(session_root)
+    after
+      Process.delete(:h080b_workspace_executable_revalidation_count)
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "routed launch rejects a replacement executable at the admitted path" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-app-server-executable-replacement-#{System.unique_integer([:positive])}"
+      )
+
+    workspace_root = Path.join(test_root, "workspaces")
+    workspace = Path.join(workspace_root, "MT-EXECUTABLE-REPLACEMENT")
+    codex_binary = Path.join(test_root, "codex")
+    replacement_binary = Path.join(test_root, "codex.replacement")
+    launch_marker = Path.join(test_root, "replacement-launched")
+    session_root = Path.join(test_root, "session")
+    File.mkdir_p!(workspace)
+
+    try do
+      File.write!(codex_binary, "#!/bin/sh\nexit 0\n")
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: workspace_root,
+        agent_routing: "routed",
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      profile = Config.settings!().agent.profiles["builder"]
+      admission_key = :h080b_workspace_executable_replacement_count
+      Process.put(admission_key, 0)
+
+      workspace_admit = fn _issue, _workspace ->
+        invocation = Process.get(admission_key, 0) + 1
+        Process.put(admission_key, invocation)
+
+        if invocation == 2 do
+          File.write!(replacement_binary, "#!/bin/sh\ntouch #{launch_marker}\nexit 0\n")
+          File.chmod!(replacement_binary, 0o755)
+          File.rename!(replacement_binary, codex_binary)
+        end
+
+        :ok
+      end
+
+      runtime_admit = fn _worker_host, _executable, _opts -> {:ok, :admitted} end
+
+      assert {:error, {:runtime_isolation_unavailable, :runtime_changed_after_admission}} =
+               AppServer.start_session(
+                 workspace,
+                 Profile.runtime_options(profile) ++
+                   [
+                     runtime_session_root: session_root,
+                     test_runtime_workspace_admit: workspace_admit,
+                     test_runtime_isolation_admit: runtime_admit
+                   ]
+               )
+
+      assert Process.get(admission_key) == 2
+      assert File.regular?(codex_binary)
+      refute File.exists?(replacement_binary)
+      refute File.exists?(launch_marker)
+      refute File.exists?(session_root)
+    after
+      Process.delete(:h080b_workspace_executable_replacement_count)
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "routed launch cleans its prepared home when the namespace exits before app-server startup" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-app-server-namespace-spawn-failure-#{System.unique_integer([:positive])}"
+      )
+
+    workspace_root = Path.join(test_root, "workspaces")
+    workspace = Path.join(workspace_root, "MT-NAMESPACE-SPAWN-FAILURE")
+    codex_binary = Path.join(test_root, "codex")
+    session_root = Path.join(test_root, "session")
+    File.mkdir_p!(workspace)
+    File.write!(codex_binary, "#!/bin/sh\nexit 0\n")
+    File.chmod!(codex_binary, 0o755)
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: workspace_root,
+        agent_routing: "routed",
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      profile = Config.settings!().agent.profiles["builder"]
+      admission_key = :h080b_workspace_namespace_spawn_count
+      Process.put(admission_key, 0)
+
+      workspace_admit = fn _issue, _workspace ->
+        invocation = Process.get(admission_key, 0) + 1
+        Process.put(admission_key, invocation)
+        if invocation == 2, do: File.rm_rf!(workspace)
+        :ok
+      end
+
+      runtime_admit = fn _worker_host, _executable, _opts -> {:ok, :admitted} end
+
+      assert {:error, {:port_exit, 2}} =
+               AppServer.start_session(
+                 workspace,
+                 Profile.runtime_options(profile) ++
+                   [
+                     runtime_session_root: session_root,
+                     test_runtime_workspace_admit: workspace_admit,
+                     test_runtime_isolation_admit: runtime_admit
+                   ]
+               )
+
+      assert Process.get(admission_key) == 2
+      refute File.exists?(session_root)
+    after
+      Process.delete(:h080b_workspace_namespace_spawn_count)
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "routed admission blocks missing ownership context and credential-bearing Git state" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-app-server-boundary-#{System.unique_integer([:positive])}"
+      )
+
+    workspace_root = Path.join(test_root, "workspaces")
+    missing_context_workspace = Path.join(workspace_root, "MT-MISSING-CONTEXT")
+    codex_binary = Path.join(test_root, "codex")
+    session_root = Path.join(test_root, "session")
+    File.mkdir_p!(missing_context_workspace)
+    File.mkdir_p!(Path.dirname(codex_binary))
+    File.write!(codex_binary, "#!/bin/sh\nexit 0\n")
+    File.chmod!(codex_binary, 0o700)
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: workspace_root,
+        agent_routing: "routed",
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      profile = Config.settings!().agent.profiles["builder"]
+
+      runtime_admit = fn _worker_host, _executable, _opts ->
+        send(self(), :runtime_admitted)
+        {:ok, :admitted}
+      end
+
+      assert {:error, {:runtime_isolation_unavailable, :workspace_identity_unproven}} =
+               AppServer.start_session(
+                 missing_context_workspace,
+                 Profile.runtime_options(profile) ++
+                   [
+                     runtime_session_root: session_root,
+                     test_runtime_isolation_admit: runtime_admit
+                   ]
+               )
+
+      refute_received :runtime_admitted
+      refute File.exists?(session_root)
+
+      issue = %Issue{
+        id: "app-server-credential-residue",
+        identifier: "MT-CREDENTIAL-RESIDUE",
+        title: "Credential residue admission",
+        state: "In Progress"
+      }
+
+      ledger = workspace_ownership_ledger()
+
+      assert {:ok, owned_workspace} =
+               SymphonyElixir.Workspace.create_for_issue(issue, nil, ledger)
+
+      File.mkdir_p!(Path.join(owned_workspace, ".git"))
+      File.write!(Path.join(owned_workspace, ".git/config"), "[credential]\n  helper = store\n")
+
+      assert {:error, {:runtime_isolation_unavailable, :workspace_scm_boundary_unproven}} =
+               AppServer.start_session(
+                 owned_workspace,
+                 Profile.runtime_options(profile) ++
+                   [
+                     runtime_issue: issue,
+                     ownership_ledger: ledger,
+                     runtime_session_root: session_root,
+                     test_runtime_isolation_admit: runtime_admit
+                   ]
+               )
+
+      refute_received :runtime_admitted
+      refute File.exists?(session_root)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "routed admission rejects invalid workspace and runtime verifier callback results" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-app-server-callbacks-#{System.unique_integer([:positive])}"
+      )
+
+    workspace_root = Path.join(test_root, "workspaces")
+    workspace = Path.join(workspace_root, "MT-ADMISSION-CALLBACKS")
+    codex_binary = Path.join(test_root, "codex")
+    session_root = Path.join(test_root, "session")
+    File.mkdir_p!(workspace)
+    File.write!(codex_binary, "#!/bin/sh\nexit 0\n")
+    File.chmod!(codex_binary, 0o755)
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: workspace_root,
+        agent_routing: "routed",
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      profile = Config.settings!().agent.profiles["builder"]
+
+      workspace_admission_results = [
+        {:error, :stale_ownership},
+        :invalid_workspace_admission
+      ]
+
+      Enum.each(workspace_admission_results, fn admission_result ->
+        workspace_admission = fn _issue, _workspace -> admission_result end
+
+        assert {:error, {:runtime_isolation_unavailable, reason}} =
+                 AppServer.start_session(
+                   workspace,
+                   Profile.runtime_options(profile) ++
+                     [test_runtime_workspace_admit: workspace_admission]
+                 )
+
+        expected_reason =
+          case admission_result do
+            {:error, detail} -> {:workspace_identity_unproven, detail}
+            invalid -> {:workspace_admission_invalid, invalid}
+          end
+
+        assert reason == expected_reason
+      end)
+
+      workspace_admission = fn issue, admitted_workspace, ledger ->
+        send(self(), {:workspace_admission_arity_three, issue, admitted_workspace, ledger})
+        :ok
+      end
+
+      isolation_admission_results = [
+        {:not_a_callback, {:runtime_isolation_admission_invalid, :callback}},
+        {
+          fn _host, _executable, _opts -> :invalid_result end,
+          {:runtime_isolation_admission_invalid, :invalid_result}
+        },
+        {fn _host, _executable, _opts -> {:error, :unproven} end, :unproven},
+        {
+          fn _host, _executable, _opts -> raise ArgumentError, "sentinel" end,
+          {:runtime_isolation_admission_failed, ArgumentError}
+        },
+        {fn _host, _executable, _opts -> throw(:unproven) end, :runtime_isolation_admission_failed}
+      ]
+
+      Enum.each(isolation_admission_results, fn {admission, expected_reason} ->
+        assert {:error, ^expected_reason} =
+                 AppServer.start_session(
+                   workspace,
+                   Profile.runtime_options(profile) ++
+                     [
+                       runtime_session_root: session_root,
+                       test_runtime_workspace_admit: workspace_admission,
+                       test_runtime_isolation_admit: admission
+                     ]
+                 )
+
+        assert_received {:workspace_admission_arity_three, nil, ^workspace, nil}
+        refute File.exists?(session_root)
+      end)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "direct routed turn errors stop the child and remove the session home" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-direct-turn-cleanup-#{System.unique_integer([:positive])}"
+      )
+
+    workspace_root = Path.join(test_root, "workspaces")
+    workspace = Path.join(workspace_root, "MT-DIRECT-TURN-CLEANUP")
+    codex_binary = Path.join(test_root, "codex")
+    session_root = Path.join(test_root, "session")
+    File.mkdir_p!(workspace)
+
+    try do
+      thread_result = %{
+        "thread" => %{"id" => "thread-direct-turn-cleanup"},
+        "activePermissionProfile" => %{"id" => "symphony_builder_write"},
+        "runtimeWorkspaceRoots" => [Path.expand(workspace)],
+        "cwd" => Path.expand(workspace)
+      }
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r _line; do
+        count=$((count + 1))
+        case "$count" in
+          1) printf '%s\\n' '{"id":1,"result":{}}' ;;
+          2) ;;
+          3) printf '%s\\n' '#{Jason.encode!(%{"id" => 2, "result" => thread_result})}' ;;
+          4)
+            printf '%s\\n' '#{Jason.encode!(%{"id" => 3, "result" => %{"turn" => %{"id" => "turn-direct-turn-cleanup"}, "activePermissionProfile" => %{"id" => "symphony_builder_write"}, "runtimeWorkspaceRoots" => [Path.expand(workspace)], "cwd" => Path.expand(workspace)}})}'
+            printf '%s\\n' '{"method":"turn/failed","params":{"reason":"sandbox failure"}}'
+            ;;
+          *) ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: workspace_root,
+        agent_routing: "routed",
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      profile = Config.settings!().agent.profiles["builder"]
+
+      issue = %Issue{
+        id: "issue-direct-turn-cleanup",
+        identifier: "MT-DIRECT-TURN-CLEANUP",
+        title: "Direct turn cleanup"
+      }
+
+      assert {:ok, session} =
+               AppServer.start_session(
+                 workspace,
+                 Profile.runtime_options(profile) ++
+                   [
+                     runtime_session_root: session_root,
+                     test_runtime_workspace_admit: &admit_workspace_for_test/2,
+                     test_runtime_isolation_admit: &admit_for_test/3
+                   ]
+               )
+
+      on_exit(fn ->
+        if is_integer(session.os_pid) do
+          _ =
+            System.cmd("kill", ["-KILL", Integer.to_string(session.os_pid)], stderr_to_stdout: true)
+        end
+
+        File.rm_rf(test_root)
+      end)
+
+      assert {:error, {:turn_failed, %{"reason" => "sandbox failure"}}} =
+               AppServer.run_turn(session, "Run direct", issue)
+
+      refute File.exists?(session_root)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "direct routed turn errors return cleanup failures" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-direct-turn-cleanup-error-#{System.unique_integer([:positive])}"
+      )
+
+    workspace_root = Path.join(test_root, "workspaces")
+    workspace = Path.join(workspace_root, "MT-DIRECT-TURN-CLEANUP-ERROR")
+    codex_binary = Path.join(test_root, "codex")
+    session_root = Path.join(test_root, "session")
+    File.mkdir_p!(workspace)
+
+    try do
+      thread_result = %{
+        "thread" => %{"id" => "thread-direct-turn-cleanup-error"},
+        "activePermissionProfile" => %{"id" => "symphony_builder_write"},
+        "runtimeWorkspaceRoots" => [Path.expand(workspace)],
+        "cwd" => Path.expand(workspace)
+      }
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r _line; do
+        count=$((count + 1))
+        case "$count" in
+          1) printf '%s\\n' '{"id":1,"result":{}}' ;;
+          2) ;;
+          3) printf '%s\\n' '#{Jason.encode!(%{"id" => 2, "result" => thread_result})}' ;;
+          4)
+            printf '%s\\n' '#{Jason.encode!(%{"id" => 3, "result" => %{"turn" => %{"id" => "turn-direct-turn-cleanup-error"}, "activePermissionProfile" => %{"id" => "symphony_builder_write"}, "runtimeWorkspaceRoots" => [Path.expand(workspace)], "cwd" => Path.expand(workspace)}})}'
+            printf '%s\\n' '{"method":"turn/failed","params":{"reason":"sandbox failure"}}'
+            ;;
+          *) ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: workspace_root,
+        agent_routing: "routed",
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      profile = Config.settings!().agent.profiles["builder"]
+
+      issue = %Issue{
+        id: "issue-direct-turn-cleanup-error",
+        identifier: "MT-DIRECT-TURN-CLEANUP-ERROR",
+        title: "Cleanup error"
+      }
+
+      assert {:ok, session} =
+               AppServer.start_session(
+                 workspace,
+                 Profile.runtime_options(profile) ++
+                   [
+                     runtime_session_root: session_root,
+                     test_runtime_workspace_admit: &admit_workspace_for_test/2,
+                     test_runtime_isolation_admit: &admit_for_test/3
+                   ]
+               )
+
+      on_exit(fn ->
+        if is_integer(session.os_pid) do
+          _ =
+            System.cmd("kill", ["-KILL", Integer.to_string(session.os_pid)], stderr_to_stdout: true)
+        end
+
+        File.rm_rf(test_root)
+      end)
+
+      session = Map.put(session, :ephemeral_home, %{root: <<0>>})
+
+      assert {:error, {:runtime_isolation_cleanup_failed, _reason}} =
+               AppServer.run_turn(session, "Run direct", issue)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "routed thread provenance mismatch stops the child and removes the session home" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-routed-mismatch-#{System.unique_integer([:positive])}"
+      )
+
+    workspace_root = Path.join(test_root, "workspaces")
+    workspace = Path.join(workspace_root, "MT-ROUTED-MISMATCH")
+    codex_binary = Path.join(test_root, "codex")
+    session_root = Path.join(test_root, "session")
+    File.mkdir_p!(workspace)
+
+    try do
+      wrong_thread_result = %{
+        "thread" => %{"id" => "thread-routed-mismatch"},
+        "activePermissionProfile" => %{"id" => "symphony_wrong_profile"},
+        "runtimeWorkspaceRoots" => [Path.expand(workspace)],
+        "cwd" => Path.expand(workspace)
+      }
+
+      write_direct_routed_codex!(codex_binary, wrong_thread_result)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: workspace_root,
+        agent_routing: "routed",
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      profile = Config.settings!().agent.profiles["builder"]
+
+      assert {:error, {:runtime_provenance_mismatch, :thread_start, :active_permission_profile, "symphony_builder_write", "symphony_wrong_profile"}} =
+               AppServer.start_session(
+                 workspace,
+                 Profile.runtime_options(profile) ++
+                   [
+                     runtime_session_root: session_root,
+                     test_runtime_workspace_admit: &admit_workspace_for_test/2,
+                     test_runtime_isolation_admit: &admit_for_test/3
+                   ]
+               )
+
+      refute File.exists?(session_root)
+
+      invalid_thread_result = %{
+        "thread" => %{"status" => "missing-id"},
+        "activePermissionProfile" => %{"id" => "symphony_builder_write"},
+        "runtimeWorkspaceRoots" => [Path.expand(workspace)],
+        "cwd" => Path.expand(workspace)
+      }
+
+      write_direct_routed_codex!(codex_binary, invalid_thread_result)
+
+      assert {:error, {:invalid_thread_payload, %{"status" => "missing-id"}}} =
+               AppServer.start_session(
+                 workspace,
+                 Profile.runtime_options(profile) ++
+                   [
+                     runtime_session_root: session_root,
+                     test_runtime_workspace_admit: &admit_workspace_for_test/2,
+                     test_runtime_isolation_admit: &admit_for_test/3
+                   ]
+               )
+
+      refute File.exists?(session_root)
+
+      valid_thread_result = %{
+        "thread" => %{"id" => "thread-routed-turn-provenance"},
+        "activePermissionProfile" => %{"id" => "symphony_builder_write"},
+        "runtimeWorkspaceRoots" => [Path.expand(workspace)],
+        "cwd" => Path.expand(workspace)
+      }
+
+      turn_result = %{"turn" => %{"id" => "turn-missing-provenance"}}
+      write_direct_routed_codex!(codex_binary, valid_thread_result, turn_result)
+
+      assert {:ok, session} =
+               AppServer.start_session(
+                 workspace,
+                 Profile.runtime_options(profile) ++
+                   [
+                     runtime_session_root: session_root,
+                     test_runtime_workspace_admit: &admit_workspace_for_test/2,
+                     test_runtime_isolation_admit: &admit_for_test/3
+                   ]
+               )
+
+      issue = %Issue{
+        id: "app-server-missing-turn-provenance",
+        identifier: "MT-MISSING-TURN-PROVENANCE",
+        title: "Missing turn provenance"
+      }
+
+      assert {:error, {:runtime_provenance_missing, :turn_start}} =
+               AppServer.run_turn(session, "Run direct", issue)
+
+      refute File.exists?(session_root)
+
+      malformed_turn_result = %{
+        "turn" => %{"id" => "turn-malformed-provenance"},
+        "activePermissionProfile" => 17,
+        "runtimeWorkspaceRoots" => [Path.expand(workspace)],
+        "cwd" => Path.expand(workspace)
+      }
+
+      write_direct_routed_codex!(codex_binary, valid_thread_result, malformed_turn_result)
+
+      assert {:ok, malformed_session} =
+               AppServer.start_session(
+                 workspace,
+                 Profile.runtime_options(profile) ++
+                   [
+                     runtime_session_root: session_root,
+                     test_runtime_workspace_admit: &admit_workspace_for_test/2,
+                     test_runtime_isolation_admit: &admit_for_test/3
+                   ]
+               )
+
+      assert {:error, {:runtime_provenance_mismatch, :turn_start, :active_permission_profile, "symphony_builder_write", nil}} =
+               AppServer.run_turn(malformed_session, "Run direct", issue)
+
+      refute File.exists?(session_root)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "routed session home stays in place when child exit cannot be confirmed" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-stop-unconfirmed-#{System.unique_integer([:positive])}"
+      )
+
+    fake_kill = Path.join(test_root, "kill")
+    home = Path.join(test_root, "session-home")
+    previous_path = System.get_env("PATH")
+    real_kill = System.find_executable("kill")
+    File.mkdir_p!(home)
+    File.write!(Path.join(home, "session-marker"), "retain until process exit")
+    File.write!(fake_kill, "#!/bin/sh\nexit 0\n")
+    File.chmod!(fake_kill, 0o755)
+    System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
+
+    port =
+      Port.open({:spawn_executable, ~c"/bin/sh"}, [
+        :binary,
+        :exit_status,
+        args: [~c"-c", ~c"trap '' TERM; while :; do sleep 1; done"]
+      ])
+
+    {:os_pid, os_pid} = :erlang.port_info(port, :os_pid)
+
+    on_exit(fn ->
+      if is_nil(previous_path),
+        do: System.delete_env("PATH"),
+        else: System.put_env("PATH", previous_path)
+
+      _ = System.cmd(real_kill, ["-KILL", Integer.to_string(os_pid)], stderr_to_stdout: true)
+      File.rm_rf!(test_root)
+    end)
+
+    assert {:error, {:stop_failed, :process_still_running}} =
+             AppServer.stop_session(%{port: port, os_pid: os_pid, ephemeral_home: home})
+
+    assert File.exists?(Path.join(home, "session-marker"))
+
+    assert {:error, {:stop_failed, :process_still_running}} =
+             AppServer.stop_session(%{port: port, os_pid: os_pid, ephemeral_home: home})
+
+    assert File.exists?(Path.join(home, "session-marker"))
+  end
+
+  test "routed containment timeout retains its session home" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "h080b-routed-stop-timeout-#{System.unique_integer([:positive])}"
+      )
+
+    home = Path.join(test_root, "session-home")
+    File.mkdir_p!(home)
+    File.write!(Path.join(home, "session-marker"), "retain until containment is proven")
+
+    port =
+      Port.open({:spawn_executable, ~c"/usr/bin/python3"}, [
+        :binary,
+        :exit_status,
+        args: [
+          ~c"-c",
+          ~c"import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"
+        ]
+      ])
+
+    {:os_pid, os_pid} = :erlang.port_info(port, :os_pid)
+
+    on_exit(fn ->
+      _ =
+        System.cmd(
+          System.find_executable("kill") || "/bin/kill",
+          ["-KILL", Integer.to_string(os_pid)],
+          stderr_to_stdout: true
+        )
+
+      File.rm_rf!(test_root)
+    end)
+
+    assert {:error, {:containment_unconfirmed, :termination_timeout}} =
+             AppServer.stop_session(%{
+               port: port,
+               os_pid: os_pid,
+               ephemeral_home: home,
+               runtime_containment: :linux_pid_namespace
+             })
+
+    assert File.exists?(Path.join(home, "session-marker"))
+  end
+
+  test "routed stop contains a descendant that escapes the runtime session" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-escaped-descendant-#{System.unique_integer([:positive])}"
+      )
+
+    workspace_root = Path.join(test_root, "workspaces")
+    workspace = Path.join(workspace_root, "MT-ESCAPED-DESCENDANT")
+    codex_binary = Path.join(test_root, "codex")
+    session_root = Path.join(test_root, "session")
+    runtime_identity_path = Path.join(test_root, "runtime-identity")
+    descendant_identity_path = Path.join(test_root, "descendant-identity")
+    File.mkdir_p!(workspace)
+
+    File.write!(
+      codex_binary,
+      """
+      #!/usr/bin/python3
+      import json
+      import os
+      import signal
+      import sys
+      import time
+
+      runtime_identity_path = #{Jason.encode!(runtime_identity_path)}
+      descendant_identity_path = #{Jason.encode!(descendant_identity_path)}
+      descendant = os.fork()
+
+      if descendant == 0:
+          os.setsid()
+          with open(descendant_identity_path, "w", encoding="utf-8") as file:
+              file.write(f"{os.getpid()} {os.getsid(0)}")
+          signal.signal(signal.SIGTERM, signal.SIG_IGN)
+          while True:
+              time.sleep(0.1)
+
+      with open(runtime_identity_path, "w", encoding="utf-8") as file:
+          file.write(f"{os.getpid()} {os.getsid(0)}")
+
+      thread = {
+          "thread": {"id": "thread-escaped-descendant"},
+          "activePermissionProfile": {"id": "symphony_builder_write"},
+          "runtimeWorkspaceRoots": [#{Jason.encode!(Path.expand(workspace))}],
+          "cwd": #{Jason.encode!(Path.expand(workspace))},
+      }
+
+      for request_number, _line in enumerate(sys.stdin, start=1):
+          if request_number == 1:
+              print(json.dumps({"id": 1, "result": {}}), flush=True)
+          elif request_number == 3:
+              print(json.dumps({"id": 2, "result": thread}), flush=True)
+              sys.exit(0)
+      """
+    )
+
+    File.chmod!(codex_binary, 0o700)
+
+    on_exit(fn ->
+      unless File.dir?(session_root), do: File.rm_rf(test_root)
+    end)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      workspace_root: workspace_root,
+      agent_routing: "routed",
+      codex_command: "#{codex_binary} app-server"
+    )
+
+    profile = Config.settings!().agent.profiles["builder"]
+
+    assert {:ok, session} =
+             AppServer.start_session(
+               workspace,
+               Profile.runtime_options(profile) ++
+                 [
+                   runtime_session_root: session_root,
+                   test_runtime_workspace_admit: &admit_workspace_for_test/2,
+                   test_runtime_isolation_admit: &admit_for_test/3
+                 ]
+             )
+
+    on_exit(fn ->
+      stop_result = if File.dir?(session_root), do: AppServer.stop_session(session), else: :ok
+
+      if stop_result == :ok and not File.dir?(session_root) do
+        File.rm_rf(test_root)
+      end
+    end)
+
+    assert wait_for_test_file(runtime_identity_path)
+    assert wait_for_test_file(descendant_identity_path)
+    {runtime_namespace_pid, runtime_session_id} = read_process_identity!(runtime_identity_path)
+
+    {descendant_namespace_pid, descendant_session_id} =
+      read_process_identity!(descendant_identity_path)
+
+    assert descendant_session_id == descendant_namespace_pid
+    refute descendant_session_id == runtime_session_id
+    assert wait_for_namespace_pid_absence(session.os_pid, runtime_namespace_pid)
+
+    descendant_host_pid = wait_for_namespace_host_pid(session.os_pid, descendant_namespace_pid)
+    assert test_pid_alive?(descendant_host_pid)
+    assert File.dir?(session_root)
+
+    assert :ok = AppServer.stop_session(session)
+
+    refute test_pid_alive?(descendant_host_pid)
+    refute File.exists?(session_root)
+  end
+
+  test "routed launch accepts a root-owned Codex executable when path trust is enforced" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-trusted-runtime-#{System.unique_integer([:positive])}"
+      )
+
+    workspace_root = Path.join(test_root, "workspaces")
+    workspace = Path.join(workspace_root, "MT-TRUSTED-RUNTIME")
+    session_root = Path.join(test_root, "session")
+    executable = System.find_executable("true") || "/usr/bin/true"
+    codex_link = Path.join(test_root, "codex")
+    File.mkdir_p!(workspace)
+
+    on_exit(fn -> File.rm_rf(test_root) end)
+
+    assert {:ok, executable_stat} = File.stat(executable)
+    assert executable_stat.uid == 0
+    File.ln_s!(executable, codex_link)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      workspace_root: workspace_root,
+      agent_routing: "routed",
+      codex_command: "#{codex_link} app-server"
+    )
+
+    profile = Config.settings!().agent.profiles["builder"]
+
+    assert {:error, {:port_exit, 0}} =
+             AppServer.start_session(
+               workspace,
+               Profile.runtime_options(profile) ++
+                 [
+                   command: "#{codex_link} app-server",
+                   runtime_session_root: session_root,
+                   test_runtime_workspace_admit: &admit_workspace_for_test/2,
+                   test_runtime_isolation_admit: &admit_for_test/3,
+                   test_routed_enforce_runtime_path_trust: true
+                 ]
+             )
+
+    refute File.exists?(session_root)
+  end
+
+  test "routed launch fails closed when its platform has no Linux proof" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-unsupported-platform-#{System.unique_integer([:positive])}"
+      )
+
+    workspace_root = Path.join(test_root, "workspaces")
+    workspace = Path.join(workspace_root, "MT-UNSUPPORTED-PLATFORM")
+    session_root = Path.join(test_root, "session")
+    executable = System.find_executable("true") || "/usr/bin/true"
+    codex_link = Path.join(test_root, "codex")
+    File.mkdir_p!(workspace)
+
+    on_exit(fn -> File.rm_rf(test_root) end)
+
+    File.ln_s!(executable, codex_link)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      workspace_root: workspace_root,
+      agent_routing: "routed",
+      codex_command: "#{codex_link} app-server"
+    )
+
+    profile = Config.settings!().agent.profiles["builder"]
+
+    assert {:error, {:runtime_isolation_unavailable, :unsupported_platform}} =
+             AppServer.start_session(
+               workspace,
+               Profile.runtime_options(profile) ++
+                 [
+                   command: "#{codex_link} app-server",
+                   runtime_session_root: session_root,
+                   test_runtime_workspace_admit: &admit_workspace_for_test/2,
+                   test_runtime_isolation_admit: &admit_for_test/3,
+                   test_routed_platform: {:unix, :darwin}
+                 ]
+             )
+
+    refute File.exists?(session_root)
+  end
+
+  test "routed launch rejects a user-owned Codex installation when path trust is enforced" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-runtime-replacement-#{System.unique_integer([:positive])}"
+      )
+
+    workspace_root = Path.join(test_root, "workspaces")
+    workspace = Path.join(workspace_root, "MT-RUNTIME-REPLACEMENT")
+    codex_binary = Path.join(test_root, "codex")
+    session_root = Path.join(test_root, "session")
+    File.mkdir_p!(workspace)
+
+    on_exit(fn -> File.rm_rf(test_root) end)
+
+    try do
+      write_direct_routed_codex!(
+        codex_binary,
+        %{
+          "thread" => %{"id" => "thread-runtime-replacement"},
+          "activePermissionProfile" => %{"id" => "symphony_builder_write"},
+          "runtimeWorkspaceRoots" => [Path.expand(workspace)],
+          "cwd" => Path.expand(workspace)
+        }
+      )
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: workspace_root,
+        agent_routing: "routed",
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      profile = Config.settings!().agent.profiles["builder"]
+
+      assert {:error, {:runtime_isolation_unavailable, :codex_installation_untrusted}} =
+               AppServer.start_session(
+                 workspace,
+                 Profile.runtime_options(profile) ++
+                   [
+                     runtime_session_root: session_root,
+                     test_runtime_workspace_admit: &admit_workspace_for_test/2,
+                     test_runtime_isolation_admit: &admit_for_test/3,
+                     test_routed_enforce_runtime_path_trust: true
+                   ]
+               )
+
+      refute File.exists?(session_root)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "routed launch rejects a user-writable Linux guard tool path" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-untrusted-guard-#{System.unique_integer([:positive])}"
+      )
+
+    workspace_root = Path.join(test_root, "workspaces")
+    workspace = Path.join(workspace_root, "MT-UNTRUSTED-GUARD")
+    codex_binary = Path.join(test_root, "codex")
+    session_root = Path.join(test_root, "session")
+    File.mkdir_p!(workspace)
+
+    on_exit(fn -> File.rm_rf(test_root) end)
+
+    write_direct_routed_codex!(
+      codex_binary,
+      %{
+        "thread" => %{"id" => "thread-untrusted-guard"},
+        "activePermissionProfile" => %{"id" => "symphony_builder_write"},
+        "runtimeWorkspaceRoots" => [Path.expand(workspace)],
+        "cwd" => Path.expand(workspace)
+      }
+    )
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      workspace_root: workspace_root,
+      agent_routing: "routed",
+      codex_command: "#{codex_binary} app-server"
+    )
+
+    profile = Config.settings!().agent.profiles["builder"]
+
+    assert {:error, {:runtime_isolation_unavailable, {:untrusted_linux_guard_tool, "unshare"}}} =
+             AppServer.start_session(
+               workspace,
+               Profile.runtime_options(profile) ++
+                 [
+                   runtime_session_root: session_root,
+                   test_runtime_workspace_admit: &admit_workspace_for_test/2,
+                   test_runtime_isolation_admit: &admit_for_test/3,
+                   test_routed_guard_tool_paths: %{"unshare" => codex_binary}
+                 ]
+             )
+
+    trusted_guard_directory =
+      System.find_executable("true")
+      |> Path.dirname()
+
+    assert {:ok, %File.Stat{type: :directory, uid: 0}} = File.stat(trusted_guard_directory)
+
+    assert {:error, {:runtime_isolation_unavailable, {:untrusted_linux_guard_tool, "unshare"}}} =
+             AppServer.start_session(
+               workspace,
+               Profile.runtime_options(profile) ++
+                 [
+                   runtime_session_root: session_root,
+                   test_runtime_workspace_admit: &admit_workspace_for_test/2,
+                   test_runtime_isolation_admit: &admit_for_test/3,
+                   test_routed_guard_tool_paths: %{"unshare" => trusted_guard_directory}
+                 ]
+             )
+
+    refute File.exists?(session_root)
+  end
+
+  @tag timeout: 120_000
+  @tag skip:
+         if(System.find_executable("codex"),
+           do: false,
+           else: "pinned Codex executable is unavailable"
+         )
+  test "pinned Codex returns routed thread provenance before exposing the session" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-pinned-#{System.unique_integer([:positive])}"
+      )
+
+    workspace_root = Path.join(test_root, "workspaces")
+    workspace = Path.join(workspace_root, "MT-PINNED-CODEX")
+    session_root = Path.join(test_root, "session")
+    File.mkdir_p!(workspace)
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: workspace_root,
+        agent_routing: "routed",
+        codex_command: "codex app-server"
+      )
+
+      profile = Config.settings!().agent.profiles["builder"]
+
+      runtime_path_trust_opts =
+        if System.get_env("SYMPHONY_ENFORCE_TEST_RUNTIME_PATH_TRUST") == "1",
+          do: [test_routed_enforce_runtime_path_trust: true],
+          else: []
+
+      assert {:ok, session} =
+               AppServer.start_session(
+                 workspace,
+                 Profile.runtime_options(profile) ++
+                   [
+                     runtime_session_root: session_root,
+                     test_runtime_workspace_admit: &admit_workspace_for_test/2
+                   ] ++
+                   runtime_path_trust_opts
+               )
+
+      assert session.routed
+      assert session.permission_profile == "symphony_builder_write"
+      assert session.runtime_workspace_roots == [Path.expand(workspace)]
+      assert :ok = AppServer.stop_session(session)
+      refute File.exists?(session_root)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  @tag timeout: 120_000
+  test "routed launch fails closed when its isolation evidence is invalidated before spawn" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-app-server-stale-runtime-proof-#{System.unique_integer([:positive])}"
+      )
+
+    workspace_root = Path.join(test_root, "workspaces")
+    workspace = Path.join(workspace_root, "MT-STALE-RUNTIME-PROOF")
+    session_root = Path.join(test_root, "session")
+    File.mkdir_p!(workspace)
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: workspace_root,
+        agent_routing: "routed",
+        codex_command: "codex app-server"
+      )
+
+      profile = Config.settings!().agent.profiles["builder"]
+      admission_key = :h080b_runtime_proof_revalidation_count
+      Process.put(admission_key, 0)
+
+      workspace_admit = fn _issue, _workspace ->
+        invocation = Process.get(admission_key, 0) + 1
+        Process.put(admission_key, invocation)
+        if invocation == 2, do: RuntimeIsolation.clear()
+        :ok
+      end
+
+      runtime_path_trust_opts =
+        if System.get_env("SYMPHONY_ENFORCE_TEST_RUNTIME_PATH_TRUST") == "1",
+          do: [test_routed_enforce_runtime_path_trust: true],
+          else: []
+
+      assert {:error, {:runtime_isolation_unavailable, :runtime_changed_after_admission}} =
+               AppServer.start_session(
+                 workspace,
+                 Profile.runtime_options(profile) ++
+                   [
+                     runtime_session_root: session_root,
+                     test_runtime_workspace_admit: workspace_admit
+                   ] ++ runtime_path_trust_opts
+               )
+
+      assert Process.get(admission_key) == 2
+      refute File.exists?(session_root)
+    after
+      Process.delete(:h080b_runtime_proof_revalidation_count)
+      File.rm_rf(test_root)
+    end
+  end
+
+  defp admit_for_test(nil, _executable, _opts), do: {:ok, :test_admitted}
+
+  defp admit_workspace_for_test(_issue, _workspace), do: :ok
+
+  defp wait_for_test_file(path, attempts \\ 100)
+
+  defp wait_for_test_file(_path, 0), do: false
+
+  defp wait_for_test_file(path, attempts) do
+    if File.regular?(path) do
+      true
+    else
+      Process.sleep(10)
+      wait_for_test_file(path, attempts - 1)
+    end
+  end
+
+  defp read_process_identity!(path) do
+    [pid, session_id] = path |> File.read!() |> String.split()
+    {String.to_integer(pid), String.to_integer(session_id)}
+  end
+
+  defp wait_for_namespace_pid_absence(unshare_pid, namespace_pid, attempts \\ 100)
+
+  defp wait_for_namespace_pid_absence(_unshare_pid, _namespace_pid, 0), do: false
+
+  defp wait_for_namespace_pid_absence(unshare_pid, namespace_pid, attempts) do
+    if is_nil(find_namespace_host_pid(unshare_pid, namespace_pid)) do
+      true
+    else
+      Process.sleep(10)
+      wait_for_namespace_pid_absence(unshare_pid, namespace_pid, attempts - 1)
+    end
+  end
+
+  defp wait_for_namespace_host_pid(unshare_pid, namespace_pid, attempts \\ 100)
+
+  defp wait_for_namespace_host_pid(_unshare_pid, _namespace_pid, 0), do: nil
+
+  defp wait_for_namespace_host_pid(unshare_pid, namespace_pid, attempts) do
+    case find_namespace_host_pid(unshare_pid, namespace_pid) do
+      pid when is_integer(pid) ->
+        pid
+
+      nil ->
+        Process.sleep(10)
+        wait_for_namespace_host_pid(unshare_pid, namespace_pid, attempts - 1)
+    end
+  end
+
+  defp find_namespace_host_pid(unshare_pid, namespace_pid) do
+    unshare_pid
+    |> runtime_process_tree_pids()
+    |> Enum.find(&namespace_pid_matches?(&1, namespace_pid))
+  end
+
+  defp namespace_pid_matches?(host_pid, namespace_pid) do
+    with {:ok, status} <- File.read("/proc/#{host_pid}/status"),
+         line when is_binary(line) <- Enum.find(String.split(status, "\n"), &String.starts_with?(&1, "NSpid:")),
+         value when is_binary(value) <- line |> String.replace_prefix("NSpid:", "") |> String.split() |> List.last() do
+      String.to_integer(value) == namespace_pid
+    else
+      _missing_status -> false
+    end
+  end
+
+  defp runtime_process_tree_pids(root_pid) do
+    runtime_process_tree_pids([root_pid], MapSet.new())
+  end
+
+  defp runtime_process_tree_pids([], seen), do: MapSet.to_list(seen)
+
+  defp runtime_process_tree_pids([pid | remaining], seen) do
+    if MapSet.member?(seen, pid) do
+      runtime_process_tree_pids(remaining, seen)
+    else
+      children = runtime_process_children(pid)
+      runtime_process_tree_pids(remaining ++ children, MapSet.put(seen, pid))
+    end
+  end
+
+  defp runtime_process_children(pid) do
+    case File.read("/proc/#{pid}/task/#{pid}/children") do
+      {:ok, contents} -> contents |> String.split() |> Enum.flat_map(&parse_process_id/1)
+      _error -> []
+    end
+  end
+
+  defp parse_process_id(value) do
+    case Integer.parse(value) do
+      {pid, ""} -> [pid]
+      _invalid -> []
+    end
+  end
+
+  defp test_pid_alive?(pid) do
+    case System.cmd(System.find_executable("kill") || "/bin/kill", ["-0", Integer.to_string(pid)], stderr_to_stdout: true) do
+      {_output, 0} -> true
+      {_output, _status} -> false
+    end
+  end
+
+  defp write_direct_routed_codex!(path, thread_result, turn_result \\ nil) do
+    turn_response =
+      if is_map(turn_result), do: Jason.encode!(%{"id" => 3, "result" => turn_result}), else: ""
+
+    File.write!(path, """
+    #!/bin/sh
+    count=0
+    while IFS= read -r _line; do
+      count=$((count + 1))
+      case "$count" in
+        1) printf '%s\\n' '#{Jason.encode!(%{"id" => 1, "result" => %{}})}' ;;
+        2) ;;
+        3) printf '%s\\n' '#{Jason.encode!(%{"id" => 2, "result" => thread_result})}' ;;
+        4) printf '%s\\n' '#{turn_response}' ;;
+        *) exit 0 ;;
+      esac
+    done
+    """)
+
+    File.chmod!(path, 0o755)
   end
 
   test "app server launches over ssh for remote workers" do
@@ -1704,6 +3305,82 @@ defmodule SymphonyElixir.AppServerTest do
              end)
     after
       File.rm_rf(test_root)
+    end
+  end
+
+  test "prepared routed session homes must match profile, workspace, and access" do
+    workspace =
+      Path.join(
+        System.tmp_dir!(),
+        "h080b-validated-session-#{System.unique_integer([:positive])}"
+      )
+
+    policies = %{permission_profile: "symphony_builder_write", access: :write}
+
+    session_home = %{
+      permission_profile: "symphony_builder_write",
+      workspace: workspace,
+      access: :write
+    }
+
+    assert :ok = AppServer.validate_session_home(session_home, policies, workspace)
+
+    assert {:error, {:runtime_profile_mismatch, :prepared_session_home, "symphony_builder_write", "other_profile"}} =
+             AppServer.validate_session_home(
+               %{session_home | permission_profile: "other_profile"},
+               policies,
+               workspace
+             )
+
+    assert {:error, {:runtime_workspace_mismatch, :prepared_session_home, ^workspace, "/outside/workspace"}} =
+             AppServer.validate_session_home(
+               %{session_home | workspace: "/outside/workspace"},
+               policies,
+               workspace
+             )
+
+    assert {:error, {:runtime_access_mismatch, :prepared_session_home, :write, :read}} =
+             AppServer.validate_session_home(%{session_home | access: :read}, policies, workspace)
+  end
+
+  test "routed session startup cleans its private home after namespace exit proves termination" do
+    test_root =
+      Path.join(System.tmp_dir!(), "h080b-app-server-spawn-#{System.unique_integer([:positive])}")
+
+    workspace_root = Path.join(test_root, "workspaces")
+    workspace = Path.join(workspace_root, "MT-SPAWN-FAILURE")
+    codex_binary = Path.join(test_root, "codex")
+    session_root = Path.join(test_root, "session")
+    File.mkdir_p!(workspace)
+    File.write!(codex_binary, "#!/h080b/missing/interpreter\nexit 0\n")
+    File.chmod!(codex_binary, 0o700)
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: workspace_root,
+        agent_routing: "routed",
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      profile = Config.settings!().agent.profiles["builder"]
+
+      assert {:error, {:port_exit, 0}} =
+               AppServer.start_session(
+                 workspace,
+                 Profile.runtime_options(profile) ++
+                   [
+                     runtime_session_root: session_root,
+                     test_runtime_workspace_admit: &admit_workspace_for_test/2,
+                     test_runtime_isolation_admit: fn _host, _executable, _opts ->
+                       {:ok, :admitted}
+                     end
+                   ]
+               )
+
+      refute File.exists?(session_root)
+    after
+      unless File.dir?(session_root), do: File.rm_rf(test_root)
     end
   end
 end

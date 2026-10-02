@@ -1,11 +1,53 @@
 defmodule SymphonyElixir.AppServerEdgeTest do
   use SymphonyElixir.TestSupport
 
-  alias SymphonyElixir.AgentRuntime.Route
+  alias SymphonyElixir.AgentRuntime.{Profile, Route}
   alias SymphonyElixir.Tracker.Memory
 
+  test "remote startup rejects an empty workspace before launch" do
+    assert {:error, {:invalid_workspace_cwd, :empty_remote_workspace, "worker-01"}} =
+             AppServer.start_session("", worker_host: "worker-01")
+  end
+
+  test "routed remote startup fails closed before opening SSH" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-app-server-remote-runtime-#{System.unique_integer([:positive])}"
+      )
+
+    workspace_root = Path.join(test_root, "workspaces")
+    File.mkdir_p!(workspace_root)
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: workspace_root,
+        agent_routing: "routed",
+        codex_command: "codex app-server"
+      )
+
+      settings = Config.settings!()
+      assert settings.agent.routing == "routed"
+      profile = settings.agent.profiles["builder"]
+
+      assert {:error, {:runtime_isolation_unavailable, :remote_containment_unproven}} =
+               AppServer.start_session(
+                 Path.join(workspace_root, "MT-REMOTE"),
+                 Profile.runtime_options(profile) ++ [worker_host: "worker-01"]
+               )
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "the default start-session API still enforces the local workspace boundary" do
-    test_root = Path.join(System.tmp_dir!(), "symphony-app-server-default-start-#{System.unique_integer([:positive])}")
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-app-server-default-start-#{System.unique_integer([:positive])}"
+      )
+
     workspace_root = Path.join(test_root, "workspaces")
     File.mkdir_p!(workspace_root)
 
@@ -14,6 +56,28 @@ defmodule SymphonyElixir.AppServerEdgeTest do
 
       assert {:error, {:invalid_workspace_cwd, :workspace_root, _}} =
                AppServer.start_session(workspace_root)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "startup rejects a cyclic workspace path before launch" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-app-server-workspace-cycle-#{System.unique_integer([:positive])}"
+      )
+
+    workspace_root = Path.join(test_root, "workspaces")
+    cyclic_workspace = Path.join(workspace_root, "cycle")
+    File.mkdir_p!(workspace_root)
+    File.ln_s!(cyclic_workspace, cyclic_workspace)
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+      assert {:error, {:invalid_workspace_cwd, :path_unreadable, ^cyclic_workspace, :eloop}} =
+               AppServer.start_session(cyclic_workspace)
     after
       File.rm_rf(test_root)
     end
@@ -66,6 +130,301 @@ defmodule SymphonyElixir.AppServerEdgeTest do
         assert :ok = AppServer.stop_session(session)
       end
     )
+  end
+
+  test "a successful turn remains successful when session stop succeeds" do
+    with_fixture(
+      [
+        [json_line(%{"id" => 1, "result" => %{}})],
+        [],
+        [json_line(%{"id" => 2, "result" => %{"thread" => %{"id" => "thread-run-stop-ok"}}})],
+        [
+          json_line(%{"id" => 3, "result" => %{"turn" => %{"id" => "turn-run-stop-ok"}}}),
+          json_line(%{"method" => "turn/completed"})
+        ]
+      ],
+      fn workspace, binary, issue ->
+        assert {:ok, %{result: :turn_completed, thread_id: "thread-run-stop-ok"}} =
+                 AppServer.run(workspace, "successful turn", issue, command: "#{binary} app-server")
+      end
+    )
+  end
+
+  test "a successful turn returns a typed error when session stop fails" do
+    with_fixture(
+      [
+        [json_line(%{"id" => 1, "result" => %{}})],
+        [],
+        [json_line(%{"id" => 2, "result" => %{"thread" => %{"id" => "thread-stop-failure"}}})],
+        [
+          json_line(%{"id" => 3, "result" => %{"turn" => %{"id" => "turn-stop-failure"}}}),
+          json_line(%{"method" => "turn/completed"})
+        ]
+      ],
+      fn workspace, binary, issue ->
+        stop_session = fn session ->
+          assert :ok = AppServer.stop_session(session)
+          {:error, {:containment_unconfirmed, :injected_test_failure}}
+        end
+
+        assert {:error, {:runtime_stop_failed, {:containment_unconfirmed, :injected_test_failure}}} =
+                 AppServer.run(workspace, "successful turn", issue,
+                   command: "#{binary} app-server",
+                   test_stop_session: stop_session
+                 )
+      end
+    )
+  end
+
+  test "a turn failure remains in the stop failure when both fail" do
+    with_fixture(
+      [
+        [json_line(%{"id" => 1, "result" => %{}})],
+        [],
+        [json_line(%{"id" => 2, "result" => %{"thread" => %{"id" => "thread-double-failure"}}})],
+        [
+          json_line(%{
+            "id" => 3,
+            "error" => %{"message" => "turn contains sensitive response text"}
+          })
+        ]
+      ],
+      fn workspace, binary, issue ->
+        stop_session = fn session ->
+          assert :ok = AppServer.stop_session(session)
+          {:error, {:containment_unconfirmed, :injected_test_failure}}
+        end
+
+        expected_failure =
+          {
+            :error,
+            {
+              :runtime_stop_failed,
+              {:containment_unconfirmed, :injected_test_failure},
+              {:turn_failed, :response_error}
+            }
+          }
+
+        assert ^expected_failure =
+                 AppServer.run(workspace, "failed turn", issue,
+                   command: "#{binary} app-server",
+                   test_stop_session: stop_session
+                 )
+      end
+    )
+  end
+
+  test "run re-raises a turn callback exception after a successful stop" do
+    with_fixture(
+      [
+        [json_line(%{"id" => 1, "result" => %{}})],
+        [],
+        [json_line(%{"id" => 2, "result" => %{"thread" => %{"id" => "thread-raised-turn"}}})],
+        [json_line(%{"id" => 3, "result" => %{"turn" => %{"id" => "turn-raised-turn"}}})]
+      ],
+      fn workspace, binary, issue ->
+        on_message = fn
+          %{event: :session_started} -> raise "sensitive turn failure"
+          _message -> :ok
+        end
+
+        assert_raise RuntimeError, "sensitive turn failure", fn ->
+          AppServer.run(workspace, "raising turn", issue,
+            command: "#{binary} app-server",
+            on_message: on_message
+          )
+        end
+      end
+    )
+  end
+
+  test "run keeps a raised turn failure safe when stop also fails" do
+    with_fixture(
+      [
+        [json_line(%{"id" => 1, "result" => %{}})],
+        [],
+        [json_line(%{"id" => 2, "result" => %{"thread" => %{"id" => "thread-raised-stop"}}})],
+        [json_line(%{"id" => 3, "result" => %{"turn" => %{"id" => "turn-raised-stop"}}})]
+      ],
+      fn workspace, binary, issue ->
+        on_message = fn
+          %{event: :session_started} -> raise "sensitive turn failure"
+          _message -> :ok
+        end
+
+        stop_session = fn session ->
+          assert :ok = AppServer.stop_session(session)
+          {:error, {:containment_unconfirmed, :injected_test_failure}}
+        end
+
+        expected_failure =
+          {:error,
+           {
+             :runtime_stop_failed,
+             {:containment_unconfirmed, :injected_test_failure},
+             {:turn_raised, :error, :unspecified}
+           }}
+
+        assert ^expected_failure =
+                 AppServer.run(workspace, "raising turn", issue,
+                   command: "#{binary} app-server",
+                   on_message: on_message,
+                   test_stop_session: stop_session
+                 )
+      end
+    )
+  end
+
+  test "run reduces stop callback throws to a typed failure" do
+    with_fixture(
+      [
+        [json_line(%{"id" => 1, "result" => %{}})],
+        [],
+        [json_line(%{"id" => 2, "result" => %{"thread" => %{"id" => "thread-stop-throw"}}})],
+        [
+          json_line(%{"id" => 3, "result" => %{"turn" => %{"id" => "turn-stop-throw"}}}),
+          json_line(%{"method" => "turn/completed"})
+        ]
+      ],
+      fn workspace, binary, issue ->
+        stop_session = fn session ->
+          assert :ok = AppServer.stop_session(session)
+          throw({:sensitive_stop_failure, "private detail"})
+        end
+
+        assert {:error, {:runtime_stop_failed, {:stop_failure, :throw}}} =
+                 AppServer.run(workspace, "successful turn", issue,
+                   command: "#{binary} app-server",
+                   test_stop_session: stop_session
+                 )
+      end
+    )
+  end
+
+  test "run re-throws a turn callback throw after a successful stop" do
+    with_fixture(
+      [
+        [json_line(%{"id" => 1, "result" => %{}})],
+        [],
+        [json_line(%{"id" => 2, "result" => %{"thread" => %{"id" => "thread-thrown-turn"}}})],
+        [json_line(%{"id" => 3, "result" => %{"turn" => %{"id" => "turn-thrown-turn"}}})]
+      ],
+      fn workspace, binary, issue ->
+        on_message = fn
+          %{event: :session_started} -> throw(:turn_callback_thrown)
+          _message -> :ok
+        end
+
+        assert catch_throw(
+                 AppServer.run(workspace, "throwing turn", issue,
+                   command: "#{binary} app-server",
+                   on_message: on_message
+                 )
+               ) == :turn_callback_thrown
+      end
+    )
+  end
+
+  test "run reduces a stop callback exception to a typed failure" do
+    with_fixture(
+      [
+        [json_line(%{"id" => 1, "result" => %{}})],
+        [],
+        [json_line(%{"id" => 2, "result" => %{"thread" => %{"id" => "thread-stop-raise"}}})],
+        [
+          json_line(%{"id" => 3, "result" => %{"turn" => %{"id" => "turn-stop-raise"}}}),
+          json_line(%{"method" => "turn/completed"})
+        ]
+      ],
+      fn workspace, binary, issue ->
+        stop_session = fn session ->
+          assert :ok = AppServer.stop_session(session)
+          raise "sensitive stop failure"
+        end
+
+        assert {:error, {:runtime_stop_failed, {:stop_exception, RuntimeError}}} =
+                 AppServer.run(workspace, "successful turn", issue,
+                   command: "#{binary} app-server",
+                   test_stop_session: stop_session
+                 )
+      end
+    )
+  end
+
+  test "run reduces malformed stop results without returning their details" do
+    with_fixture(
+      [
+        [json_line(%{"id" => 1, "result" => %{}})],
+        [],
+        [json_line(%{"id" => 2, "result" => %{"thread" => %{"id" => "thread-stop-malformed"}}})],
+        [
+          json_line(%{"id" => 3, "result" => %{"turn" => %{"id" => "turn-stop-malformed"}}}),
+          json_line(%{"method" => "turn/completed"})
+        ]
+      ],
+      fn workspace, binary, issue ->
+        stop_session = fn session ->
+          assert :ok = AppServer.stop_session(session)
+          {:malformed_stop_result, "private detail", %{payload: "sensitive"}}
+        end
+
+        assert {:error, {:runtime_stop_failed, {:invalid_stop_result, :malformed_stop_result}}} =
+                 AppServer.run(workspace, "successful turn", issue,
+                   command: "#{binary} app-server",
+                   test_stop_session: stop_session
+                 )
+      end
+    )
+  end
+
+  test "run keeps safe turn context when both turn and stop return invalid outcomes" do
+    with_fixture(
+      [
+        [json_line(%{"id" => 1, "result" => %{}})],
+        [],
+        [json_line(%{"id" => 2, "result" => %{"thread" => %{"id" => "thread-invalid-outcomes"}}})],
+        [json_line(%{"id" => 3, "result" => %{"turn" => %{"id" => "turn-invalid-outcomes"}}})]
+      ],
+      fn workspace, binary, issue ->
+        on_message = fn
+          %{event: :session_started} -> throw(:turn_callback_failure)
+          _message -> :ok
+        end
+
+        stop_session = fn session ->
+          assert :ok = AppServer.stop_session(session)
+          :malformed_stop_result
+        end
+
+        assert {:error,
+                {
+                  :runtime_stop_failed,
+                  {:invalid_stop_result, :malformed_stop_result},
+                  {:turn_raised, :throw, :turn_callback_failure}
+                }} =
+                 AppServer.run(workspace, "throwing turn", issue,
+                   command: "#{binary} app-server",
+                   on_message: on_message,
+                   test_stop_session: stop_session
+                 )
+      end
+    )
+  end
+
+  test "stop returns session-home cleanup failure after process exit is confirmed" do
+    shell = System.find_executable("sh") || "/bin/sh"
+
+    port =
+      Port.open({:spawn_executable, String.to_charlist(shell)}, [
+        :binary,
+        :exit_status,
+        args: [~c"-c", ~c"exit 0"]
+      ])
+
+    {:os_pid, os_pid} = :erlang.port_info(port, :os_pid)
+
+    assert {:error, {:runtime_isolation_cleanup_failed, :invalid_session_home}} =
+             AppServer.stop_session(%{port: port, os_pid: os_pid, ephemeral_home: %{}})
   end
 
   test "turn-start protocol failures emit startup_failed without changing the runtime" do
@@ -130,7 +489,11 @@ defmodule SymphonyElixir.AppServerEdgeTest do
         [
           json_line(%{"id" => 3, "result" => %{"turn" => %{"id" => "turn-shape"}}}),
           json_line(%{"id" => 9, "result" => %{"diagnostic" => "ignored"}}),
-          json_line(%{"id" => 10, "method" => "item/tool/call", "params" => %{"arguments" => %{}}}),
+          json_line(%{
+            "id" => 10,
+            "method" => "item/tool/call",
+            "params" => %{"arguments" => %{}}
+          }),
           json_line(%{"method" => "turn/completed"})
         ]
       ],
@@ -162,7 +525,11 @@ defmodule SymphonyElixir.AppServerEdgeTest do
           json_line(%{"id" => 3, "result" => %{"turn" => %{"id" => "turn-approval"}}}),
           json_line(%{"id" => 10, "method" => "execCommandApproval", "params" => %{}}),
           json_line(%{"id" => 11, "method" => "applyPatchApproval", "params" => %{}}),
-          json_line(%{"id" => 12, "method" => "item/fileChange/requestApproval", "params" => %{}}),
+          json_line(%{
+            "id" => 12,
+            "method" => "item/fileChange/requestApproval",
+            "params" => %{}
+          }),
           json_line(%{"method" => "turn/completed"})
         ]
       ],
@@ -177,7 +544,9 @@ defmodule SymphonyElixir.AppServerEdgeTest do
                  )
 
         assert_received {:app_server_edge_message, %{event: :approval_auto_approved, decision: "approved_for_session"}}
+
         assert_received {:app_server_edge_message, %{event: :approval_auto_approved, decision: "approved_for_session"}}
+
         assert_received {:app_server_edge_message, %{event: :approval_auto_approved, decision: "acceptForSession"}}
       end
     )
@@ -214,8 +583,16 @@ defmodule SymphonyElixir.AppServerEdgeTest do
         [json_line(%{"id" => 2, "result" => %{"thread" => %{"id" => "thread-normalize"}}})],
         [
           json_line(%{"id" => 3, "result" => %{"turn" => %{"id" => "turn-normalize"}}}),
-          json_line(%{"id" => 20, "method" => "item/tool/call", "params" => %{"tool" => "successful", "arguments" => %{}}}),
-          json_line(%{"id" => 21, "method" => "item/tool/call", "params" => %{"tool" => "raw", "arguments" => %{}}}),
+          json_line(%{
+            "id" => 20,
+            "method" => "item/tool/call",
+            "params" => %{"tool" => "successful", "arguments" => %{}}
+          }),
+          json_line(%{
+            "id" => 21,
+            "method" => "item/tool/call",
+            "params" => %{"tool" => "raw", "arguments" => %{}}
+          }),
           json_line(%{"method" => "turn/completed"})
         ]
       ],
@@ -241,23 +618,38 @@ defmodule SymphonyElixir.AppServerEdgeTest do
     )
   end
 
-  defp with_fixture(cases, test_fun) when is_function(test_fun), do: with_fixture(cases, [], test_fun)
+  defp with_fixture(cases, test_fun) when is_function(test_fun),
+    do: with_fixture(cases, [], test_fun)
 
   defp with_fixture(cases, workflow_overrides, test_fun) do
-    test_root = Path.join(System.tmp_dir!(), "symphony-app-server-edge-#{System.unique_integer([:positive])}")
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-app-server-edge-#{System.unique_integer([:positive])}"
+      )
+
     workspace_root = Path.join(test_root, "workspaces")
     workspace = Path.join(workspace_root, "SYNTHETIC")
-    binary = Path.join(test_root, "fake-codex")
+    binary = Path.join(test_root, "codex")
     File.mkdir_p!(workspace)
     write_fake_codex!(binary, cases)
 
     try do
       write_workflow_file!(
         Workflow.workflow_file_path(),
-        Keyword.merge([workspace_root: workspace_root, codex_command: "#{binary} app-server"], workflow_overrides)
+        Keyword.merge(
+          [workspace_root: workspace_root, codex_command: "#{binary} app-server"],
+          workflow_overrides
+        )
       )
 
-      issue = %Issue{id: "synthetic-issue", identifier: "SYNTHETIC", title: "Synthetic issue", state: "In Progress"}
+      issue = %Issue{
+        id: "synthetic-issue",
+        identifier: "SYNTHETIC",
+        title: "Synthetic issue",
+        state: "In Progress"
+      }
+
       test_fun.(workspace, binary, issue)
     after
       File.rm_rf(test_root)
@@ -327,7 +719,11 @@ defmodule SymphonyElixir.AppServerEdgeTest do
         assert binding.adapter == Memory
         assert binding.agent_tool_context == initial_context
         assert binding.secret_environment_names == []
-        assert Enum.map(binding.tool_specs, &Map.fetch!(&1, "name")) == ["memory_read", "memory_transition"]
+
+        assert Enum.map(binding.tool_specs, &Map.fetch!(&1, "name")) == [
+                 "memory_read",
+                 "memory_transition"
+               ]
 
         assert {:ok, _first_turn} =
                  AppServer.run_turn(session, "first turn", issue, agent_tool_context: initial_context)
@@ -347,21 +743,28 @@ defmodule SymphonyElixir.AppServerEdgeTest do
   end
 
   test "a refreshed Plane route gets a new thread catalogue after a session boundary" do
-    test_root = Path.join(System.tmp_dir!(), "symphony-plane-thread-catalogue-#{System.unique_integer([:positive])}")
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-plane-thread-catalogue-#{System.unique_integer([:positive])}"
+      )
+
     workspace_root = Path.join(test_root, "workspaces")
     workspace = Path.join(workspace_root, "SYNTHETIC")
-    binary = Path.join(test_root, "fake-codex")
+    binary = Path.join(test_root, "codex")
     trace = Path.join(test_root, "codex-trace.jsonl")
     previous_plane_api_key = System.get_env("PLANE_API_KEY")
     System.put_env("PLANE_API_KEY", "test-plane-secret")
     File.mkdir_p!(workspace)
     write_plane_workflow!(Workflow.workflow_file_path(), workspace_root)
-    write_tracing_fake_codex!(binary, trace)
+    write_tracing_fake_codex!(binary, trace, workspace)
 
     try do
       profile = Config.settings!().agent.profiles["builder"]
       ready_route = Route.new(%Issue{id: "plane-thread-catalogue", state: "Ready"}, profile)
-      in_progress_route = Route.new(%Issue{id: "plane-thread-catalogue", state: "In Progress"}, profile)
+
+      in_progress_route =
+        Route.new(%Issue{id: "plane-thread-catalogue", state: "In Progress"}, profile)
 
       ready_context = %{
         issue_id: "plane-thread-catalogue",
@@ -378,22 +781,36 @@ defmodule SymphonyElixir.AppServerEdgeTest do
           trusted_lifecycle_state: :in_progress
       }
 
+      runtime_opts =
+        Profile.runtime_options(profile)
+        |> Keyword.put(:command, "#{binary} app-server")
+        |> Keyword.put(:test_runtime_workspace_admit, fn _issue, _workspace -> :ok end)
+        |> Keyword.put(:test_runtime_isolation_admit, fn _host, _executable, _opts ->
+          {:ok, :test_verified}
+        end)
+
       assert {:ok, ready_session} =
-               AppServer.start_session(workspace,
-                 command: "#{binary} app-server",
-                 agent_tool_context: ready_context
+               AppServer.start_session(
+                 workspace,
+                 Keyword.put(runtime_opts, :agent_tool_context, ready_context)
                )
 
-      assert transition_target_enum(ready_session.dynamic_tool_binding.tool_specs) == ["In Progress"]
+      assert transition_target_enum(ready_session.dynamic_tool_binding.tool_specs) == [
+               "In Progress"
+             ]
+
       assert :ok = AppServer.stop_session(ready_session)
 
       assert {:ok, in_progress_session} =
-               AppServer.start_session(workspace,
-                 command: "#{binary} app-server",
-                 agent_tool_context: in_progress_context
+               AppServer.start_session(
+                 workspace,
+                 Keyword.put(runtime_opts, :agent_tool_context, in_progress_context)
                )
 
-      assert transition_target_enum(in_progress_session.dynamic_tool_binding.tool_specs) == ["In Review"]
+      assert transition_target_enum(in_progress_session.dynamic_tool_binding.tool_specs) == [
+               "In Review"
+             ]
+
       assert :ok = AppServer.stop_session(in_progress_session)
 
       thread_starts =
@@ -482,8 +899,20 @@ defmodule SymphonyElixir.AppServerEdgeTest do
     :ok
   end
 
-  defp write_tracing_fake_codex!(path, trace) do
+  defp write_tracing_fake_codex!(path, trace, workspace) do
     trace = String.replace(trace, "'", "'\\''")
+    workspace = Path.expand(workspace)
+
+    thread_start_response =
+      Jason.encode!(%{
+        "id" => 2,
+        "result" => %{
+          "thread" => %{"id" => "thread-plane"},
+          "activePermissionProfile" => "symphony_builder_write",
+          "runtimeWorkspaceRoots" => [workspace],
+          "cwd" => workspace
+        }
+      })
 
     File.write!(path, """
     #!/bin/sh
@@ -498,7 +927,7 @@ defmodule SymphonyElixir.AppServerEdgeTest do
         2)
           ;;
         3)
-          printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-plane"}}}'
+          printf '%s\\n' '#{thread_start_response}'
           ;;
         *)
           exit 0

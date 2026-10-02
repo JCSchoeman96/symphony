@@ -7,6 +7,7 @@ defmodule SymphonyElixir.Config.Schema do
 
   alias SymphonyElixir.AgentRuntime.Profile
   alias SymphonyElixir.AgentRuntime.Router
+  alias SymphonyElixir.Codex.IsolationProfile
   alias SymphonyElixir.PathSafety
   alias SymphonyElixir.WorkControl.ProviderProjectContract
 
@@ -508,6 +509,63 @@ defmodule SymphonyElixir.Config.Schema do
 
   def validate_routed_turn_sandbox_policy(_settings), do: :ok
 
+  @spec validate_routed_runtime_profiles(t()) :: :ok | {:error, term()}
+  def validate_routed_runtime_profiles(%__MODULE__{agent: %{routing: "routed", profiles: profiles}})
+      when is_map(profiles) do
+    Enum.reduce_while(profiles, :ok, fn {name, profile}, :ok ->
+      case validate_routed_runtime_profile(name, profile) do
+        :ok -> {:cont, :ok}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  def validate_routed_runtime_profiles(%__MODULE__{agent: %{routing: "routed"}}),
+    do: {:error, :routed_runtime_profiles_missing}
+
+  def validate_routed_runtime_profiles(_settings), do: :ok
+
+  defp validate_routed_runtime_profile(name, %Profile{responsibility: "merge"} = profile) do
+    if profile.runtime == "deferred" and is_nil(profile.command) and profile.sandbox == "read-only" do
+      :ok
+    else
+      {:error, {:invalid_routed_runtime_profile, name, :merge_must_be_deferred}}
+    end
+  end
+
+  defp validate_routed_runtime_profile(name, %Profile{} = profile) do
+    expected_sandbox =
+      case profile.responsibility do
+        role when role in ["planning", "review"] -> "read-only"
+        role when role in ["implementation", "correction"] -> "workspace-write"
+        _unsupported -> nil
+      end
+
+    case {profile.runtime, IsolationProfile.profile_name(profile.responsibility), expected_sandbox} do
+      {"codex", permission_profile, sandbox}
+      when is_binary(permission_profile) and sandbox == profile.sandbox ->
+        :ok
+
+      {runtime, {:error, _reason}, _sandbox} ->
+        invalid_routed_runtime_profile(
+          name,
+          {:unsupported_runtime_responsibility, profile.responsibility, runtime}
+        )
+
+      {runtime, _permission_profile, _sandbox} ->
+        invalid_routed_runtime_profile(
+          name,
+          {:runtime_or_access_mismatch, runtime, profile.responsibility, profile.sandbox}
+        )
+    end
+  end
+
+  defp validate_routed_runtime_profile(name, _profile),
+    do: {:error, {:invalid_routed_runtime_profile, name, :invalid_profile}}
+
+  defp invalid_routed_runtime_profile(name, reason),
+    do: {:error, {:invalid_routed_runtime_profile, name, reason}}
+
   @spec validate_routed_turn_sandbox_policy_type(map()) :: :ok | {:error, term()}
   def validate_routed_turn_sandbox_policy_type(%{} = policy) do
     case normalize_turn_sandbox_type(Map.get(policy, "type")) do
@@ -550,8 +608,8 @@ defmodule SymphonyElixir.Config.Schema do
   end
 
   defp normalize_turn_sandbox_type(type) when is_binary(type), do: type
-  defp normalize_turn_sandbox_type(type) when is_atom(type), do: Atom.to_string(type)
   defp normalize_turn_sandbox_type(nil), do: :missing_type
+  defp normalize_turn_sandbox_type(type) when is_atom(type), do: Atom.to_string(type)
   defp normalize_turn_sandbox_type(_type), do: :invalid_type
 
   @spec validate_source_control(%__MODULE__{}) :: :ok | {:error, term()}

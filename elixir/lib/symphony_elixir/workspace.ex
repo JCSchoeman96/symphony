@@ -56,6 +56,40 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
+  @doc """
+  Revalidates a local workspace against its current configured root and owned ledger record.
+
+  This check only reads configuration, the filesystem, and the ownership ledger. It never
+  provisions or changes an ownership record.
+  """
+  @spec revalidate_owned_local_workspace(map() | String.t() | nil, Path.t(), OwnershipLedger.t()) ::
+          :ok | {:error, term()}
+  def revalidate_owned_local_workspace(issue, workspace, %OwnershipLedger{} = ledger)
+      when is_binary(workspace) do
+    with {:ok, identity} <- issue_identity(issue),
+         {:ok, root_binding} <- current_local_root_binding(),
+         expected_workspace <- Path.join(root_binding.canonical_root, workspace_key(identity.identifier)),
+         :ok <- validate_runtime_workspace_path(workspace, expected_workspace),
+         {:ok, records} <- OwnershipLedger.list_for_work_item(ledger, identity.id),
+         {:ok, record} <-
+           exact_owned_record(
+             records,
+             identity,
+             expected_workspace,
+             root_binding.configured_root,
+             root_binding.canonical_root,
+             root_binding.root_identity,
+             nil,
+             ledger.host_identity
+           ),
+         :ok <- validate_runtime_host_identity(ledger, record) do
+      validate_runtime_workspace_filesystem_identity(expected_workspace, record)
+    end
+  end
+
+  def revalidate_owned_local_workspace(_issue, workspace, _ledger),
+    do: {:error, {:workspace_path_unreadable, workspace, :invalid}}
+
   defp prepare_workspace(ledger, identity, workspace, nil, opts),
     do: prepare_local_workspace(ledger, identity, workspace, opts)
 
@@ -443,6 +477,73 @@ defmodule SymphonyElixir.Workspace do
       record.configured_root_identity,
       record.trusted_host_identity
     }
+  end
+
+  defp current_local_root_binding do
+    configured_root = configured_root_binding(nil)
+
+    with {:ok, canonical_root} <- PathSafety.canonicalize(configured_root),
+         {:ok, root_identity} <- OwnershipLedger.root_identity(canonical_root) do
+      {:ok,
+       %{
+         configured_root: configured_root,
+         canonical_root: canonical_root,
+         root_identity: root_identity
+       }}
+    end
+  end
+
+  defp validate_runtime_workspace_path(workspace, expected_workspace) do
+    expanded_workspace = Path.expand(workspace)
+
+    case File.lstat(expanded_workspace) do
+      {:ok, %File.Stat{type: :directory}} ->
+        case PathSafety.canonicalize(expanded_workspace) do
+          {:ok, ^expected_workspace} -> :ok
+          _other -> {:error, {:workspace_identity_mismatch, expanded_workspace}}
+        end
+
+      _other ->
+        {:error, {:workspace_identity_mismatch, expanded_workspace}}
+    end
+  end
+
+  defp validate_runtime_host_identity(ledger, record) do
+    with {:ok, current_host_identity} <- read_runtime_host_identity(ledger.host_identity_path),
+         true <- current_host_identity == ledger.host_identity,
+         true <- current_host_identity == record.trusted_host_identity do
+      :ok
+    else
+      false -> {:error, :workspace_host_identity_mismatch}
+      {:error, reason} -> {:error, {:workspace_host_identity_unavailable, reason}}
+    end
+  end
+
+  defp read_runtime_host_identity(path) do
+    case File.lstat(path) do
+      {:ok, %File.Stat{type: :regular}} ->
+        case File.read(path) do
+          {:ok, identity} when is_binary(identity) and byte_size(identity) > 0 -> {:ok, identity}
+          {:ok, _identity} -> {:error, :empty}
+          {:error, reason} -> {:error, reason}
+        end
+
+      {:ok, %File.Stat{type: type}} ->
+        {:error, {:not_regular, type}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp validate_runtime_workspace_filesystem_identity(workspace, record) do
+    case OwnershipLedger.filesystem_identity(workspace) do
+      {:ok, filesystem_identity} when filesystem_identity == record.top_level_filesystem_identity ->
+        :ok
+
+      _other ->
+        {:error, {:workspace_identity_mismatch, workspace}}
+    end
   end
 
   defp reserved_record(
