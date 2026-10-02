@@ -83,6 +83,7 @@ jobs:
       - linux-isolation-proof
     if: ${{ needs.linux-isolation-proof.result == 'success' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
