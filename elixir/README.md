@@ -36,6 +36,18 @@ issue claimed and exposes it as blocked in the runtime state, JSON API, and dash
 entry itself is runtime state, but routed safety counters and exhaustion are durable in a
 project-scoped DETS ledger; restarting does not restore a Codex session or retry timer.
 
+### Routed runtime isolation
+
+Routed Codex sessions currently support local workers on Linux and macOS. Before a session starts,
+Symphony resolves the direct Codex executable, verifies the actual sandbox, creates a session-local
+`HOME`, `CODEX_HOME`, and XDG state, and applies the role's permission profile to the exact issue
+workspace. `make all` runs this proof with `@openai/codex` `0.159.3`; a missing, incompatible, or
+unproven Codex runtime blocks the gate and the session.
+
+Routed remote workers remain fail-closed. A configured `worker_host` is blocked before remote
+workspace provisioning or App Server launch until a separately verified containment boundary exists.
+The existing SSH path does not count as runtime isolation evidence.
+
 Automatic retry accounting is bounded per issue lineage: ordinary runtime or spawn failures receive
 at most three retries, capacity waits do not consume that failure budget, and reviewer-to-correction
 loops stop after three cycles. Normal continuations and route changes are tracked separately. CI

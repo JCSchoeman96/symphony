@@ -44,6 +44,32 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
+  test "runtime workspace revalidation rejects a replacement at the owned path" do
+    workspace_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-workspace-runtime-admission-#{System.unique_integer([:positive])}"
+      )
+
+    issue = %Issue{id: "h080b-owned", identifier: "H080B-OWNED"}
+    ledger = workspace_ownership_ledger()
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+      assert {:ok, workspace} = Workspace.create_for_issue(issue, nil, ledger)
+      assert :ok = Workspace.revalidate_owned_local_workspace(issue, workspace, ledger)
+
+      replacement = workspace <> ".replacement"
+      File.rename!(workspace, replacement)
+      File.mkdir!(workspace)
+
+      assert {:error, {:workspace_identity_mismatch, _path}} =
+               Workspace.revalidate_owned_local_workspace(issue, workspace, ledger)
+    after
+      File.rm_rf(workspace_root)
+    end
+  end
+
   test "workspace refuses a pre-existing directory without durable ownership" do
     workspace_root =
       Path.join(
@@ -2962,6 +2988,19 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     assert {:error, {:path_canonicalize_failed, ^expanded_path, :enametoolong}} =
              SymphonyElixir.PathSafety.canonicalize(path)
+  end
+
+  test "path safety rejects a symlink cycle without following it indefinitely" do
+    root = Path.join(System.tmp_dir!(), "symphony-path-cycle-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(root)
+    on_exit(fn -> File.rm_rf(root) end)
+
+    cycle = Path.join(root, "cycle")
+    File.ln_s!("cycle", cycle)
+    expanded_cycle = Path.expand(cycle)
+
+    assert {:error, {:path_canonicalize_failed, ^expanded_cycle, :eloop}} =
+             SymphonyElixir.PathSafety.canonicalize(cycle)
   end
 
   test "runtime sandbox policy resolution defaults when omitted and ignores workspace for explicit policies" do

@@ -4,15 +4,33 @@ defmodule SymphonyElixir.AgentRunner do
   """
 
   require Logger
-  alias SymphonyElixir.{AgentRuntime, Config, PromptBuilder, SourceControl, Tracker, Workspace}
-  alias SymphonyElixir.AgentRuntime.{Profile, Route, Router}
+  alias SymphonyElixir.{AgentRuntime, Config, CredentialBoundary, PromptBuilder, SourceControl, Tracker, Workspace}
+  alias SymphonyElixir.AgentRuntime.{Profile, Route, Router, RuntimeIsolation}
   alias SymphonyElixir.AgentRuntime.RuntimeAttempt.Identity, as: RuntimeAttemptIdentity
+  alias SymphonyElixir.Codex.IsolationProfile
   alias SymphonyElixir.Dependency.Guard
   alias SymphonyElixir.Tracker.Issue
   alias SymphonyElixir.WorkControl.{LifecycleAssessment, WorkflowLifecycle, WorkItem}
   alias SymphonyElixir.Workspace.OwnershipLedger
 
   @type worker_host :: String.t() | nil
+
+  @runtime_isolation_boundary_errors [
+    :runtime_provenance_mismatch,
+    :runtime_provenance_missing,
+    :runtime_profile_mismatch,
+    :runtime_workspace_mismatch,
+    :runtime_access_mismatch,
+    :runtime_isolation_cleanup_failed,
+    :runtime_isolation_admission_failed,
+    :runtime_isolation_admission_invalid,
+    :unsafe_routed_command,
+    :invalid_routed_policy,
+    :invalid_workspace_cwd,
+    :codex_identity_failed,
+    :codex_executable_not_found,
+    :ephemeral_home_failed
+  ]
 
   @doc false
   @spec continue_with_issue_for_test(Issue.t(), ([String.t()] -> term())) ::
@@ -67,15 +85,111 @@ defmodule SymphonyElixir.AgentRunner do
         route_log_context(route)
     )
 
-    case run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
-      :ok ->
+    case pre_workspace_isolation_reason(route, worker_host) do
+      {:error, reason} ->
+        notify_runtime_isolation_blocked(codex_update_recipient, issue, runtime_attempt_identity(opts), reason)
         :ok
 
-      {:error, reason} ->
-        Logger.error("Agent run failed for #{issue_context(issue)}: #{inspect(reason)}")
-        raise RuntimeError, "Agent run failed for #{issue_context(issue)}: #{inspect(reason)}"
+      :ok ->
+        run_worker_attempt(
+          safely_run_on_worker_host(issue, codex_update_recipient, opts, worker_host),
+          issue,
+          codex_update_recipient,
+          opts
+        )
     end
   end
+
+  defp safely_run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
+    {:returned, run_on_worker_host(issue, codex_update_recipient, opts, worker_host)}
+  catch
+    kind, reason -> {:raised, kind, reason, __STACKTRACE__}
+  end
+
+  defp run_worker_attempt({:returned, result}, issue, recipient, opts),
+    do: run_worker_attempt_result(result, issue, recipient, opts)
+
+  defp run_worker_attempt({:raised, kind, reason, stacktrace}, issue, recipient, opts) do
+    case runtime_isolation_block_reason(reason) do
+      nil -> :erlang.raise(kind, reason, stacktrace)
+      isolation_reason -> report_runtime_isolation_block(recipient, issue, opts, isolation_reason)
+    end
+  end
+
+  defp run_worker_attempt_result(:ok, _issue, _recipient, _opts), do: :ok
+
+  defp run_worker_attempt_result({:error, reason}, issue, recipient, opts) do
+    case runtime_isolation_block_reason(reason) do
+      nil ->
+        Logger.error("Agent run failed for #{issue_context(issue)}: #{inspect(reason)}")
+        raise RuntimeError, "Agent run failed for #{issue_context(issue)}: #{inspect(reason)}"
+
+      isolation_reason ->
+        report_runtime_isolation_block(recipient, issue, opts, isolation_reason)
+    end
+  end
+
+  defp run_worker_attempt_result(result, issue, _recipient, _opts) do
+    Logger.error("Agent run returned an invalid result for #{issue_context(issue)}: #{inspect(result)}")
+    raise RuntimeError, "Agent run returned an invalid result for #{issue_context(issue)}"
+  end
+
+  defp report_runtime_isolation_block(recipient, issue, opts, isolation_reason) do
+    Logger.warning("Agent run blocked because runtime isolation could not be proven for #{issue_context(issue)}")
+    notify_runtime_isolation_blocked(recipient, issue, runtime_attempt_identity(opts), isolation_reason)
+    :ok
+  end
+
+  defp runtime_isolation_block_reason({:runtime_isolation_unavailable, _detail} = reason), do: reason
+  defp runtime_isolation_block_reason({:runtime_isolation_failed, _detail} = reason), do: reason
+
+  defp runtime_isolation_block_reason({:runtime_stop_failed, {:stop_failed, detail}})
+       when detail in [:session_stopped, :process_still_running, :process_state_unavailable],
+       do: {:runtime_isolation_unavailable, :runtime_cleanup_unconfirmed}
+
+  defp runtime_isolation_block_reason({:stop_failed, detail})
+       when detail in [:session_stopped, :process_still_running, :process_state_unavailable],
+       do: {:runtime_isolation_unavailable, :runtime_cleanup_unconfirmed}
+
+  defp runtime_isolation_block_reason({wrapper, reason})
+       when wrapper in [:start_failed, :turn_failed, :runtime_stop_failed],
+       do: runtime_isolation_block_reason(reason)
+
+  defp runtime_isolation_block_reason(reason) when is_tuple(reason) and tuple_size(reason) > 0 do
+    case find_runtime_isolation_reason(Tuple.to_list(reason)) do
+      {:runtime_isolation_unavailable, _detail} = isolation_reason ->
+        isolation_reason
+
+      {:runtime_isolation_failed, _detail} = isolation_reason ->
+        isolation_reason
+
+      _missing ->
+        if elem(reason, 0) in @runtime_isolation_boundary_errors do
+          {:runtime_isolation_unavailable, :app_server_boundary_unproven}
+        else
+          nil
+        end
+    end
+  end
+
+  defp runtime_isolation_block_reason(_reason), do: nil
+
+  defp find_runtime_isolation_reason([{:runtime_isolation_unavailable, _detail} = reason | _rest]),
+    do: reason
+
+  defp find_runtime_isolation_reason([{:runtime_isolation_failed, _detail} = reason | _rest]),
+    do: reason
+
+  defp find_runtime_isolation_reason([term | rest]) when is_tuple(term) do
+    case runtime_isolation_block_reason(term) do
+      {:runtime_isolation_unavailable, _detail} = reason -> reason
+      {:runtime_isolation_failed, _detail} = reason -> reason
+      _missing -> find_runtime_isolation_reason(rest)
+    end
+  end
+
+  defp find_runtime_isolation_reason([_term | rest]), do: find_runtime_isolation_reason(rest)
+  defp find_runtime_isolation_reason([]), do: nil
 
   defp run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
     Logger.info("Starting worker attempt for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
@@ -88,7 +202,14 @@ defmodule SymphonyElixir.AgentRunner do
 
         try do
           with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host) do
-            run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host)
+            case admit_local_routed_runtime(issue, workspace, opts, worker_host) do
+              :ok ->
+                run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host)
+
+              {:error, reason} ->
+                notify_runtime_isolation_blocked(codex_update_recipient, issue, runtime_identity, reason)
+                :ok
+            end
           end
         after
           Workspace.run_after_run_hook(workspace, issue, worker_host)
@@ -190,6 +311,7 @@ defmodule SymphonyElixir.AgentRunner do
       |> Keyword.put(:worker_host, worker_host)
       |> profile_runtime_options(route)
       |> Keyword.put(:agent_tool_context, agent_tool_context(issue, route, opts))
+      |> Keyword.put(:runtime_issue, issue)
       |> Keyword.delete(:route)
       |> Keyword.delete(:issue_state_fetcher)
       |> Keyword.delete(:plane_epoch_snapshot_reader)
@@ -220,6 +342,130 @@ defmodule SymphonyElixir.AgentRunner do
       end)
     end
   end
+
+  defp pre_workspace_isolation_reason(route, worker_host) do
+    with :ok <- validate_routed_executable_profile(route),
+         :ok <- routed_remote_isolation_reason(route, worker_host) do
+      validate_routed_executable_command(route)
+    end
+  end
+
+  defp validate_routed_executable_profile(route) do
+    if Config.settings!().agent.routing == "routed" and not executable_routed_profile?(route) do
+      {:error, {:runtime_isolation_unavailable, :routed_profile_not_executable}}
+    else
+      :ok
+    end
+  end
+
+  defp executable_routed_profile?(%Route{
+         runtime_name: "codex",
+         profile: %Profile{runtime: "codex", responsibility: responsibility}
+       }) do
+    is_binary(IsolationProfile.profile_name(responsibility))
+  end
+
+  defp executable_routed_profile?(_route), do: false
+
+  defp validate_routed_executable_command(%Route{
+         profile: %Profile{runtime: "codex", command: command}
+       }) do
+    cond do
+      Config.settings!().agent.routing != "routed" ->
+        :ok
+
+      not is_binary(command) or String.trim(command) == "" ->
+        {:error, {:runtime_isolation_unavailable, :routed_command_missing}}
+
+      true ->
+        case IsolationProfile.resolve_codex_executable(command) do
+          {:ok, _resolved} -> :ok
+          {:error, reason} -> {:error, {:runtime_isolation_unavailable, reason}}
+        end
+    end
+  end
+
+  defp validate_routed_executable_command(_route), do: :ok
+
+  defp routed_remote_isolation_reason(%Route{runtime_name: "codex"}, worker_host)
+       when is_binary(worker_host) do
+    if Config.settings!().agent.routing == "routed" do
+      {:error, {:runtime_isolation_unavailable, :remote_containment_unproven}}
+    else
+      :ok
+    end
+  end
+
+  defp routed_remote_isolation_reason(_route, _worker_host), do: :ok
+
+  defp admit_local_routed_runtime(issue, workspace, opts, nil) do
+    route = Keyword.get(opts, :route)
+
+    if Config.settings!().agent.routing == "routed" and match?(%Route{runtime_name: "codex"}, route) do
+      profile = route.profile
+
+      with %Profile{runtime: "codex"} <- profile,
+           %OwnershipLedger{} = ledger <- Keyword.get(opts, :ownership_ledger),
+           :ok <- Workspace.revalidate_owned_local_workspace(issue, workspace, ledger),
+           :ok <- CredentialBoundary.workspace_credential_residue(workspace),
+           {:ok, %{executable: executable}} <- IsolationProfile.resolve_codex_executable(profile.command),
+           {:ok, _evidence} <- admit_runtime_isolation(executable, opts) do
+        :ok
+      else
+        {:error, {:runtime_isolation_unavailable, _detail} = reason} ->
+          {:error, reason}
+
+        {:error, {:runtime_isolation_failed, _detail} = reason} ->
+          {:error, reason}
+
+        {:error, {:unsafe_workspace_scm_credentials, _detail}} ->
+          {:error, {:runtime_isolation_unavailable, :workspace_scm_boundary_unproven}}
+
+        {:error, _reason} ->
+          {:error, {:runtime_isolation_unavailable, :workspace_identity_or_runtime_unproven}}
+
+        _other ->
+          {:error, {:runtime_isolation_unavailable, :admission_unproven}}
+      end
+    else
+      :ok
+    end
+  end
+
+  defp admit_local_routed_runtime(_issue, _workspace, _opts, _worker_host), do: :ok
+
+  defp admit_runtime_isolation(executable, opts) do
+    admission =
+      if test_environment?() do
+        Keyword.get(opts, :test_runtime_isolation_admit, &RuntimeIsolation.admit/3)
+      else
+        &RuntimeIsolation.admit/3
+      end
+
+    case admission do
+      admit when is_function(admit, 3) -> admit.(nil, executable, [])
+      admit when is_function(admit, 2) -> admit.(nil, executable)
+      _invalid -> {:error, {:runtime_isolation_admission_invalid, :callback}}
+    end
+  rescue
+    error in [ArgumentError, ErlangError] ->
+      {:error, {:runtime_isolation_admission_failed, error.__struct__}}
+  catch
+    _kind, _reason -> {:error, :runtime_isolation_admission_failed}
+  end
+
+  defp test_environment? do
+    Code.ensure_loaded?(Mix) and function_exported?(Mix, :env, 0) and Mix.env() == :test
+  rescue
+    _ -> false
+  end
+
+  defp notify_runtime_isolation_blocked(recipient, %Issue{id: issue_id}, identity, reason)
+       when is_binary(issue_id) and is_pid(recipient) do
+    send_runtime_event(recipient, {:runtime_isolation_blocked, issue_id, reason}, identity)
+  end
+
+  defp notify_runtime_isolation_blocked(_recipient, _issue, _identity, _reason), do: :ok
 
   defp do_run_codex_turns(context, turn_number, max_turns) do
     prompt_opts =
@@ -469,9 +715,28 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp start_restarted_runtime_session(runtime, next_context, turn_number, max_turns) do
-    case runtime.start_session(next_context.workspace, next_context.opts) do
+    runtime_opts = restarted_runtime_options(next_context)
+    admission_opts = Keyword.put(runtime_opts, :route, next_context.route)
+    worker_host = Keyword.get(admission_opts, :worker_host)
+
+    case admit_local_routed_runtime(next_context.issue, next_context.workspace, admission_opts, worker_host) do
+      :ok -> start_restarted_session(runtime, next_context, runtime_opts, turn_number, max_turns)
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp restarted_runtime_options(next_context) do
+    next_context.opts
+    |> profile_runtime_options(next_context.route)
+    |> Keyword.put(:worker_host, Keyword.get(next_context.opts, :worker_host))
+    |> Keyword.put(:agent_tool_context, agent_tool_context(next_context.issue, next_context.route, next_context.opts))
+    |> Keyword.put(:runtime_issue, next_context.issue)
+  end
+
+  defp start_restarted_session(runtime, next_context, runtime_opts, turn_number, max_turns) do
+    case runtime.start_session(next_context.workspace, runtime_opts) do
       {:ok, session} ->
-        restarted_context = %{next_context | session: session, session_restarted?: true}
+        restarted_context = %{next_context | session: session, opts: runtime_opts, session_restarted?: true}
 
         run_runtime_session(runtime, session, fn ->
           do_run_codex_turns(restarted_context, turn_number, max_turns)

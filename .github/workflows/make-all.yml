@@ -2,16 +2,22 @@ name: make-all
 
 on:
   pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
   push:
     branches:
       - main
 
 jobs:
-  make-all:
+  linux-full-gate:
+    name: linux-full-gate
+    needs:
+      - macos-isolation-proof
+    if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.macos-isolation-proof.result == 'success' }}
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: elixir
 
     steps:
       - name: Checkout
@@ -24,6 +30,13 @@ jobs:
           cache: true
           working_directory: elixir
 
+      - name: Install pinned Codex
+        run: npm install --global --no-audit --no-fund @openai/codex@0.159.3
+
+      - name: Verify Codex version
+        run: |
+          test "$(codex --version)" = "codex-cli 0.159.3"
+
       - name: Cache deps and build
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
@@ -35,4 +48,60 @@ jobs:
             ${{ runner.os }}-mix-
 
       - name: Verify make all
-        run: make all
+        run: make -C elixir all
+
+  macos-isolation-proof:
+    name: macos-isolation-proof
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set up mise tools
+        uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db # v3
+        with:
+          install: true
+          cache: true
+          working_directory: elixir
+
+      - name: Install pinned Codex
+        run: npm install --global --no-audit --no-fund @openai/codex@0.159.3
+
+      - name: Verify Codex version
+        run: |
+          test "$(codex --version)" = "codex-cli 0.159.3"
+
+      - name: Cache deps and build
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            elixir/deps
+            elixir/_build
+          key: ${{ runner.os }}-mix-${{ hashFiles('elixir/mix.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-mix-
+
+      - name: Install Elixir dependencies
+        run: make -C elixir setup
+
+      - name: Run isolation proof
+        run: make -C elixir isolation-proof
+
+  make-all:
+    name: make-all
+    if: ${{ always() }}
+    needs:
+      - linux-full-gate
+      - macos-isolation-proof
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Require platform gates
+        run: |
+          test "${{ needs.macos-isolation-proof.result }}" = success
+
+      - name: Require Linux full gate when the PR is not a draft
+        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.draft == false }}
+        run: |
+          test "${{ needs.linux-full-gate.result }}" = success

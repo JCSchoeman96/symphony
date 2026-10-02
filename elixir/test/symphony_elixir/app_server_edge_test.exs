@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.AppServerEdgeTest do
   use SymphonyElixir.TestSupport
 
-  alias SymphonyElixir.AgentRuntime.Route
+  alias SymphonyElixir.AgentRuntime.{Profile, Route}
   alias SymphonyElixir.Tracker.Memory
 
   test "the default start-session API still enforces the local workspace boundary" do
@@ -247,7 +247,7 @@ defmodule SymphonyElixir.AppServerEdgeTest do
     test_root = Path.join(System.tmp_dir!(), "symphony-app-server-edge-#{System.unique_integer([:positive])}")
     workspace_root = Path.join(test_root, "workspaces")
     workspace = Path.join(workspace_root, "SYNTHETIC")
-    binary = Path.join(test_root, "fake-codex")
+    binary = Path.join(test_root, "codex")
     File.mkdir_p!(workspace)
     write_fake_codex!(binary, cases)
 
@@ -350,13 +350,13 @@ defmodule SymphonyElixir.AppServerEdgeTest do
     test_root = Path.join(System.tmp_dir!(), "symphony-plane-thread-catalogue-#{System.unique_integer([:positive])}")
     workspace_root = Path.join(test_root, "workspaces")
     workspace = Path.join(workspace_root, "SYNTHETIC")
-    binary = Path.join(test_root, "fake-codex")
+    binary = Path.join(test_root, "codex")
     trace = Path.join(test_root, "codex-trace.jsonl")
     previous_plane_api_key = System.get_env("PLANE_API_KEY")
     System.put_env("PLANE_API_KEY", "test-plane-secret")
     File.mkdir_p!(workspace)
     write_plane_workflow!(Workflow.workflow_file_path(), workspace_root)
-    write_tracing_fake_codex!(binary, trace)
+    write_tracing_fake_codex!(binary, trace, workspace)
 
     try do
       profile = Config.settings!().agent.profiles["builder"]
@@ -378,20 +378,20 @@ defmodule SymphonyElixir.AppServerEdgeTest do
           trusted_lifecycle_state: :in_progress
       }
 
+      runtime_opts =
+        Profile.runtime_options(profile)
+        |> Keyword.put(:command, "#{binary} app-server")
+        |> Keyword.put(:test_runtime_workspace_admit, fn _issue, _workspace -> :ok end)
+        |> Keyword.put(:test_runtime_isolation_admit, fn _host, _executable, _opts -> {:ok, :test_verified} end)
+
       assert {:ok, ready_session} =
-               AppServer.start_session(workspace,
-                 command: "#{binary} app-server",
-                 agent_tool_context: ready_context
-               )
+               AppServer.start_session(workspace, Keyword.put(runtime_opts, :agent_tool_context, ready_context))
 
       assert transition_target_enum(ready_session.dynamic_tool_binding.tool_specs) == ["In Progress"]
       assert :ok = AppServer.stop_session(ready_session)
 
       assert {:ok, in_progress_session} =
-               AppServer.start_session(workspace,
-                 command: "#{binary} app-server",
-                 agent_tool_context: in_progress_context
-               )
+               AppServer.start_session(workspace, Keyword.put(runtime_opts, :agent_tool_context, in_progress_context))
 
       assert transition_target_enum(in_progress_session.dynamic_tool_binding.tool_specs) == ["In Review"]
       assert :ok = AppServer.stop_session(in_progress_session)
@@ -482,8 +482,20 @@ defmodule SymphonyElixir.AppServerEdgeTest do
     :ok
   end
 
-  defp write_tracing_fake_codex!(path, trace) do
+  defp write_tracing_fake_codex!(path, trace, workspace) do
     trace = String.replace(trace, "'", "'\\''")
+    workspace = Path.expand(workspace)
+
+    thread_start_response =
+      Jason.encode!(%{
+        "id" => 2,
+        "result" => %{
+          "thread" => %{"id" => "thread-plane"},
+          "activePermissionProfile" => "symphony_builder_write",
+          "runtimeWorkspaceRoots" => [workspace],
+          "cwd" => workspace
+        }
+      })
 
     File.write!(path, """
     #!/bin/sh
@@ -498,7 +510,7 @@ defmodule SymphonyElixir.AppServerEdgeTest do
         2)
           ;;
         3)
-          printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-plane"}}}'
+          printf '%s\\n' '#{thread_start_response}'
           ;;
         *)
           exit 0
