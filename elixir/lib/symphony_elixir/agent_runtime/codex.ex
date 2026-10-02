@@ -15,6 +15,8 @@ defmodule SymphonyElixir.AgentRuntime.Codex do
   @spec runtime_metadata() :: AgentRuntime.runtime_metadata()
   def runtime_metadata, do: %{name: :codex}
 
+  # Startup success depends on the external Codex runtime and App Server response.
+  @dialyzer {:nowarn_function, start_session: 2}
   @spec start_session(Path.t(), keyword()) ::
           {:ok, AgentRuntime.session()} | {:error, AgentRuntime.start_error()}
   def start_session(workspace, opts \\ []) do

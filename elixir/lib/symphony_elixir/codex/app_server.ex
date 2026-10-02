@@ -18,6 +18,188 @@ defmodule SymphonyElixir.Codex.AppServer do
   @stop_poll_interval_ms 10
   @stop_poll_attempts 20
   @port_monitor_timeout_ms 5_000
+  @routed_stop_token <<0, "SYMPHONY_STOP", "\n">>
+  @linux_guard_stop_timeout_ms 5_000
+
+  @linux_runtime_guard_script ~S"""
+  import ctypes, errno, json, os, selectors, signal, sys, time
+
+  stop_token = b"\x00SYMPHONY_STOP\n"
+  path, *runtime_args = sys.argv[1:]
+
+  child_input, parent_input = os.pipe()
+  parent_output, child_output = os.pipe()
+  child = os.fork()
+
+  if child == 0:
+      try:
+          os.dup2(child_input, 0)
+          os.dup2(child_output, 1)
+          os.dup2(child_output, 2)
+          for descriptor in (child_input, parent_input, parent_output, child_output):
+              if descriptor > 2:
+                  os.close(descriptor)
+          os.execve(path, [path, *runtime_args], os.environ)
+      except BaseException as error:
+          os.write(2, ("symphony runtime guard: runtime exec failed: " + type(error).__name__ + "\n").encode())
+          os._exit(126)
+
+  os.close(child_input)
+  os.close(child_output)
+  signal.signal(signal.SIGTERM, lambda _signum, _frame: None)
+  signal.signal(signal.SIGINT, lambda _signum, _frame: None)
+  signal.signal(signal.SIGHUP, lambda _signum, _frame: None)
+  selector = selectors.DefaultSelector()
+  os.set_blocking(0, False)
+  os.set_blocking(parent_output, False)
+  os.set_blocking(parent_input, False)
+  selector.register(0, selectors.EVENT_READ, "host-input")
+  selector.register(parent_output, selectors.EVENT_READ, "runtime-output")
+  pending = bytearray()
+  pending_runtime_output = bytearray()
+  startup_response_seen = False
+  stopping = False
+
+  def write_all(descriptor, data):
+      view = memoryview(data)
+      while view:
+          try:
+              view = view[os.write(descriptor, view):]
+          except InterruptedError:
+              continue
+
+  def reap_children():
+      status = ctypes.c_int()
+      waitpid = ctypes.CDLL(None, use_errno=True).waitpid
+      waitpid.argtypes = (ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.c_int)
+      waitpid.restype = ctypes.c_int
+      while True:
+          result = waitpid(-1, ctypes.byref(status), os.WNOHANG | 0x40000000)
+          if result > 0:
+              continue
+          if result == 0:
+              return
+          if ctypes.get_errno() == errno.EINTR:
+              continue
+          if ctypes.get_errno() == errno.ECHILD:
+              return
+          raise OSError(ctypes.get_errno(), "waitpid failed")
+
+  def namespace_processes():
+      try:
+          return [int(name) for name in os.listdir("/proc") if name.isdigit() and int(name) != 1]
+      except OSError:
+          return None
+
+  def signal_namespace_processes(signum):
+      pids = namespace_processes()
+      if pids is None:
+          return None
+      for pid in pids:
+          try:
+              os.kill(pid, signum)
+          except ProcessLookupError:
+              pass
+          except PermissionError:
+              return None
+      return pids
+
+  def contain_namespace(timeout):
+      deadline = time.monotonic() + timeout
+      term_sent = False
+      while time.monotonic() < deadline:
+          pids = namespace_processes()
+          if pids is None:
+              return False
+          if not pids:
+              reap_children()
+              return namespace_processes() == []
+          if not term_sent:
+              signal_namespace_processes(signal.SIGTERM)
+              term_sent = True
+          elif time.monotonic() + 0.2 < deadline:
+              signal_namespace_processes(signal.SIGKILL)
+          reap_children()
+          time.sleep(0.01)
+      return False
+
+  while True:
+      if stopping:
+          if contain_namespace(4.0):
+              os._exit(0)
+          try:
+              os.write(2, b"symphony runtime guard: descendants remain; retaining containment\n")
+          except OSError:
+              pass
+          time.sleep(0.1)
+          continue
+
+      try:
+          events = selector.select(timeout=0.1)
+      except InterruptedError:
+          continue
+      reap_children()
+      for key, _mask in events:
+          if key.data == "host-input":
+              try:
+                  data = os.read(0, 65536)
+              except BlockingIOError:
+                  continue
+              if not data:
+                  selector.unregister(0)
+                  stopping = True
+                  try:
+                      os.close(parent_input)
+                  except OSError:
+                      pass
+                  break
+              pending.extend(data)
+              while b"\n" in pending:
+                  line, _, remainder = pending.partition(b"\n")
+                  pending = bytearray(remainder)
+                  if line + b"\n" == stop_token:
+                      stopping = True
+                      selector.unregister(0)
+                      try:
+                          os.close(parent_input)
+                      except OSError:
+                          pass
+                      break
+                  try:
+                      write_all(parent_input, line + b"\n")
+                  except BrokenPipeError:
+                      stopping = True
+                      break
+              if stopping:
+                  break
+          else:
+              try:
+                  data = os.read(parent_output, 65536)
+              except BlockingIOError:
+                  continue
+              if not data:
+                  selector.unregister(parent_output)
+                  os.close(parent_output)
+                  if not startup_response_seen:
+                      stopping = True
+                      try:
+                          os.close(parent_input)
+                      except OSError:
+                          pass
+              else:
+                  pending_runtime_output.extend(data)
+                  while b"\n" in pending_runtime_output:
+                      line, _, remainder = pending_runtime_output.partition(b"\n")
+                      pending_runtime_output = bytearray(remainder)
+                      try:
+                          message = json.loads(line)
+                          if isinstance(message, dict) and message.get("id") == 1 and ("result" in message or "error" in message):
+                              startup_response_seen = True
+                      except (UnicodeDecodeError, json.JSONDecodeError):
+                          pass
+                  write_all(1, data)
+
+  """
   @type session :: %{
           :port => port(),
           :os_pid => pos_integer() | nil,
@@ -38,16 +220,83 @@ defmodule SymphonyElixir.Codex.AppServer do
           optional(:access) => :read | :write | nil
         }
 
+  # Startup success depends on the external app-server protocol response.
+  @dialyzer {:nowarn_function, run: 4}
   @spec run(Path.t(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
   def run(workspace, prompt, issue, opts \\ []) do
     with {:ok, session} <- start_session(workspace, opts) do
-      try do
-        run_turn(session, prompt, issue, opts)
-      after
-        stop_session(session)
-      end
+      execution_result =
+        capture_execution_result(fn ->
+          run_turn(session, prompt, issue, Keyword.put(opts, :defer_runtime_stop, true))
+        end)
+
+      stop_result = stop_run_session(session, opts)
+      combine_execution_and_stop(execution_result, stop_result)
     end
   end
+
+  @dialyzer {:nowarn_function, capture_execution_result: 1}
+  defp capture_execution_result(fun) do
+    {:returned, fun.()}
+  rescue
+    exception -> {:raised, :error, exception, __STACKTRACE__}
+  catch
+    kind, reason -> {:raised, kind, reason, __STACKTRACE__}
+  end
+
+  @dialyzer {:nowarn_function, stop_run_session: 2}
+  defp stop_run_session(session, opts) do
+    test_stop_session = Keyword.get(opts, :test_stop_session)
+
+    result =
+      if test_environment?() and is_function(test_stop_session, 1) do
+        test_stop_session.(session)
+      else
+        stop_session(session)
+      end
+
+    case result do
+      :ok -> :ok
+      {:error, reason} -> {:error, reason}
+      other -> {:error, {:invalid_stop_result, safe_failure_tag(other)}}
+    end
+  rescue
+    exception -> {:error, {:stop_exception, exception.__struct__}}
+  catch
+    kind, _reason -> {:error, {:stop_failure, kind}}
+  end
+
+  @dialyzer {:nowarn_function, combine_execution_and_stop: 2}
+  defp combine_execution_and_stop({:returned, result}, :ok), do: result
+
+  defp combine_execution_and_stop({:raised, kind, reason, stacktrace}, :ok) do
+    :erlang.raise(kind, reason, stacktrace)
+  end
+
+  defp combine_execution_and_stop(execution_result, {:error, stop_reason}) do
+    case execution_failure_context(execution_result) do
+      nil -> {:error, {:runtime_stop_failed, stop_reason}}
+      context -> {:error, {:runtime_stop_failed, stop_reason, context}}
+    end
+  end
+
+  @dialyzer {:nowarn_function, execution_failure_context: 1}
+  defp execution_failure_context({:returned, {:error, reason}}),
+    do: {:turn_failed, safe_failure_tag(reason)}
+
+  defp execution_failure_context({:returned, {:ok, _result}}), do: nil
+
+  defp execution_failure_context({:returned, result}),
+    do: {:turn_result, safe_failure_tag(result)}
+
+  defp execution_failure_context({:raised, kind, reason, _stacktrace}),
+    do: {:turn_raised, kind, safe_failure_tag(reason)}
+
+  @dialyzer {:nowarn_function, safe_failure_tag: 1}
+  defp safe_failure_tag(reason) when is_atom(reason), do: reason
+  defp safe_failure_tag({tag, _reason}) when is_atom(tag), do: tag
+  defp safe_failure_tag({tag, _first, _second}) when is_atom(tag), do: tag
+  defp safe_failure_tag(_reason), do: :unspecified
 
   @spec start_session(Path.t(), keyword()) :: {:ok, session()} | {:error, term()}
   def start_session(workspace, opts \\ []) do
@@ -83,10 +332,24 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp start_prepared_launch(workspace, worker_host, dynamic_tool_binding, opts, session_policies, launch) do
+  defp start_prepared_launch(
+         workspace,
+         worker_host,
+         dynamic_tool_binding,
+         opts,
+         session_policies,
+         launch
+       ) do
     case revalidate_routed_workspace(workspace, session_policies, opts) do
       :ok ->
-        case start_port(workspace, worker_host, dynamic_tool_binding, opts, session_policies, launch) do
+        case start_port(
+               workspace,
+               worker_host,
+               dynamic_tool_binding,
+               opts,
+               session_policies,
+               launch
+             ) do
           {:ok, port, ephemeral_home} ->
             start_session_on_port(
               port,
@@ -114,7 +377,15 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp start_session_on_port(port, ephemeral_home, workspace, worker_host, dynamic_tool_binding, opts, session_policies) do
+  defp start_session_on_port(
+         port,
+         ephemeral_home,
+         workspace,
+         worker_host,
+         dynamic_tool_binding,
+         opts,
+         session_policies
+       ) do
     case do_start_session(port, workspace, session_policies, dynamic_tool_binding) do
       {:ok, thread_id} ->
         session =
@@ -132,11 +403,25 @@ defmodule SymphonyElixir.Codex.AppServer do
         {:ok, session}
 
       {:error, reason} ->
-        cleanup_failed_session_start(port, ephemeral_home, reason)
+        cleanup_failed_session_start(
+          port,
+          ephemeral_home,
+          reason,
+          routed_policies?(session_policies)
+        )
     end
   end
 
-  defp build_session(port, ephemeral_home, workspace, worker_host, dynamic_tool_binding, opts, session_policies, thread_id) do
+  defp build_session(
+         port,
+         ephemeral_home,
+         workspace,
+         worker_host,
+         dynamic_tool_binding,
+         opts,
+         session_policies,
+         thread_id
+       ) do
     os_pid = port_os_pid(port)
 
     %{
@@ -154,14 +439,17 @@ defmodule SymphonyElixir.Codex.AppServer do
       ephemeral_home: ephemeral_home,
       runtime_policies: session_policies,
       routed: routed_policies?(session_policies),
+      runtime_containment: if(routed_policies?(session_policies), do: :linux_pid_namespace, else: nil),
       permission_profile: policy_value(session_policies, :permission_profile),
       runtime_workspace_roots: policy_value(session_policies, :runtime_workspace_roots),
       access: policy_value(session_policies, :access)
     }
   end
 
-  defp cleanup_failed_session_start(port, ephemeral_home, reason) do
-    case stop_port(port) do
+  defp cleanup_failed_session_start(port, ephemeral_home, reason, routed?) do
+    stop_result = if routed?, do: stop_routed_port(port), else: stop_port(port)
+
+    case stop_result do
       :ok ->
         case cleanup_ephemeral_home(ephemeral_home) do
           :ok -> {:error, reason}
@@ -173,8 +461,8 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp routed_failure(session, session_policies, reason) do
-    if routed_policies?(session_policies) do
+  defp routed_failure(session, session_policies, reason, opts) do
+    if routed_policies?(session_policies) and not Keyword.get(opts, :defer_runtime_stop, false) do
       case stop_session(session) do
         :ok -> {:error, reason}
         {:error, cleanup_reason} -> {:error, cleanup_reason}
@@ -269,12 +557,12 @@ defmodule SymphonyElixir.Codex.AppServer do
               metadata
             )
 
-            routed_failure(session, session_policies, reason)
+            routed_failure(session, session_policies, reason, opts)
         end
 
       {:error, reason} ->
         Logger.error("Codex session failed for #{issue_context(issue)}: #{inspect(reason)}")
-        result = routed_failure(session, session_policies, reason)
+        result = routed_failure(session, session_policies, reason, opts)
         emit_message(on_message, :startup_failed, %{reason: elem(result, 1)}, metadata)
         result
     end
@@ -282,7 +570,14 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   @spec stop_session(session()) :: :ok | {:error, term()}
   def stop_session(%{port: port} = session) when is_port(port) do
-    case stop_port(port, Map.get(session, :os_pid)) do
+    stop_result =
+      if Map.get(session, :runtime_containment) == :linux_pid_namespace do
+        stop_routed_port(port)
+      else
+        stop_port(port, Map.get(session, :os_pid))
+      end
+
+    case stop_result do
       :ok ->
         cleanup_ephemeral_home(Map.get(session, :ephemeral_home))
 
@@ -335,7 +630,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp start_port(workspace, nil, dynamic_tool_binding, opts, session_policies, launch) do
     if routed_policies?(session_policies) do
-      start_routed_local_port(workspace, dynamic_tool_binding, launch)
+      start_routed_local_port(workspace, dynamic_tool_binding, launch, opts)
     else
       start_legacy_local_port(workspace, dynamic_tool_binding, opts)
     end
@@ -389,9 +684,14 @@ defmodule SymphonyElixir.Codex.AppServer do
            session_home: session_home,
            launch_identity: launch_identity,
            runtime_evidence: runtime_evidence
-         }
+         },
+         opts
        ) do
-    with :ok <- validate_routed_runtime_identity(resolved, launch_identity, runtime_evidence) do
+    with :ok <- require_linux_routed_runtime(opts),
+         {:ok, unshare} <- routed_guard_tool("unshare", opts),
+         {:ok, python} <- routed_guard_tool("python3", opts),
+         :ok <- validate_routed_runtime_identity(resolved, launch_identity, runtime_evidence),
+         :ok <- validate_routed_runtime_path(resolved, opts) do
       env =
         CredentialBoundary.routed_port_env(
           dynamic_tool_binding.secret_environment_names,
@@ -399,14 +699,29 @@ defmodule SymphonyElixir.Codex.AppServer do
           session_home.codex_home
         )
 
+      args = [
+        "--user",
+        "--map-current-user",
+        "--pid",
+        "--fork",
+        "--mount-proc",
+        python,
+        "-I",
+        "-S",
+        "-c",
+        @linux_runtime_guard_script,
+        resolved.native_executable
+        | resolved.argv
+      ]
+
       port =
         Port.open(
-          {:spawn_executable, String.to_charlist(resolved.executable)},
+          {:spawn_executable, String.to_charlist(unshare)},
           [
             :binary,
             :exit_status,
             :stderr_to_stdout,
-            args: Enum.map(resolved.argv, &String.to_charlist/1),
+            args: Enum.map(args, &String.to_charlist/1),
             cd: String.to_charlist(workspace),
             env: env,
             line: @port_line_bytes
@@ -414,17 +729,101 @@ defmodule SymphonyElixir.Codex.AppServer do
         )
 
       {:ok, port, session_home}
+    else
+      {:error, _reason} = error -> error
     end
   rescue
     error in [ArgumentError, ErlangError] ->
       {:error, {:codex_spawn_failed, error.__struct__}}
   end
 
+  defp require_linux_routed_runtime(opts) do
+    platform =
+      if test_environment?() and Keyword.has_key?(opts, :test_routed_platform),
+        do: Keyword.get(opts, :test_routed_platform),
+        else: :os.type()
+
+    case platform do
+      {:unix, :linux} -> :ok
+      _unsupported -> {:error, {:runtime_isolation_unavailable, :unsupported_platform}}
+    end
+  end
+
+  defp validate_routed_runtime_path(resolved, opts) do
+    enforce_trusted_path? =
+      not test_environment?() or Keyword.get(opts, :test_routed_enforce_runtime_path_trust, false)
+
+    if enforce_trusted_path?,
+      do: validate_trusted_runtime_paths([resolved.executable, resolved.native_executable]),
+      else: :ok
+  end
+
+  defp validate_trusted_runtime_paths(paths) do
+    if Enum.all?(paths, &(validate_trusted_host_executable(&1) == :ok)),
+      do: :ok,
+      else: {:error, {:runtime_isolation_unavailable, :codex_installation_untrusted}}
+  end
+
+  defp routed_guard_tool(name, opts) do
+    override = Keyword.get(opts, :test_routed_guard_tool_paths, %{})
+    candidate = if test_environment?(), do: Map.get(override, name), else: nil
+    candidate = candidate || System.find_executable(name)
+
+    with true <- is_binary(candidate),
+         {:ok, canonical} <- PathSafety.canonicalize(candidate),
+         :ok <- validate_trusted_host_executable(canonical) do
+      {:ok, canonical}
+    else
+      _failure ->
+        {:error, {:runtime_isolation_unavailable, {:untrusted_linux_guard_tool, name}}}
+    end
+  end
+
+  defp validate_trusted_host_executable(path) do
+    if Enum.all?(trusted_path_ancestors(path), &trusted_path_component?/1),
+      do: :ok,
+      else: {:error, :untrusted_path}
+  rescue
+    _ -> {:error, :untrusted_path}
+  end
+
+  defp trusted_path_component?({candidate, is_executable}) do
+    with {:ok, %File.Stat{} = stat} <- File.stat(candidate),
+         true <- stat.uid == 0,
+         true <- Bitwise.band(stat.mode, 0o022) == 0,
+         true <- Bitwise.band(stat.mode, 0o6000) == 0 do
+      trusted_path_type?(stat, is_executable)
+    else
+      _failure -> false
+    end
+  end
+
+  defp trusted_path_type?(%File.Stat{type: :regular, mode: mode}, true),
+    do: Bitwise.band(mode, 0o111) != 0
+
+  defp trusted_path_type?(%File.Stat{type: :directory}, false), do: true
+  defp trusted_path_type?(_stat, _is_executable), do: false
+
+  defp trusted_path_ancestors(path) do
+    trusted_path_ancestors(Path.dirname(path), [{path, true}])
+  end
+
+  defp trusted_path_ancestors(path, acc) do
+    if path == "/" do
+      [{"/", false} | acc]
+    else
+      trusted_path_ancestors(Path.dirname(path), [{path, false} | acc])
+    end
+  end
+
   defp local_port_env(dynamic_tool_binding, opts) do
     if routed_profile?(opts) do
       home_dir = CredentialBoundary.create_routed_ephemeral_home!()
 
-      {CredentialBoundary.routed_port_env(dynamic_tool_binding.secret_environment_names, home_dir), home_dir}
+      {CredentialBoundary.routed_port_env(
+         dynamic_tool_binding.secret_environment_names,
+         home_dir
+       ), home_dir}
     else
       {CredentialBoundary.port_env(dynamic_tool_binding.secret_environment_names), nil}
     end
@@ -621,7 +1020,8 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp revalidate_routed_workspace(workspace, session_policies, opts) when is_map(session_policies) do
+  defp revalidate_routed_workspace(workspace, session_policies, opts)
+       when is_map(session_policies) do
     if routed_policies?(session_policies) do
       case test_runtime_workspace_admit(opts) do
         {:test, admission} ->
@@ -647,11 +1047,13 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp invoke_test_workspace_admission(admission, workspace, opts) when is_function(admission, 2) do
+  defp invoke_test_workspace_admission(admission, workspace, opts)
+       when is_function(admission, 2) do
     normalize_workspace_admission(admission.(Keyword.get(opts, :runtime_issue), workspace))
   end
 
-  defp invoke_test_workspace_admission(admission, workspace, opts) when is_function(admission, 3) do
+  defp invoke_test_workspace_admission(admission, workspace, opts)
+       when is_function(admission, 3) do
     normalize_workspace_admission(
       admission.(
         Keyword.get(opts, :runtime_issue),
@@ -736,44 +1138,47 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp admit_runtime(executable, opts) do
-    test_admission? = test_environment?() and Keyword.has_key?(opts, :test_runtime_isolation_admit)
+    test_admission? =
+      test_environment?() and Keyword.has_key?(opts, :test_runtime_isolation_admit)
 
-    admit =
-      if test_environment?() do
-        Keyword.get(opts, :test_runtime_isolation_admit, &RuntimeIsolation.admit/3)
-      else
-        &RuntimeIsolation.admit/3
-      end
-
-    result =
-      cond do
-        is_function(admit, 3) -> admit.(nil, executable, [])
-        is_function(admit, 2) -> admit.(nil, executable)
-        true -> {:error, {:runtime_isolation_admission_invalid, :callback}}
-      end
-
-    case result do
-      {:ok, _evidence} when test_admission? ->
-        {:ok, :test_admitted}
-
-      {:ok, %{status: :verified, fingerprint: fingerprint}} ->
-        {:ok, {:verified, fingerprint}}
-
-      {:error, reason} ->
-        {:error, reason}
-
-      {:ok, _evidence} ->
-        {:error, {:runtime_isolation_admission_invalid, :evidence}}
-
-      other ->
-        {:error, {:runtime_isolation_admission_invalid, other}}
-    end
+    opts
+    |> runtime_admission_callback()
+    |> invoke_runtime_admission(executable)
+    |> normalize_runtime_admission(test_admission?)
   rescue
     error in [ArgumentError, ErlangError] ->
       {:error, {:runtime_isolation_admission_failed, error.__struct__}}
   catch
     _kind, _reason -> {:error, :runtime_isolation_admission_failed}
   end
+
+  defp runtime_admission_callback(opts) do
+    if test_environment?(),
+      do: Keyword.get(opts, :test_runtime_isolation_admit, &RuntimeIsolation.admit/3),
+      else: &RuntimeIsolation.admit/3
+  end
+
+  defp invoke_runtime_admission(admit, executable) when is_function(admit, 3),
+    do: admit.(nil, executable, [])
+
+  defp invoke_runtime_admission(admit, executable) when is_function(admit, 2),
+    do: admit.(nil, executable)
+
+  defp invoke_runtime_admission(_admit, _executable),
+    do: {:error, {:runtime_isolation_admission_invalid, :callback}}
+
+  defp normalize_runtime_admission({:ok, _evidence}, true), do: {:ok, :test_admitted}
+
+  defp normalize_runtime_admission({:ok, %{status: :verified, fingerprint: fingerprint}}, _test?),
+    do: {:ok, {:verified, fingerprint}}
+
+  defp normalize_runtime_admission({:error, reason}, _test?), do: {:error, reason}
+
+  defp normalize_runtime_admission({:ok, _evidence}, _test?),
+    do: {:error, {:runtime_isolation_admission_invalid, :evidence}}
+
+  defp normalize_runtime_admission(other, _test?),
+    do: {:error, {:runtime_isolation_admission_invalid, other}}
 
   defp runtime_file_identity(resolved) do
     paths = Enum.uniq([resolved.executable, resolved.native_executable])
@@ -794,7 +1199,8 @@ defmodule SymphonyElixir.Codex.AppServer do
 
         {:cont, {:ok, Map.put(identities, path, identity)}}
       else
-        _error -> {:halt, {:error, {:runtime_isolation_unavailable, :runtime_changed_after_admission}}}
+        _error ->
+          {:halt, {:error, {:runtime_isolation_unavailable, :runtime_changed_after_admission}}}
       end
     end)
   rescue
@@ -935,7 +1341,11 @@ defmodule SymphonyElixir.Codex.AppServer do
           "runtimeWorkspaceRoots" => policy_value(session_policies, :runtime_workspace_roots)
         })
       else
-        Map.put(base_params, "sandboxPolicy", policy_value(session_policies, :turn_sandbox_policy, %{}))
+        Map.put(
+          base_params,
+          "sandboxPolicy",
+          policy_value(session_policies, :turn_sandbox_policy, %{})
+        )
       end
 
     params = maybe_put_model(params, model)
@@ -1007,7 +1417,10 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp provenance_payload?(payload) when is_map(payload) do
-    Enum.any?(["activePermissionProfile", "runtimeWorkspaceRoots", "cwd"], &Map.has_key?(payload, &1))
+    Enum.any?(
+      ["activePermissionProfile", "runtimeWorkspaceRoots", "cwd"],
+      &Map.has_key?(payload, &1)
+    )
   end
 
   defp provenance_payload?(_payload), do: false
@@ -1041,11 +1454,26 @@ defmodule SymphonyElixir.Codex.AppServer do
     )
   end
 
-  defp receive_loop(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests) do
+  defp receive_loop(
+         port,
+         on_message,
+         timeout_ms,
+         pending_line,
+         tool_executor,
+         auto_approve_requests
+       ) do
     receive do
       {^port, {:data, {:eol, chunk}}} ->
         complete_line = pending_line <> to_string(chunk)
-        handle_incoming(port, on_message, complete_line, timeout_ms, tool_executor, auto_approve_requests)
+
+        handle_incoming(
+          port,
+          on_message,
+          complete_line,
+          timeout_ms,
+          tool_executor,
+          auto_approve_requests
+        )
 
       {^port, {:data, {:noeol, chunk}}} ->
         receive_loop(
@@ -1411,7 +1839,9 @@ defmodule SymphonyElixir.Codex.AppServer do
     }
   end
 
-  defp dynamic_tool_output(%{"contentItems" => [%{"text" => text} | _]}) when is_binary(text), do: text
+  defp dynamic_tool_output(%{"contentItems" => [%{"text" => text} | _]}) when is_binary(text),
+    do: text
+
   defp dynamic_tool_output(result), do: Jason.encode!(result, pretty: true)
 
   defp dynamic_tool_content_items(output) when is_binary(output) do
@@ -1498,7 +1928,8 @@ defmodule SymphonyElixir.Codex.AppServer do
        ),
        do: :input_required
 
-  defp tool_request_user_input_approval_answers(%{"questions" => questions}) when is_list(questions) do
+  defp tool_request_user_input_approval_answers(%{"questions" => questions})
+       when is_list(questions) do
     answers =
       Enum.reduce_while(questions, %{}, fn question, acc ->
         case tool_request_user_input_approval_answer(question) do
@@ -1554,7 +1985,8 @@ defmodule SymphonyElixir.Codex.AppServer do
       |> String.trim()
       |> String.downcase()
 
-    String.starts_with?(normalized_label, "approve") or String.starts_with?(normalized_label, "allow")
+    String.starts_with?(normalized_label, "approve") or
+      String.starts_with?(normalized_label, "allow")
   end
 
   defp await_response(port, request_id) do
@@ -1630,6 +2062,24 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp stop_port(port) when is_port(port) do
     stop_port(port, port_os_pid(port))
+  end
+
+  defp stop_routed_port(port) when is_port(port) do
+    ref = :erlang.monitor(:port, port)
+
+    try do
+      Port.command(port, @routed_stop_token)
+    rescue
+      ArgumentError -> :already_closed
+    end
+
+    receive do
+      {:DOWN, ^ref, :port, ^port, _reason} -> :ok
+    after
+      @linux_guard_stop_timeout_ms ->
+        Process.demonitor(ref, [:flush])
+        {:error, {:containment_unconfirmed, :termination_timeout}}
+    end
   end
 
   defp stop_port(port, fallback_os_pid) when is_port(port) do
@@ -1725,7 +2175,12 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp emit_message(on_message, event, details, metadata) when is_function(on_message, 1) do
-    message = metadata |> Map.merge(details) |> Map.put(:event, event) |> Map.put(:timestamp, DateTime.utc_now())
+    message =
+      metadata
+      |> Map.merge(details)
+      |> Map.put(:event, event)
+      |> Map.put(:timestamp, DateTime.utc_now())
+
     on_message.(message)
   end
 
@@ -1759,7 +2214,8 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp tool_call_name(params) when is_map(params) do
-    case Map.get(params, "tool") || Map.get(params, :tool) || Map.get(params, "name") || Map.get(params, :name) do
+    case Map.get(params, "tool") || Map.get(params, :tool) || Map.get(params, "name") ||
+           Map.get(params, :name) do
       name when is_binary(name) ->
         case String.trim(name) do
           "" -> nil

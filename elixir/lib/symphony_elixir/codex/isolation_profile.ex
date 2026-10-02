@@ -1021,8 +1021,12 @@ defmodule SymphonyElixir.Codex.IsolationProfile do
 
   defp session_root(opts) do
     case Keyword.get(opts, :root) do
-      root when is_binary(root) -> Path.expand(root)
-      _ -> Path.join(System.tmp_dir!(), "symphony-routed-session-#{System.unique_integer([:positive])}")
+      root when is_binary(root) ->
+        Path.expand(root)
+
+      _ ->
+        suffix = :crypto.strong_rand_bytes(16) |> Base.url_encode64(padding: false)
+        Path.join(System.tmp_dir!(), "symphony-routed-session-#{suffix}")
     end
   end
 
