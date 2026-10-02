@@ -30,6 +30,8 @@ jobs:
       - name: Install pinned Codex under the trusted host root
         run: |
           sudo npm install --prefix /opt/symphony-codex-0.159.3 --no-save --no-package-lock --no-audit --no-fund '@openai/codex-linux-x64@npm:@openai/codex@0.159.3-linux-x64'
+          sudo chown -R root:root /opt/symphony-codex-0.159.3
+          sudo chmod -R go-w,a-s /opt/symphony-codex-0.159.3
           echo "/opt/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin" >> "$GITHUB_PATH"
           echo "/opt/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex-path" >> "$GITHUB_PATH"
 
@@ -90,6 +92,8 @@ jobs:
       - name: Install pinned Codex under the trusted host root
         run: |
           sudo npm install --prefix /opt/symphony-codex-0.159.3 --no-save --no-package-lock --no-audit --no-fund '@openai/codex-linux-x64@npm:@openai/codex@0.159.3-linux-x64'
+          sudo chown -R root:root /opt/symphony-codex-0.159.3
+          sudo chmod -R go-w,a-s /opt/symphony-codex-0.159.3
           echo "/opt/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin" >> "$GITHUB_PATH"
           echo "/opt/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex-path" >> "$GITHUB_PATH"
 
