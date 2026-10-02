@@ -115,7 +115,8 @@ PATH=/home/jcschoeman96/.codex/packages/standalone/releases/0.159.3-x86_64-unkno
 The local developer installation is user-owned, so the test-only actual-Codex proof uses its
 explicit test bypass for the host ownership precondition. A separate regression asserts that the
 same user-owned path is rejected when that precondition is enforced. CI installs the pinned native
-Codex package under `/opt` as root and enables the precondition in the pinned actual-Codex test.
+Codex package under `/usr/local/lib/symphony-codex-0.159.3` as root and enables the precondition in
+the pinned actual-Codex test.
 
 ## Verification state
 
@@ -126,15 +127,17 @@ Codex package under `/opt` as root and enables the precondition in the pinned ac
 | `make -C elixir isolation-proof` | Passed; 72 tests, 0 failures |
 | Focused RuntimeIsolation, Orchestrator isolation, AppServer, and AgentRuntime suites | Passed; 114 tests, 0 failures |
 | Escaped descendant, state retention, executable replacement, path trust, and stop-result regressions | Passed within the focused and proof suites |
-| `make -C elixir all` | Passed; 1,641 tests, 0 failures, 6 skipped; 90.00% coverage |
+| `make -C elixir all` | Passed locally; 1,641 tests, 0 failures, 6 skipped; 90.01% coverage |
 | Dialyzer | Passed; 0 errors, 0 skipped, 0 unnecessary skips |
 | `mix format --check-formatted` | Passed |
 | `git diff --check` | Passed |
-| Protected Linux CI jobs and PR checks | Pending push of this candidate |
+| Protected Linux CI jobs and PR checks | `make-all` requires successful `linux-isolation-proof` and `linux-full-gate`; CI evaluates each on the PR merge ref |
 | macOS/iOS support | Unsupported and not certified; no macOS proof runs |
 | H-080B acceptance | Not granted |
 
-The repository workflow installs Codex 0.159.3 under root-owned `/opt`, enables the launch-path
-invariant in the pinned actual-Codex test, runs the Linux actual-Codex proof, and then runs the Linux
-full gate. Protected `make-all` requires both Linux jobs to succeed; a skipped proof or gate fails
-`make-all`. macOS and iOS are unsupported and not certified, so no macOS proof runs.
+The repository workflow installs Codex 0.159.3 under `/usr/local/lib/symphony-codex-0.159.3` with
+root ownership and non-writable package ancestry. It runs the Linux actual-Codex proof and then the
+Linux full gate. The full gate runs `make ci` and `make isolation-proof` in separate steps because
+the hosted runner cancels a single step after about seven minutes; together they preserve the
+`make all` sequence. Protected `make-all` requires both Linux jobs to succeed; a skipped proof or
+gate fails `make-all`. macOS and iOS are unsupported and not certified, so no macOS proof runs.

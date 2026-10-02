@@ -132,7 +132,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-mix-
 
-      - name: Verify make all
+      - name: Run Linux quality gate (make ci)
         env:
           SYMPHONY_ENFORCE_TEST_RUNTIME_PATH_TRUST: "1"
         timeout-minutes: 15
@@ -142,7 +142,13 @@ jobs:
           echo "Full gate Codex path: $codex_path"
           stat -Lc 'Codex file: uid=%u mode=%a type=%F path=%n' "$codex_path"
           namei -l "$codex_path"
-          make -C elixir all
+          make -C elixir ci
+
+      - name: Run Linux full-gate Codex regressions (make isolation-proof)
+        env:
+          SYMPHONY_ENFORCE_TEST_RUNTIME_PATH_TRUST: "1"
+        timeout-minutes: 15
+        run: make -C elixir isolation-proof
 
   make-all:
     name: make-all
