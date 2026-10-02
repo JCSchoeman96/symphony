@@ -48,6 +48,8 @@ jobs:
           export PATH="/opt/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin:/opt/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex-path:$PATH"
           codex_path="$(command -v codex)"
           echo "Pinned Codex path: $codex_path"
+          stat -Lc 'Codex file: uid=%u mode=%a type=%F path=%n' "$codex_path"
+          namei -l "$codex_path"
           test "$(stat -c '%u' "$codex_path")" = "0"
           test "$(codex --version)" = "codex-cli 0.159.3"
 
@@ -67,8 +69,12 @@ jobs:
       - name: Run Linux isolation proof
         env:
           SYMPHONY_ENFORCE_TEST_RUNTIME_PATH_TRUST: "1"
-        run: >-
-          PATH="/opt/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin:/opt/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex-path:$PATH"
+        run: |
+          export PATH="/opt/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin:/opt/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex-path:$PATH"
+          codex_path="$(command -v codex)"
+          echo "Isolation proof Codex path: $codex_path"
+          stat -Lc 'Codex file: uid=%u mode=%a type=%F path=%n' "$codex_path"
+          namei -l "$codex_path"
           make -C elixir isolation-proof
 
   linux-full-gate:
@@ -110,6 +116,8 @@ jobs:
           export PATH="/opt/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin:/opt/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex-path:$PATH"
           codex_path="$(command -v codex)"
           echo "Pinned Codex path: $codex_path"
+          stat -Lc 'Codex file: uid=%u mode=%a type=%F path=%n' "$codex_path"
+          namei -l "$codex_path"
           test "$(stat -c '%u' "$codex_path")" = "0"
           test "$(codex --version)" = "codex-cli 0.159.3"
 
@@ -126,8 +134,12 @@ jobs:
       - name: Verify make all
         env:
           SYMPHONY_ENFORCE_TEST_RUNTIME_PATH_TRUST: "1"
-        run: >-
-          PATH="/opt/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin:/opt/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex-path:$PATH"
+        run: |
+          export PATH="/opt/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin:/opt/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex-path:$PATH"
+          codex_path="$(command -v codex)"
+          echo "Full gate Codex path: $codex_path"
+          stat -Lc 'Codex file: uid=%u mode=%a type=%F path=%n' "$codex_path"
+          namei -l "$codex_path"
           make -C elixir all
 
   make-all:
