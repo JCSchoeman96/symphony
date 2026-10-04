@@ -20,6 +20,7 @@
 | `03c3b9d343ff93c7c1cf60d1e5d903b70716dbff` | Hosted result: 1,640 tests, 0 failures, 6 skipped, 1 excluded, 89.97% coverage. | Superseded and rejected because it weakened accepted H-070A and 90% coverage authority. |
 | `9643cc5f39dd6b7d4b09348accbdce7e1992d489` | Hosted run `37200799277`: 1,424 tests, 0 failures, 6 skipped; all three H-070A scale epochs passed; runner canceled Mix while it generated the coverage report. No coverage result was produced. | Superseded. `make-all` correctly failed because the Linux full gate did not complete. |
 | `0973eb4` | Non-scale coverage probe: 1,649 tests, 0 failures, 6 skipped, 1 assigned to the H-070A shard; coverage varied between 89.99% and 90.02% across runs. | Insufficient alone to certify the fixed threshold; the next candidate aggregates both coverage exports. |
+| `7e8ad45a10fcadbd75a600fddf0faf2dbe4b84bb` | Local `make all` passed: 1,649 non-scale tests, 1 H-070A test, 6 skipped, 90.02% aggregate coverage, Dialyzer clean, and 72 isolation-proof tests passed. Hosted run `37202957994` was canceled during the non-scale test step before ExUnit produced a summary; H-070A and coverage aggregation were skipped. | Superseded; `make-all` correctly failed. |
 
 The current remediation candidate is the PR #31 head. Its exact HEAD/tree and synthetic merge
 SHA/tree/parents are recorded in the PR description and repeated by the required Linux CI checkout
@@ -148,13 +149,13 @@ the pinned actual-Codex test.
 | `make -C elixir isolation-proof` | Passed on the remediation candidate; 72 tests, 0 failures |
 | Focused AgentRunner, Orchestrator runtime isolation, AppServer, and RuntimeIsolation suites | Passed; 114 tests, 0 failures |
 | Retained-containment lifecycle and stale-identity regressions | Passed in focused suites; the production timeout result retains the exact RuntimeAttempt, fence, and workspace record without retry or replacement |
-| `make -C elixir all` | Passed with exported coverage aggregation: non-scale shard 1,649 tests, 0 failures, 6 skipped; H-070A shard 1 test, 0 failures; aggregate 90.00%; Dialyzer clean; actual-Codex proof 72 tests, 0 failures |
-| H-070A scale characterization | Mandatory shard passed: 1,000 items / 5,000 edges (1.392 s), 5,000 / 25,000 (34.818 s), and 10,000 / 50,000 (140.615 s) |
+| `make -C elixir all` | Passed on `7e8ad45` with exported coverage aggregation: non-scale shard 1,649 tests, 0 failures, 6 skipped; H-070A shard 1 test, 0 failures; aggregate 90.02%; Dialyzer clean; actual-Codex proof 72 tests, 0 failures |
+| H-070A scale characterization | Mandatory shard passed: 1,000 items / 5,000 edges (1.425 s), 5,000 / 25,000 (35.370 s), and 10,000 / 50,000 (140.874 s) |
 | Coverage split probe | Before aggregation, non-scale coverage alone varied from 89.99% to 90.02%. The gate now aggregates exports from both test shards and enforces 90.00% across all accepted tests. |
 | Dialyzer | Passed; 0 errors, 0 skipped, 0 unnecessary skips |
 | `mix format --check-formatted` | Passed |
 | `git diff --check` | Passed |
-| Protected Linux CI jobs and PR checks | Pending the pushed aggregate-coverage candidate. The superseded run `37200799277` passed isolation proof, was canceled during coverage reporting, and correctly failed `make-all`. |
+| Protected Linux CI jobs and PR checks | Run `37202957994` on `7e8ad45`: isolation proof passed; the runner canceled the non-scale Mix process before a test summary, and `make-all` failed as required. A fresh exact-candidate workflow run is pending. |
 | macOS/iOS support | Unsupported and not certified; no macOS proof runs |
 | H-080B acceptance | Not granted |
 
