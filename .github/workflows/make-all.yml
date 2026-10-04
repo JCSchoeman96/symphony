@@ -146,12 +146,18 @@ jobs:
           make -C elixir fmt-check
           make -C elixir lint
 
-      - name: Run tests with coverage
+      - name: Run non-scale test shard and export coverage
         env:
           SYMPHONY_ENFORCE_TEST_RUNTIME_PATH_TRUST: "1"
         run: |
           export PATH="/usr/local/lib/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin:/usr/local/lib/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex-path:$PATH"
           make -C elixir coverage
+
+      - name: Run mandatory H-070A scale shard and export coverage
+        run: make -C elixir h070a-scale
+
+      - name: Enforce the aggregated 90% coverage threshold
+        run: make -C elixir coverage-report
 
       - name: Run Dialyzer
         timeout-minutes: 30

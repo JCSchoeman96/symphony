@@ -18,6 +18,8 @@
 |---|---|---|
 | `c61f248711cb99f65ce1e899c903ec40d5089150` | Historical local result: 1,641 tests, 0 failures, 6 skipped, approximately 90.01% coverage. | Historical only; not verification of a later candidate. |
 | `03c3b9d343ff93c7c1cf60d1e5d903b70716dbff` | Hosted result: 1,640 tests, 0 failures, 6 skipped, 1 excluded, 89.97% coverage. | Superseded and rejected because it weakened accepted H-070A and 90% coverage authority. |
+| `9643cc5f39dd6b7d4b09348accbdce7e1992d489` | Hosted run `37200799277`: 1,424 tests, 0 failures, 6 skipped; all three H-070A scale epochs passed; runner canceled Mix while it generated the coverage report. No coverage result was produced. | Superseded. `make-all` correctly failed because the Linux full gate did not complete. |
+| `0973eb4` | Non-scale coverage probe: 1,649 tests, 0 failures, 6 skipped, 1 assigned to the H-070A shard; coverage varied between 89.99% and 90.02% across runs. | Insufficient alone to certify the fixed threshold; the next candidate aggregates both coverage exports. |
 
 The current remediation candidate is the PR #31 head. Its exact HEAD/tree and synthetic merge
 SHA/tree/parents are recorded in the PR description and repeated by the required Linux CI checkout
@@ -146,23 +148,27 @@ the pinned actual-Codex test.
 | `make -C elixir isolation-proof` | Passed on the remediation candidate; 72 tests, 0 failures |
 | Focused AgentRunner, Orchestrator runtime isolation, AppServer, and RuntimeIsolation suites | Passed; 114 tests, 0 failures |
 | Retained-containment lifecycle and stale-identity regressions | Passed in focused suites; the production timeout result retains the exact RuntimeAttempt, fence, and workspace record without retry or replacement |
-| `make -C elixir all` | Passed on Linux; 1,650 tests, 0 failures, 6 skipped; 90.02% coverage |
-| H-070A scale characterization | Mandatory and passed: 1,000 items / 5,000 edges (1.417 s), 5,000 / 25,000 (34.493 s), and 10,000 / 50,000 (137.757 s) |
+| `make -C elixir all` | Passed with exported coverage aggregation: non-scale shard 1,649 tests, 0 failures, 6 skipped; H-070A shard 1 test, 0 failures; aggregate 90.00%; Dialyzer clean; actual-Codex proof 72 tests, 0 failures |
+| H-070A scale characterization | Mandatory shard passed: 1,000 items / 5,000 edges (1.392 s), 5,000 / 25,000 (34.818 s), and 10,000 / 50,000 (140.615 s) |
+| Coverage split probe | Before aggregation, non-scale coverage alone varied from 89.99% to 90.02%. The gate now aggregates exports from both test shards and enforces 90.00% across all accepted tests. |
 | Dialyzer | Passed; 0 errors, 0 skipped, 0 unnecessary skips |
 | `mix format --check-formatted` | Passed |
 | `git diff --check` | Passed |
-| Protected Linux CI jobs and PR checks | Pending the pushed exact candidate; `make-all` requires both Linux jobs and `validate-pr-description` remains required by branch protection |
+| Protected Linux CI jobs and PR checks | Pending the pushed aggregate-coverage candidate. The superseded run `37200799277` passed isolation proof, was canceled during coverage reporting, and correctly failed `make-all`. |
 | macOS/iOS support | Unsupported and not certified; no macOS proof runs |
 | H-080B acceptance | Not granted |
 
 The repository workflow installs Codex 0.159.3 under `/usr/local/lib/symphony-codex-0.159.3` with
 root ownership and non-writable package ancestry. Protected `make-all` requires the Linux
 `linux-isolation-proof` job (`make isolation-proof`, including path-trust enforcement) and the
-`linux-full-gate` job (`make ci`), which runs every test including the accepted H-070A scale test at
-the fixed 90% coverage threshold, then Dialyzer. Together they preserve the local `make all`
-sequence without duplicating the actual-Codex proof in the full gate. A failed or skipped proof or
-gate fails `make-all`. macOS and iOS are unsupported and not certified, so no macOS proof runs.
+`linux-full-gate` job. That gate runs format, lint, exports coverage from the non-scale test shard,
+executes and exports the mandatory H-070A 1,000/5,000/10,000 item scale shard, aggregates both
+exports with `mix test.coverage` at the fixed 90% threshold, and then runs Dialyzer. Both local
+`make all` and protected `make-all` require each step. A failed or skipped proof, test shard,
+coverage aggregation, or quality check fails `make-all`. macOS and iOS are unsupported and not
+certified, so no macOS proof runs.
 
 If a hosted runner terminates a coverage run, that run is recorded as terminated by the runner;
-this evidence does not infer a generic time limit. No test is excluded from the required Linux
-coverage command.
+this evidence does not infer a generic time limit. The H-070A test is assigned to a separate
+mandatory test shard, and its exported coverage is aggregated with the rest of the suite before
+the 90% threshold is applied. No accepted test is dropped from the required Linux quality gate.

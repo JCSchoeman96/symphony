@@ -1,10 +1,10 @@
-.PHONY: help all setup deps build fmt fmt-check lint test coverage ci dialyzer e2e \
+.PHONY: help all setup deps build fmt fmt-check lint test coverage h070a-scale coverage-report ci dialyzer e2e \
 	isolation-proof verify-codex
 
 MIX ?= mix
 
 help:
-	@echo "Targets: setup, deps, fmt, fmt-check, lint, test, coverage, dialyzer, e2e, isolation-proof, ci"
+	@echo "Targets: setup, deps, build, fmt, fmt-check, lint, test, coverage, h070a-scale, coverage-report, dialyzer, e2e, isolation-proof, ci"
 
 setup:
 	$(MIX) setup
@@ -25,7 +25,14 @@ lint:
 	$(MIX) lint
 
 coverage:
-	$(MIX) test --cover
+	rm -f cover/*.coverdata
+	$(MIX) test --cover --exclude h070a_scale --export-coverage non-scale
+
+h070a-scale:
+	$(MIX) test --cover --only h070a_scale --export-coverage h070a-scale
+
+coverage-report:
+	$(MIX) test.coverage
 
 test:
 	$(MIX) test
@@ -54,6 +61,8 @@ ci:
 	$(MAKE) fmt-check
 	$(MAKE) lint
 	$(MAKE) coverage
+	$(MAKE) h070a-scale
+	$(MAKE) coverage-report
 	$(MAKE) dialyzer
 
 all: ci isolation-proof
