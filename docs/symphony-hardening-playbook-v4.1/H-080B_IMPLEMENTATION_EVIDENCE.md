@@ -16,23 +16,23 @@
 
 ### Current candidate snapshot
 
-The currently pushed code snapshot is `9823f96149404e6ada29b047106cd49435d4feb0`, tree
-`45422cf64bd1a499ec961c24f6c2d300129db0c1`, based on
+The CI-topology candidate is `3b1bedd2e9ef47b2a514be14ae2b2eae907ccb1c`, tree
+`78e7a0989379fef3d6cd76a8cc645a6aa4e7fc23`, based on
 `56798754c8f6fd80d7ec53b604800873e339e030` (tree
-`a2770cbd2a5f4b96617b3fe18f324f0376d0cdf1`). Its PR synthetic merge is
-`b8eb83b01aa45e33a93c450d5387af9ede45ce5d`, tree
-`45422cf64bd1a499ec961c24f6c2d300129db0c1`, with parents
+`a2770cbd2a5f4b96617b3fe18f324f0376d0cdf1`). PR #31's synthetic merge is
+`978ecd4dd40c47e426f3bd40fc72e6f99f641476`, tree
+`78e7a0989379fef3d6cd76a8cc645a6aa4e7fc23`, with parents
 `56798754c8f6fd80d7ec53b604800873e339e030` and
-`9823f96149404e6ada29b047106cd49435d4feb0`.
+`3b1bedd2e9ef47b2a514be14ae2b2eae907ccb1c`.
 
-Local `make -C elixir all` passed on this code snapshot: 1,649 non-scale tests, 0 failures,
-6 skipped; the mandatory H-070A test passed; aggregate coverage was 90.02%; Dialyzer was clean;
-and the actual-Codex isolation proof passed with 72 tests and 0 failures. The hosted run for this
-exact snapshot is not green: run `37210286913` passed `linux-isolation-proof` (72/0), but its
-`linux-full-gate` was cancelled during partition 3 after 174 tests, 0 failures, and 2 skipped.
-Partitions 4–8, the transition fixture shard, H-070A scale shard, coverage aggregation, and
-Dialyzer were skipped; protected `make-all` failed. The logs show the runner shutdown signal and
-do not establish its cause. The hosted run therefore does not verify the full candidate.
+Hosted run `37222737751` passed on that exact synthetic merge. Each code-bearing job logged
+the same merge SHA, tree, and subject, and asserted that the checkout SHA equaled `$GITHUB_SHA`.
+The synthetic merge parents above were independently resolved from the Git object; the job logs
+are not used as evidence for parent identity.
+All eight ordinary coverage partitions, the transition fixture, H-070A, artifact aggregation at
+90.04%, static quality, Dialyzer, Linux isolation proof, and protected `make-all` succeeded.
+`validate-pr-description` run `37222737756` also passed. The exact results and artifact imports
+are recorded below. H-080B remains unaccepted; H-080C is not authorized.
 
 | Candidate | Evidence | Status |
 |---|---|---|
@@ -42,6 +42,8 @@ do not establish its cause. The hosted run therefore does not verify the full ca
 | `0973eb4` | Non-scale coverage probe: 1,649 tests, 0 failures, 6 skipped, 1 assigned to the H-070A shard; coverage varied between 89.99% and 90.02% across runs. | Insufficient alone to certify the fixed threshold; the next candidate aggregates both coverage exports. |
 | `7e8ad45a10fcadbd75a600fddf0faf2dbe4b84bb` | Local `make all` passed: 1,649 non-scale tests, 1 H-070A test, 6 skipped, 90.02% aggregate coverage, Dialyzer clean, and 72 isolation-proof tests passed. Hosted run `37202957994` was canceled during the non-scale test step before ExUnit produced a summary; H-070A and coverage aggregation were skipped. | Superseded; `make-all` correctly failed. |
 | `3afae77f9abb2e2e91716e1d790a87736ae8f0e6` | Hosted run `37204294595`, attempt 1: 1,526 tests, 0 failures, 6 skipped, 1 excluded; attempt 2: 1,253 tests, 0 failures, 6 skipped, 1 excluded. Both attempts were canceled during coverage export. H-070A, aggregate coverage, and Dialyzer did not run. | Superseded; `make-all` correctly failed because the Linux full gate did not complete. No generic runner time limit is inferred. |
+| `9d284d5ae48baf840bb5e7415de3679e5b0dc73e` | Two executions of hosted run `37214310186` on unchanged HEAD stopped during coverage partition 3. Attempt 2 showed 172 tests, 0 failures, and 2 skipped before shutdown; the runner reported a shutdown signal and cancellation. | Superseded. The external cause is not established; `make-all` failed because required evidence did not complete. |
+| `3b1bedd2e9ef47b2a514be14ae2b2eae907ccb1c` | Hosted run `37222737751`: all required Linux jobs passed; 90.04% aggregate coverage. Local `make -C elixir all`: 90.02%; artifact-layout simulation re-imported all ten exports. | Current CI-topology candidate; ready for fresh independent review, not accepted. |
 
 The earlier locally verified snapshot `9e081f88dc72d37ec7bf6de78bb574d10eb71b49` is retained in
 the history only; it does not establish the current candidate's hosted status. The historical rows
@@ -174,22 +176,56 @@ reject user-owned or writable executable hierarchies.
 | Dialyzer | Passed; 0 errors, 0 skipped, 0 unnecessary skips |
 | `mix format --check-formatted` | Passed |
 | `git diff --check` | Passed |
-| Hosted run `37210286913` on `9823f96` / synthetic merge `b8eb83b` | `linux-isolation-proof` passed (72/0). `linux-full-gate` was cancelled during partition 3 (174 tests, 0 failures, 2 skipped); remaining partitions, H-070A, coverage aggregation, and Dialyzer were skipped. `make-all` failed as required. No aggregate hosted coverage result was produced. |
-| Hosted `validate-pr-description` run `37210286800` | Passed against the PR body before its evidence refresh; rerun is required after the description update. |
+| Current local `make -C elixir all` on `3b1bedd` | Passed: 1,649 ordinary and transition tests, 0 failures, 6 skipped; the one H-070A test passed separately; 90.02% aggregate coverage; Dialyzer clean; Linux isolation proof 72/0. |
+| H-070A on `3b1bedd` | Passed all required epochs: 1,000 / 5,000 edges, 5,000 / 25,000 edges, and 10,000 / 50,000 edges. |
+| Separate-artifact coverage simulation | Recombined eight partition exports, `transition-fixture.coverdata`, and `h070a-scale.coverdata` from ten separate artifact directories. Mix imported all ten and passed at 90.02%. |
+| Hosted Linux workflow `37222737751` on merge `978ecd4` | Passed: eight coverage partitions, transition coverage, H-070A, all ten artifact imports at 90.04%, static quality, Dialyzer, Linux isolation proof (72/0), and `make-all`. Every code-bearing job logged the exact merge SHA/tree/subject and checked `HEAD == $GITHUB_SHA`. |
+| Hosted partitions 1–8 | Passed with 342, 259, 191, 231, 100, 174, 122, and 168 tests, respectively; 0 failures; 6 skipped across the partitions. The single `h070a_scale` test is excluded from the ordinary partition run and executed by the dedicated H-070A job. |
+| Hosted transition coverage | Passed: 62 tests, 0 failures. |
+| Hosted partition 3 | Traced isolated job passed in 53 seconds: 191 tests, 0 failures, 2 skipped. |
+| Hosted H-070A | Passed in 4m26s: one characterization test, 0 failures; 1,000 items / 5,000 edges, 5,000 / 25,000 edges, and 10,000 / 50,000 edges. |
+| Hosted static quality and Dialyzer | Passed build, formatting, SpecsCheck, Credo, and Dialyzer; Dialyzer reported 0 errors and 0 skipped. |
+| Hosted Linux isolation proof | Passed with root-owned Codex 0.159.3 and path-trust enforcement: 72 tests, 0 failures. |
+| Hosted `validate-pr-description` run `37222737756` | Passed against the refreshed PR body. |
+| Branch protection | Still requires `make-all` and `validate-pr-description`; both checks remain bound to GitHub Actions app ID `15368`. |
+| Earlier hosted run `37210286913` on `9823f96` / merge `b8eb83b` | Isolation proof passed (72/0); the former full gate was cancelled during partition 3 after 174 tests, 0 failures, 2 skipped. Later evidence jobs were skipped; `make-all` failed. |
+| Hosted run `37214310186` on `9d284d5` | Two executions on unchanged HEAD stopped during partition 3. Attempt 2 reported 172 tests, 0 failures, 2 skipped before runner shutdown and cancellation. The cause is not established. |
 | macOS/iOS support | Unsupported and not certified; no macOS proof runs |
 | H-080B acceptance | Not granted |
 
-The repository workflow installs Codex 0.159.3 under `/usr/local/lib/symphony-codex-0.159.3` with
-root ownership and non-writable package ancestry. Protected `make-all` requires the Linux
-`linux-isolation-proof` job (`make isolation-proof`, including path-trust enforcement) and the
-`linux-full-gate` job. That gate runs format and lint, then eight required Mix test partitions and a
-required paired transition-fixture shard. It runs and exports the mandatory H-070A
-1,000/5,000/10,000 item scale shard, aggregates every coverage export with `mix test.coverage` at
-the fixed 90% threshold, and runs Dialyzer. Local `make all` runs the same tests and checks. A
-failed or skipped proof, partition, fixture shard, scale shard, coverage aggregation, or quality
-check fails `make-all`. macOS and iOS are unsupported and not certified, so no macOS proof runs.
+The workflow installs Codex 0.159.3 under `/usr/local/lib/symphony-codex-0.159.3` with root
+ownership and non-writable package ancestry. The required Linux jobs are `linux-isolation-proof`,
+eight non-fail-fast coverage partitions, transition coverage, H-070A scale, aggregate coverage,
+static quality, and Dialyzer. The aggregate job checks for exactly ten non-empty exports before
+running `mix test.coverage`; the repository's fixed `threshold: 90` remains unchanged. Protected
+`make-all` uses `if: always()` and explicitly fails unless every required job reports success,
+including the matrix result. A failed, cancelled, or skipped mandatory job cannot satisfy it.
 
-Prior hosted coverage runs ended with runner cancellation after ExUnit reported passing tests. The
-logs do not establish a general runner time limit. The current gate keeps every accepted test in a
-required partition and runs the H-070A test in its own required shard. It aggregates all exports
-before applying the 90% threshold. No accepted test is dropped from the required Linux quality gate.
+Two hosted executions of run `37214310186` on unchanged `9d284d5` ended during partition 3 after
+the runner reported shutdown/cancellation. Those logs establish runner shutdown, not its external
+cause or a general platform time limit. The isolated partition-3 job on `3b1bedd` passed. No tests
+were removed, no coverage threshold was lowered, and the H-070A fixture sizes and assertions are
+unchanged. macOS/iOS remain unsupported and are not part of the required workflow.
+
+## Partition-3 diagnostic assignment
+
+Mix 1.19.5 sorts the ordinary test file list and assigns files round-robin across eight partitions.
+Partition 3 contains these exact files:
+
+- `test/mix/tasks/specs_check_task_test.exs`
+- `test/symphony_elixir/app_server_test.exs`
+- `test/symphony_elixir/credential_boundary_test.exs`
+- `test/symphony_elixir/github_live_e2e_test.exs`
+- `test/symphony_elixir/jira_live_e2e_test.exs`
+- `test/symphony_elixir/orchestrator_attempt_lineage_test.exs`
+- `test/symphony_elixir/plane_agent_tool_test.exs`
+- `test/symphony_elixir/plane_state_projection_test.exs`
+- `test/symphony_elixir/retry_refresh_test.exs`
+- `test/symphony_elixir/runtime_transition_authority_binding_test.exs`
+- `test/symphony_elixir/ssh_test.exs`
+- `test/symphony_elixir/transition_policy_test.exs`
+- `test/symphony_elixir/workspace_ownership_test.exs`
+
+Only this matrix member runs with ExUnit `--trace` for cancellation diagnosis. Its hosted run
+passed with 191 tests, 0 failures, and 2 skipped. `app_server_test.exs` also passed in the separate
+actual-Codex isolation job.
