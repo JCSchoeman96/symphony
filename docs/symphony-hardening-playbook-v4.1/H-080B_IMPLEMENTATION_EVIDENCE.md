@@ -21,11 +21,12 @@
 | `9643cc5f39dd6b7d4b09348accbdce7e1992d489` | Hosted run `37200799277`: 1,424 tests, 0 failures, 6 skipped; all three H-070A scale epochs passed; runner canceled Mix while it generated the coverage report. No coverage result was produced. | Superseded. `make-all` correctly failed because the Linux full gate did not complete. |
 | `0973eb4` | Non-scale coverage probe: 1,649 tests, 0 failures, 6 skipped, 1 assigned to the H-070A shard; coverage varied between 89.99% and 90.02% across runs. | Insufficient alone to certify the fixed threshold; the next candidate aggregates both coverage exports. |
 | `7e8ad45a10fcadbd75a600fddf0faf2dbe4b84bb` | Local `make all` passed: 1,649 non-scale tests, 1 H-070A test, 6 skipped, 90.02% aggregate coverage, Dialyzer clean, and 72 isolation-proof tests passed. Hosted run `37202957994` was canceled during the non-scale test step before ExUnit produced a summary; H-070A and coverage aggregation were skipped. | Superseded; `make-all` correctly failed. |
+| `3afae77f9abb2e2e91716e1d790a87736ae8f0e6` | Hosted run `37204294595`, attempt 1: 1,526 tests, 0 failures, 6 skipped, 1 excluded; attempt 2: 1,253 tests, 0 failures, 6 skipped, 1 excluded. Both attempts were canceled during coverage export. H-070A, aggregate coverage, and Dialyzer did not run. | Superseded; `make-all` correctly failed because the Linux full gate did not complete. No generic runner time limit is inferred. |
 
-The current remediation candidate is the PR #31 head. Its exact HEAD/tree and synthetic merge
-SHA/tree/parents are recorded in the PR description and repeated by the required Linux CI checkout
-steps. Those values identify the candidate that reviewers should evaluate; the historical rows
-above are not evidence for it.
+The locally verified implementation snapshot is commit `9e081f88dc72d37ec7bf6de78bb574d10eb71b49`,
+tree `4b641db7a4be167c75de5964c764015d99a8019f`, based on the accepted `main` commit above. The
+PR description and required Linux CI checkout steps record the exact final PR head and synthetic
+merge identity. The historical rows above are not evidence for the current candidate.
 
 ## Boundary implemented
 
@@ -127,18 +128,17 @@ against real Codex sandbox commands.
 | Pinned Codex timeout path terminates and cleans the probe process | Pass |
 | Host-side semantic tool retains authorized host control without copying its credential to Codex | Covered by the passing credential-channel and app-server tests |
 
-The local Linux proof command is:
+The Linux proof command uses the root-owned pinned executable path and enforces the trusted-path
+precondition:
 
 ```sh
-PATH=/home/jcschoeman96/.local/share/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin:/home/jcschoeman96/.local/share/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex-path:$PATH \
-  make -C elixir isolation-proof
+PATH=/usr/local/lib/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin:/usr/local/lib/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex-path:$PATH \
+SYMPHONY_ENFORCE_TEST_RUNTIME_PATH_TRUST=1 make -C elixir isolation-proof
 ```
 
-The local developer installation is user-owned, so the test-only actual-Codex proof uses its
-explicit test bypass for the host ownership precondition. A separate regression asserts that the
-same user-owned path is rejected when that precondition is enforced. CI installs the pinned native
-Codex package under `/usr/local/lib/symphony-codex-0.159.3` as root and enables the precondition in
-the pinned actual-Codex test.
+Both local verification and CI use the root-owned package under
+`/usr/local/lib/symphony-codex-0.159.3` and enforce the trusted-path precondition. The tests also
+reject user-owned or writable executable hierarchies.
 
 ## Verification state
 
@@ -146,30 +146,30 @@ the pinned actual-Codex test.
 |---|---|
 | Linux split-read actual-Codex feasibility | Passed on pinned 0.159.3 |
 | Actual-Codex four-role proof | Passed on pinned 0.159.3; all four roles |
-| `make -C elixir isolation-proof` | Passed on the remediation candidate; 72 tests, 0 failures |
-| Focused AgentRunner, Orchestrator runtime isolation, AppServer, and RuntimeIsolation suites | Passed; 114 tests, 0 failures |
-| Retained-containment lifecycle and stale-identity regressions | Passed in focused suites; the production timeout result retains the exact RuntimeAttempt, fence, and workspace record without retry or replacement |
-| `make -C elixir all` | Passed on `7e8ad45` with exported coverage aggregation: non-scale shard 1,649 tests, 0 failures, 6 skipped; H-070A shard 1 test, 0 failures; aggregate 90.02%; Dialyzer clean; actual-Codex proof 72 tests, 0 failures |
-| H-070A scale characterization | Mandatory shard passed: 1,000 items / 5,000 edges (1.425 s), 5,000 / 25,000 (35.370 s), and 10,000 / 50,000 (140.874 s) |
-| Coverage split probe | Before aggregation, non-scale coverage alone varied from 89.99% to 90.02%. The gate now aggregates exports from both test shards and enforces 90.00% across all accepted tests. |
+| `make -C elixir isolation-proof` | Passed on the pinned, root-owned Codex 0.159.3 path with path-trust enforcement; 72 tests, 0 failures |
+| Focused AgentRunner, Orchestrator runtime isolation, RuntimeIsolation, teardown, and AppServer suites | Passed; 156 tests, 0 failures |
+| Retained-containment lifecycle and stale-identity regressions | Passed in the focused suite; the production timeout result retains the exact RuntimeAttempt, fence, and workspace record without retry or replacement |
+| `make -C elixir all` | Passed on implementation snapshot `9e081f8`: 1,649 non-scale tests, 0 failures, 6 skipped; one H-070A test passed; 90.03% aggregated coverage; Dialyzer clean; actual-Codex proof 72 tests, 0 failures |
+| H-070A scale characterization | Mandatory shard passed: 1,000 items / 5,000 edges (1.433 s), 5,000 / 25,000 (35.955 s), and 10,000 / 50,000 (145.577 s) |
+| Coverage policy | Eight native Mix test partitions plus the paired transition fixture shard export coverage; the mandatory H-070A shard exports separately. `mix test.coverage` imports all ten exports and passes the fixed 90% threshold. No accepted test is omitted. |
 | Dialyzer | Passed; 0 errors, 0 skipped, 0 unnecessary skips |
 | `mix format --check-formatted` | Passed |
 | `git diff --check` | Passed |
-| Protected Linux CI jobs and PR checks | Run `37202957994` on `7e8ad45`: isolation proof passed; the runner canceled the non-scale Mix process before a test summary, and `make-all` failed as required. A fresh exact-candidate workflow run is pending. |
+| Protected Linux CI jobs and PR checks | The preceding candidate runs are recorded above. The partitioned Linux gate is pending on this implementation snapshot; `make-all` must pass `linux-isolation-proof` and `linux-full-gate`, and `validate-pr-description` remains required. |
 | macOS/iOS support | Unsupported and not certified; no macOS proof runs |
 | H-080B acceptance | Not granted |
 
 The repository workflow installs Codex 0.159.3 under `/usr/local/lib/symphony-codex-0.159.3` with
 root ownership and non-writable package ancestry. Protected `make-all` requires the Linux
 `linux-isolation-proof` job (`make isolation-proof`, including path-trust enforcement) and the
-`linux-full-gate` job. That gate runs format, lint, exports coverage from the non-scale test shard,
-executes and exports the mandatory H-070A 1,000/5,000/10,000 item scale shard, aggregates both
-exports with `mix test.coverage` at the fixed 90% threshold, and then runs Dialyzer. Both local
-`make all` and protected `make-all` require each step. A failed or skipped proof, test shard,
-coverage aggregation, or quality check fails `make-all`. macOS and iOS are unsupported and not
-certified, so no macOS proof runs.
+`linux-full-gate` job. That gate runs format and lint, then eight required Mix test partitions and a
+required paired transition-fixture shard. It runs and exports the mandatory H-070A
+1,000/5,000/10,000 item scale shard, aggregates every coverage export with `mix test.coverage` at
+the fixed 90% threshold, and runs Dialyzer. Local `make all` runs the same tests and checks. A
+failed or skipped proof, partition, fixture shard, scale shard, coverage aggregation, or quality
+check fails `make-all`. macOS and iOS are unsupported and not certified, so no macOS proof runs.
 
-If a hosted runner terminates a coverage run, that run is recorded as terminated by the runner;
-this evidence does not infer a generic time limit. The H-070A test is assigned to a separate
-mandatory test shard, and its exported coverage is aggregated with the rest of the suite before
-the 90% threshold is applied. No accepted test is dropped from the required Linux quality gate.
+Prior hosted coverage runs ended with runner cancellation after ExUnit reported passing tests. The
+logs do not establish a general runner time limit. The current gate keeps every accepted test in a
+required partition and runs the H-070A test in its own required shard. It aggregates all exports
+before applying the 90% threshold. No accepted test is dropped from the required Linux quality gate.
