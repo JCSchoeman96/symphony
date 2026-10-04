@@ -3077,7 +3077,8 @@ defmodule SymphonyElixir.OrchestratorPlaneEpochTest do
     assert_receive {:plane_project_snapshot, _closing_snapshot_task, _closing_snapshot_opts}, 1_000
     assert eventually(fn -> :sys.get_state(pid).plane_epoch_status == :current end)
     assert_receive {:plane_epoch_runtime_started, runner_pid, _start_opts}, 2_000
-    assert_receive {:plane_epoch_runtime_turn, ^runner_pid, ^issue, _turn_opts}, 2_000
+    assert_receive {:plane_epoch_runtime_turn, ^runner_pid, ^issue, turn_opts}, 2_000
+    original_identity = turn_opts[:runtime_attempt_identity]
 
     :sys.replace_state(pid, fn state ->
       entry = Map.fetch!(state.running, issue.id)
@@ -3089,7 +3090,30 @@ defmodule SymphonyElixir.OrchestratorPlaneEpochTest do
     send(runner_pid, :complete_plane_epoch_turn)
     assert_receive {:plane_epoch_runtime_stopped, ^runner_pid}, 2_000
     refute_receive {:plane_epoch_runtime_turn, ^runner_pid, _issue, _opts}, 100
-    assert eventually(fn -> not Map.has_key?(:sys.get_state(pid).running, issue.id) end)
+
+    assert eventually(fn ->
+             case :sys.get_state(pid).running[issue.id] do
+               %{
+                 runtime_attempt: %RuntimeAttempt{
+                   identity: %{runtime_attempt_id: "newer-runtime-attempt"},
+                   state: :containment_unconfirmed
+                 },
+                 containment_status: :unconfirmed
+               } ->
+                 true
+
+               _other ->
+                 false
+             end
+           end)
+
+    retained_state = :sys.get_state(pid)
+    assert MapSet.member?(retained_state.durable_in_flight, issue.id)
+    refute Map.has_key?(retained_state.retry_attempts, issue.id)
+
+    assert {:ok, %{in_flight: true, authority_fence: %{runtime_attempt: ^original_identity}}} =
+             AttemptLedger.current(retained_state.attempt_ledger, issue.id)
+
     assert :atomics.get(Application.fetch_env!(:symphony_elixir, :plane_epoch_issue_read_counter), 1) == 0
     assert :atomics.get(Application.fetch_env!(:symphony_elixir, :plane_epoch_graph_fetch_counter), 1) == 1
 

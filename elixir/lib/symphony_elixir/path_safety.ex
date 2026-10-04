@@ -6,7 +6,7 @@ defmodule SymphonyElixir.PathSafety do
     expanded_path = Path.expand(path)
     {root, segments} = split_absolute_path(expanded_path)
 
-    case resolve_segments(root, [], segments) do
+    case resolve_segments(root, [], segments, []) do
       {:ok, canonical_path} ->
         {:ok, canonical_path}
 
@@ -20,27 +20,50 @@ defmodule SymphonyElixir.PathSafety do
     {root, segments}
   end
 
-  defp resolve_segments(root, resolved_segments, []), do: {:ok, join_path(root, resolved_segments)}
+  @spec resolve_segments(String.t(), [String.t()], [String.t()], [String.t()]) ::
+          {:ok, String.t()} | {:error, term()}
+  defp resolve_segments(root, resolved_segments, [], _visited_symlinks),
+    do: {:ok, join_path(root, resolved_segments)}
 
-  defp resolve_segments(root, resolved_segments, [segment | rest]) do
+  defp resolve_segments(root, resolved_segments, [segment | rest], visited_symlinks) do
     candidate_path = join_path(root, resolved_segments ++ [segment])
 
     case File.lstat(candidate_path) do
       {:ok, %File.Stat{type: :symlink}} ->
-        with {:ok, target} <- :file.read_link_all(String.to_charlist(candidate_path)) do
-          resolved_target = Path.expand(IO.chardata_to_string(target), join_path(root, resolved_segments))
-          {target_root, target_segments} = split_absolute_path(resolved_target)
-          resolve_segments(target_root, [], target_segments ++ rest)
-        end
+        follow_symlink(candidate_path, root, resolved_segments, rest, visited_symlinks)
 
       {:ok, _stat} ->
-        resolve_segments(root, resolved_segments ++ [segment], rest)
+        resolve_segments(root, resolved_segments ++ [segment], rest, visited_symlinks)
 
       {:error, :enoent} ->
         {:ok, join_path(root, resolved_segments ++ [segment | rest])}
 
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  @spec follow_symlink(String.t(), String.t(), [String.t()], [String.t()], [String.t()]) ::
+          {:ok, String.t()} | {:error, term()}
+  defp follow_symlink(candidate_path, root, resolved_segments, rest, visited_symlinks) do
+    if candidate_path in visited_symlinks do
+      {:error, :eloop}
+    else
+      case File.read_link(candidate_path) do
+        {:ok, target} ->
+          resolved_target = Path.expand(target, join_path(root, resolved_segments))
+          {target_root, target_segments} = split_absolute_path(resolved_target)
+
+          resolve_segments(
+            target_root,
+            [],
+            target_segments ++ rest,
+            [candidate_path | visited_symlinks]
+          )
+
+        {:error, reason} ->
+          {:error, reason}
+      end
     end
   end
 

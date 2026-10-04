@@ -56,6 +56,17 @@ defmodule SymphonyElixir.AgentRuntimeStopFailureTestRuntime do
   def stop_session(_session), do: {:error, {:stop_failed, :test_failure}}
 end
 
+defmodule SymphonyElixir.AgentRuntimeAlreadyStoppedTestRuntime do
+  @behaviour SymphonyElixir.AgentRuntime
+
+  def capabilities, do: []
+  def runtime_metadata, do: %{name: :test}
+
+  def start_session(_workspace, _opts), do: {:ok, :test_session}
+  def run_turn(_session, _prompt, _issue, _opts), do: {:ok, :completed}
+  def stop_session(_session), do: {:error, {:session_not_active, :stopped}}
+end
+
 defmodule SymphonyElixir.AgentRuntimeTest do
   use SymphonyElixir.TestSupport
 
@@ -206,6 +217,19 @@ defmodule SymphonyElixir.AgentRuntimeTest do
         issue_state_fetcher: fn [_issue_id] -> {:ok, [%{issue | state: "Done"}]} end
       )
     end
+  end
+
+  test "AgentRunner preserves a completed turn when the runtime is already stopped" do
+    test_pid = self()
+    issue = %Issue{id: "runtime-already-stopped", identifier: "SYM-STOPPED", title: "Already stopped", state: "In Progress"}
+
+    assert :ok =
+             AgentRunner.run(issue, test_pid,
+               runtime: SymphonyElixir.AgentRuntimeAlreadyStoppedTestRuntime,
+               max_turns: 1,
+               ownership_ledger: workspace_ownership_ledger(),
+               issue_state_fetcher: fn [_issue_id] -> {:ok, [%{issue | state: "Done"}]} end
+             )
   end
 
   test "AgentRunner executes an injected runtime through the runtime contract" do

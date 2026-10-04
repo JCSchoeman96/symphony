@@ -77,8 +77,11 @@ defmodule SymphonyElixir.AgentRuntime.RuntimeAttempt do
 
   @allowed_transitions %{
     queued: [:starting],
-    starting: [:running, :retry_queued, :blocked, :failed, :cancelled],
-    running: [:completed, :retry_queued, :blocked, :failed, :cancelled],
+    starting: [:running, :stopping, :retry_queued, :blocked, :failed, :cancelled],
+    running: [:stopping, :completed, :retry_queued, :blocked, :failed, :cancelled],
+    stopping: [:containment_unconfirmed, :containment_proven_dead],
+    containment_unconfirmed: [],
+    containment_proven_dead: [:running, :completed, :retry_queued, :blocked, :failed, :cancelled],
     completed: [],
     retry_queued: [],
     blocked: [],
@@ -92,6 +95,9 @@ defmodule SymphonyElixir.AgentRuntime.RuntimeAttempt do
           :queued
           | :starting
           | :running
+          | :stopping
+          | :containment_unconfirmed
+          | :containment_proven_dead
           | :completed
           | :retry_queued
           | :blocked
@@ -105,7 +111,19 @@ defmodule SymphonyElixir.AgentRuntime.RuntimeAttempt do
 
   @spec new(Identity.t(), state()) :: t()
   def new(%Identity{} = identity, state)
-      when state in [:queued, :starting, :running, :completed, :retry_queued, :blocked, :failed, :cancelled] do
+      when state in [
+             :queued,
+             :starting,
+             :running,
+             :stopping,
+             :containment_unconfirmed,
+             :containment_proven_dead,
+             :completed,
+             :retry_queued,
+             :blocked,
+             :failed,
+             :cancelled
+           ] do
     %__MODULE__{identity: identity, state: state}
   end
 

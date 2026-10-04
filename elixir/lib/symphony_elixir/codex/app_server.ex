@@ -4,37 +4,299 @@ defmodule SymphonyElixir.Codex.AppServer do
   """
 
   require Logger
-  alias SymphonyElixir.{Codex.DynamicTool, Config, CredentialBoundary, PathSafety, SSH}
+  alias SymphonyElixir.AgentRuntime.RuntimeIsolation
+  alias SymphonyElixir.Codex.DynamicTool
+  alias SymphonyElixir.Codex.IsolationProfile
+  alias SymphonyElixir.{Config, CredentialBoundary, PathSafety, SSH, Workspace}
+  alias SymphonyElixir.Workspace.OwnershipLedger
 
   @initialize_id 1
   @thread_start_id 2
   @turn_start_id 3
   @port_line_bytes 1_048_576
   @max_stream_log_bytes 1_000
+  @stop_poll_interval_ms 10
+  @stop_poll_attempts 20
+  @port_monitor_timeout_ms 5_000
+  @routed_stop_token <<0, "SYMPHONY_STOP", "\n">>
+  @linux_guard_stop_timeout_ms 5_000
+
+  @linux_runtime_guard_script ~S"""
+  import ctypes, errno, json, os, selectors, signal, sys, time
+
+  stop_token = b"\x00SYMPHONY_STOP\n"
+  path, *runtime_args = sys.argv[1:]
+
+  child_input, parent_input = os.pipe()
+  parent_output, child_output = os.pipe()
+  child = os.fork()
+
+  if child == 0:
+      try:
+          os.dup2(child_input, 0)
+          os.dup2(child_output, 1)
+          os.dup2(child_output, 2)
+          for descriptor in (child_input, parent_input, parent_output, child_output):
+              if descriptor > 2:
+                  os.close(descriptor)
+          os.execve(path, [path, *runtime_args], os.environ)
+      except BaseException as error:
+          os.write(2, ("symphony runtime guard: runtime exec failed: " + type(error).__name__ + "\n").encode())
+          os._exit(126)
+
+  os.close(child_input)
+  os.close(child_output)
+  signal.signal(signal.SIGTERM, lambda _signum, _frame: None)
+  signal.signal(signal.SIGINT, lambda _signum, _frame: None)
+  signal.signal(signal.SIGHUP, lambda _signum, _frame: None)
+  selector = selectors.DefaultSelector()
+  os.set_blocking(0, False)
+  os.set_blocking(parent_output, False)
+  os.set_blocking(parent_input, False)
+  selector.register(0, selectors.EVENT_READ, "host-input")
+  selector.register(parent_output, selectors.EVENT_READ, "runtime-output")
+  pending = bytearray()
+  pending_runtime_output = bytearray()
+  startup_response_seen = False
+  stopping = False
+
+  def write_all(descriptor, data):
+      view = memoryview(data)
+      while view:
+          try:
+              view = view[os.write(descriptor, view):]
+          except InterruptedError:
+              continue
+
+  def reap_children():
+      status = ctypes.c_int()
+      waitpid = ctypes.CDLL(None, use_errno=True).waitpid
+      waitpid.argtypes = (ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.c_int)
+      waitpid.restype = ctypes.c_int
+      while True:
+          result = waitpid(-1, ctypes.byref(status), os.WNOHANG | 0x40000000)
+          if result > 0:
+              continue
+          if result == 0:
+              return
+          if ctypes.get_errno() == errno.EINTR:
+              continue
+          if ctypes.get_errno() == errno.ECHILD:
+              return
+          raise OSError(ctypes.get_errno(), "waitpid failed")
+
+  def namespace_processes():
+      try:
+          return [int(name) for name in os.listdir("/proc") if name.isdigit() and int(name) != 1]
+      except OSError:
+          return None
+
+  def signal_namespace_processes(signum):
+      pids = namespace_processes()
+      if pids is None:
+          return None
+      for pid in pids:
+          try:
+              os.kill(pid, signum)
+          except ProcessLookupError:
+              pass
+          except PermissionError:
+              return None
+      return pids
+
+  def contain_namespace(timeout):
+      deadline = time.monotonic() + timeout
+      term_sent = False
+      while time.monotonic() < deadline:
+          pids = namespace_processes()
+          if pids is None:
+              return False
+          if not pids:
+              reap_children()
+              return namespace_processes() == []
+          if not term_sent:
+              signal_namespace_processes(signal.SIGTERM)
+              term_sent = True
+          elif time.monotonic() + 0.2 < deadline:
+              signal_namespace_processes(signal.SIGKILL)
+          reap_children()
+          time.sleep(0.01)
+      return False
+
+  while True:
+      if stopping:
+          if contain_namespace(4.0):
+              os._exit(0)
+          try:
+              os.write(2, b"symphony runtime guard: descendants remain; retaining containment\n")
+          except OSError:
+              pass
+          time.sleep(0.1)
+          continue
+
+      try:
+          events = selector.select(timeout=0.1)
+      except InterruptedError:
+          continue
+      reap_children()
+      for key, _mask in events:
+          if key.data == "host-input":
+              try:
+                  data = os.read(0, 65536)
+              except BlockingIOError:
+                  continue
+              if not data:
+                  selector.unregister(0)
+                  stopping = True
+                  try:
+                      os.close(parent_input)
+                  except OSError:
+                      pass
+                  break
+              pending.extend(data)
+              while b"\n" in pending:
+                  line, _, remainder = pending.partition(b"\n")
+                  pending = bytearray(remainder)
+                  if line + b"\n" == stop_token:
+                      stopping = True
+                      selector.unregister(0)
+                      try:
+                          os.close(parent_input)
+                      except OSError:
+                          pass
+                      break
+                  try:
+                      write_all(parent_input, line + b"\n")
+                  except BrokenPipeError:
+                      stopping = True
+                      break
+              if stopping:
+                  break
+          else:
+              try:
+                  data = os.read(parent_output, 65536)
+              except BlockingIOError:
+                  continue
+              if not data:
+                  selector.unregister(parent_output)
+                  os.close(parent_output)
+                  if not startup_response_seen:
+                      stopping = True
+                      try:
+                          os.close(parent_input)
+                      except OSError:
+                          pass
+              else:
+                  pending_runtime_output.extend(data)
+                  while b"\n" in pending_runtime_output:
+                      line, _, remainder = pending_runtime_output.partition(b"\n")
+                      pending_runtime_output = bytearray(remainder)
+                      try:
+                          message = json.loads(line)
+                          if isinstance(message, dict) and message.get("id") == 1 and ("result" in message or "error" in message):
+                              startup_response_seen = True
+                      except (UnicodeDecodeError, json.JSONDecodeError):
+                          pass
+                  write_all(1, data)
+
+  """
   @type session :: %{
-          port: port(),
-          metadata: map(),
-          approval_policy: String.t() | map(),
-          auto_approve_requests: boolean(),
-          thread_sandbox: String.t(),
-          turn_sandbox_policy: map(),
-          thread_id: String.t(),
-          workspace: Path.t(),
-          worker_host: String.t() | nil,
-          dynamic_tool_binding: map(),
-          ephemeral_home: Path.t() | nil
+          :port => port(),
+          :os_pid => pos_integer() | nil,
+          :metadata => map(),
+          :approval_policy => String.t() | map(),
+          :auto_approve_requests => boolean(),
+          :thread_sandbox => String.t() | nil,
+          :turn_sandbox_policy => map(),
+          :thread_id => String.t(),
+          :workspace => Path.t(),
+          :worker_host => String.t() | nil,
+          :dynamic_tool_binding => map(),
+          :ephemeral_home => Path.t() | map() | nil,
+          optional(:runtime_policies) => map(),
+          optional(:routed) => boolean(),
+          optional(:permission_profile) => String.t() | nil,
+          optional(:runtime_workspace_roots) => [Path.t()] | nil,
+          optional(:access) => :read | :write | nil
         }
 
+  # Startup success depends on the external app-server protocol response.
+  @dialyzer {:nowarn_function, run: 4}
   @spec run(Path.t(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
   def run(workspace, prompt, issue, opts \\ []) do
     with {:ok, session} <- start_session(workspace, opts) do
-      try do
-        run_turn(session, prompt, issue, opts)
-      after
-        stop_session(session)
-      end
+      execution_result =
+        capture_execution_result(fn ->
+          run_turn(session, prompt, issue, Keyword.put(opts, :defer_runtime_stop, true))
+        end)
+
+      stop_result = stop_run_session(session, opts)
+      combine_execution_and_stop(execution_result, stop_result)
     end
   end
+
+  @dialyzer {:nowarn_function, capture_execution_result: 1}
+  defp capture_execution_result(fun) do
+    {:returned, fun.()}
+  rescue
+    exception -> {:raised, :error, exception, __STACKTRACE__}
+  catch
+    kind, reason -> {:raised, kind, reason, __STACKTRACE__}
+  end
+
+  @dialyzer {:nowarn_function, stop_run_session: 2}
+  defp stop_run_session(session, opts) do
+    test_stop_session = Keyword.get(opts, :test_stop_session)
+
+    result =
+      if test_environment?() and is_function(test_stop_session, 1) do
+        test_stop_session.(session)
+      else
+        stop_session(session)
+      end
+
+    case result do
+      :ok -> :ok
+      {:error, reason} -> {:error, reason}
+      other -> {:error, {:invalid_stop_result, safe_failure_tag(other)}}
+    end
+  rescue
+    exception -> {:error, {:stop_exception, exception.__struct__}}
+  catch
+    kind, _reason -> {:error, {:stop_failure, kind}}
+  end
+
+  @dialyzer {:nowarn_function, combine_execution_and_stop: 2}
+  defp combine_execution_and_stop({:returned, result}, :ok), do: result
+
+  defp combine_execution_and_stop({:raised, kind, reason, stacktrace}, :ok) do
+    :erlang.raise(kind, reason, stacktrace)
+  end
+
+  defp combine_execution_and_stop(execution_result, {:error, stop_reason}) do
+    case execution_failure_context(execution_result) do
+      nil -> {:error, {:runtime_stop_failed, stop_reason}}
+      context -> {:error, {:runtime_stop_failed, stop_reason, context}}
+    end
+  end
+
+  @dialyzer {:nowarn_function, execution_failure_context: 1}
+  defp execution_failure_context({:returned, {:error, reason}}),
+    do: {:turn_failed, safe_failure_tag(reason)}
+
+  defp execution_failure_context({:returned, {:ok, _result}}), do: nil
+
+  defp execution_failure_context({:returned, result}),
+    do: {:turn_result, safe_failure_tag(result)}
+
+  defp execution_failure_context({:raised, kind, reason, _stacktrace}),
+    do: {:turn_raised, kind, safe_failure_tag(reason)}
+
+  @dialyzer {:nowarn_function, safe_failure_tag: 1}
+  defp safe_failure_tag(reason) when is_atom(reason), do: reason
+  defp safe_failure_tag({tag, _reason}) when is_atom(tag), do: tag
+  defp safe_failure_tag({tag, _first, _second}) when is_atom(tag), do: tag
+  defp safe_failure_tag(_reason), do: :unspecified
 
   @spec start_session(Path.t(), keyword()) :: {:ok, session()} | {:error, term()}
   def start_session(workspace, opts \\ []) do
@@ -42,33 +304,171 @@ defmodule SymphonyElixir.Codex.AppServer do
     dynamic_tool_binding = DynamicTool.bind(opts)
 
     with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
-         {:ok, port, ephemeral_home} <-
-           start_port(expanded_workspace, worker_host, dynamic_tool_binding, opts) do
-      metadata = port_metadata(port, worker_host)
+         {:ok, session_policies} <- session_policies(expanded_workspace, worker_host, opts) do
+      start_with_policies(
+        expanded_workspace,
+        worker_host,
+        dynamic_tool_binding,
+        opts,
+        session_policies
+      )
+    end
+  end
 
-      with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host, opts),
-           {:ok, thread_id} <-
-             do_start_session(port, expanded_workspace, session_policies, dynamic_tool_binding) do
-        {:ok,
-         %{
-           port: port,
-           metadata: metadata,
-           approval_policy: session_policies.approval_policy,
-           auto_approve_requests: auto_approve_requests?(session_policies, opts),
-           thread_sandbox: session_policies.thread_sandbox,
-           turn_sandbox_policy: session_policies.turn_sandbox_policy,
-           thread_id: thread_id,
-           workspace: expanded_workspace,
-           worker_host: worker_host,
-           dynamic_tool_binding: dynamic_tool_binding,
-           ephemeral_home: ephemeral_home
-         }}
-      else
-        {:error, reason} ->
-          cleanup_ephemeral_home(ephemeral_home)
-          stop_port(port)
-          {:error, reason}
+  defp start_with_policies(workspace, worker_host, dynamic_tool_binding, opts, session_policies) do
+    case prepare_launch(workspace, worker_host, session_policies, opts) do
+      {:ok, launch} ->
+        start_prepared_launch(
+          workspace,
+          worker_host,
+          dynamic_tool_binding,
+          opts,
+          session_policies,
+          launch
+        )
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp start_prepared_launch(
+         workspace,
+         worker_host,
+         dynamic_tool_binding,
+         opts,
+         session_policies,
+         launch
+       ) do
+    case revalidate_routed_workspace(workspace, session_policies, opts) do
+      :ok ->
+        case start_port(
+               workspace,
+               worker_host,
+               dynamic_tool_binding,
+               opts,
+               session_policies,
+               launch
+             ) do
+          {:ok, port, ephemeral_home} ->
+            start_session_on_port(
+              port,
+              ephemeral_home,
+              workspace,
+              worker_host,
+              dynamic_tool_binding,
+              opts,
+              session_policies
+            )
+
+          {:error, reason} ->
+            cleanup_launch_after_error(launch, reason)
+        end
+
+      {:error, reason} ->
+        cleanup_launch_after_error(launch, reason)
+    end
+  end
+
+  defp cleanup_launch_after_error(launch, reason) do
+    case cleanup_launch(launch) do
+      :ok -> {:error, reason}
+      {:error, cleanup_reason} -> {:error, cleanup_reason}
+    end
+  end
+
+  defp start_session_on_port(
+         port,
+         ephemeral_home,
+         workspace,
+         worker_host,
+         dynamic_tool_binding,
+         opts,
+         session_policies
+       ) do
+    case do_start_session(port, workspace, session_policies, dynamic_tool_binding) do
+      {:ok, thread_id} ->
+        session =
+          build_session(
+            port,
+            ephemeral_home,
+            workspace,
+            worker_host,
+            dynamic_tool_binding,
+            opts,
+            session_policies,
+            thread_id
+          )
+
+        {:ok, session}
+
+      {:error, reason} ->
+        cleanup_failed_session_start(
+          port,
+          ephemeral_home,
+          reason,
+          routed_policies?(session_policies)
+        )
+    end
+  end
+
+  defp build_session(
+         port,
+         ephemeral_home,
+         workspace,
+         worker_host,
+         dynamic_tool_binding,
+         opts,
+         session_policies,
+         thread_id
+       ) do
+    os_pid = port_os_pid(port)
+
+    %{
+      port: port,
+      os_pid: os_pid,
+      metadata: port_metadata(port, worker_host),
+      approval_policy: policy_value(session_policies, :approval_policy),
+      auto_approve_requests: auto_approve_requests?(session_policies, opts),
+      thread_sandbox: policy_value(session_policies, :thread_sandbox),
+      turn_sandbox_policy: policy_value(session_policies, :turn_sandbox_policy, %{}),
+      thread_id: thread_id,
+      workspace: workspace,
+      worker_host: worker_host,
+      dynamic_tool_binding: dynamic_tool_binding,
+      ephemeral_home: ephemeral_home,
+      runtime_policies: session_policies,
+      routed: routed_policies?(session_policies),
+      runtime_containment: if(routed_policies?(session_policies), do: :linux_pid_namespace, else: nil),
+      permission_profile: policy_value(session_policies, :permission_profile),
+      runtime_workspace_roots: policy_value(session_policies, :runtime_workspace_roots),
+      access: policy_value(session_policies, :access)
+    }
+  end
+
+  defp cleanup_failed_session_start(port, ephemeral_home, reason, routed?) do
+    stop_result = if routed?, do: stop_routed_port(port), else: stop_port(port)
+
+    case stop_result do
+      :ok ->
+        case cleanup_ephemeral_home(ephemeral_home) do
+          :ok -> {:error, reason}
+          {:error, cleanup_reason} -> {:error, cleanup_reason}
+        end
+
+      {:error, _stop_reason} = error ->
+        error
+    end
+  end
+
+  defp routed_failure(session, session_policies, reason, opts) do
+    if routed_policies?(session_policies) and not Keyword.get(opts, :defer_runtime_stop, false) do
+      case stop_session(session) do
+        :ok -> {:error, reason}
+        {:error, cleanup_reason} -> {:error, cleanup_reason}
       end
+    else
+      {:error, reason}
     end
   end
 
@@ -79,15 +479,27 @@ defmodule SymphonyElixir.Codex.AppServer do
           metadata: metadata,
           approval_policy: approval_policy,
           auto_approve_requests: auto_approve_requests,
-          turn_sandbox_policy: turn_sandbox_policy,
           thread_id: thread_id,
           workspace: workspace,
           dynamic_tool_binding: dynamic_tool_binding
-        },
+        } = session,
         prompt,
         issue,
         opts \\ []
       ) do
+    session_policies =
+      Map.get(
+        session,
+        :runtime_policies,
+        %{
+          approval_policy: approval_policy,
+          turn_sandbox_policy: Map.get(session, :turn_sandbox_policy, %{}),
+          routed: Map.get(session, :routed, false),
+          permission_profile: Map.get(session, :permission_profile),
+          runtime_workspace_roots: Map.get(session, :runtime_workspace_roots)
+        }
+      )
+
     on_message = Keyword.get(opts, :on_message, &default_on_message/1)
     turn_tool_binding = overlay_agent_tool_context(dynamic_tool_binding, opts)
 
@@ -102,8 +514,7 @@ defmodule SymphonyElixir.Codex.AppServer do
            prompt,
            issue,
            workspace,
-           approval_policy,
-           turn_sandbox_policy,
+           session_policies,
            Keyword.get(opts, :model)
          ) do
       {:ok, turn_id} ->
@@ -146,20 +557,33 @@ defmodule SymphonyElixir.Codex.AppServer do
               metadata
             )
 
-            {:error, reason}
+            routed_failure(session, session_policies, reason, opts)
         end
 
       {:error, reason} ->
         Logger.error("Codex session failed for #{issue_context(issue)}: #{inspect(reason)}")
-        emit_message(on_message, :startup_failed, %{reason: reason}, metadata)
-        {:error, reason}
+        result = routed_failure(session, session_policies, reason, opts)
+        emit_message(on_message, :startup_failed, %{reason: elem(result, 1)}, metadata)
+        result
     end
   end
 
-  @spec stop_session(session()) :: :ok | {:error, {:stop_failed, term()}}
+  @spec stop_session(session()) :: :ok | {:error, term()}
   def stop_session(%{port: port} = session) when is_port(port) do
-    cleanup_ephemeral_home(Map.get(session, :ephemeral_home))
-    stop_port(port)
+    stop_result =
+      if Map.get(session, :runtime_containment) == :linux_pid_namespace do
+        stop_routed_port(port)
+      else
+        stop_port(port, Map.get(session, :os_pid))
+      end
+
+    case stop_result do
+      :ok ->
+        cleanup_ephemeral_home(Map.get(session, :ephemeral_home))
+
+      {:error, _reason} = error ->
+        error
+    end
   end
 
   defp validate_workspace_cwd(workspace, nil) when is_binary(workspace) do
@@ -204,7 +628,29 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp start_port(workspace, nil, dynamic_tool_binding, opts) do
+  defp start_port(workspace, nil, dynamic_tool_binding, opts, session_policies, launch) do
+    if routed_policies?(session_policies) do
+      start_routed_local_port(workspace, dynamic_tool_binding, launch, opts)
+    else
+      start_legacy_local_port(workspace, dynamic_tool_binding, opts)
+    end
+  end
+
+  defp start_port(workspace, worker_host, dynamic_tool_binding, opts, session_policies, _launch)
+       when is_binary(worker_host) do
+    if routed_policies?(session_policies) do
+      {:error, {:runtime_isolation_unavailable, :remote_containment_unproven}}
+    else
+      remote_command = remote_launch_command(workspace, dynamic_tool_binding, opts)
+
+      case SSH.start_port(worker_host, remote_command, line: @port_line_bytes) do
+        {:ok, port} -> {:ok, port, nil}
+        {:error, reason} -> {:error, reason}
+      end
+    end
+  end
+
+  defp start_legacy_local_port(workspace, dynamic_tool_binding, opts) do
     executable = System.find_executable("bash")
 
     if is_nil(executable) do
@@ -230,12 +676,143 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp start_port(workspace, worker_host, dynamic_tool_binding, opts) when is_binary(worker_host) do
-    remote_command = remote_launch_command(workspace, dynamic_tool_binding, opts)
+  defp start_routed_local_port(
+         workspace,
+         dynamic_tool_binding,
+         %{
+           resolved: resolved,
+           session_home: session_home,
+           launch_identity: launch_identity,
+           runtime_evidence: runtime_evidence
+         },
+         opts
+       ) do
+    with :ok <- require_linux_routed_runtime(opts),
+         {:ok, unshare} <- routed_guard_tool("unshare", opts),
+         {:ok, python} <- routed_guard_tool("python3", opts),
+         :ok <- validate_routed_runtime_identity(resolved, launch_identity, runtime_evidence),
+         :ok <- validate_routed_runtime_path(resolved, opts) do
+      env =
+        CredentialBoundary.routed_port_env(
+          dynamic_tool_binding.secret_environment_names,
+          session_home.home,
+          session_home.codex_home
+        )
 
-    case SSH.start_port(worker_host, remote_command, line: @port_line_bytes) do
-      {:ok, port} -> {:ok, port, nil}
-      {:error, reason} -> {:error, reason}
+      args = [
+        "--user",
+        "--map-current-user",
+        "--pid",
+        "--fork",
+        "--mount-proc",
+        python,
+        "-I",
+        "-S",
+        "-c",
+        @linux_runtime_guard_script,
+        resolved.native_executable
+        | resolved.argv
+      ]
+
+      port =
+        Port.open(
+          {:spawn_executable, String.to_charlist(unshare)},
+          [
+            :binary,
+            :exit_status,
+            :stderr_to_stdout,
+            args: Enum.map(args, &String.to_charlist/1),
+            cd: String.to_charlist(workspace),
+            env: env,
+            line: @port_line_bytes
+          ]
+        )
+
+      {:ok, port, session_home}
+    else
+      {:error, _reason} = error -> error
+    end
+  rescue
+    error in [ArgumentError, ErlangError] ->
+      {:error, {:codex_spawn_failed, error.__struct__}}
+  end
+
+  defp require_linux_routed_runtime(opts) do
+    platform =
+      if test_environment?() and Keyword.has_key?(opts, :test_routed_platform),
+        do: Keyword.get(opts, :test_routed_platform),
+        else: :os.type()
+
+    case platform do
+      {:unix, :linux} -> :ok
+      _unsupported -> {:error, {:runtime_isolation_unavailable, :unsupported_platform}}
+    end
+  end
+
+  defp validate_routed_runtime_path(resolved, opts) do
+    enforce_trusted_path? =
+      not test_environment?() or Keyword.get(opts, :test_routed_enforce_runtime_path_trust, false)
+
+    if enforce_trusted_path?,
+      do: validate_trusted_runtime_paths([resolved.executable, resolved.native_executable]),
+      else: :ok
+  end
+
+  defp validate_trusted_runtime_paths(paths) do
+    if Enum.all?(paths, &(validate_trusted_host_executable(&1) == :ok)),
+      do: :ok,
+      else: {:error, {:runtime_isolation_unavailable, :codex_installation_untrusted}}
+  end
+
+  defp routed_guard_tool(name, opts) do
+    override = Keyword.get(opts, :test_routed_guard_tool_paths, %{})
+    candidate = if test_environment?(), do: Map.get(override, name), else: nil
+    candidate = candidate || System.find_executable(name)
+
+    with true <- is_binary(candidate),
+         {:ok, canonical} <- PathSafety.canonicalize(candidate),
+         :ok <- validate_trusted_host_executable(canonical) do
+      {:ok, canonical}
+    else
+      _failure ->
+        {:error, {:runtime_isolation_unavailable, {:untrusted_linux_guard_tool, name}}}
+    end
+  end
+
+  defp validate_trusted_host_executable(path) do
+    if Enum.all?(trusted_path_ancestors(path), &trusted_path_component?/1),
+      do: :ok,
+      else: {:error, :untrusted_path}
+  rescue
+    _ -> {:error, :untrusted_path}
+  end
+
+  defp trusted_path_component?({candidate, is_executable}) do
+    with {:ok, %File.Stat{} = stat} <- File.stat(candidate),
+         true <- stat.uid == 0,
+         true <- Bitwise.band(stat.mode, 0o022) == 0,
+         true <- Bitwise.band(stat.mode, 0o6000) == 0 do
+      trusted_path_type?(stat, is_executable)
+    else
+      _failure -> false
+    end
+  end
+
+  defp trusted_path_type?(%File.Stat{type: :regular, mode: mode}, true),
+    do: Bitwise.band(mode, 0o111) != 0
+
+  defp trusted_path_type?(%File.Stat{type: :directory}, false), do: true
+  defp trusted_path_type?(_stat, _is_executable), do: false
+
+  defp trusted_path_ancestors(path) do
+    trusted_path_ancestors(Path.dirname(path), [{path, true}])
+  end
+
+  defp trusted_path_ancestors(path, acc) do
+    if path == "/" do
+      [{"/", false} | acc]
+    else
+      trusted_path_ancestors(Path.dirname(path), [{path, false} | acc])
     end
   end
 
@@ -243,7 +820,10 @@ defmodule SymphonyElixir.Codex.AppServer do
     if routed_profile?(opts) do
       home_dir = CredentialBoundary.create_routed_ephemeral_home!()
 
-      {CredentialBoundary.routed_port_env(dynamic_tool_binding.secret_environment_names, home_dir), home_dir}
+      {CredentialBoundary.routed_port_env(
+         dynamic_tool_binding.secret_environment_names,
+         home_dir
+       ), home_dir}
     else
       {CredentialBoundary.port_env(dynamic_tool_binding.secret_environment_names), nil}
     end
@@ -267,10 +847,17 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp cleanup_ephemeral_home(nil), do: :ok
 
+  defp cleanup_ephemeral_home(%{} = session_home) do
+    IsolationProfile.cleanup_session_home(session_home)
+  end
+
   defp cleanup_ephemeral_home(home_dir) when is_binary(home_dir) do
     File.rm_rf(home_dir)
     :ok
   end
+
+  defp cleanup_launch(%{session_home: session_home}), do: cleanup_ephemeral_home(session_home)
+  defp cleanup_launch(_launch), do: :ok
 
   defp remote_launch_command(workspace, dynamic_tool_binding, opts) when is_binary(workspace) do
     unset_command =
@@ -297,13 +884,26 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp auto_approve_requests?(session_policies, opts) do
-    routed_profile?(opts) == false and session_policies.approval_policy == "never"
+    routed_policies?(session_policies) == false and
+      policy_value(session_policies, :approval_policy) == "never" and
+      routed_profile?(opts) == false
   end
 
   defp routed_profile?(opts) do
     case Keyword.get(opts, :sandbox) do
       sandbox when sandbox in ["read-only", "workspace-write"] -> true
       _ -> false
+    end
+  end
+
+  defp routed_policies?(session_policies) when is_map(session_policies) do
+    policy_value(session_policies, :routed, false) == true
+  end
+
+  defp policy_value(session_policies, key, default \\ nil) when is_map(session_policies) do
+    case Map.fetch(session_policies, key) do
+      {:ok, value} -> value
+      :error -> Map.get(session_policies, Atom.to_string(key), default)
     end
   end
 
@@ -355,6 +955,296 @@ defmodule SymphonyElixir.Codex.AppServer do
     Config.codex_runtime_settings(workspace, Keyword.put(opts, :remote, true))
   end
 
+  defp prepare_launch(_workspace, worker_host, session_policies, _opts)
+       when is_binary(worker_host) do
+    if routed_policies?(session_policies) do
+      {:error, {:runtime_isolation_unavailable, :remote_containment_unproven}}
+    else
+      {:ok, nil}
+    end
+  end
+
+  defp prepare_launch(workspace, nil, session_policies, opts) do
+    if routed_policies?(session_policies) do
+      prepare_routed_launch(workspace, session_policies, opts)
+    else
+      {:ok, nil}
+    end
+  end
+
+  defp prepare_routed_launch(workspace, session_policies, opts) do
+    with :ok <- validate_routed_policy(session_policies, workspace),
+         :ok <- revalidate_routed_workspace(workspace, session_policies, opts),
+         {:ok, resolved} <- IsolationProfile.resolve_codex_executable(runtime_command(opts)),
+         {:ok, launch_identity} <- runtime_file_identity(resolved),
+         {:ok, runtime_evidence} <- admit_runtime(resolved.executable, opts),
+         :ok <- validate_routed_runtime_identity(resolved, launch_identity, runtime_evidence),
+         {:ok, session_home} <-
+           IsolationProfile.prepare_session_home(
+             workspace,
+             policy_value(session_policies, :responsibility),
+             resolved.native_executable,
+             session_home_opts(opts)
+           ) do
+      bind_routed_session_home(
+        resolved,
+        session_home,
+        session_policies,
+        workspace,
+        launch_identity,
+        runtime_evidence
+      )
+    end
+  end
+
+  defp bind_routed_session_home(
+         resolved,
+         session_home,
+         session_policies,
+         workspace,
+         launch_identity,
+         runtime_evidence
+       ) do
+    case validate_session_home(session_home, session_policies, workspace) do
+      :ok ->
+        {:ok,
+         %{
+           resolved: resolved,
+           session_home: session_home,
+           launch_identity: launch_identity,
+           runtime_evidence: runtime_evidence
+         }}
+
+      {:error, reason} ->
+        cleanup_launch_after_error(%{session_home: session_home}, reason)
+    end
+  end
+
+  defp revalidate_routed_workspace(workspace, session_policies, opts)
+       when is_map(session_policies) do
+    if routed_policies?(session_policies) do
+      case test_runtime_workspace_admit(opts) do
+        {:test, admission} ->
+          invoke_test_workspace_admission(admission, workspace, opts)
+
+        :production ->
+          revalidate_runtime_workspace(workspace, opts)
+      end
+    else
+      :ok
+    end
+  end
+
+  defp test_runtime_workspace_admit(opts) do
+    if test_environment?() do
+      case Keyword.get(opts, :test_runtime_workspace_admit) do
+        admission when is_function(admission, 2) -> {:test, admission}
+        admission when is_function(admission, 3) -> {:test, admission}
+        _missing -> :production
+      end
+    else
+      :production
+    end
+  end
+
+  defp invoke_test_workspace_admission(admission, workspace, opts)
+       when is_function(admission, 2) do
+    normalize_workspace_admission(admission.(Keyword.get(opts, :runtime_issue), workspace))
+  end
+
+  defp invoke_test_workspace_admission(admission, workspace, opts)
+       when is_function(admission, 3) do
+    normalize_workspace_admission(
+      admission.(
+        Keyword.get(opts, :runtime_issue),
+        workspace,
+        Keyword.get(opts, :ownership_ledger)
+      )
+    )
+  end
+
+  defp normalize_workspace_admission(:ok), do: :ok
+
+  defp normalize_workspace_admission({:error, reason}),
+    do: {:error, {:runtime_isolation_unavailable, {:workspace_identity_unproven, reason}}}
+
+  defp normalize_workspace_admission(other),
+    do: {:error, {:runtime_isolation_unavailable, {:workspace_admission_invalid, other}}}
+
+  defp revalidate_runtime_workspace(workspace, opts) do
+    issue = Keyword.get(opts, :runtime_issue)
+    ledger = Keyword.get(opts, :ownership_ledger)
+
+    with %OwnershipLedger{} <- ledger,
+         true <- is_map(issue) or is_struct(issue),
+         :ok <- Workspace.revalidate_owned_local_workspace(issue, workspace, ledger),
+         :ok <- CredentialBoundary.workspace_credential_residue(workspace) do
+      :ok
+    else
+      {:error, {:unsafe_workspace_scm_credentials, _reason}} ->
+        {:error, {:runtime_isolation_unavailable, :workspace_scm_boundary_unproven}}
+
+      {:error, _reason} ->
+        {:error, {:runtime_isolation_unavailable, :workspace_identity_unproven}}
+
+      _missing_context ->
+        {:error, {:runtime_isolation_unavailable, :workspace_identity_unproven}}
+    end
+  end
+
+  defp validate_routed_policy(session_policies, workspace) do
+    responsibility = policy_value(session_policies, :responsibility)
+    permission_profile = policy_value(session_policies, :permission_profile)
+    runtime_workspace_roots = policy_value(session_policies, :runtime_workspace_roots)
+    access = policy_value(session_policies, :access)
+
+    cond do
+      not is_binary(responsibility) or String.trim(responsibility) == "" ->
+        {:error, {:invalid_routed_policy, :responsibility}}
+
+      not is_binary(permission_profile) or String.trim(permission_profile) == "" ->
+        {:error, {:invalid_routed_policy, :permission_profile}}
+
+      access not in [:read, :write] ->
+        {:error, {:invalid_routed_policy, :access}}
+
+      runtime_workspace_roots != [workspace] ->
+        {:error, {:invalid_routed_policy, :runtime_workspace_roots, [workspace], runtime_workspace_roots}}
+
+      true ->
+        :ok
+    end
+  end
+
+  @doc false
+  @spec validate_session_home(map(), map(), Path.t()) :: :ok | {:error, term()}
+  def validate_session_home(session_home, session_policies, workspace) do
+    expected_profile = policy_value(session_policies, :permission_profile)
+    expected_access = policy_value(session_policies, :access)
+
+    cond do
+      session_home.permission_profile != expected_profile ->
+        {:error, {:runtime_profile_mismatch, :prepared_session_home, expected_profile, session_home.permission_profile}}
+
+      session_home.workspace != workspace ->
+        {:error, {:runtime_workspace_mismatch, :prepared_session_home, workspace, session_home.workspace}}
+
+      session_home.access != expected_access ->
+        {:error, {:runtime_access_mismatch, :prepared_session_home, expected_access, session_home.access}}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp admit_runtime(executable, opts) do
+    test_admission? =
+      test_environment?() and Keyword.has_key?(opts, :test_runtime_isolation_admit)
+
+    opts
+    |> runtime_admission_callback()
+    |> invoke_runtime_admission(executable)
+    |> normalize_runtime_admission(test_admission?)
+  rescue
+    error in [ArgumentError, ErlangError] ->
+      {:error, {:runtime_isolation_admission_failed, error.__struct__}}
+  catch
+    _kind, _reason -> {:error, :runtime_isolation_admission_failed}
+  end
+
+  defp runtime_admission_callback(opts) do
+    if test_environment?(),
+      do: Keyword.get(opts, :test_runtime_isolation_admit, &RuntimeIsolation.admit/3),
+      else: &RuntimeIsolation.admit/3
+  end
+
+  defp invoke_runtime_admission(admit, executable) when is_function(admit, 3),
+    do: admit.(nil, executable, [])
+
+  defp invoke_runtime_admission(admit, executable) when is_function(admit, 2),
+    do: admit.(nil, executable)
+
+  defp invoke_runtime_admission(_admit, _executable),
+    do: {:error, {:runtime_isolation_admission_invalid, :callback}}
+
+  defp normalize_runtime_admission({:ok, _evidence}, true), do: {:ok, :test_admitted}
+
+  defp normalize_runtime_admission({:ok, %{status: :verified, fingerprint: fingerprint}}, _test?),
+    do: {:ok, {:verified, fingerprint}}
+
+  defp normalize_runtime_admission({:error, reason}, _test?), do: {:error, reason}
+
+  defp normalize_runtime_admission({:ok, _evidence}, _test?),
+    do: {:error, {:runtime_isolation_admission_invalid, :evidence}}
+
+  defp normalize_runtime_admission(other, _test?),
+    do: {:error, {:runtime_isolation_admission_invalid, other}}
+
+  defp runtime_file_identity(resolved) do
+    paths = Enum.uniq([resolved.executable, resolved.native_executable])
+
+    Enum.reduce_while(paths, {:ok, %{}}, fn path, {:ok, identities} ->
+      with {:ok, canonical_path} <- PathSafety.canonicalize(path),
+           {:ok, %File.Stat{} = stat} <- File.stat(canonical_path),
+           {:ok, binary} <- File.read(canonical_path) do
+        identity = %{
+          path: canonical_path,
+          device: {stat.major_device, stat.minor_device},
+          inode: stat.inode,
+          mode: stat.mode,
+          size: stat.size,
+          mtime: stat.mtime,
+          digest: :crypto.hash(:sha256, binary)
+        }
+
+        {:cont, {:ok, Map.put(identities, path, identity)}}
+      else
+        _error ->
+          {:halt, {:error, {:runtime_isolation_unavailable, :runtime_changed_after_admission}}}
+      end
+    end)
+  rescue
+    _error in [ArgumentError, File.Error, ErlangError] ->
+      {:error, {:runtime_isolation_unavailable, :runtime_changed_after_admission}}
+  end
+
+  defp validate_routed_runtime_identity(resolved, expected_identity, runtime_evidence) do
+    with {:ok, current_identity} <- runtime_file_identity(resolved),
+         true <- current_identity == expected_identity,
+         :ok <- validate_runtime_evidence(resolved.executable, runtime_evidence) do
+      :ok
+    else
+      false -> {:error, {:runtime_isolation_unavailable, :runtime_changed_after_admission}}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp validate_runtime_evidence(_executable, :test_admitted), do: :ok
+
+  defp validate_runtime_evidence(executable, {:verified, fingerprint}) do
+    case RuntimeIsolation.evidence(executable) do
+      %{status: :verified, fingerprint: ^fingerprint} -> :ok
+      _evidence -> {:error, {:runtime_isolation_unavailable, :runtime_changed_after_admission}}
+    end
+  rescue
+    _error -> {:error, {:runtime_isolation_unavailable, :verifier_unavailable}}
+  catch
+    :exit, _reason -> {:error, {:runtime_isolation_unavailable, :verifier_unavailable}}
+  end
+
+  defp test_environment? do
+    Code.ensure_loaded?(Mix) and function_exported?(Mix, :env, 0) and Mix.env() == :test
+  rescue
+    _ -> false
+  end
+
+  defp session_home_opts(opts) do
+    case Keyword.get(opts, :runtime_session_root, Keyword.get(opts, :session_home_root)) do
+      root when is_binary(root) -> [root: root]
+      _ -> []
+    end
+  end
+
   defp do_start_session(port, workspace, session_policies, dynamic_tool_binding) do
     case send_initialize(port) do
       :ok -> start_thread(port, workspace, session_policies, dynamic_tool_binding)
@@ -362,18 +1252,21 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp start_thread(
-         port,
-         workspace,
-         %{approval_policy: approval_policy, thread_sandbox: thread_sandbox},
-         dynamic_tool_binding
-       ) do
+  defp start_thread(port, workspace, session_policies, dynamic_tool_binding) do
+    if routed_policies?(session_policies) do
+      start_routed_thread(port, workspace, session_policies, dynamic_tool_binding)
+    else
+      start_legacy_thread(port, workspace, session_policies, dynamic_tool_binding)
+    end
+  end
+
+  defp start_legacy_thread(port, workspace, session_policies, dynamic_tool_binding) do
     send_message(port, %{
       "method" => "thread/start",
       "id" => @thread_start_id,
       "params" => %{
-        "approvalPolicy" => approval_policy,
-        "sandbox" => thread_sandbox,
+        "approvalPolicy" => policy_value(session_policies, :approval_policy),
+        "sandbox" => policy_value(session_policies, :thread_sandbox),
         "cwd" => workspace,
         "dynamicTools" => dynamic_tool_binding.tool_specs
       }
@@ -391,17 +1284,44 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
+  defp start_routed_thread(port, workspace, session_policies, dynamic_tool_binding) do
+    send_message(port, %{
+      "method" => "thread/start",
+      "id" => @thread_start_id,
+      "params" => %{
+        "approvalPolicy" => policy_value(session_policies, :approval_policy),
+        "permissions" => policy_value(session_policies, :permission_profile),
+        "runtimeWorkspaceRoots" => policy_value(session_policies, :runtime_workspace_roots),
+        "cwd" => workspace,
+        "dynamicTools" => dynamic_tool_binding.tool_specs
+      }
+    })
+
+    case await_response(port, @thread_start_id) do
+      {:ok, %{"thread" => %{"id" => thread_id}} = response} ->
+        case validate_runtime_provenance(response, session_policies, workspace, :thread_start) do
+          :ok -> {:ok, thread_id}
+          {:error, _reason} = error -> error
+        end
+
+      {:ok, %{"thread" => thread_payload}} ->
+        {:error, {:invalid_thread_payload, thread_payload}}
+
+      other ->
+        other
+    end
+  end
+
   defp start_turn(
          port,
          thread_id,
          prompt,
          issue,
          workspace,
-         approval_policy,
-         turn_sandbox_policy,
+         session_policies,
          model
        ) do
-    params = %{
+    base_params = %{
       "threadId" => thread_id,
       "input" => [
         %{
@@ -411,9 +1331,22 @@ defmodule SymphonyElixir.Codex.AppServer do
       ],
       "cwd" => workspace,
       "title" => "#{issue.identifier}: #{issue.title}",
-      "approvalPolicy" => approval_policy,
-      "sandboxPolicy" => turn_sandbox_policy
+      "approvalPolicy" => policy_value(session_policies, :approval_policy)
     }
+
+    params =
+      if routed_policies?(session_policies) do
+        Map.merge(base_params, %{
+          "permissions" => policy_value(session_policies, :permission_profile),
+          "runtimeWorkspaceRoots" => policy_value(session_policies, :runtime_workspace_roots)
+        })
+      else
+        Map.put(
+          base_params,
+          "sandboxPolicy",
+          policy_value(session_policies, :turn_sandbox_policy, %{})
+        )
+      end
 
     params = maybe_put_model(params, model)
 
@@ -424,10 +1357,85 @@ defmodule SymphonyElixir.Codex.AppServer do
     })
 
     case await_response(port, @turn_start_id) do
-      {:ok, %{"turn" => %{"id" => turn_id}}} -> {:ok, turn_id}
-      other -> other
+      {:ok, %{"turn" => %{"id" => turn_id}} = response} ->
+        case validate_turn_provenance(response, session_policies, workspace) do
+          :ok -> {:ok, turn_id}
+          {:error, _reason} = error -> error
+        end
+
+      other ->
+        other
     end
   end
+
+  defp validate_runtime_provenance(response, session_policies, workspace, phase) do
+    expected_profile = policy_value(session_policies, :permission_profile)
+    expected_roots = policy_value(session_policies, :runtime_workspace_roots)
+
+    actual_profile =
+      response
+      |> Map.get("activePermissionProfile")
+      |> profile_id()
+
+    actual_roots = Map.get(response, "runtimeWorkspaceRoots")
+    actual_cwd = Map.get(response, "cwd")
+
+    with :ok <-
+           compare_provenance(
+             phase,
+             :active_permission_profile,
+             expected_profile,
+             actual_profile
+           ),
+         :ok <- compare_provenance(phase, :runtime_workspace_roots, expected_roots, actual_roots) do
+      compare_provenance(phase, :cwd, workspace, actual_cwd)
+    end
+  end
+
+  defp validate_turn_provenance(response, session_policies, workspace) do
+    case routed_policies?(session_policies) do
+      true -> validate_routed_turn_provenance(response, session_policies, workspace)
+      false -> :ok
+    end
+  end
+
+  defp validate_routed_turn_provenance(response, session_policies, workspace) do
+    turn_payload = Map.get(response, "turn", %{})
+
+    case turn_provenance_present?(response, turn_payload) do
+      true ->
+        provenance = Map.merge(response, turn_payload_map(turn_payload))
+        validate_runtime_provenance(provenance, session_policies, workspace, :turn_start)
+
+      false ->
+        {:error, {:runtime_provenance_missing, :turn_start}}
+    end
+  end
+
+  defp turn_provenance_present?(response, turn_payload) do
+    Enum.any?([response, turn_payload], &provenance_payload?/1)
+  end
+
+  defp provenance_payload?(payload) when is_map(payload) do
+    Enum.any?(
+      ["activePermissionProfile", "runtimeWorkspaceRoots", "cwd"],
+      &Map.has_key?(payload, &1)
+    )
+  end
+
+  defp provenance_payload?(_payload), do: false
+
+  defp turn_payload_map(turn_payload) when is_map(turn_payload), do: turn_payload
+  defp turn_payload_map(_turn_payload), do: %{}
+
+  defp profile_id(%{"id" => id}) when is_binary(id), do: id
+  defp profile_id(id) when is_binary(id), do: id
+  defp profile_id(_profile), do: nil
+
+  defp compare_provenance(_phase, _field, expected, expected), do: :ok
+
+  defp compare_provenance(phase, field, expected, actual),
+    do: {:error, {:runtime_provenance_mismatch, phase, field, expected, actual}}
 
   defp maybe_put_model(params, model) when is_binary(model) do
     if String.trim(model) == "", do: params, else: Map.put(params, "model", model)
@@ -446,11 +1454,26 @@ defmodule SymphonyElixir.Codex.AppServer do
     )
   end
 
-  defp receive_loop(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests) do
+  defp receive_loop(
+         port,
+         on_message,
+         timeout_ms,
+         pending_line,
+         tool_executor,
+         auto_approve_requests
+       ) do
     receive do
       {^port, {:data, {:eol, chunk}}} ->
         complete_line = pending_line <> to_string(chunk)
-        handle_incoming(port, on_message, complete_line, timeout_ms, tool_executor, auto_approve_requests)
+
+        handle_incoming(
+          port,
+          on_message,
+          complete_line,
+          timeout_ms,
+          tool_executor,
+          auto_approve_requests
+        )
 
       {^port, {:data, {:noeol, chunk}}} ->
         receive_loop(
@@ -816,7 +1839,9 @@ defmodule SymphonyElixir.Codex.AppServer do
     }
   end
 
-  defp dynamic_tool_output(%{"contentItems" => [%{"text" => text} | _]}) when is_binary(text), do: text
+  defp dynamic_tool_output(%{"contentItems" => [%{"text" => text} | _]}) when is_binary(text),
+    do: text
+
   defp dynamic_tool_output(result), do: Jason.encode!(result, pretty: true)
 
   defp dynamic_tool_content_items(output) when is_binary(output) do
@@ -903,7 +1928,8 @@ defmodule SymphonyElixir.Codex.AppServer do
        ),
        do: :input_required
 
-  defp tool_request_user_input_approval_answers(%{"questions" => questions}) when is_list(questions) do
+  defp tool_request_user_input_approval_answers(%{"questions" => questions})
+       when is_list(questions) do
     answers =
       Enum.reduce_while(questions, %{}, fn question, acc ->
         case tool_request_user_input_approval_answer(question) do
@@ -959,7 +1985,8 @@ defmodule SymphonyElixir.Codex.AppServer do
       |> String.trim()
       |> String.downcase()
 
-    String.starts_with?(normalized_label, "approve") or String.starts_with?(normalized_label, "allow")
+    String.starts_with?(normalized_label, "approve") or
+      String.starts_with?(normalized_label, "allow")
   end
 
   defp await_response(port, request_id) do
@@ -1034,23 +2061,126 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp stop_port(port) when is_port(port) do
+    stop_port(port, port_os_pid(port))
+  end
+
+  defp stop_routed_port(port) when is_port(port) do
     ref = :erlang.monitor(:port, port)
 
-    result =
-      try do
-        Port.close(port)
-        :ok
-      rescue
-        ArgumentError -> {:error, {:stop_failed, :session_stopped}}
-      end
+    try do
+      Port.command(port, @routed_stop_token)
+    rescue
+      ArgumentError -> :already_closed
+    end
 
     receive do
-      {:DOWN, ^ref, :port, ^port, _reason} -> result
+      {:DOWN, ^ref, :port, ^port, _reason} -> :ok
+    after
+      @linux_guard_stop_timeout_ms ->
+        Process.demonitor(ref, [:flush])
+        {:error, {:containment_unconfirmed, :termination_timeout}}
     end
   end
 
+  defp stop_port(port, fallback_os_pid) when is_port(port) do
+    os_pid = port_os_pid(port) || fallback_os_pid
+    ref = :erlang.monitor(:port, port)
+
+    close_result = close_port(port)
+
+    receive do
+      {:DOWN, ^ref, :port, ^port, _reason} ->
+        case {close_result, os_pid} do
+          {:already_closed, nil} ->
+            {:error, {:stop_failed, :session_stopped}}
+
+          _ ->
+            case terminate_os_process(os_pid) do
+              :ok -> :ok
+              {:error, reason} -> {:error, {:stop_failed, reason}}
+            end
+        end
+    after
+      @port_monitor_timeout_ms ->
+        Process.demonitor(ref, [:flush])
+        _ = terminate_os_process(os_pid)
+        {:error, {:stop_failed, :process_state_unavailable}}
+    end
+  end
+
+  defp close_port(port) do
+    Port.close(port)
+    :closed
+  rescue
+    ArgumentError -> :already_closed
+  end
+
+  defp port_os_pid(port) when is_port(port) do
+    case :erlang.port_info(port, :os_pid) do
+      {:os_pid, os_pid} when is_integer(os_pid) -> os_pid
+      _ -> nil
+    end
+  rescue
+    ArgumentError -> nil
+  end
+
+  defp terminate_os_process(nil), do: :ok
+
+  defp terminate_os_process(os_pid) when is_integer(os_pid) and os_pid > 0 do
+    case System.find_executable("kill") do
+      nil ->
+        {:error, :process_state_unavailable}
+
+      kill ->
+        run_kill(kill, ["-TERM", "-#{os_pid}"])
+        run_kill(kill, ["-TERM", Integer.to_string(os_pid)])
+
+        case await_os_process_exit(kill, os_pid, @stop_poll_attempts) do
+          :ok ->
+            :ok
+
+          {:error, :process_still_running} ->
+            run_kill(kill, ["-KILL", "-#{os_pid}"])
+            run_kill(kill, ["-KILL", Integer.to_string(os_pid)])
+            await_os_process_exit(kill, os_pid, @stop_poll_attempts * 5)
+
+          {:error, _reason} = error ->
+            error
+        end
+    end
+  end
+
+  defp await_os_process_exit(_kill, _os_pid, 0), do: {:error, :process_still_running}
+
+  defp await_os_process_exit(kill, os_pid, attempts) do
+    case run_kill(kill, ["-0", Integer.to_string(os_pid)]) do
+      {:ok, 0} ->
+        Process.sleep(@stop_poll_interval_ms)
+        await_os_process_exit(kill, os_pid, attempts - 1)
+
+      {:ok, _status} ->
+        :ok
+
+      :error ->
+        {:error, :process_state_unavailable}
+    end
+  end
+
+  defp run_kill(kill, args) do
+    case System.cmd(kill, args, stderr_to_stdout: true) do
+      {_output, status} -> {:ok, status}
+    end
+  rescue
+    _ -> :error
+  end
+
   defp emit_message(on_message, event, details, metadata) when is_function(on_message, 1) do
-    message = metadata |> Map.merge(details) |> Map.put(:event, event) |> Map.put(:timestamp, DateTime.utc_now())
+    message =
+      metadata
+      |> Map.merge(details)
+      |> Map.put(:event, event)
+      |> Map.put(:timestamp, DateTime.utc_now())
+
     on_message.(message)
   end
 
@@ -1084,7 +2214,8 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp tool_call_name(params) when is_map(params) do
-    case Map.get(params, "tool") || Map.get(params, :tool) || Map.get(params, "name") || Map.get(params, :name) do
+    case Map.get(params, "tool") || Map.get(params, :tool) || Map.get(params, "name") ||
+           Map.get(params, :name) do
       name when is_binary(name) ->
         case String.trim(name) do
           "" -> nil

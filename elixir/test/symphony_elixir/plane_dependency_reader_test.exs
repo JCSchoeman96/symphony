@@ -1,5 +1,5 @@
 defmodule SymphonyElixir.PlaneDependencyReaderTest do
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
 
   alias SymphonyElixir.Dependency.{Graph, Policy}
   alias SymphonyElixir.Plane.{Adapter, ReadScheduler}
@@ -625,6 +625,7 @@ defmodule SymphonyElixir.PlaneDependencyReaderTest do
   end
 
   @tag timeout: 240_000
+  @tag :h070a_scale
   test "characterizes bounded 1,000, 5,000, and 10,000 item epochs" do
     for item_count <- [1_000, 5_000, 10_000] do
       run_scale_fixture(item_count)

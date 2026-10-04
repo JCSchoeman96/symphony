@@ -1,6 +1,7 @@
 defmodule SymphonyElixir.CredentialChannelEnforcementTest do
   use SymphonyElixir.TestSupport
 
+  alias SymphonyElixir.AgentRuntime.Profile
   alias SymphonyElixir.Codex.DynamicTool
   alias SymphonyElixir.{Config, CredentialBoundary, Workflow, Workspace}
   alias SymphonyElixir.GitHub.SourceControl
@@ -418,6 +419,47 @@ defmodule SymphonyElixir.CredentialChannelEnforcementTest do
            end)
   end
 
+  test "authorized semantic reads use host auth without returning it to the runtime" do
+    sentinel = "h080b-host-linear-auth-sentinel"
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "linear",
+      tracker_api_token: sentinel,
+      tracker_project_slug: "h080b-project"
+    )
+
+    assert Config.settings!().tracker.api_key == sentinel
+
+    binding = DynamicTool.bind()
+
+    assert Enum.map(binding.tool_specs, &Map.fetch!(&1, "name")) == [
+             "linear_graphql",
+             "linear_transition"
+           ]
+
+    parent = self()
+
+    response =
+      DynamicTool.execute(
+        "linear_graphql",
+        %{"query" => "query Viewer { viewer { id } }"},
+        binding,
+        linear_client: fn query, variables, opts ->
+          send(parent, {:host_semantic_read, query, variables, Keyword.fetch!(opts, :tracker_settings)})
+          {:ok, %{"data" => %{"viewer" => %{"id" => "h080b-viewer"}}}}
+        end
+      )
+
+    assert_received {:host_semantic_read, "query Viewer { viewer { id } }", %{}, tracker_settings}
+    assert tracker_settings.api_key == sentinel
+    assert response["success"]
+    refute response["output"] =~ sentinel
+
+    unsupported = DynamicTool.execute("linear_raw_authenticated_request", %{}, binding)
+    refute unsupported["success"]
+    refute unsupported["output"] =~ sentinel
+  end
+
   test "github transport requires a host token" do
     previous = System.get_env("GITHUB_TOKEN")
     System.delete_env("GITHUB_TOKEN")
@@ -462,7 +504,7 @@ defmodule SymphonyElixir.CredentialChannelEnforcementTest do
              Config.validate!()
   end
 
-  test "routed runtime sandbox policies restrict filesystem reads to the workspace" do
+  test "routed permission profiles bind workspace access by responsibility" do
     root =
       Path.join(
         System.tmp_dir!(),
@@ -480,36 +522,56 @@ defmodule SymphonyElixir.CredentialChannelEnforcementTest do
 
     assert {:ok, canonical_workspace} = SymphonyElixir.PathSafety.canonicalize(Path.expand(workspace))
 
+    profiles = Config.settings!().agent.profiles
+
     assert {:ok, write_settings} =
-             Config.codex_runtime_settings(workspace, sandbox: "workspace-write")
+             Config.codex_runtime_settings(workspace, Profile.runtime_options(profiles["builder"]))
 
-    assert write_settings.turn_sandbox_policy ==
-             Config.Schema.routed_credential_safe_workspace_write_policy(canonical_workspace)
+    assert write_settings.permission_profile == "symphony_builder_write"
+    assert write_settings.runtime_workspace_roots == [canonical_workspace]
+    assert write_settings.access == :write
+    assert write_settings.turn_sandbox_policy == %{}
 
-    assert {:ok, read_settings} = Config.codex_runtime_settings(workspace, sandbox: "read-only")
+    assert {:ok, read_settings} =
+             Config.codex_runtime_settings(workspace, Profile.runtime_options(profiles["planner"]))
 
-    assert read_settings.turn_sandbox_policy ==
-             Config.Schema.routed_credential_safe_read_only_policy(canonical_workspace)
+    assert read_settings.permission_profile == "symphony_planner_read"
+    assert read_settings.runtime_workspace_roots == [canonical_workspace]
+    assert read_settings.access == :read
+    assert read_settings.turn_sandbox_policy == %{}
 
     File.rm_rf(root)
   end
 
   test "routed profile sandbox forces non-auto approval policy" do
+    root = Path.join(System.tmp_dir!(), "symphony-routed-profile-approval-#{System.unique_integer([:positive])}")
+    workspace = Path.join(root, "ISSUE-APPROVAL")
+    File.mkdir_p!(workspace)
+    on_exit(fn -> File.rm_rf(root) end)
+
     write_workflow_file!(Workflow.workflow_file_path(),
       agent_routing: "routed",
+      tracker_kind: "memory",
+      workspace_root: root,
       codex_approval_policy: "never"
     )
 
+    profiles = Config.settings!().agent.profiles
+    planner_opts = Profile.runtime_options(profiles["planner"])
+    builder_opts = Profile.runtime_options(profiles["builder"])
+
     assert {:ok, settings} =
-             Config.codex_runtime_settings("/tmp/workspace", sandbox: "read-only")
+             Config.codex_runtime_settings(workspace, planner_opts)
 
     refute settings.approval_policy == "never"
     assert settings.approval_policy == CredentialBoundary.routed_safe_approval_policy()
+    assert settings.permission_profile == "symphony_planner_read"
 
     assert {:ok, write_settings} =
-             Config.codex_runtime_settings("/tmp/workspace", sandbox: "workspace-write")
+             Config.codex_runtime_settings(workspace, builder_opts)
 
     assert write_settings.approval_policy == CredentialBoundary.routed_safe_approval_policy()
+    assert write_settings.permission_profile == "symphony_builder_write"
   end
 
   test "github default api url stays pinned" do

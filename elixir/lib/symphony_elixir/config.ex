@@ -3,8 +3,12 @@ defmodule SymphonyElixir.Config do
   Runtime configuration loaded from `WORKFLOW.md`.
   """
 
-  alias SymphonyElixir.{Config.Schema, Tracker}
-  alias SymphonyElixir.{Workflow, WorkflowStore}
+  alias SymphonyElixir.AgentRuntime.Profile
+  alias SymphonyElixir.Codex.IsolationProfile
+  alias SymphonyElixir.Config.Schema
+  alias SymphonyElixir.Tracker
+  alias SymphonyElixir.Workflow
+  alias SymphonyElixir.WorkflowStore
 
   @default_prompt_template """
   You are working on an issue from the configured tracker.
@@ -23,7 +27,12 @@ defmodule SymphonyElixir.Config do
   @type codex_runtime_settings :: %{
           approval_policy: String.t() | map(),
           thread_sandbox: String.t(),
-          turn_sandbox_policy: map()
+          turn_sandbox_policy: map(),
+          routed: boolean(),
+          responsibility: String.t() | nil,
+          permission_profile: String.t() | nil,
+          runtime_workspace_roots: [Path.t()],
+          access: :read | :write | nil
         }
 
   @spec settings() :: {:ok, Schema.t()} | {:error, term()}
@@ -101,18 +110,80 @@ defmodule SymphonyElixir.Config do
           {:ok, codex_runtime_settings()} | {:error, term()}
   def codex_runtime_settings(workspace \\ nil, opts \\ []) do
     with {:ok, settings} <- settings() do
-      with {:ok, turn_sandbox_policy} <-
-             Schema.resolve_runtime_turn_sandbox_policy(settings, workspace, opts) do
-        runtime_settings = %{
-          approval_policy: settings.codex.approval_policy,
-          thread_sandbox: settings.codex.thread_sandbox,
-          turn_sandbox_policy: turn_sandbox_policy
-        }
-
-        apply_profile_sandbox(runtime_settings, Keyword.get(opts, :sandbox), workspace, opts)
-      end
+      resolve_codex_runtime_settings(settings, workspace, opts)
     end
   end
+
+  defp resolve_codex_runtime_settings(settings, workspace, opts) do
+    case {settings.agent.routing, Keyword.get(opts, :profile)} do
+      {"routed", %Profile{} = profile} ->
+        routed_runtime_settings(settings, workspace, opts, profile)
+
+      {"routed", _missing_or_invalid_profile} ->
+        {:error, :routed_runtime_profile_required}
+
+      {"legacy", _profile} ->
+        legacy_runtime_settings(settings, workspace, opts)
+
+      _other ->
+        {:error, {:unsupported_agent_routing, settings.agent.routing}}
+    end
+  end
+
+  defp legacy_runtime_settings(settings, workspace, opts) do
+    with {:ok, turn_sandbox_policy} <-
+           Schema.resolve_runtime_turn_sandbox_policy(settings, workspace, opts) do
+      runtime_settings = %{
+        approval_policy: settings.codex.approval_policy,
+        thread_sandbox: settings.codex.thread_sandbox,
+        turn_sandbox_policy: turn_sandbox_policy,
+        routed: false,
+        responsibility: nil,
+        permission_profile: nil,
+        runtime_workspace_roots: [],
+        access: nil
+      }
+
+      apply_profile_sandbox(runtime_settings, Keyword.get(opts, :sandbox), workspace, opts)
+    end
+  end
+
+  defp routed_runtime_settings(settings, workspace, opts, %Profile{} = profile) do
+    with :ok <- Profile.validate_effective_policy(profile),
+         :ok <- validate_routed_codex_profile(profile),
+         true <- Keyword.get(opts, :sandbox) == profile.sandbox || {:error, :routed_sandbox_mismatch},
+         {:ok, canonical_workspace} <- Schema.canonical_turn_sandbox_workspace(settings, workspace, opts),
+         permission_profile when is_binary(permission_profile) <-
+           IsolationProfile.profile_name(profile.responsibility),
+         {:ok, access} <- routed_access(profile.responsibility) do
+      {:ok,
+       %{
+         approval_policy: SymphonyElixir.CredentialBoundary.routed_safe_approval_policy(),
+         thread_sandbox: profile.sandbox,
+         turn_sandbox_policy: %{},
+         routed: true,
+         responsibility: profile.responsibility,
+         permission_profile: permission_profile,
+         runtime_workspace_roots: [canonical_workspace],
+         access: access
+       }}
+    else
+      {:error, reason} -> {:error, reason}
+      other -> {:error, {:routed_permission_profile_unavailable, other}}
+    end
+  end
+
+  defp validate_routed_codex_profile(%Profile{runtime: "codex"}), do: :ok
+
+  defp validate_routed_codex_profile(%Profile{responsibility: responsibility}),
+    do: {:error, {:non_executable_routed_responsibility, responsibility}}
+
+  defp routed_access(responsibility) when responsibility in ["planning", "review"], do: {:ok, :read}
+
+  defp routed_access(responsibility) when responsibility in ["implementation", "correction"],
+    do: {:ok, :write}
+
+  defp routed_access(responsibility), do: {:error, {:unsupported_runtime_responsibility, responsibility}}
 
   defp apply_profile_sandbox(runtime_settings, nil, _workspace, _opts), do: {:ok, runtime_settings}
 
@@ -152,7 +223,8 @@ defmodule SymphonyElixir.Config do
            :ok <- validate_plane_runtime_mode(settings),
            :ok <- Tracker.validate_routed_capabilities(settings),
            :ok <- Schema.validate_source_control(settings),
-           :ok <- Schema.validate_routed_turn_sandbox_policy(settings) do
+           :ok <- Schema.validate_routed_turn_sandbox_policy(settings),
+           :ok <- Schema.validate_routed_runtime_profiles(settings) do
         Schema.validate_project_identity(settings)
       end
     end

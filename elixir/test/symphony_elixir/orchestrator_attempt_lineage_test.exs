@@ -1423,9 +1423,14 @@ defmodule SymphonyElixir.OrchestratorAttemptLineageTest do
     end)
 
     assert eventually(fn ->
-             case read_snapshot(path, project_id, issue.id) do
-               {:ok, %{status: :closed}} -> true
-               _ -> false
+             state = :sys.get_state(pid)
+
+             case AttemptLedger.current(state.attempt_ledger, issue.id) do
+               {:ok, %{status: :closed, close_pending: false}} ->
+                 not Map.has_key?(state.attempt_counters, issue.id)
+
+               _ ->
+                 false
              end
            end)
 
