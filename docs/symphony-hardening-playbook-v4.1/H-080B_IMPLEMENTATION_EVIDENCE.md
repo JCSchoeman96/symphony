@@ -14,6 +14,26 @@
 
 ## Evidence history
 
+### Current candidate snapshot
+
+The currently pushed code snapshot is `9823f96149404e6ada29b047106cd49435d4feb0`, tree
+`45422cf64bd1a499ec961c24f6c2d300129db0c1`, based on
+`56798754c8f6fd80d7ec53b604800873e339e030` (tree
+`a2770cbd2a5f4b96617b3fe18f324f0376d0cdf1`). Its PR synthetic merge is
+`b8eb83b01aa45e33a93c450d5387af9ede45ce5d`, tree
+`45422cf64bd1a499ec961c24f6c2d300129db0c1`, with parents
+`56798754c8f6fd80d7ec53b604800873e339e030` and
+`9823f96149404e6ada29b047106cd49435d4feb0`.
+
+Local `make -C elixir all` passed on this code snapshot: 1,649 non-scale tests, 0 failures,
+6 skipped; the mandatory H-070A test passed; aggregate coverage was 90.02%; Dialyzer was clean;
+and the actual-Codex isolation proof passed with 72 tests and 0 failures. The hosted run for this
+exact snapshot is not green: run `37210286913` passed `linux-isolation-proof` (72/0), but its
+`linux-full-gate` was cancelled during partition 3 after 174 tests, 0 failures, and 2 skipped.
+Partitions 4–8, the transition fixture shard, H-070A scale shard, coverage aggregation, and
+Dialyzer were skipped; protected `make-all` failed. The logs show the runner shutdown signal and
+do not establish its cause. The hosted run therefore does not verify the full candidate.
+
 | Candidate | Evidence | Status |
 |---|---|---|
 | `c61f248711cb99f65ce1e899c903ec40d5089150` | Historical local result: 1,641 tests, 0 failures, 6 skipped, approximately 90.01% coverage. | Historical only; not verification of a later candidate. |
@@ -23,10 +43,9 @@
 | `7e8ad45a10fcadbd75a600fddf0faf2dbe4b84bb` | Local `make all` passed: 1,649 non-scale tests, 1 H-070A test, 6 skipped, 90.02% aggregate coverage, Dialyzer clean, and 72 isolation-proof tests passed. Hosted run `37202957994` was canceled during the non-scale test step before ExUnit produced a summary; H-070A and coverage aggregation were skipped. | Superseded; `make-all` correctly failed. |
 | `3afae77f9abb2e2e91716e1d790a87736ae8f0e6` | Hosted run `37204294595`, attempt 1: 1,526 tests, 0 failures, 6 skipped, 1 excluded; attempt 2: 1,253 tests, 0 failures, 6 skipped, 1 excluded. Both attempts were canceled during coverage export. H-070A, aggregate coverage, and Dialyzer did not run. | Superseded; `make-all` correctly failed because the Linux full gate did not complete. No generic runner time limit is inferred. |
 
-The locally verified implementation snapshot is commit `9e081f88dc72d37ec7bf6de78bb574d10eb71b49`,
-tree `4b641db7a4be167c75de5964c764015d99a8019f`, based on the accepted `main` commit above. The
-PR description and required Linux CI checkout steps record the exact final PR head and synthetic
-merge identity. The historical rows above are not evidence for the current candidate.
+The earlier locally verified snapshot `9e081f88dc72d37ec7bf6de78bb574d10eb71b49` is retained in
+the history only; it does not establish the current candidate's hosted status. The historical rows
+above do not verify a later candidate.
 
 ## Boundary implemented
 
@@ -147,15 +166,16 @@ reject user-owned or writable executable hierarchies.
 | Linux split-read actual-Codex feasibility | Passed on pinned 0.159.3 |
 | Actual-Codex four-role proof | Passed on pinned 0.159.3; all four roles |
 | `make -C elixir isolation-proof` | Passed on the pinned, root-owned Codex 0.159.3 path with path-trust enforcement; 72 tests, 0 failures |
-| Focused AgentRunner, Orchestrator runtime isolation, RuntimeIsolation, teardown, and AppServer suites | Passed; 156 tests, 0 failures |
+| Focused AgentRunner, Orchestrator runtime isolation, RuntimeIsolation, teardown, AppServer, and attempt-lineage suites | Passed on `9823f96`: 123 tests, 0 failures |
 | Retained-containment lifecycle and stale-identity regressions | Passed in the focused suite; the production timeout result retains the exact RuntimeAttempt, fence, and workspace record without retry or replacement |
-| `make -C elixir all` | Passed on implementation snapshot `9e081f8`: 1,649 non-scale tests, 0 failures, 6 skipped; one H-070A test passed; 90.03% aggregated coverage; Dialyzer clean; actual-Codex proof 72 tests, 0 failures |
-| H-070A scale characterization | Mandatory shard passed: 1,000 items / 5,000 edges (1.433 s), 5,000 / 25,000 (35.955 s), and 10,000 / 50,000 (145.577 s) |
+| `make -C elixir all` | Passed locally on `9823f96`: 1,649 non-scale tests, 0 failures, 6 skipped; mandatory H-070A test passed; 90.02% aggregate coverage; Dialyzer clean; actual-Codex proof 72 tests, 0 failures |
+| H-070A scale characterization | Passed locally on `9823f96`: 1,000 items / 5,000 edges (2.638 s), 5,000 / 25,000 (37.464 s), and 10,000 / 50,000 (150.744 s) |
 | Coverage policy | Eight native Mix test partitions plus the paired transition fixture shard export coverage; the mandatory H-070A shard exports separately. `mix test.coverage` imports all ten exports and passes the fixed 90% threshold. No accepted test is omitted. |
 | Dialyzer | Passed; 0 errors, 0 skipped, 0 unnecessary skips |
 | `mix format --check-formatted` | Passed |
 | `git diff --check` | Passed |
-| Protected Linux CI jobs and PR checks | The preceding candidate runs are recorded above. The partitioned Linux gate is pending on this implementation snapshot; `make-all` must pass `linux-isolation-proof` and `linux-full-gate`, and `validate-pr-description` remains required. |
+| Hosted run `37210286913` on `9823f96` / synthetic merge `b8eb83b` | `linux-isolation-proof` passed (72/0). `linux-full-gate` was cancelled during partition 3 (174 tests, 0 failures, 2 skipped); remaining partitions, H-070A, coverage aggregation, and Dialyzer were skipped. `make-all` failed as required. No aggregate hosted coverage result was produced. |
+| Hosted `validate-pr-description` run `37210286800` | Passed against the PR body before its evidence refresh; rerun is required after the description update. |
 | macOS/iOS support | Unsupported and not certified; no macOS proof runs |
 | H-080B acceptance | Not granted |
 
