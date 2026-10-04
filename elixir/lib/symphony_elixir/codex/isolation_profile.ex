@@ -705,9 +705,30 @@ defmodule SymphonyElixir.Codex.IsolationProfile do
   end
 
   defp create_probe_fixture do
-    probe_id = System.unique_integer([:positive])
+    create_probe_fixture(3)
+  end
+
+  defp create_probe_fixture(attempts) when attempts > 0 do
+    probe_id = :crypto.strong_rand_bytes(18) |> Base.url_encode64(padding: false)
     host_home = System.user_home!()
     root = Path.join(host_home, ".symphony-h080b-probe-#{probe_id}")
+
+    case File.mkdir(root) do
+      :ok ->
+        create_probe_fixture(root, probe_id)
+
+      {:error, :eexist} ->
+        create_probe_fixture(attempts - 1)
+
+      {:error, reason} ->
+        {:error, {:probe_fixture_failed, :root_creation, reason}}
+    end
+  end
+
+  defp create_probe_fixture(0), do: {:error, {:probe_fixture_failed, :root_creation, :collision}}
+
+  defp create_probe_fixture(root, probe_id) do
+    host_home = System.user_home!()
     workspace = Path.join(root, "workspace")
     sibling = Path.join(root, "sibling")
     outside = Path.join(root, "outside")
@@ -761,7 +782,7 @@ defmodule SymphonyElixir.Codex.IsolationProfile do
          host_synthetic_sibling: Path.join(root, "SYNTHETIC-SIBLING")
        }}
     rescue
-      error in [File.Error, ArgumentError] ->
+      error in [File.Error, File.LinkError, ArgumentError] ->
         result = {:error, {:probe_fixture_failed, error.__struct__}}
         combine_cleanup_result(result, cleanup_probe_fixture(%{root: root, fake_home: fake_home}))
     end

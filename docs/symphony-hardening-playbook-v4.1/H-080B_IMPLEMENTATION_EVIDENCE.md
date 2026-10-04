@@ -12,6 +12,18 @@
 | `H-080C` | Not authorized. No H-080C implementation or change is included. |
 | `PLATFORM_CERTIFICATION` | Linux only. macOS and iOS are unsupported and not certified. |
 
+## Evidence history
+
+| Candidate | Evidence | Status |
+|---|---|---|
+| `c61f248711cb99f65ce1e899c903ec40d5089150` | Historical local result: 1,641 tests, 0 failures, 6 skipped, approximately 90.01% coverage. | Historical only; not verification of a later candidate. |
+| `03c3b9d343ff93c7c1cf60d1e5d903b70716dbff` | Hosted result: 1,640 tests, 0 failures, 6 skipped, 1 excluded, 89.97% coverage. | Superseded and rejected because it weakened accepted H-070A and 90% coverage authority. |
+
+The current remediation candidate is the PR #31 head. Its exact HEAD/tree and synthetic merge
+SHA/tree/parents are recorded in the PR description and repeated by the required Linux CI checkout
+steps. Those values identify the candidate that reviewers should evaluate; the historical rows
+above are not evidence for it.
+
 ## Boundary implemented
 
 Routed local Codex admission requires a cached, supervised `RuntimeIsolation` proof for the admitted
@@ -47,6 +59,13 @@ typed `containment_unconfirmed` failure.
 The successful lifecycle is `admitted -> running -> stopping -> containment proven dead -> cleanup
 -> stopped`. If the stop wait expires, the lifecycle is `stopping -> containment unconfirmed -> state
 retained -> typed failure`.
+
+AgentRunner reports those transitions with the exact RuntimeAttempt identity. On timeout, Orchestrator
+keeps that attempt in its active runtime map, retains the authority fence and workspace ownership,
+and blocks retries and replacement dispatch without recording an ordinary failure. A stale proof
+for another RuntimeAttempt is ignored. There is no safe post-timeout observer today, so an unconfirmed
+attempt stays retained until an authorized reconciliation path can positively establish namespace
+death.
 
 `AppServer.run/4` captures the turn and stop outcomes explicitly. A stop failure overrides a
 successful turn; when both fail, it preserves a safe turn-failure tag without returning response
@@ -108,7 +127,7 @@ against real Codex sandbox commands.
 The local Linux proof command is:
 
 ```sh
-PATH=/home/jcschoeman96/.codex/packages/standalone/releases/0.159.3-x86_64-unknown-linux-musl/bin:/home/jcschoeman96/.codex/packages/standalone/releases/0.159.3-x86_64-unknown-linux-musl/codex-path:$PATH \
+PATH=/home/jcschoeman96/.local/share/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin:/home/jcschoeman96/.local/share/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex-path:$PATH \
   make -C elixir isolation-proof
 ```
 
@@ -124,20 +143,26 @@ the pinned actual-Codex test.
 |---|---|
 | Linux split-read actual-Codex feasibility | Passed on pinned 0.159.3 |
 | Actual-Codex four-role proof | Passed on pinned 0.159.3; all four roles |
-| `make -C elixir isolation-proof` | Passed; 72 tests, 0 failures |
-| Focused RuntimeIsolation, Orchestrator isolation, AppServer, and AgentRuntime suites | Passed; 114 tests, 0 failures |
-| Escaped descendant, state retention, executable replacement, path trust, and stop-result regressions | Passed within the focused and proof suites |
-| `make -C elixir all` | Passed locally; 1,641 tests, 0 failures, 6 skipped; 90.01% coverage |
+| `make -C elixir isolation-proof` | Passed on the remediation candidate; 72 tests, 0 failures |
+| Focused AgentRunner, Orchestrator runtime isolation, AppServer, and RuntimeIsolation suites | Passed; 114 tests, 0 failures |
+| Retained-containment lifecycle and stale-identity regressions | Passed in focused suites; the production timeout result retains the exact RuntimeAttempt, fence, and workspace record without retry or replacement |
+| `make -C elixir all` | Passed on Linux; 1,650 tests, 0 failures, 6 skipped; 90.02% coverage |
+| H-070A scale characterization | Mandatory and passed: 1,000 items / 5,000 edges (1.417 s), 5,000 / 25,000 (34.493 s), and 10,000 / 50,000 (137.757 s) |
 | Dialyzer | Passed; 0 errors, 0 skipped, 0 unnecessary skips |
 | `mix format --check-formatted` | Passed |
 | `git diff --check` | Passed |
-| Protected Linux CI jobs and PR checks | `make-all` requires successful `linux-isolation-proof` and `linux-full-gate`; CI evaluates each on the PR merge ref |
+| Protected Linux CI jobs and PR checks | Pending the pushed exact candidate; `make-all` requires both Linux jobs and `validate-pr-description` remains required by branch protection |
 | macOS/iOS support | Unsupported and not certified; no macOS proof runs |
 | H-080B acceptance | Not granted |
 
 The repository workflow installs Codex 0.159.3 under `/usr/local/lib/symphony-codex-0.159.3` with
 root ownership and non-writable package ancestry. Protected `make-all` requires the Linux
 `linux-isolation-proof` job (`make isolation-proof`, including path-trust enforcement) and the
-`linux-full-gate` job (`make ci`). Together they preserve the local `make all` sequence without
-duplicating the expensive actual-Codex proof in the full gate. A skipped proof or gate fails
-`make-all`. macOS and iOS are unsupported and not certified, so no macOS proof runs.
+`linux-full-gate` job (`make ci`), which runs every test including the accepted H-070A scale test at
+the fixed 90% coverage threshold, then Dialyzer. Together they preserve the local `make all`
+sequence without duplicating the actual-Codex proof in the full gate. A failed or skipped proof or
+gate fails `make-all`. macOS and iOS are unsupported and not certified, so no macOS proof runs.
+
+If a hosted runner terminates a coverage run, that run is recorded as terminated by the runner;
+this evidence does not infer a generic time limit. No test is excluded from the required Linux
+coverage command.

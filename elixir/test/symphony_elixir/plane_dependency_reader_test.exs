@@ -1,5 +1,5 @@
 defmodule SymphonyElixir.PlaneDependencyReaderTest do
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
 
   alias SymphonyElixir.Dependency.{Graph, Policy}
   alias SymphonyElixir.Plane.{Adapter, ReadScheduler}

@@ -1165,6 +1165,20 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   def handle_info(
+        {:runtime_attempt_lifecycle, issue_id, %RuntimeAttemptIdentity{} = identity, lifecycle_state},
+        state
+      )
+      when is_binary(issue_id) do
+    case validate_current_runtime_event(state, issue_id, identity, require_running: false) do
+      {:ok, validated_issue_id, running_entry} ->
+        apply_runtime_attempt_lifecycle(state, validated_issue_id, running_entry, lifecycle_state)
+
+      :stale ->
+        {:noreply, state}
+    end
+  end
+
+  def handle_info(
         {:worker_runtime_info, issue_id, %RuntimeAttemptIdentity{} = identity, runtime_info},
         %{running: running} = state
       )
@@ -1407,26 +1421,74 @@ defmodule SymphonyElixir.Orchestrator do
         {:noreply, state}
 
       issue_id ->
-        {running_entry, state} = pop_running_entry(state, issue_id)
-        state = record_session_completion_totals(state, running_entry)
-        session_id = running_entry_session_id(running_entry)
+        running_entry = Map.fetch!(running, issue_id)
 
-        state =
-          case release_runtime_fence_after_task_down(state, issue_id, running_entry) do
-            {:ok, released_state} ->
-              handle_agent_down(reason, released_state, issue_id, running_entry, session_id)
-
-            {:error, blocked_state, fence_reason} ->
-              error = attempt_ledger_error(fence_reason)
-              block_issue_from_entry(blocked_state, issue_id, running_entry, error)
-          end
-
-        Logger.info("Agent task finished for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}")
-
-        notify_dashboard()
-        {:noreply, state}
+        if containment_unproven_runtime_attempt?(running_entry) do
+          retained_state = retain_runtime_containment_after_task_down(state, issue_id, running_entry)
+          notify_dashboard()
+          {:noreply, retained_state}
+        else
+          handle_releasable_running_task_down(state, issue_id, running_entry, reason)
+        end
     end
   end
+
+  defp handle_releasable_running_task_down(state, issue_id, running_entry, reason) do
+    {_removed_entry, state} = pop_running_entry(state, issue_id)
+    state = record_session_completion_totals(state, running_entry)
+    session_id = running_entry_session_id(running_entry)
+
+    state =
+      case release_runtime_fence_after_task_down(state, issue_id, running_entry) do
+        {:ok, released_state} ->
+          handle_agent_down(reason, released_state, issue_id, running_entry, session_id)
+
+        {:error, blocked_state, fence_reason} ->
+          error = attempt_ledger_error(fence_reason)
+          block_issue_from_entry(blocked_state, issue_id, running_entry, error)
+      end
+
+    Logger.info("Agent task finished for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}")
+    notify_dashboard()
+    {:noreply, state}
+  end
+
+  defp containment_unproven_runtime_attempt?(running_entry),
+    do: runtime_containment_unproven_entry?(running_entry)
+
+  defp retain_runtime_containment_after_task_down(state, issue_id, running_entry) do
+    updated_entry =
+      running_entry
+      |> mark_runtime_containment_unconfirmed(:task_down_without_containment_proof)
+      |> Map.put(:pid, nil)
+      |> Map.put(:ref, nil)
+
+    Logger.warning("Retaining runtime authority for issue_id=#{issue_id} because containment is unconfirmed")
+    %{state | running: Map.put(state.running, issue_id, updated_entry)}
+  end
+
+  defp release_runtime_fence_after_task_down(
+         %State{} = state,
+         _issue_id,
+         %{
+           containment_status: containment_status,
+           runtime_attempt: %RuntimeAttempt{}
+         }
+       )
+       when containment_status in [:active, :stopping, :unconfirmed],
+       do: {:error, state, {:containment_unconfirmed, :termination_unproven}}
+
+  defp release_runtime_fence_after_task_down(
+         %State{} = state,
+         _issue_id,
+         %{
+           runtime_attempt: %RuntimeAttempt{
+             state: attempt_state
+           }
+         }
+       )
+       when attempt_state in [:stopping, :containment_unconfirmed],
+       do: {:error, state, {:containment_unconfirmed, :termination_unproven}}
 
   defp release_runtime_fence_after_task_down(%State{attempt_ledger_status: :disabled} = state, _issue_id, _entry),
     do: {:ok, state}
@@ -5789,12 +5851,23 @@ defmodule SymphonyElixir.Orchestrator do
   defp dependency_denied?(_dependency), do: false
 
   defp block_issue_from_entry(%State{} = state, issue_id, running_entry, error, dependency \\ nil) do
-    case transition_running_entry_attempt(running_entry, :blocked) do
-      {:ok, running_entry} ->
-        do_block_issue_from_entry(state, issue_id, running_entry, error, dependency)
+    if runtime_containment_unproven_entry?(running_entry) do
+      retained_entry =
+        mark_runtime_containment_unconfirmed(running_entry, :authority_retained_without_stop_proof)
 
-      {:error, :invalid_runtime_attempt_transition} ->
-        block_issue_from_terminal_attempt(state, issue_id, running_entry, error, dependency)
+      %{
+        state
+        | running: Map.put(state.running, issue_id, retained_entry),
+          claimed: MapSet.put(state.claimed, issue_id)
+      }
+    else
+      case transition_running_entry_attempt(running_entry, :blocked) do
+        {:ok, running_entry} ->
+          do_block_issue_from_entry(state, issue_id, running_entry, error, dependency)
+
+        {:error, :invalid_runtime_attempt_transition} ->
+          block_issue_from_terminal_attempt(state, issue_id, running_entry, error, dependency)
+      end
     end
   end
 
@@ -7489,9 +7562,11 @@ defmodule SymphonyElixir.Orchestrator do
   defp runtime_attempt_identity_from(_runtime_attempt), do: nil
 
   defp apply_runtime_attempt_session_started(state, running, validated_issue_id, running_entry) do
-    with %RuntimeAttempt{state: :starting} = attempt <- Map.get(running_entry, :runtime_attempt),
+    with %RuntimeAttempt{state: attempt_state} = attempt <- Map.get(running_entry, :runtime_attempt),
+         true <- attempt_state in [:starting, :containment_proven_dead],
          {:ok, running_attempt} <- RuntimeAttempt.mark_running(attempt) do
-      updated_running_entry = Map.put(running_entry, :runtime_attempt, running_attempt)
+      updated_running_entry =
+        Map.put(running_entry, :runtime_attempt, running_attempt)
 
       notify_dashboard()
       {:noreply, %{state | running: Map.put(running, validated_issue_id, updated_running_entry)}}
@@ -7499,6 +7574,129 @@ defmodule SymphonyElixir.Orchestrator do
       _ -> {:noreply, state}
     end
   end
+
+  defp apply_runtime_attempt_lifecycle(state, issue_id, running_entry, :stopping) do
+    transition_runtime_attempt_lifecycle(state, issue_id, running_entry, :stopping)
+  end
+
+  defp apply_runtime_attempt_lifecycle(state, issue_id, running_entry, :runtime_started) do
+    case Map.get(running_entry, :runtime_attempt) do
+      %RuntimeAttempt{state: :running} ->
+        updated_entry =
+          running_entry
+          |> Map.put(:containment_status, :active)
+          |> Map.delete(:containment_reason)
+
+        {:noreply, %{state | running: Map.put(state.running, issue_id, updated_entry)}}
+
+      _other_state ->
+        {:noreply, state}
+    end
+  end
+
+  defp apply_runtime_attempt_lifecycle(state, issue_id, running_entry, :containment_proven_dead) do
+    transition_runtime_attempt_lifecycle(state, issue_id, running_entry, :containment_proven_dead)
+  end
+
+  defp apply_runtime_attempt_lifecycle(
+         state,
+         issue_id,
+         running_entry,
+         {:containment_unconfirmed, reason}
+       )
+       when reason in [:termination_timeout] do
+    updated_entry = mark_runtime_containment_unconfirmed(running_entry, reason)
+
+    if match?(%RuntimeAttempt{state: :containment_unconfirmed}, Map.get(updated_entry, :runtime_attempt)) do
+      notify_dashboard()
+      {:noreply, %{state | running: Map.put(state.running, issue_id, updated_entry)}}
+    else
+      {:noreply, state}
+    end
+  end
+
+  defp apply_runtime_attempt_lifecycle(state, _issue_id, _running_entry, _lifecycle_state),
+    do: {:noreply, state}
+
+  defp transition_runtime_attempt_lifecycle(state, issue_id, running_entry, target_state) do
+    with %RuntimeAttempt{} = attempt <- Map.get(running_entry, :runtime_attempt),
+         {:ok, updated_attempt} <- RuntimeAttempt.transition(attempt, target_state) do
+      updated_entry =
+        running_entry
+        |> Map.put(:runtime_attempt, updated_attempt)
+        |> Map.put(:containment_status, if(target_state == :stopping, do: :stopping, else: :proven_dead))
+        |> Map.delete(:containment_reason)
+
+      notify_dashboard()
+      {:noreply, %{state | running: Map.put(state.running, issue_id, updated_entry)}}
+    else
+      _invalid_transition ->
+        {:noreply, state}
+    end
+  end
+
+  defp mark_runtime_containment_unconfirmed(
+         %{runtime_attempt: %RuntimeAttempt{state: :starting} = attempt} = running_entry,
+         reason
+       ) do
+    with {:ok, stopping} <- RuntimeAttempt.transition(attempt, :stopping),
+         {:ok, unconfirmed} <- RuntimeAttempt.transition(stopping, :containment_unconfirmed) do
+      running_entry
+      |> Map.put(:runtime_attempt, unconfirmed)
+      |> Map.put(:containment_status, :unconfirmed)
+      |> Map.put(:containment_reason, reason)
+    else
+      _invalid_transition ->
+        running_entry
+        |> Map.put(:containment_status, :unconfirmed)
+        |> Map.put(:containment_reason, reason)
+    end
+  end
+
+  defp mark_runtime_containment_unconfirmed(
+         %{runtime_attempt: %RuntimeAttempt{state: :running} = attempt} = running_entry,
+         reason
+       ) do
+    with {:ok, stopping} <- RuntimeAttempt.transition(attempt, :stopping),
+         {:ok, unconfirmed} <- RuntimeAttempt.transition(stopping, :containment_unconfirmed) do
+      running_entry
+      |> Map.put(:runtime_attempt, unconfirmed)
+      |> Map.put(:containment_status, :unconfirmed)
+      |> Map.put(:containment_reason, reason)
+    else
+      _invalid_transition ->
+        running_entry
+        |> Map.put(:containment_status, :unconfirmed)
+        |> Map.put(:containment_reason, reason)
+    end
+  end
+
+  defp mark_runtime_containment_unconfirmed(
+         %{runtime_attempt: %RuntimeAttempt{state: :stopping} = attempt} = running_entry,
+         reason
+       ) do
+    case RuntimeAttempt.transition(attempt, :containment_unconfirmed) do
+      {:ok, unconfirmed} ->
+        running_entry
+        |> Map.put(:runtime_attempt, unconfirmed)
+        |> Map.put(:containment_status, :unconfirmed)
+        |> Map.put(:containment_reason, reason)
+
+      {:error, _reason} ->
+        running_entry
+        |> Map.put(:containment_status, :unconfirmed)
+        |> Map.put(:containment_reason, reason)
+    end
+  end
+
+  defp mark_runtime_containment_unconfirmed(
+         %{runtime_attempt: %RuntimeAttempt{state: :containment_unconfirmed}} = running_entry,
+         reason
+       ) do
+    Map.put_new(running_entry, :containment_reason, reason)
+  end
+
+  defp mark_runtime_containment_unconfirmed(running_entry, _reason), do: running_entry
 
   defp schedule_agent_route_change_retry(state, issue_id, running_entry, route_change) do
     case clear_attempt_in_flight(state, issue_id) do
@@ -7597,17 +7795,39 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp transition_running_entry_attempt(running_entry, to_state)
        when is_map(running_entry) and is_atom(to_state) do
+    if terminal_runtime_attempt_state?(to_state) and runtime_containment_unproven_entry?(running_entry) do
+      {:error, :invalid_runtime_attempt_transition}
+    else
+      transition_runtime_attempt_entry(running_entry, to_state)
+    end
+  end
+
+  defp transition_runtime_attempt_entry(running_entry, to_state) do
     case Map.get(running_entry, :runtime_attempt) do
       %RuntimeAttempt{} = attempt ->
-        case RuntimeAttempt.transition(attempt, to_state) do
-          {:ok, updated} -> {:ok, Map.put(running_entry, :runtime_attempt, updated)}
-          {:error, :invalid_transition} -> {:error, :invalid_runtime_attempt_transition}
-        end
+        transition_runtime_attempt_entry(running_entry, attempt, to_state)
 
       _ ->
         {:ok, running_entry}
     end
   end
+
+  defp transition_runtime_attempt_entry(running_entry, attempt, to_state) do
+    case RuntimeAttempt.transition(attempt, to_state) do
+      {:ok, updated} -> {:ok, Map.put(running_entry, :runtime_attempt, updated)}
+      {:error, :invalid_transition} -> {:error, :invalid_runtime_attempt_transition}
+    end
+  end
+
+  defp runtime_containment_unproven_entry?(%{runtime_attempt: %RuntimeAttempt{state: attempt_state}} = running_entry) do
+    Map.get(running_entry, :containment_status) in [:active, :stopping, :unconfirmed] or
+      attempt_state in [:stopping, :containment_unconfirmed]
+  end
+
+  defp runtime_containment_unproven_entry?(_running_entry), do: false
+
+  defp terminal_runtime_attempt_state?(attempt_state),
+    do: attempt_state in [:completed, :retry_queued, :blocked, :failed, :cancelled]
 
   defp active_work_item_for_attempt(%State{} = state, issue_id) when is_binary(issue_id) do
     case Map.get(state.work_control, issue_id) do
@@ -7840,6 +8060,10 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp attempt_ledger_error({:attempt_ledger_unavailable, reason}) do
     "attempt ledger unavailable; automatic work is blocked: #{inspect(reason)}"
+  end
+
+  defp attempt_ledger_error({:containment_unconfirmed, _reason}) do
+    "routed runtime containment is unconfirmed; runtime authority remains retained"
   end
 
   defp record_route_change_events(state, issue_id, route_change),
@@ -9208,6 +9432,24 @@ defmodule SymphonyElixir.Orchestrator do
         notify_dashboard()
         {:noreply, blocked_state}
     end
+  end
+
+  defp apply_runtime_isolation_blocked(
+         state,
+         issue_id,
+         %{runtime_attempt: %RuntimeAttempt{state: attempt_state}} = running_entry,
+         reason
+       )
+       when attempt_state in [:running, :stopping, :containment_unconfirmed] do
+    safe_reason = safe_runtime_isolation_reason(reason)
+
+    updated_entry =
+      mark_runtime_containment_unconfirmed(running_entry, :runtime_isolation_unconfirmed)
+
+    Logger.warning("Retaining runtime authority for issue_id=#{issue_id} because containment is unconfirmed: #{safe_reason}")
+
+    notify_dashboard()
+    {:noreply, %{state | running: Map.put(state.running, issue_id, updated_entry)}}
   end
 
   defp apply_runtime_isolation_blocked(state, issue_id, running_entry, reason) do

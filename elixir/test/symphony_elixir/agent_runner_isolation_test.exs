@@ -83,6 +83,31 @@ defmodule SymphonyElixir.AgentRunnerStopBoundaryFailureRuntime do
   def stop_session(_session), do: {:error, {:stop_failed, :process_still_running}}
 end
 
+defmodule SymphonyElixir.AgentRunnerNestedContainmentTimeoutRuntime do
+  @spec start_session(Path.t(), keyword()) :: {:ok, map()}
+  def start_session(_workspace, opts), do: {:ok, %{test_pid: Keyword.fetch!(opts, :test_pid)}}
+
+  @spec run_turn(map(), String.t(), map(), keyword()) :: {:ok, term()}
+  def run_turn(_session, _prompt, _issue, _opts), do: {:ok, :completed}
+
+  @spec stop_session(map()) :: {:error, term()}
+  def stop_session(_session),
+    do: {:error, {:runtime_stop_failed, {:containment_unconfirmed, :termination_timeout}}}
+end
+
+defmodule SymphonyElixir.AgentRunnerRaisedNestedContainmentTimeoutRuntime do
+  @spec start_session(Path.t(), keyword()) :: no_return()
+  def start_session(_workspace, _opts) do
+    throw({:turn_failed, {:runtime_stop_failed, {:containment_unconfirmed, :termination_timeout}, :app_server_stop}})
+  end
+
+  @spec run_turn(term(), String.t(), map(), keyword()) :: {:ok, term()}
+  def run_turn(_session, _prompt, _issue, _opts), do: {:ok, :unreachable}
+
+  @spec stop_session(term()) :: :ok
+  def stop_session(_session), do: :ok
+end
+
 defmodule SymphonyElixir.AgentRunnerRestartIsolationFailureRuntime do
   @spec start_session(Path.t(), keyword()) :: {:ok, map()} | {:error, term()}
   def start_session(_workspace, opts) do
@@ -109,10 +134,33 @@ defmodule SymphonyElixir.AgentRunnerRestartIsolationFailureRuntime do
   end
 end
 
+defmodule SymphonyElixir.AgentRunnerSuccessfulRestartRuntime do
+  @spec start_session(Path.t(), keyword()) :: {:ok, map()}
+  def start_session(_workspace, opts) do
+    start_count = Process.get(:agent_runner_successful_restart_start_count, 0) + 1
+    Process.put(:agent_runner_successful_restart_start_count, start_count)
+    send(Keyword.fetch!(opts, :test_pid), {:successful_restart_started, start_count})
+    {:ok, %{test_pid: Keyword.fetch!(opts, :test_pid), start_count: start_count}}
+  end
+
+  @spec run_turn(map(), String.t(), map(), keyword()) :: {:ok, term()}
+  def run_turn(session, _prompt, _issue, _opts) do
+    send(session.test_pid, {:successful_restart_turn, session.start_count})
+    {:ok, :completed}
+  end
+
+  @spec stop_session(map()) :: :ok
+  def stop_session(session) do
+    send(session.test_pid, {:successful_restart_stopped, session.start_count})
+    :ok
+  end
+end
+
 defmodule SymphonyElixir.AgentRunnerIsolationTest do
   use SymphonyElixir.TestSupport
 
   alias SymphonyElixir.AgentRuntime.Router
+  alias SymphonyElixir.AgentRuntime.RuntimeAttempt.Identity
   alias SymphonyElixir.WorkControl.{GuardClass, WorkItem}
   alias SymphonyElixir.Workspace.OwnershipLedger
 
@@ -381,6 +429,94 @@ defmodule SymphonyElixir.AgentRunnerIsolationTest do
     }
   end
 
+  test "nested runtime stop containment timeout reports a typed retained lifecycle event" do
+    issue = %Issue{
+      id: "runner-nested-containment-timeout",
+      identifier: "SYM-NESTED-CONTAINMENT",
+      title: "Nested containment timeout",
+      state: "In Progress"
+    }
+
+    identity = %Identity{
+      runtime_attempt_id: "attempt-nested-containment-timeout",
+      work_item_id: issue.id,
+      lineage_generation: "lineage-nested-containment-timeout",
+      responsibility: "implementation",
+      runtime_profile: "builder"
+    }
+
+    issue_id = issue.id
+
+    assert {:error, {:runtime_containment_unconfirmed, :termination_timeout}} =
+             AgentRunner.run(issue, self(),
+               runtime: SymphonyElixir.AgentRunnerNestedContainmentTimeoutRuntime,
+               test_pid: self(),
+               max_turns: 1,
+               runtime_attempt_identity: identity,
+               ownership_ledger: workspace_ownership_ledger()
+             )
+
+    assert_receive {:runtime_attempt_lifecycle, ^issue_id, ^identity, :stopping}
+
+    assert_receive {
+      :runtime_attempt_lifecycle,
+      ^issue_id,
+      ^identity,
+      {:containment_unconfirmed, :termination_timeout}
+    }
+  end
+
+  test "nested contextual containment timeout from startup is classified and sanitized" do
+    issue = %Issue{
+      id: "runner-raised-nested-containment-timeout",
+      identifier: "SYM-RAISED-NESTED-CONTAINMENT",
+      title: "Raised nested containment timeout",
+      state: "In Progress"
+    }
+
+    identity = %Identity{
+      runtime_attempt_id: "attempt-raised-nested-containment-timeout",
+      work_item_id: issue.id,
+      lineage_generation: "lineage-raised-nested-containment-timeout",
+      responsibility: "implementation",
+      runtime_profile: "builder"
+    }
+
+    issue_id = issue.id
+
+    assert {:error, {:runtime_containment_unconfirmed, :termination_timeout}} =
+             AgentRunner.run(issue, self(),
+               runtime: SymphonyElixir.AgentRunnerRaisedNestedContainmentTimeoutRuntime,
+               runtime_attempt_identity: identity,
+               ownership_ledger: workspace_ownership_ledger()
+             )
+
+    assert_receive {
+      :runtime_attempt_lifecycle,
+      ^issue_id,
+      ^identity,
+      {:containment_unconfirmed, :termination_timeout}
+    }
+  end
+
+  test "unconfirmed teardown without a RuntimeAttempt identity raises a typed safe error" do
+    issue = %Issue{
+      id: "runner-containment-missing-identity",
+      identifier: "SYM-CONTAINMENT-MISSING-IDENTITY",
+      title: "Containment missing identity",
+      state: "In Progress"
+    }
+
+    assert_raise RuntimeError, "Routed runtime containment could not be associated with an attempt", fn ->
+      AgentRunner.run(issue, self(),
+        runtime: SymphonyElixir.AgentRunnerNestedContainmentTimeoutRuntime,
+        test_pid: self(),
+        max_turns: 1,
+        ownership_ledger: workspace_ownership_ledger()
+      )
+    end
+  end
+
   test "raised typed isolation failure from session start reports a block" do
     issue = %Issue{
       id: "runner-raised-start-isolation",
@@ -448,6 +584,70 @@ defmodule SymphonyElixir.AgentRunnerIsolationTest do
     assert_receive {:restart_runtime_started, 2}
     assert_receive {:runtime_isolation_blocked, "runner-restart-isolation", reason}
     assert reason == {:runtime_isolation_unavailable, :restart_boundary_unproven}
+  end
+
+  test "restarted runtime reports active containment after positive stop proof" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      agent_routing: "routed",
+      tracker_active_states: ["Ready", "In Progress"],
+      max_turns: 2
+    )
+
+    issue = %Issue{
+      id: "runner-successful-restart",
+      identifier: "SYM-SUCCESSFUL-RESTART",
+      title: "Successful restart",
+      state: "Ready",
+      dispatchable: true
+    }
+
+    refreshed_issue = %{issue | state: "In Progress"}
+
+    {:ok, work_item} =
+      WorkItem.from_issue(issue, %{
+        provider: :memory,
+        observed_at: DateTime.utc_now(),
+        prior_validated_lifecycle_state: issue.state
+      })
+
+    assert {:ok, route} = Router.resolve(work_item, Config.settings!().agent.profiles)
+
+    identity = %Identity{
+      runtime_attempt_id: "attempt-successful-restart",
+      work_item_id: issue.id,
+      lineage_generation: "lineage-successful-restart",
+      responsibility: "implementation",
+      runtime_profile: "builder"
+    }
+
+    assert :ok =
+             AgentRunner.run(issue, self(),
+               runtime: SymphonyElixir.AgentRunnerSuccessfulRestartRuntime,
+               test_pid: self(),
+               runtime_attempt_identity: identity,
+               route: route,
+               work_item: work_item,
+               guard_evidence: [GuardClass.requirement(:mechanical_guard, :dispatch_guard)],
+               issue_state_fetcher: fn [_issue_id] -> {:ok, [refreshed_issue]} end,
+               test_runtime_isolation_admit: fn _worker_host, _executable, _opts -> {:ok, :admitted} end,
+               ownership_ledger: workspace_ownership_ledger()
+             )
+
+    assert_receive {:successful_restart_started, 1}
+    assert_receive {:runtime_attempt_lifecycle, issue_id, ^identity, :runtime_started}
+    assert issue_id == issue.id
+    assert_receive {:successful_restart_turn, 1}
+    assert_receive {:successful_restart_stopped, 1}
+    assert_receive {:runtime_attempt_lifecycle, ^issue_id, ^identity, :stopping}
+    assert_receive {:runtime_attempt_lifecycle, ^issue_id, ^identity, :containment_proven_dead}
+
+    assert_receive {:successful_restart_started, 2}
+    assert_receive {:runtime_attempt_lifecycle, ^issue_id, ^identity, :runtime_started}
+    assert_receive {:successful_restart_turn, 2}
+    assert_receive {:successful_restart_stopped, 2}
+    assert_receive {:runtime_attempt_lifecycle, ^issue_id, ^identity, :stopping}
+    assert_receive {:runtime_attempt_lifecycle, ^issue_id, ^identity, :containment_proven_dead}
   end
 
   test "restarted routed sessions repeat workspace SCM residue admission" do

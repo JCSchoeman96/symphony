@@ -53,6 +53,12 @@ Routed Linux sessions also require Codex, `unshare`, and `python3` executables a
 be root-owned and not group/world-writable. User-owned or mutable installations fail closed before
 launch.
 
+If the PID namespace does not stop before the bounded wait ends, Orchestrator keeps that exact
+RuntimeAttempt and its authority fence, retains the workspace ownership record, and blocks retries
+and replacement dispatch. The fence can be released only after the same attempt reports that its
+containment unit has terminated. The current runtime has no post-timeout observer, so an unconfirmed
+attempt remains retained until an authorized reconciliation path can prove termination.
+
 Routed remote workers remain fail-closed. A configured `worker_host` is blocked before remote
 workspace provisioning or App Server launch until a separately verified containment boundary exists.
 The existing SSH path does not count as runtime isolation evidence.

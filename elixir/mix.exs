@@ -10,7 +10,7 @@ defmodule SymphonyElixir.MixProject do
       start_permanent: Mix.env() == :prod,
       test_coverage: [
         summary: [
-          threshold: coverage_threshold()
+          threshold: 90
         ],
         ignore_modules: [
           SymphonyElixir.Asana.Client,
@@ -111,12 +111,5 @@ defmodule SymphonyElixir.MixProject do
         ]
       ]
     ]
-  end
-
-  defp coverage_threshold do
-    case System.get_env("SYMPHONY_TEST_COVERAGE_THRESHOLD") do
-      nil -> 90
-      value -> String.to_integer(value)
-    end
   end
 end

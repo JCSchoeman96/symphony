@@ -25,7 +25,7 @@ lint:
 	$(MIX) lint
 
 coverage:
-	$(MIX) test --cover $(if $(EXCLUDE_TAGS),--exclude $(EXCLUDE_TAGS),)
+	$(MIX) test --cover
 
 test:
 	$(MIX) test

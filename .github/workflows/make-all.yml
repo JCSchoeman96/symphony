@@ -20,6 +20,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
+      - name: Record exact candidate checkout
+        run: |
+          echo "CI checkout SHA: $(git rev-parse HEAD)"
+          echo "CI checkout tree: $(git rev-parse 'HEAD^{tree}')"
+          echo "CI checkout subject: $(git show -s --format=%s HEAD)"
+          echo "CI checkout parents: $(git show -s --format=%P HEAD)"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+
       - name: Set up mise tools
         uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db # v3
         with:
@@ -89,6 +97,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
+      - name: Record exact candidate checkout
+        run: |
+          echo "CI checkout SHA: $(git rev-parse HEAD)"
+          echo "CI checkout tree: $(git rev-parse 'HEAD^{tree}')"
+          echo "CI checkout subject: $(git show -s --format=%s HEAD)"
+          echo "CI checkout parents: $(git show -s --format=%P HEAD)"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+
       - name: Set up mise tools
         uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db # v3
         with:
@@ -131,13 +147,11 @@ jobs:
           make -C elixir lint
 
       - name: Run tests with coverage
-        timeout-minutes: 25
         env:
           SYMPHONY_ENFORCE_TEST_RUNTIME_PATH_TRUST: "1"
-          SYMPHONY_TEST_COVERAGE_THRESHOLD: "89"
         run: |
           export PATH="/usr/local/lib/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin:/usr/local/lib/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex-path:$PATH"
-          make -C elixir coverage EXCLUDE_TAGS=h070a_scale
+          make -C elixir coverage
 
       - name: Run Dialyzer
         timeout-minutes: 30

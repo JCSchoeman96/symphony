@@ -48,7 +48,8 @@ defmodule SymphonyElixir.AgentRunner do
     build_turn_prompt(issue, [route: route], turn_number, max_turns)
   end
 
-  @spec run(map(), pid() | nil, keyword()) :: :ok | no_return()
+  @spec run(map(), pid() | nil, keyword()) ::
+          :ok | {:error, {:runtime_containment_unconfirmed, :termination_timeout}} | no_return()
   def run(issue, codex_update_recipient \\ nil, opts \\ []) do
     # The orchestrator owns host retries so one worker lifetime never hops machines.
     worker_host =
@@ -110,22 +111,34 @@ defmodule SymphonyElixir.AgentRunner do
     do: run_worker_attempt_result(result, issue, recipient, opts)
 
   defp run_worker_attempt({:raised, kind, reason, stacktrace}, issue, recipient, opts) do
-    case runtime_isolation_block_reason(reason) do
-      nil -> :erlang.raise(kind, reason, stacktrace)
-      isolation_reason -> report_runtime_isolation_block(recipient, issue, opts, isolation_reason)
+    case runtime_containment_unconfirmed_reason(reason) do
+      nil ->
+        case runtime_isolation_block_reason(reason) do
+          nil -> :erlang.raise(kind, reason, stacktrace)
+          isolation_reason -> report_runtime_isolation_block(recipient, issue, opts, isolation_reason)
+        end
+
+      containment_reason ->
+        report_runtime_containment_unconfirmed(recipient, issue, opts, containment_reason)
     end
   end
 
   defp run_worker_attempt_result(:ok, _issue, _recipient, _opts), do: :ok
 
   defp run_worker_attempt_result({:error, reason}, issue, recipient, opts) do
-    case runtime_isolation_block_reason(reason) do
+    case runtime_containment_unconfirmed_reason(reason) do
       nil ->
-        Logger.error("Agent run failed for #{issue_context(issue)}: #{inspect(reason)}")
-        raise RuntimeError, "Agent run failed for #{issue_context(issue)}: #{inspect(reason)}"
+        case runtime_isolation_block_reason(reason) do
+          nil ->
+            Logger.error("Agent run failed for #{issue_context(issue)}: #{inspect(reason)}")
+            raise RuntimeError, "Agent run failed for #{issue_context(issue)}: #{inspect(reason)}"
 
-      isolation_reason ->
-        report_runtime_isolation_block(recipient, issue, opts, isolation_reason)
+          isolation_reason ->
+            report_runtime_isolation_block(recipient, issue, opts, isolation_reason)
+        end
+
+      containment_reason ->
+        report_runtime_containment_unconfirmed(recipient, issue, opts, containment_reason)
     end
   end
 
@@ -139,6 +152,38 @@ defmodule SymphonyElixir.AgentRunner do
     notify_runtime_isolation_blocked(recipient, issue, runtime_attempt_identity(opts), isolation_reason)
     :ok
   end
+
+  defp report_runtime_containment_unconfirmed(recipient, issue, opts, containment_reason) do
+    case runtime_attempt_identity(opts) do
+      %RuntimeAttemptIdentity{} = identity ->
+        Logger.warning("Routed runtime containment remains unconfirmed for #{issue_context(issue)}")
+
+        notify_runtime_attempt_lifecycle(
+          recipient,
+          issue,
+          identity,
+          {:containment_unconfirmed, containment_reason}
+        )
+
+        {:error, {:runtime_containment_unconfirmed, containment_reason}}
+
+      _missing_identity ->
+        Logger.error("Routed runtime containment has no RuntimeAttempt identity for #{issue_context(issue)}")
+        raise RuntimeError, "Routed runtime containment could not be associated with an attempt"
+    end
+  end
+
+  defp runtime_containment_unconfirmed_reason({:runtime_stop_failed, {:containment_unconfirmed, :termination_timeout}}),
+    do: :termination_timeout
+
+  defp runtime_containment_unconfirmed_reason({:runtime_stop_failed, {:containment_unconfirmed, :termination_timeout}, _context}),
+    do: :termination_timeout
+
+  defp runtime_containment_unconfirmed_reason({wrapper, reason})
+       when wrapper in [:runtime_stop_failed, :turn_failed, :start_failed, :error],
+       do: runtime_containment_unconfirmed_reason(reason)
+
+  defp runtime_containment_unconfirmed_reason(_reason), do: nil
 
   defp runtime_isolation_block_reason({:runtime_isolation_unavailable, _detail} = reason), do: reason
   defp runtime_isolation_block_reason({:runtime_isolation_failed, _detail} = reason), do: reason
@@ -297,6 +342,45 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp send_runtime_attempt_session_started(_recipient, _issue, _identity), do: :ok
 
+  defp runtime_attempt_lifecycle_callback(context) do
+    fn lifecycle_state ->
+      notify_runtime_attempt_lifecycle(
+        context.codex_update_recipient,
+        context.issue,
+        context.runtime_attempt_identity,
+        lifecycle_state
+      )
+    end
+  end
+
+  defp notify_runtime_attempt_lifecycle(
+         recipient,
+         %Issue{id: issue_id},
+         %RuntimeAttemptIdentity{} = identity,
+         lifecycle_state
+       )
+       when is_pid(recipient) and is_binary(issue_id) do
+    message_state =
+      case lifecycle_state do
+        :stopping ->
+          :stopping
+
+        :containment_proven_dead ->
+          :containment_proven_dead
+
+        :runtime_started ->
+          :runtime_started
+
+        {:containment_unconfirmed, reason} when reason in [:termination_timeout] ->
+          {:containment_unconfirmed, reason}
+      end
+
+    send(recipient, {:runtime_attempt_lifecycle, issue_id, identity, message_state})
+    :ok
+  end
+
+  defp notify_runtime_attempt_lifecycle(_recipient, _issue, _identity, _lifecycle_state), do: :ok
+
   defp run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host) do
     route = Keyword.get(opts, :route)
     max_turns = max_turns_for_run(route, opts)
@@ -320,6 +404,7 @@ defmodule SymphonyElixir.AgentRunner do
 
     with {:ok, session} <- runtime.start_session(workspace, runtime_opts) do
       send_runtime_attempt_session_started(codex_update_recipient, issue, runtime_identity)
+      notify_runtime_attempt_lifecycle(codex_update_recipient, issue, runtime_identity, :runtime_started)
 
       context = %{
         runtime: runtime,
@@ -337,9 +422,14 @@ defmodule SymphonyElixir.AgentRunner do
         session_restarted?: false
       }
 
-      run_runtime_session(runtime, session, fn ->
-        do_run_codex_turns(context, 1, max_turns)
-      end)
+      lifecycle_callback = runtime_attempt_lifecycle_callback(context)
+
+      run_runtime_session(
+        runtime,
+        session,
+        fn -> do_run_codex_turns(context, 1, max_turns) end,
+        lifecycle_callback
+      )
     end
   end
 
@@ -575,7 +665,8 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp run_runtime_session(runtime, session, fun) when is_function(fun, 0) do
+  defp run_runtime_session(runtime, session, fun, lifecycle_callback)
+       when is_function(fun, 0) and is_function(lifecycle_callback, 1) do
     execution_result =
       try do
         {:returned, fun.()}
@@ -585,19 +676,23 @@ defmodule SymphonyElixir.AgentRunner do
 
     case execution_result do
       {:returned, {:restart_runtime_session, next_context, turn_number, max_turns}} ->
-        restart_runtime_session(runtime, session, next_context, turn_number, max_turns)
+        restart_runtime_session(runtime, session, next_context, turn_number, max_turns, lifecycle_callback)
 
       _other ->
-        finish_runtime_session(runtime, session, execution_result)
+        finish_runtime_session(runtime, session, execution_result, lifecycle_callback)
     end
   end
 
-  defp finish_runtime_session(runtime, session, execution_result) do
+  defp finish_runtime_session(runtime, session, execution_result, lifecycle_callback) do
+    lifecycle_callback.(:stopping)
+
     case stop_runtime_session(runtime, session) do
       :ok ->
+        lifecycle_callback.(:containment_proven_dead)
         restore_execution_result(execution_result)
 
       {:error, {:session_not_active, :stopped}} ->
+        lifecycle_callback.(:containment_proven_dead)
         restore_execution_result(execution_result)
 
       {:error, reason} ->
@@ -615,6 +710,14 @@ defmodule SymphonyElixir.AgentRunner do
     exception -> {:error, {:exception, exception}}
   catch
     kind, reason -> {:error, {kind, reason}}
+  end
+
+  defp restore_execution_result({:returned, {:error, reason}}) do
+    if runtime_containment_unconfirmed_reason(reason) do
+      {:error, {:runtime_turn_failed_after_containment_recovery, :turn_failed}}
+    else
+      {:error, reason}
+    end
   end
 
   defp restore_execution_result({:returned, result}), do: result
@@ -701,12 +804,16 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp restart_runtime_session(runtime, session, next_context, turn_number, max_turns) do
+  defp restart_runtime_session(runtime, session, next_context, turn_number, max_turns, lifecycle_callback) do
+    lifecycle_callback.(:stopping)
+
     case stop_runtime_session(runtime, session) do
       :ok ->
+        lifecycle_callback.(:containment_proven_dead)
         start_restarted_runtime_session(runtime, next_context, turn_number, max_turns)
 
       {:error, {:session_not_active, :stopped}} ->
+        lifecycle_callback.(:containment_proven_dead)
         start_restarted_runtime_session(runtime, next_context, turn_number, max_turns)
 
       {:error, reason} ->
@@ -738,9 +845,25 @@ defmodule SymphonyElixir.AgentRunner do
       {:ok, session} ->
         restarted_context = %{next_context | session: session, opts: runtime_opts, session_restarted?: true}
 
-        run_runtime_session(runtime, session, fn ->
-          do_run_codex_turns(restarted_context, turn_number, max_turns)
-        end)
+        send_runtime_attempt_session_started(
+          restarted_context.codex_update_recipient,
+          restarted_context.issue,
+          restarted_context.runtime_attempt_identity
+        )
+
+        notify_runtime_attempt_lifecycle(
+          restarted_context.codex_update_recipient,
+          restarted_context.issue,
+          restarted_context.runtime_attempt_identity,
+          :runtime_started
+        )
+
+        run_runtime_session(
+          runtime,
+          session,
+          fn -> do_run_codex_turns(restarted_context, turn_number, max_turns) end,
+          runtime_attempt_lifecycle_callback(restarted_context)
+        )
 
       {:error, reason} ->
         {:error, reason}
