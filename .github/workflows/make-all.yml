@@ -85,13 +85,9 @@ jobs:
           namei -l "$codex_path"
           make -C elixir isolation-proof
 
-  linux-full-gate:
-    name: linux-full-gate
-    needs:
-      - linux-isolation-proof
-    if: ${{ needs.linux-isolation-proof.result == 'success' }}
+  linux-static-quality:
+    name: linux-static-quality
     runs-on: ubuntu-latest
-    timeout-minutes: 90
 
     steps:
       - name: Checkout
@@ -102,124 +98,199 @@ jobs:
           echo "CI checkout SHA: $(git rev-parse HEAD)"
           echo "CI checkout tree: $(git rev-parse 'HEAD^{tree}')"
           echo "CI checkout subject: $(git show -s --format=%s HEAD)"
-          echo "CI checkout parents: $(git show -s --format=%P HEAD)"
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
 
-      - name: Set up mise tools
-        uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db # v3
+      - name: Set up Linux Elixir
+        uses: ./.github/actions/setup-linux-elixir
+
+      - name: Build
+        run: make -C elixir build
+
+      - name: Check formatting
+        run: make -C elixir fmt-check
+
+      - name: Run specs and Credo
+        run: make -C elixir lint
+
+  linux-coverage-partitions:
+    name: linux-coverage-partition-${{ matrix.partition }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [1, 2, 3, 4, 5, 6, 7, 8]
+    env:
+      SYMPHONY_ENFORCE_TEST_RUNTIME_PATH_TRUST: "1"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Record exact candidate checkout
+        run: |
+          echo "CI checkout SHA: $(git rev-parse HEAD)"
+          echo "CI checkout tree: $(git rev-parse 'HEAD^{tree}')"
+          echo "CI checkout subject: $(git show -s --format=%s HEAD)"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+
+      - name: Set up Linux Elixir and pinned Codex
+        uses: ./.github/actions/setup-linux-elixir
         with:
-          install: true
-          cache: true
-          working_directory: elixir
+          codex: "true"
 
-      - name: Install pinned Codex under the trusted host root
-        run: |
-          sudo npm install --prefix /usr/local/lib/symphony-codex-0.159.3 --no-save --no-package-lock --no-audit --no-fund '@openai/codex-linux-x64@npm:@openai/codex@0.159.3-linux-x64'
-          sudo chown -R root:root /usr/local/lib/symphony-codex-0.159.3
-          sudo chmod -R go-w,a-s /usr/local/lib/symphony-codex-0.159.3
-          echo "/usr/local/lib/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin" >> "$GITHUB_PATH"
-          echo "/usr/local/lib/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex-path" >> "$GITHUB_PATH"
+      - name: Run traced coverage partition 3
+        if: ${{ matrix.partition == 3 }}
+        run: make -C elixir coverage-partition PARTITION=${{ matrix.partition }} TRACE=1
 
-      - name: Enable and verify unprivileged Linux namespaces
-        run: |
-          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
-            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-          fi
-          unshare --user --map-current-user --pid --fork --mount-proc \
-            /usr/bin/python3 -I -S -c 'import os; assert os.getpid() == 1'
+      - name: Run coverage partition
+        if: ${{ matrix.partition != 3 }}
+        run: make -C elixir coverage-partition PARTITION=${{ matrix.partition }}
 
-      - name: Cache deps and build
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      - name: Require partition coverage export
+        run: test -s "elixir/cover/${{ matrix.partition }}.coverdata"
+
+      - name: Upload partition coverage
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          path: |
-            elixir/deps
-            elixir/_build
-          key: ${{ runner.os }}-mix-${{ hashFiles('elixir/mix.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-mix-
+          name: coverage-partition-${{ matrix.partition }}
+          path: elixir/cover/${{ matrix.partition }}.coverdata
+          if-no-files-found: error
+          retention-days: 1
 
-      - name: Prepare Linux quality gate
+  linux-transition-coverage:
+    name: linux-transition-coverage
+    runs-on: ubuntu-latest
+    env:
+      SYMPHONY_ENFORCE_TEST_RUNTIME_PATH_TRUST: "1"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Record exact candidate checkout
         run: |
-          export PATH="/usr/local/lib/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin:/usr/local/lib/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex-path:$PATH"
-          make -C elixir setup
-          make -C elixir build
-          make -C elixir fmt-check
-          make -C elixir lint
+          echo "CI checkout SHA: $(git rev-parse HEAD)"
+          echo "CI checkout tree: $(git rev-parse 'HEAD^{tree}')"
+          echo "CI checkout subject: $(git show -s --format=%s HEAD)"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
 
-      - name: Clear previous coverage exports
-        run: make -C elixir coverage-clean
+      - name: Set up Linux Elixir and pinned Codex
+        uses: ./.github/actions/setup-linux-elixir
+        with:
+          codex: "true"
 
-      - name: Run coverage partition 1 of 8
-        env:
-          SYMPHONY_ENFORCE_TEST_RUNTIME_PATH_TRUST: "1"
+      - name: Run transition fixture coverage
+        run: make -C elixir coverage-transition-fixture
+
+      - name: Require transition coverage export
+        run: test -s elixir/cover/transition-fixture.coverdata
+
+      - name: Upload transition coverage
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: coverage-transition
+          path: elixir/cover/transition-fixture.coverdata
+          if-no-files-found: error
+          retention-days: 1
+
+  linux-h070a-scale:
+    name: linux-h070a-scale
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Record exact candidate checkout
         run: |
-          export PATH="/usr/local/lib/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin:/usr/local/lib/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex-path:$PATH"
-          make -C elixir coverage-partition PARTITION=1
+          echo "CI checkout SHA: $(git rev-parse HEAD)"
+          echo "CI checkout tree: $(git rev-parse 'HEAD^{tree}')"
+          echo "CI checkout subject: $(git show -s --format=%s HEAD)"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
 
-      - name: Run coverage partition 2 of 8
-        env:
-          SYMPHONY_ENFORCE_TEST_RUNTIME_PATH_TRUST: "1"
-        run: |
-          export PATH="/usr/local/lib/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin:/usr/local/lib/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex-path:$PATH"
-          make -C elixir coverage-partition PARTITION=2
+      - name: Set up Linux Elixir and pinned Codex
+        uses: ./.github/actions/setup-linux-elixir
+        with:
+          codex: "true"
 
-      - name: Run coverage partition 3 of 8
-        env:
-          SYMPHONY_ENFORCE_TEST_RUNTIME_PATH_TRUST: "1"
-        run: |
-          export PATH="/usr/local/lib/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin:/usr/local/lib/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex-path:$PATH"
-          make -C elixir coverage-partition PARTITION=3
-
-      - name: Run coverage partition 4 of 8
-        env:
-          SYMPHONY_ENFORCE_TEST_RUNTIME_PATH_TRUST: "1"
-        run: |
-          export PATH="/usr/local/lib/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin:/usr/local/lib/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex-path:$PATH"
-          make -C elixir coverage-partition PARTITION=4
-
-      - name: Run coverage partition 5 of 8
-        env:
-          SYMPHONY_ENFORCE_TEST_RUNTIME_PATH_TRUST: "1"
-        run: |
-          export PATH="/usr/local/lib/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin:/usr/local/lib/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex-path:$PATH"
-          make -C elixir coverage-partition PARTITION=5
-
-      - name: Run coverage partition 6 of 8
-        env:
-          SYMPHONY_ENFORCE_TEST_RUNTIME_PATH_TRUST: "1"
-        run: |
-          export PATH="/usr/local/lib/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin:/usr/local/lib/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex-path:$PATH"
-          make -C elixir coverage-partition PARTITION=6
-
-      - name: Run coverage partition 7 of 8
-        env:
-          SYMPHONY_ENFORCE_TEST_RUNTIME_PATH_TRUST: "1"
-        run: |
-          export PATH="/usr/local/lib/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin:/usr/local/lib/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex-path:$PATH"
-          make -C elixir coverage-partition PARTITION=7
-
-      - name: Run coverage partition 8 of 8
-        env:
-          SYMPHONY_ENFORCE_TEST_RUNTIME_PATH_TRUST: "1"
-        run: |
-          export PATH="/usr/local/lib/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin:/usr/local/lib/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex-path:$PATH"
-          make -C elixir coverage-partition PARTITION=8
-
-      - name: Run cross-file transition tests and export coverage
-        env:
-          SYMPHONY_ENFORCE_TEST_RUNTIME_PATH_TRUST: "1"
-        run: |
-          export PATH="/usr/local/lib/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin:/usr/local/lib/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex-path:$PATH"
-          make -C elixir coverage-transition-fixture
-
-      - name: Run mandatory H-070A scale shard and export coverage
+      - name: Run mandatory H-070A scale characterization
         run: make -C elixir h070a-scale
 
-      - name: Enforce the aggregated 90% coverage threshold
+      - name: Require H-070A coverage export
+        run: test -s elixir/cover/h070a-scale.coverdata
+
+      - name: Upload H-070A coverage
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: coverage-h070a-scale
+          path: elixir/cover/h070a-scale.coverdata
+          if-no-files-found: error
+          retention-days: 1
+
+  linux-aggregate-coverage:
+    name: linux-aggregate-coverage
+    needs:
+      - linux-coverage-partitions
+      - linux-transition-coverage
+      - linux-h070a-scale
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Record exact candidate checkout
+        run: |
+          echo "CI checkout SHA: $(git rev-parse HEAD)"
+          echo "CI checkout tree: $(git rev-parse 'HEAD^{tree}')"
+          echo "CI checkout subject: $(git show -s --format=%s HEAD)"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+
+      - name: Set up Linux Elixir
+        uses: ./.github/actions/setup-linux-elixir
+
+      - name: Download coverage artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: coverage-*
+          path: elixir/cover
+          merge-multiple: true
+
+      - name: Verify complete coverage artifact set
+        shell: bash
+        run: |
+          expected_exports=$(printf '%s\n' \
+            1.coverdata 2.coverdata 3.coverdata 4.coverdata \
+            5.coverdata 6.coverdata 7.coverdata 8.coverdata \
+            h070a-scale.coverdata transition-fixture.coverdata | sort)
+          actual_exports=$(find elixir/cover -maxdepth 1 -type f -name '*.coverdata' -printf '%f\n' | sort)
+          diff -u <(printf '%s\n' "$expected_exports") <(printf '%s\n' "$actual_exports")
+          while IFS= read -r export_file; do
+            test -s "elixir/cover/$export_file"
+          done <<< "$expected_exports"
+
+      - name: Enforce the fixed 90% coverage threshold
         run: make -C elixir coverage-report
 
+  linux-dialyzer:
+    name: linux-dialyzer
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Record exact candidate checkout
+        run: |
+          echo "CI checkout SHA: $(git rev-parse HEAD)"
+          echo "CI checkout tree: $(git rev-parse 'HEAD^{tree}')"
+          echo "CI checkout subject: $(git show -s --format=%s HEAD)"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+
+      - name: Set up Linux Elixir
+        uses: ./.github/actions/setup-linux-elixir
+
       - name: Run Dialyzer
-        timeout-minutes: 30
         run: make -C elixir dialyzer
 
   make-all:
@@ -227,14 +298,39 @@ jobs:
     if: ${{ always() }}
     needs:
       - linux-isolation-proof
-      - linux-full-gate
+      - linux-static-quality
+      - linux-coverage-partitions
+      - linux-transition-coverage
+      - linux-h070a-scale
+      - linux-aggregate-coverage
+      - linux-dialyzer
     runs-on: ubuntu-latest
 
     steps:
       - name: Require Linux isolation proof
-        run: |
-          test "${{ needs.linux-isolation-proof.result }}" = success
+        if: ${{ always() }}
+        run: test "${{ needs.linux-isolation-proof.result }}" = success
 
-      - name: Require Linux full gate
-        run: |
-          test "${{ needs.linux-full-gate.result }}" = success
+      - name: Require static quality
+        if: ${{ always() }}
+        run: test "${{ needs.linux-static-quality.result }}" = success
+
+      - name: Require all eight coverage partitions
+        if: ${{ always() }}
+        run: test "${{ needs.linux-coverage-partitions.result }}" = success
+
+      - name: Require transition coverage
+        if: ${{ always() }}
+        run: test "${{ needs.linux-transition-coverage.result }}" = success
+
+      - name: Require H-070A scale evidence
+        if: ${{ always() }}
+        run: test "${{ needs.linux-h070a-scale.result }}" = success
+
+      - name: Require aggregate coverage
+        if: ${{ always() }}
+        run: test "${{ needs.linux-aggregate-coverage.result }}" = success
+
+      - name: Require Dialyzer
+        if: ${{ always() }}
+        run: test "${{ needs.linux-dialyzer.result }}" = success

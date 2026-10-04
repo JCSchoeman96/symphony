@@ -38,7 +38,8 @@ coverage-clean:
 
 coverage-partition:
 	@case "$(PARTITION)" in 1|2|3|4|5|6|7|8) ;; *) echo "PARTITION must be 1 through 8"; exit 2 ;; esac
-	@MIX_TEST_PARTITION=$(PARTITION) $(MIX) test $(COVERAGE_TEST_FILES) --partitions $(COVERAGE_PARTITIONS) --cover --exclude h070a_scale
+	@case "$(TRACE)" in ""|0|1) ;; *) echo "TRACE must be empty, 0, or 1"; exit 2 ;; esac
+	@MIX_TEST_PARTITION=$(PARTITION) $(MIX) test $(COVERAGE_TEST_FILES) --partitions $(COVERAGE_PARTITIONS) --cover --exclude h070a_scale $(if $(filter 1,$(TRACE)),--trace,)
 
 coverage-transition-fixture:
 	$(MIX) test test/symphony_elixir/transition_coordinator_default_path_test.exs test/symphony_elixir/transition_coordinator_test.exs --cover --exclude h070a_scale --export-coverage transition-fixture
