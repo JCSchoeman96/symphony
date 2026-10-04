@@ -1,10 +1,12 @@
-.PHONY: help all setup deps build fmt fmt-check lint test coverage h070a-scale coverage-report ci dialyzer e2e \
-	isolation-proof verify-codex
+.PHONY: help all setup deps build fmt fmt-check lint test coverage coverage-clean coverage-partition coverage-transition-fixture \
+	h070a-scale coverage-report ci dialyzer e2e isolation-proof verify-codex
 
 MIX ?= mix
+COVERAGE_PARTITIONS := 8
+COVERAGE_TEST_FILES := $(shell find test -type f -name '*_test.exs' ! -path 'test/symphony_elixir/transition_coordinator_default_path_test.exs' ! -path 'test/symphony_elixir/transition_coordinator_test.exs' | sort)
 
 help:
-	@echo "Targets: setup, deps, build, fmt, fmt-check, lint, test, coverage, h070a-scale, coverage-report, dialyzer, e2e, isolation-proof, ci"
+	@echo "Targets: setup, deps, build, fmt, fmt-check, lint, test, coverage, coverage-partition, coverage-transition-fixture, h070a-scale, coverage-report, dialyzer, e2e, isolation-proof, ci"
 
 setup:
 	$(MIX) setup
@@ -25,8 +27,21 @@ lint:
 	$(MIX) lint
 
 coverage:
+	$(MAKE) coverage-clean
+	@for partition in 1 2 3 4 5 6 7 8; do \
+		$(MAKE) coverage-partition PARTITION=$$partition || exit $$?; \
+	done
+	$(MAKE) coverage-transition-fixture
+
+coverage-clean:
 	rm -f cover/*.coverdata
-	$(MIX) test --cover --exclude h070a_scale --export-coverage non-scale
+
+coverage-partition:
+	@case "$(PARTITION)" in 1|2|3|4|5|6|7|8) ;; *) echo "PARTITION must be 1 through 8"; exit 2 ;; esac
+	@MIX_TEST_PARTITION=$(PARTITION) $(MIX) test $(COVERAGE_TEST_FILES) --partitions $(COVERAGE_PARTITIONS) --cover --exclude h070a_scale
+
+coverage-transition-fixture:
+	$(MIX) test test/symphony_elixir/transition_coordinator_default_path_test.exs test/symphony_elixir/transition_coordinator_test.exs --cover --exclude h070a_scale --export-coverage transition-fixture
 
 h070a-scale:
 	$(MIX) test --cover --only h070a_scale --export-coverage h070a-scale

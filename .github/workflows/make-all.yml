@@ -146,12 +146,71 @@ jobs:
           make -C elixir fmt-check
           make -C elixir lint
 
-      - name: Run non-scale test shard and export coverage
+      - name: Clear previous coverage exports
+        run: make -C elixir coverage-clean
+
+      - name: Run coverage partition 1 of 8
         env:
           SYMPHONY_ENFORCE_TEST_RUNTIME_PATH_TRUST: "1"
         run: |
           export PATH="/usr/local/lib/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin:/usr/local/lib/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex-path:$PATH"
-          make -C elixir coverage
+          make -C elixir coverage-partition PARTITION=1
+
+      - name: Run coverage partition 2 of 8
+        env:
+          SYMPHONY_ENFORCE_TEST_RUNTIME_PATH_TRUST: "1"
+        run: |
+          export PATH="/usr/local/lib/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin:/usr/local/lib/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex-path:$PATH"
+          make -C elixir coverage-partition PARTITION=2
+
+      - name: Run coverage partition 3 of 8
+        env:
+          SYMPHONY_ENFORCE_TEST_RUNTIME_PATH_TRUST: "1"
+        run: |
+          export PATH="/usr/local/lib/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin:/usr/local/lib/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex-path:$PATH"
+          make -C elixir coverage-partition PARTITION=3
+
+      - name: Run coverage partition 4 of 8
+        env:
+          SYMPHONY_ENFORCE_TEST_RUNTIME_PATH_TRUST: "1"
+        run: |
+          export PATH="/usr/local/lib/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin:/usr/local/lib/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex-path:$PATH"
+          make -C elixir coverage-partition PARTITION=4
+
+      - name: Run coverage partition 5 of 8
+        env:
+          SYMPHONY_ENFORCE_TEST_RUNTIME_PATH_TRUST: "1"
+        run: |
+          export PATH="/usr/local/lib/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin:/usr/local/lib/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex-path:$PATH"
+          make -C elixir coverage-partition PARTITION=5
+
+      - name: Run coverage partition 6 of 8
+        env:
+          SYMPHONY_ENFORCE_TEST_RUNTIME_PATH_TRUST: "1"
+        run: |
+          export PATH="/usr/local/lib/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin:/usr/local/lib/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex-path:$PATH"
+          make -C elixir coverage-partition PARTITION=6
+
+      - name: Run coverage partition 7 of 8
+        env:
+          SYMPHONY_ENFORCE_TEST_RUNTIME_PATH_TRUST: "1"
+        run: |
+          export PATH="/usr/local/lib/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin:/usr/local/lib/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex-path:$PATH"
+          make -C elixir coverage-partition PARTITION=7
+
+      - name: Run coverage partition 8 of 8
+        env:
+          SYMPHONY_ENFORCE_TEST_RUNTIME_PATH_TRUST: "1"
+        run: |
+          export PATH="/usr/local/lib/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin:/usr/local/lib/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex-path:$PATH"
+          make -C elixir coverage-partition PARTITION=8
+
+      - name: Run cross-file transition tests and export coverage
+        env:
+          SYMPHONY_ENFORCE_TEST_RUNTIME_PATH_TRUST: "1"
+        run: |
+          export PATH="/usr/local/lib/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin:/usr/local/lib/symphony-codex-0.159.3/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex-path:$PATH"
+          make -C elixir coverage-transition-fixture
 
       - name: Run mandatory H-070A scale shard and export coverage
         run: make -C elixir h070a-scale
