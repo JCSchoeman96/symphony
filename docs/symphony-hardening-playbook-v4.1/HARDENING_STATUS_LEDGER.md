@@ -8,6 +8,8 @@ The original V4.1 ledger became stale after V4.1-000. The discrepancy is preserv
 
 The 2026-10-05 reconciliation closes the later ledger drift across H-070B, REM-HI21, the H-I20 CompletionProof remediation, H-080A, and H-080B. Historical PR text that said a phase was still in review or unauthorized is preserved as historical state; it is not rewritten retroactively.
 
+Formal acceptance for those five reconciled rows is established by the 2026-10-07 Master Governance adjudication preserved through [the current reconciliation](GOVERNANCE_RECONCILIATION_2026-10-05.md). Those acceptances are effective 2026-10-07 and are not backdated to the historical merge dates.
+
 ## Current accepted baseline
 
 | Branch | Commit | Tree |
@@ -20,6 +22,7 @@ The 2026-10-05 reconciliation closes the later ledger drift across H-070B, REM-H
 CURRENT_ACCEPTED_PHASE = H-080B
 CURRENT_ACCEPTED_BASELINE_SHA = 0bdd3960947bb2bafd34a7eb92e970eaae07a82a
 CURRENT_ACCEPTED_BASELINE_TREE = 1cbb9dfa6a74aaf868ddf6e55b3e54232b4f6b60
+ACCEPTANCE_EFFECTIVE_DATE = 2026-10-07
 H-080C = NOT AUTHORIZED
 ```
 
@@ -49,11 +52,11 @@ The currently authorized follow-on scope is governance/documentation canonicaliz
 | H-060B | ACCEPTED | [#21](https://github.com/JCSchoeman96/symphony/pull/21) | `00ebdffdf8685f62e511061b80383fba9617f6b9` | `24d5764022573375df92d0b72e4820dc58b19e16` | [Implementation PR](https://github.com/JCSchoeman96/symphony/pull/21) | H-060C |
 | H-060C | ACCEPTED | [#22](https://github.com/JCSchoeman96/symphony/pull/22) | `eb68f5405b49400c0444de5d610c3d31f2565d49` | `8afb7022016aa88c942aee7bd9f28293572b9f01` | Post-merge verified | H-070A implementation |
 | H-070A | ACCEPTED | [#23](https://github.com/JCSchoeman96/symphony/pull/23) | `05fac06e771bbf1928e4975092741db0c94ecede` | `09c4f133ee53e685e5d0f5a427f7df72e0985c8f` | Post-merge verified baseline | H-070B implementation |
-| H-070B | ACCEPTED | [#24](https://github.com/JCSchoeman96/symphony/pull/24) | `b621d6b1663703253da72b3f822c60f509180e5d` | `4d47f467df8d779c51e737b62300a8381c75e3d` | [H-070B evidence](H-070B_IMPLEMENTATION_EVIDENCE.md); protected-main `make-all` run `36333157543`; [2026-10-05 reconciliation](GOVERNANCE_RECONCILIATION_2026-10-05.md) | REM-HI21 / H-080A preparation |
-| REM-HI21 | ACCEPTED | [#25](https://github.com/JCSchoeman96/symphony/pull/25) | `7ba76fccaacc5789443c685ed6f1d2bee7f04f9c` | `ccce54196e30a8c0928feee5639a7e8662f4fa7d` | Protected-main `make-all` run `36431327304`; [2026-10-05 reconciliation](GOVERNANCE_RECONCILIATION_2026-10-05.md) | H-080A characterization |
-| H-I20 remediation | ACCEPTED | [#29](https://github.com/JCSchoeman96/symphony/pull/29) | `e226b14f409c806ff2bc6841b1f6be34746dd128` | `75b8ad50d4a641c88c005926b597bcb9b9fd11db` | Protected-main `make-all` run `36852822353`; [2026-10-05 reconciliation](GOVERNANCE_RECONCILIATION_2026-10-05.md) | H-080A final characterization |
-| H-080A | ACCEPTED | [#30](https://github.com/JCSchoeman96/symphony/pull/30) | `56798754c8f6fd80d7ec53b604800873e339e030` | `a2770cbd2a5f4b96617b3fe18f324f0376d0cdf1` | Protected-main `make-all` run `36858770612`; [2026-10-05 reconciliation](GOVERNANCE_RECONCILIATION_2026-10-05.md) | H-080B |
-| H-080B | ACCEPTED | [#31](https://github.com/JCSchoeman96/symphony/pull/31) | `0bdd3960947bb2bafd34a7eb92e970eaae07a82a` | `1cbb9dfa6a74aaf868ddf6e55b3e54232b4f6b60` | [H-080B evidence](H-080B_IMPLEMENTATION_EVIDENCE.md); protected-main `make-all` run `37227505533`; [2026-10-05 reconciliation](GOVERNANCE_RECONCILIATION_2026-10-05.md) | Governance/documentation canonicalization only; H-080C remains unauthorized |
+| H-070B | ACCEPTED effective 2026-10-07 | [#24](https://github.com/JCSchoeman96/symphony/pull/24) | `b621d6b1663703253da72b3f822c60f509180e5d` | `4d47f467df8d779c51e737b62300a8381c75e3d` | [H-070B evidence](H-070B_IMPLEMENTATION_EVIDENCE.md); protected-main `make-all` run `36333157543`; [2026-10-05 reconciliation + 2026-10-07 Master adjudication](GOVERNANCE_RECONCILIATION_2026-10-05.md) | REM-HI21 / H-080A preparation history |
+| REM-HI21 | ACCEPTED effective 2026-10-07 | [#25](https://github.com/JCSchoeman96/symphony/pull/25) | `7ba76fccaacc5789443c685ed6f1d2bee7f04f9c` | `ccce54196e30a8c0928feee5639a7e8662f4fa7d` | Protected-main `make-all` run `36431327304`; [2026-10-05 reconciliation + 2026-10-07 Master adjudication](GOVERNANCE_RECONCILIATION_2026-10-05.md) | H-080A characterization history |
+| H-I20 remediation | ACCEPTED effective 2026-10-07 | [#29](https://github.com/JCSchoeman96/symphony/pull/29) | `e226b14f409c806ff2bc6841b1f6be34746dd128` | `75b8ad50d4a641c88c005926b597bcb9b9fd11db` | Protected-main `make-all` run `36852822353`; [2026-10-05 reconciliation + 2026-10-07 Master adjudication](GOVERNANCE_RECONCILIATION_2026-10-05.md) | H-080A final characterization history |
+| H-080A | ACCEPTED effective 2026-10-07 | [#30](https://github.com/JCSchoeman96/symphony/pull/30) | `56798754c8f6fd80d7ec53b604800873e339e030` | `a2770cbd2a5f4b96617b3fe18f324f0376d0cdf1` | Protected-main `make-all` run `36858770612`; [2026-10-05 reconciliation + 2026-10-07 Master adjudication](GOVERNANCE_RECONCILIATION_2026-10-05.md) | H-080B history |
+| H-080B | ACCEPTED effective 2026-10-07 | [#31](https://github.com/JCSchoeman96/symphony/pull/31) | `0bdd3960947bb2bafd34a7eb92e970eaae07a82a` | `1cbb9dfa6a74aaf868ddf6e55b3e54232b4f6b60` | [H-080B evidence](H-080B_IMPLEMENTATION_EVIDENCE.md); protected-main `make-all` run `37227505533`; [2026-10-05 reconciliation + 2026-10-07 Master adjudication](GOVERNANCE_RECONCILIATION_2026-10-05.md) | Governance/documentation canonicalization only; H-080C remains unauthorized |
 
 ## Historical H-080A artifacts
 
@@ -61,6 +64,6 @@ PR #26 remains an open draft historical characterization artifact and is not acc
 
 ## Current summary
 
-H-070B is accepted at `b621d6b1663703253da72b3f822c60f509180e5d`. REM-HI21 is accepted at `7ba76fccaacc5789443c685ed6f1d2bee7f04f9c`. The H-I20 CompletionProof remediation is accepted at `e226b14f409c806ff2bc6841b1f6be34746dd128`. H-080A is accepted at `56798754c8f6fd80d7ec53b604800873e339e030`. H-080B is accepted on protected `main` at `0bdd3960947bb2bafd34a7eb92e970eaae07a82a`.
+Effective 2026-10-07, H-070B is accepted at `b621d6b1663703253da72b3f822c60f509180e5d`. REM-HI21 is accepted at `7ba76fccaacc5789443c685ed6f1d2bee7f04f9c`. The H-I20 CompletionProof remediation is accepted at `e226b14f409c806ff2bc6841b1f6be34746dd128`. H-080A is accepted at `56798754c8f6fd80d7ec53b604800873e339e030`. H-080B is accepted on protected `main` at `0bdd3960947bb2bafd34a7eb92e970eaae07a82a`.
 
 H-080C remains **NOT AUTHORIZED**. The next allowed work is governance/documentation canonicalization needed to install the reconciled Unified Execution Roadmap and companion authority documents. Future implementation authorization must come from that canonicalized roadmap and its explicit prerequisite gates.
