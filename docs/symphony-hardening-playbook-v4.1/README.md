@@ -7,7 +7,7 @@ This directory contains the accepted V4.1 future-roadmap authority, the current 
 - [V4.1 master roadmap](V4_1_MASTER_ROADMAP.md) records the accepted normative V4.1 future-roadmap authority.
 - [Hardening status ledger](HARDENING_STATUS_LEDGER.md) is the concise current phase and authorization index.
 - [Historical governance reconciliation](GOVERNANCE_RECONCILIATION.md) records the reconstructed V4.1-000 through H-060A history, its evidence sources, and provenance gaps.
-- [2026-10-05 governance reconciliation](GOVERNANCE_RECONCILIATION_2026-10-05.md) reconciles H-070B through H-080B against exact Git/CI facts and current external Master-governance decisions.
+- [2026-10-05 governance reconciliation](GOVERNANCE_RECONCILIATION_2026-10-05.md) reconciles H-070B through H-080B against exact Git/CI facts and preserves the 2026-10-07 Master Governance adjudication that establishes their current formal acceptance states.
 - [V3 accepted authority index](V3_ACCEPTED_AUTHORITY.md) links the immutable accepted H-010, H-020, and H-030 authority.
 - [P-000 feasibility evidence](P-000_PLANE_PROVIDER_FEASIBILITY_EVIDENCE.md) records the accepted Plane provider feasibility assessment.
 
@@ -17,10 +17,13 @@ This directory contains the accepted V4.1 future-roadmap authority, the current 
 CURRENT_ACCEPTED_PHASE = H-080B
 CURRENT_ACCEPTED_BASELINE_SHA = 0bdd3960947bb2bafd34a7eb92e970eaae07a82a
 CURRENT_ACCEPTED_BASELINE_TREE = 1cbb9dfa6a74aaf868ddf6e55b3e54232b4f6b60
+ACCEPTANCE_EFFECTIVE_DATE = 2026-10-07
 H-080C = NOT AUTHORIZED
 ```
 
 The current follow-on authorization is governance/documentation canonicalization only. Do not infer H-080C authorization from H-080B acceptance. Future implementation authorization must follow the canonically adopted Unified Execution Roadmap and its prerequisite gates.
+
+The H-070B, REM-HI21, H-I20 remediation, H-080A, and H-080B acceptance states above are current decisions effective 2026-10-07. They are not backdated to the historical merge events. The reconciliation record preserves the fresh independent governance-review result and the explicit Master Governance authority event used to close the prior provenance gap.
 
 ## Authority boundaries
 
