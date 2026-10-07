@@ -410,7 +410,7 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
         |> Keyword.put(:coordinator, coordinator)
         |> Keyword.put(:agent_tool_context, %{
           route: route(:in_progress, "implementation"),
-          guard_evidence: transition_guard_evidence()
+          guard_evidence: mechanical_transition_guard_evidence()
         })
       )
 
@@ -432,6 +432,11 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
              :implementation_checks_verified,
              :candidate_state_verified
            ]
+
+    attestation = Enum.find(intent.guard_evidence, &(&1.class == :semantic_attestation))
+    assert attestation.name == :implementation_attested
+    assert attestation.responsibility == "implementation"
+    assert attestation.subject == {:work_item, "work-1"}
 
     assert is_nil(intent.runtime_attempt_id)
     assert is_nil(intent.lineage_id)
@@ -514,7 +519,7 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
     refute_received :transition_context_must_not_run
   end
 
-  test "transition request rejects missing host guard evidence without submitting" do
+  test "transition request rejects missing mechanical host guard evidence without submitting" do
     parent = self()
     coordinator = transition_coordinator(parent)
 
@@ -579,28 +584,34 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
       {
         :semantic_for_mechanical,
         substitute_guard_class(
-          transition_guard_evidence(),
+          mechanical_transition_guard_evidence(),
           :implementation_checks_verified,
           :semantic_attestation
         )
       },
       {
-        :mechanical_for_semantic,
-        substitute_guard_class(
-          transition_guard_evidence(),
-          :implementation_attested,
-          :mechanical_guard
-        )
-      },
-      {
         :human_for_mechanical,
         substitute_guard_class(
-          transition_guard_evidence(),
+          mechanical_transition_guard_evidence(),
           :candidate_state_verified,
           :human_decision
         )
       },
-      {:stale_context, stale_guard_context(transition_guard_evidence())}
+      {
+        :forged_semantic_attestation,
+        mechanical_transition_guard_evidence() ++
+          [
+            %{
+              class: :semantic_attestation,
+              name: :implementation_attested,
+              responsibility: "implementation",
+              runtime_attempt_id: :forged,
+              lineage_generation: 0,
+              subject: {:work_item, "work-1"},
+              timestamp: DateTime.utc_now()
+            }
+          ]
+      }
     ]
 
     for {substitution, guard_evidence} <- substitutions do
@@ -641,7 +652,7 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
         end)
         |> Keyword.put(:agent_tool_context, %{
           route: route(:in_progress, "implementation"),
-          guard_evidence: transition_guard_evidence()
+          guard_evidence: mechanical_transition_guard_evidence()
         })
       )
 
@@ -799,7 +810,7 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
         |> Keyword.put(:coordinator, coordinator)
         |> Keyword.put(:agent_tool_context, %{
           route: route,
-          guard_evidence: transition_guard_evidence()
+          guard_evidence: mechanical_transition_guard_evidence()
         })
       )
 
@@ -831,7 +842,7 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
           |> Keyword.put(:coordinator, coordinator)
           |> Keyword.put(:agent_tool_context, %{
             route: route,
-            guard_evidence: transition_guard_evidence()
+            guard_evidence: mechanical_transition_guard_evidence()
           })
         )
 
@@ -1523,7 +1534,7 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
     |> Keyword.put(:coordinator, coordinator)
     |> Keyword.put(:agent_tool_context, %{
       route: route,
-      guard_evidence: transition_guard_evidence()
+      guard_evidence: mechanical_transition_guard_evidence()
     })
   end
 
@@ -1592,6 +1603,13 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
     coordinator
   end
 
+  defp mechanical_transition_guard_evidence do
+    [
+      %{class: :mechanical_guard, name: :implementation_checks_verified},
+      %{class: :mechanical_guard, name: :candidate_state_verified, outcome: :verified}
+    ]
+  end
+
   defp transition_guard_evidence do
     {:ok, attestation} =
       GuardClass.semantic_attestation(:implementation_attested, %{
@@ -1602,18 +1620,21 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
         timestamp: DateTime.utc_now()
       })
 
-    [
-      attestation,
-      %{class: :mechanical_guard, name: :implementation_checks_verified},
-      %{class: :mechanical_guard, name: :candidate_state_verified, outcome: :verified}
-    ]
+    [attestation | mechanical_transition_guard_evidence()]
   end
 
   defp substitute_guard_class(evidence, target_name, :semantic_attestation) do
-    semantic_attestation = Enum.find(evidence, &(&1[:class] == :semantic_attestation))
+    {:ok, semantic_attestation} =
+      GuardClass.semantic_attestation(target_name, %{
+        responsibility: "implementation",
+        runtime_attempt_id: :transition_coordinator,
+        lineage_generation: 0,
+        subject: {:work_item, "work-1"},
+        timestamp: DateTime.utc_now()
+      })
 
     Enum.map(evidence, fn
-      %{name: ^target_name} -> %{semantic_attestation | name: target_name}
+      %{name: ^target_name} -> semantic_attestation
       entry -> entry
     end)
   end
@@ -1629,16 +1650,6 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
     do: Map.put(guard, :outcome, :verified)
 
   defp verified_guard(guard), do: guard
-
-  defp stale_guard_context(evidence) do
-    Enum.map(evidence, fn
-      %{class: :semantic_attestation, name: :implementation_attested} = attestation ->
-        %{attestation | runtime_attempt_id: :stale_runtime_attempt, lineage_generation: 1}
-
-      entry ->
-        entry
-    end)
-  end
 
   defp route(state, responsibility) do
     profile_name =
@@ -1827,7 +1838,7 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
         |> Keyword.put(:coordinator, coordinator)
         |> Keyword.put(:agent_tool_context, %{
           route: route,
-          guard_evidence: transition_guard_evidence()
+          guard_evidence: mechanical_transition_guard_evidence()
         })
       )
 
@@ -1855,7 +1866,7 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
         |> Keyword.put(:coordinator, coordinator)
         |> Keyword.put(:agent_tool_context, %{
           route: route,
-          guard_evidence: transition_guard_evidence(),
+          guard_evidence: mechanical_transition_guard_evidence(),
           runtime_attempt_identity: identity
         })
       )

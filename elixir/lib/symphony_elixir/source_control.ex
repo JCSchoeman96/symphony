@@ -239,7 +239,7 @@ defmodule SymphonyElixir.SourceControl do
     end
   end
 
-  defp enrich_candidate_capture(_intent, context, evidence) do
+  defp enrich_candidate_capture(%SemanticTransitionIntent{} = intent, context, evidence) do
     case settings_config(github_opts(context)) do
       {:error, reason} ->
         {:error, {:source_control, reason}}
@@ -252,16 +252,22 @@ defmodule SymphonyElixir.SourceControl do
              {:ok, candidate_ref, candidate_tree_sha} <-
                GitHubSourceControl.capture_candidate_ref(config, head_sha, github_opts(context)),
              {:ok, settings} <- Config.settings(),
-             {:ok, validated_tree_sha} <- GitHubSourceControl.validate_tree_sha(candidate_tree_sha) do
+             {:ok, validated_tree_sha} <- GitHubSourceControl.validate_tree_sha(candidate_tree_sha),
+             :ok <-
+               GitHubSourceControl.verify_required_checks(
+                 config,
+                 candidate_ref,
+                 validated_tree_sha,
+                 github_opts(context)
+               ) do
+          fingerprint = policy_fingerprint_for(config, settings)
+          checks_guard = required_checks_guard(intent)
+
           {:ok,
            evidence ++
              [
-               candidate_state_evidence(
-                 :verified,
-                 candidate_ref,
-                 validated_tree_sha,
-                 policy_fingerprint_for(config, settings)
-               )
+               candidate_state_evidence(:verified, candidate_ref, validated_tree_sha, fingerprint),
+               %{class: :mechanical_guard, name: checks_guard}
              ]}
         else
           {:error, reason} -> {:error, {:source_control, reason}}
@@ -475,6 +481,14 @@ defmodule SymphonyElixir.SourceControl do
       proof.provider_project_fingerprint == binding.provider_project_fingerprint and
       proof.workspace_id == binding.workspace_id and proof.project_id == binding.project_id
   end
+
+  defp required_checks_guard(%SemanticTransitionIntent{requested_from: :in_progress, requested_to: :in_review}),
+    do: :implementation_checks_verified
+
+  defp required_checks_guard(%SemanticTransitionIntent{requested_from: :changes_requested, requested_to: :in_review}),
+    do: :correction_checks_verified
+
+  defp required_checks_guard(_intent), do: :implementation_checks_verified
 
   defp candidate_state_evidence(outcome, candidate_ref, candidate_tree_sha, policy_fingerprint) do
     %{

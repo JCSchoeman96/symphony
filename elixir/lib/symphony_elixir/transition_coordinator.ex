@@ -387,6 +387,7 @@ defmodule SymphonyElixir.TransitionCoordinator do
          {:ok, attempt} <- authorize_attempt(attempt, intent, route),
          {:ok, context} <- load_context_with_attempt(state, intent, attempt),
          {:ok, attempt} <- ensure_pre_submit(attempt, fn -> authorize_fresh_context(intent, context) end),
+         context = apply_fresh_machine_guards(intent, context),
          {:ok, attempt} <- ensure_pre_submit(attempt, fn -> guard_context(intent, context) end),
          {:ok, context} <- bind_target_with_attempt(context, intent, attempt),
          {:ok, attempt} <- transition_attempt(attempt, :fresh_context_loaded, [context]),
@@ -592,6 +593,26 @@ defmodule SymphonyElixir.TransitionCoordinator do
         {:error, {:pre_submit, :dependency_context_unavailable}}
     end
   end
+
+  defp apply_fresh_machine_guards(
+         %SemanticTransitionIntent{requested_from: :planning, requested_to: :ready},
+         context
+       )
+       when is_map(context) do
+    planning_guard = %{class: :mechanical_guard, name: :planning_requirements_verified}
+
+    Map.update(context, :guard_evidence, [planning_guard], fn evidence ->
+      evidence = normalize_guard_evidence(evidence)
+
+      if Enum.any?(evidence, &match?(%{class: :mechanical_guard, name: :planning_requirements_verified}, &1)) do
+        evidence
+      else
+        evidence ++ [planning_guard]
+      end
+    end)
+  end
+
+  defp apply_fresh_machine_guards(_intent, context), do: context
 
   defp guard_context(%SemanticTransitionIntent{} = intent, context) do
     requirements = WorkflowLifecycle.guard_requirements(intent.requested_from, intent.requested_to) || []

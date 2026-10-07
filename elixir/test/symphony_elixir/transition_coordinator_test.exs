@@ -9,6 +9,7 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
   alias SymphonyElixir.TransitionCoordinator
 
   alias SymphonyElixir.WorkControl.{
+    GuardClass,
     ProjectContractEvidence,
     ProviderProjectContract,
     SemanticTransitionIntent,
@@ -1580,5 +1581,70 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
       )
 
     {ledger, root, counter}
+  end
+
+  test "planning to ready acquires planning_requirements_verified after fresh context authorization" do
+    test_pid = self()
+
+    {:ok, plan_attested} =
+      GuardClass.semantic_attestation(:plan_attested, %{
+        responsibility: "planning",
+        runtime_attempt_id: :transition_coordinator,
+        lineage_generation: 0,
+        subject: {:work_item, "work-1"},
+        timestamp: DateTime.utc_now()
+      })
+
+    {:ok, intent} =
+      SemanticTransitionIntent.new(%{
+        work_item_id: "work-1",
+        requested_from: :planning,
+        requested_to: :ready,
+        responsibility: "planning",
+        guard_evidence: [plan_attested]
+      })
+
+    {:ok, coordinator} =
+      TransitionCoordinator.start_link(
+        name: nil,
+        require_durable?: false,
+        load_context: fn loaded_intent ->
+          send(test_pid, :context_loaded)
+
+          {:ok,
+           Map.put(context(), :current_state, :planning)
+           |> Map.put(:guard_evidence, loaded_intent.guard_evidence)}
+        end,
+        submit: fn _attempt, _context ->
+          send(test_pid, :submitted)
+          {:ok, %{status: 204}}
+        end,
+        verify: fn attempt, _context ->
+          {:verified,
+           %{
+             assessment: %{status: :validated, validated_state: attempt.requested_to},
+             post_observation_evidence: %{
+               workspace_id: "workspace-1",
+               project_id: "project-1",
+               work_item_id: attempt.work_item_id,
+               provider_state_id: "state-#{attempt.requested_to}",
+               observed_at: DateTime.utc_now()
+             },
+             post_contract_fingerprint: ProviderProjectContract.fingerprint(contract())
+           }}
+        end,
+        apply_verified: fn _attempt, _context -> :ok end,
+        suspend: fn _work_item_id, _reason, _attempt -> :ok end
+      )
+
+    issue = %Issue{id: "work-1", state: WorkflowLifecycle.display(:planning)}
+    planner = Profile.default_profiles("codex app-server", 20)["planner"]
+    route = Route.new(issue, planner)
+
+    assert {:ok, attempt} = TransitionCoordinator.request_transition(coordinator, intent, route: route)
+    assert attempt.state == :verified
+    assert_received :context_loaded
+    assert_received :submitted
+    GenServer.stop(coordinator)
   end
 end
