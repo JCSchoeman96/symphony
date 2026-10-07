@@ -618,18 +618,39 @@ defmodule SymphonyElixir.TransitionCoordinator do
     requirements = WorkflowLifecycle.guard_requirements(intent.requested_from, intent.requested_to) || []
     evidence = Map.get(context, :guard_evidence, intent.guard_evidence)
 
-    guard_context = %{
-      subject: {:work_item, intent.work_item_id},
-      responsibility: intent.responsibility,
-      runtime_attempt_id: intent.runtime_attempt_id || :transition_coordinator,
-      lineage_generation: intent.lineage_generation || 0,
-      provider_project_contract: Map.get(context, :provider_project_contract)
-    }
+    case runtime_guard_identity(intent) do
+      {:ok, runtime_attempt_id, lineage_generation} ->
+        guard_context = %{
+          subject: {:work_item, intent.work_item_id},
+          responsibility: intent.responsibility,
+          runtime_attempt_id: runtime_attempt_id,
+          lineage_generation: lineage_generation,
+          provider_project_contract: Map.get(context, :provider_project_contract)
+        }
 
-    if GuardClass.all_satisfied?(requirements, evidence, guard_context) do
-      :ok
+        if GuardClass.all_satisfied?(requirements, evidence, guard_context) do
+          :ok
+        else
+          {:error, {:pre_submit, :required_guard_missing}}
+        end
+
+      {:error, {:pre_submit, :required_guard_missing}} ->
+        {:error, {:pre_submit, :required_guard_missing}}
+    end
+  end
+
+  defp runtime_guard_identity(%SemanticTransitionIntent{responsibility: responsibility} = intent) do
+    if runtime_responsibility?(responsibility) do
+      case {intent.runtime_attempt_id, intent.lineage_generation} do
+        {runtime_attempt_id, lineage_generation}
+        when not is_nil(runtime_attempt_id) and not is_nil(lineage_generation) ->
+          {:ok, runtime_attempt_id, lineage_generation}
+
+        _ ->
+          {:error, {:pre_submit, :required_guard_missing}}
+      end
     else
-      {:error, {:pre_submit, :required_guard_missing}}
+      {:ok, intent.runtime_attempt_id || :transition_coordinator, intent.lineage_generation || 0}
     end
   end
 
@@ -1250,6 +1271,20 @@ defmodule SymphonyElixir.TransitionCoordinator do
 
   defp default_refresh_contract(_context), do: {:error, :provider_project_contract_required}
 
+  defp fresh_context_assessment_acceptable?(%LifecycleAssessment{} = assessment, %SemanticTransitionIntent{} = intent) do
+    LifecycleAssessment.validated?(assessment) or
+      (deferred_coordinator_mechanical_guards?(intent) and
+         LifecycleAssessment.validation_required?(assessment))
+  end
+
+  defp deferred_coordinator_mechanical_guards?(%SemanticTransitionIntent{
+         requested_from: :planning,
+         requested_to: :ready
+       }),
+       do: true
+
+  defp deferred_coordinator_mechanical_guards?(_intent), do: false
+
   defp fresh_pre_context(%SemanticTransitionIntent{} = intent, context) when is_map(context) do
     with {:ok, observation} <- fresh_tracker_observation(intent.work_item_id, context),
          :ok <- validate_observation_scope(observation, Map.get(context, :provider_project_contract)),
@@ -1262,7 +1297,7 @@ defmodule SymphonyElixir.TransitionCoordinator do
              intent.guard_evidence,
              Map.put(context, :responsibility, canonical_transition_responsibility(intent))
            ),
-         true <- LifecycleAssessment.validated?(assessment),
+         true <- fresh_context_assessment_acceptable?(assessment, intent),
          source_context <-
            context
            |> Map.put(:provider_observation, observation)

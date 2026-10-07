@@ -1586,11 +1586,16 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
   test "planning to ready acquires planning_requirements_verified after fresh context authorization" do
     test_pid = self()
 
+    issue = %Issue{id: "work-1", state: WorkflowLifecycle.display(:planning)}
+    planner = Profile.default_profiles("codex app-server", 20)["planner"]
+    route = Route.new(issue, planner)
+    identity = Identity.allocate("work-1", route, "lineage-planning-coordinator-test")
+
     {:ok, plan_attested} =
       GuardClass.semantic_attestation(:plan_attested, %{
         responsibility: "planning",
-        runtime_attempt_id: :transition_coordinator,
-        lineage_generation: 0,
+        runtime_attempt_id: identity.runtime_attempt_id,
+        lineage_generation: identity.lineage_generation,
         subject: {:work_item, "work-1"},
         timestamp: DateTime.utc_now()
       })
@@ -1601,6 +1606,8 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
         requested_from: :planning,
         requested_to: :ready,
         responsibility: "planning",
+        runtime_attempt_id: identity.runtime_attempt_id,
+        lineage_generation: identity.lineage_generation,
         guard_evidence: [plan_attested]
       })
 
@@ -1636,10 +1643,6 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
         apply_verified: fn _attempt, _context -> :ok end,
         suspend: fn _work_item_id, _reason, _attempt -> :ok end
       )
-
-    issue = %Issue{id: "work-1", state: WorkflowLifecycle.display(:planning)}
-    planner = Profile.default_profiles("codex app-server", 20)["planner"]
-    route = Route.new(issue, planner)
 
     assert {:ok, attempt} = TransitionCoordinator.request_transition(coordinator, intent, route: route)
     assert attempt.state == :verified

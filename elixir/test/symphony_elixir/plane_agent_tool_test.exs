@@ -395,6 +395,8 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
     parent = self()
     work_item = work_item(:in_progress)
     contract = contract()
+    route = route(:in_progress, "implementation")
+    identity = RuntimeAttemptIdentity.allocate(work_item.id, route, "lineage-plane-delegate")
     coordinator = transition_coordinator(parent)
 
     response =
@@ -402,14 +404,15 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
         "plane_request_lifecycle_transition",
         %{"targetState" => "In Review"},
         host_opts(
-          route(:in_progress, "implementation"),
-          semantic_context(work_item, contract),
+          route,
+          semantic_context(work_item, contract, %{runtime_attempt_identity: identity}),
           nil,
           @settings
         )
         |> Keyword.put(:coordinator, coordinator)
         |> Keyword.put(:agent_tool_context, %{
-          route: route(:in_progress, "implementation"),
+          route: route,
+          runtime_attempt_identity: identity,
           guard_evidence: mechanical_transition_guard_evidence()
         })
       )
@@ -437,10 +440,11 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
     assert attestation.name == :implementation_attested
     assert attestation.responsibility == "implementation"
     assert attestation.subject == {:work_item, "work-1"}
+    assert attestation.runtime_attempt_id == identity.runtime_attempt_id
+    assert attestation.lineage_generation == identity.lineage_generation
 
-    assert is_nil(intent.runtime_attempt_id)
-    assert is_nil(intent.lineage_id)
-    assert is_nil(intent.lineage_generation)
+    assert intent.runtime_attempt_id == identity.runtime_attempt_id
+    assert intent.lineage_generation == identity.lineage_generation
     assert_received :transition_submitted
     refute response["output"] =~ "attempt"
     refute response["output"] =~ "provider_state_id"
@@ -522,16 +526,19 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
   test "transition request rejects missing mechanical host guard evidence without submitting" do
     parent = self()
     coordinator = transition_coordinator(parent)
+    route = route(:in_progress, "implementation")
+    identity = runtime_attempt_identity(route)
 
     response =
       AgentTool.execute(
         "plane_request_lifecycle_transition",
         %{"targetState" => "In Review"},
         host_opts(
-          route(:in_progress, "implementation"),
-          semantic_context(work_item(:in_progress), contract())
+          route,
+          semantic_context(work_item(:in_progress), contract(), %{runtime_attempt_identity: identity})
         )
         |> Keyword.put(:coordinator, coordinator)
+        |> Keyword.put(:agent_tool_context, %{route: route, runtime_attempt_identity: identity})
       )
 
     refute response["success"]
@@ -552,20 +559,23 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
   test "transition request ignores semantic-context guard evidence" do
     parent = self()
     coordinator = transition_coordinator(parent)
+    route = route(:in_progress, "implementation")
+    identity = runtime_attempt_identity(route)
 
     response =
       AgentTool.execute(
         "plane_request_lifecycle_transition",
         %{"targetState" => "In Review"},
         host_opts(
-          route(:in_progress, "implementation"),
+          route,
           semantic_context(
             work_item(:in_progress),
             contract(),
-            %{guard_evidence: transition_guard_evidence()}
+            %{guard_evidence: transition_guard_evidence(), runtime_attempt_identity: identity}
           )
         )
         |> Keyword.put(:coordinator, coordinator)
+        |> Keyword.put(:agent_tool_context, %{route: route, runtime_attempt_identity: identity})
       )
 
     refute response["success"]
@@ -578,7 +588,8 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
   test "transition request rejects guard substitutions before provider submission" do
     parent = self()
     route = route(:in_progress, "implementation")
-    context = semantic_context(work_item(:in_progress), contract())
+    identity = runtime_attempt_identity(route)
+    context = semantic_context(work_item(:in_progress), contract(), %{runtime_attempt_identity: identity})
 
     substitutions = [
       {
@@ -622,7 +633,7 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
           "plane_request_lifecycle_transition",
           %{"targetState" => "In Review"},
           transition_opts(route, context, coordinator)
-          |> Keyword.put(:agent_tool_context, %{route: route, guard_evidence: guard_evidence})
+          |> Keyword.put(:agent_tool_context, Map.merge(agent_tool_context(route, identity), %{guard_evidence: guard_evidence}))
         )
 
       refute response["success"], "accepted #{substitution} guard substitution"
@@ -636,24 +647,23 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
   test "transition request does not invoke provider request callbacks" do
     parent = self()
     coordinator = transition_coordinator(parent)
+    route = route(:in_progress, "implementation")
+    identity = runtime_attempt_identity(route)
 
     response =
       AgentTool.execute(
         "plane_request_lifecycle_transition",
         %{"targetState" => "In Review"},
         host_opts(
-          route(:in_progress, "implementation"),
-          semantic_context(work_item(:in_progress), contract())
+          route,
+          semantic_context(work_item(:in_progress), contract(), %{runtime_attempt_identity: identity})
         )
         |> Keyword.put(:coordinator, coordinator)
         |> Keyword.put(:request_fun, fn request ->
           send(parent, {:provider_request, request})
           {:ok, %{status: 200}}
         end)
-        |> Keyword.put(:agent_tool_context, %{
-          route: route(:in_progress, "implementation"),
-          guard_evidence: mechanical_transition_guard_evidence()
-        })
+        |> Keyword.put(:agent_tool_context, agent_tool_context(route, identity))
       )
 
     assert response["success"]
@@ -754,17 +764,19 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
   test "transition request reports an unavailable coordinator without provider access" do
     parent = self()
     route = route(:in_progress, "implementation")
-    context = semantic_context(work_item(:in_progress), contract())
+    identity = runtime_attempt_identity(route)
+    context = semantic_context(work_item(:in_progress), contract(), %{runtime_attempt_identity: identity})
+
+    base_opts = transition_opts(route, context, self())
 
     response =
       AgentTool.execute(
         "plane_request_lifecycle_transition",
         %{"targetState" => "In Review"},
-        transition_opts(route, context, self())
-        |> Keyword.put(:agent_tool_context, %{
-          route: route,
-          guard_evidence: %{class: :mechanical_guard, name: :implementation_checks_verified}
-        })
+        base_opts
+        |> Keyword.update!(:agent_tool_context, fn ctx ->
+          Map.put(ctx, :guard_evidence, %{class: :mechanical_guard, name: :implementation_checks_verified})
+        end)
         |> Keyword.put(:request_fun, fn request ->
           send(parent, {:provider_request, request})
           {:ok, %{status: 200}}
@@ -779,12 +791,11 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
       AgentTool.execute(
         "plane_request_lifecycle_transition",
         %{"targetState" => "In Review"},
-        transition_opts(route, context, self())
+        base_opts
         |> Keyword.delete(:coordinator)
-        |> Keyword.put(:agent_tool_context, %{
-          route: route,
-          guard_evidence: %{class: :mechanical_guard, name: :implementation_checks_verified}
-        })
+        |> Keyword.update!(:agent_tool_context, fn ctx ->
+          Map.put(ctx, :guard_evidence, %{class: :mechanical_guard, name: :implementation_checks_verified})
+        end)
       )
 
     refute default_response["success"]
@@ -1530,12 +1541,26 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
   end
 
   defp transition_opts(route, context, coordinator) do
+    identity = Map.get(context, :runtime_attempt_identity) || runtime_attempt_identity(route)
+    context = Map.put(context, :runtime_attempt_identity, identity)
+
     host_opts(route, context)
     |> Keyword.put(:coordinator, coordinator)
-    |> Keyword.put(:agent_tool_context, %{
+    |> Keyword.put(:agent_tool_context, agent_tool_context(route, identity))
+  end
+
+  defp agent_tool_context(route, identity \\ nil) do
+    identity = identity || runtime_attempt_identity(route)
+
+    %{
       route: route,
+      runtime_attempt_identity: identity,
       guard_evidence: mechanical_transition_guard_evidence()
-    })
+    }
+  end
+
+  defp runtime_attempt_identity(route) do
+    RuntimeAttemptIdentity.allocate("work-1", route, "lineage-plane-agent-tool-test")
   end
 
   defp semantic_context(work_item, contract, overrides \\ %{}) do

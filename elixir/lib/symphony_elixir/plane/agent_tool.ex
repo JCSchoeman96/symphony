@@ -340,23 +340,28 @@ defmodule SymphonyElixir.Plane.AgentTool do
   end
 
   defp host_semantic_attestation(_route, source, target, %WorkItem{} = work_item, host_context) do
+    with {:ok, name} <- semantic_guard_name(source, target),
+         {:ok, runtime_attempt_id} <- required_runtime_attempt_identity_field(host_context, :runtime_attempt_id),
+         {:ok, lineage_generation} <- required_runtime_attempt_identity_field(host_context, :lineage_generation) do
+      attestation_attrs = %{
+        responsibility: semantic_attestation_responsibility(host_context),
+        runtime_attempt_id: runtime_attempt_id,
+        lineage_generation: lineage_generation,
+        subject: {:work_item, work_item.id},
+        timestamp: DateTime.utc_now()
+      }
+
+      case GuardClass.semantic_attestation(name, attestation_attrs) do
+        {:ok, attestation} -> {:ok, attestation}
+        {:error, reason} -> {:error, reason}
+      end
+    end
+  end
+
+  defp semantic_guard_name(source, target) do
     case Map.fetch(@semantic_transition_guards, {source, target}) do
-      {:ok, name} ->
-        attestation_attrs = %{
-          responsibility: semantic_attestation_responsibility(host_context),
-          runtime_attempt_id: semantic_runtime_attempt_id(host_context),
-          lineage_generation: semantic_lineage_generation(host_context),
-          subject: {:work_item, work_item.id},
-          timestamp: DateTime.utc_now()
-        }
-
-        case GuardClass.semantic_attestation(name, attestation_attrs) do
-          {:ok, attestation} -> {:ok, attestation}
-          {:error, reason} -> {:error, reason}
-        end
-
-      :error ->
-        {:error, :unsupported_semantic_transition}
+      {:ok, name} -> {:ok, name}
+      :error -> {:error, :unsupported_semantic_transition}
     end
   end
 
@@ -367,17 +372,20 @@ defmodule SymphonyElixir.Plane.AgentTool do
     end
   end
 
-  defp semantic_runtime_attempt_id(host_context) do
+  defp required_runtime_attempt_identity_field(host_context, :runtime_attempt_id) do
     case Map.get(host_context, :runtime_attempt_identity) do
-      %RuntimeAttemptIdentity{runtime_attempt_id: id} -> id
-      _ -> :transition_coordinator
+      %RuntimeAttemptIdentity{runtime_attempt_id: id} when not is_nil(id) -> {:ok, id}
+      _ -> {:error, :missing_runtime_attempt_identity}
     end
   end
 
-  defp semantic_lineage_generation(host_context) do
+  defp required_runtime_attempt_identity_field(host_context, :lineage_generation) do
     case Map.get(host_context, :runtime_attempt_identity) do
-      %RuntimeAttemptIdentity{lineage_generation: generation} -> generation
-      _ -> 0
+      %RuntimeAttemptIdentity{lineage_generation: generation} when not is_nil(generation) ->
+        {:ok, generation}
+
+      _ ->
+        {:error, :missing_runtime_attempt_identity}
     end
   end
 
@@ -471,6 +479,8 @@ defmodule SymphonyElixir.Plane.AgentTool do
   defp transition_reason_code(_state, :invalid_transition_target), do: "invalid_transition_target"
   defp transition_reason_code(_state, :invalid_context), do: "invalid_transition_context"
   defp transition_reason_code(_state, :stale_runtime_attempt), do: "stale_runtime_attempt"
+
+  defp transition_reason_code(_state, :missing_runtime_attempt_identity), do: "stale_runtime_attempt"
   defp transition_reason_code(_state, :authority_unavailable), do: "authority_unavailable"
   defp transition_reason_code(_state, :invalid_intent), do: "invalid_intent"
   defp transition_reason_code(_state, :invalid_transition_result), do: "invalid_transition_result"
