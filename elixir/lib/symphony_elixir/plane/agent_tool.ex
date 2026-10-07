@@ -318,12 +318,29 @@ defmodule SymphonyElixir.Plane.AgentTool do
     if WorkItem.authority_available?(work_item), do: :ok, else: {:error, :authority_unavailable}
   end
 
-  defp acquired_transition_guard_evidence(host_context, route, source, target, work_item) do
+  defp acquired_transition_guard_evidence(host_context, _route, source, target, work_item) do
+    requirements = WorkflowLifecycle.guard_requirements(source, target) || []
+
     with :ok <- reject_supplied_semantic_attestations(host_context),
-         {:ok, semantic} <- host_semantic_attestation(route, source, target, work_item, host_context),
+         {:ok, semantic} <- host_semantic_attestation_if_required(source, target, work_item, host_context, requirements),
          mechanical <- mechanical_host_guard_evidence(host_context, work_item) do
-      {:ok, [semantic | mechanical]}
+      {:ok, semantic ++ mechanical}
     end
+  end
+
+  defp host_semantic_attestation_if_required(source, target, work_item, host_context, requirements) do
+    if semantic_attestation_required?(requirements) do
+      case host_semantic_attestation(source, target, work_item, host_context) do
+        {:ok, attestation} -> {:ok, [attestation]}
+        {:error, reason} -> {:error, reason}
+      end
+    else
+      {:ok, []}
+    end
+  end
+
+  defp semantic_attestation_required?(requirements) when is_list(requirements) do
+    Enum.any?(requirements, &match?(%{class: :semantic_attestation}, &1))
   end
 
   defp reject_supplied_semantic_attestations(context) when is_map(context) do
@@ -339,7 +356,7 @@ defmodule SymphonyElixir.Plane.AgentTool do
       else: :ok
   end
 
-  defp host_semantic_attestation(_route, source, target, %WorkItem{} = work_item, host_context) do
+  defp host_semantic_attestation(source, target, %WorkItem{} = work_item, host_context) do
     with {:ok, name} <- semantic_guard_name(source, target),
          {:ok, runtime_attempt_id} <- required_runtime_attempt_identity_field(host_context, :runtime_attempt_id),
          {:ok, lineage_generation} <- required_runtime_attempt_identity_field(host_context, :lineage_generation) do

@@ -102,6 +102,35 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
     assert AgentTool.agent_tool_specs(:not_a_context) == []
   end
 
+  test "ready to in progress executes through AgentTool with dispatch guard only and no semantic identity" do
+    parent = self()
+    route = route(:ready, "implementation")
+    coordinator = transition_coordinator(parent)
+    context = semantic_context(work_item(:ready), contract())
+
+    response =
+      AgentTool.execute(
+        "plane_request_lifecycle_transition",
+        %{"targetState" => "In Progress"},
+        host_opts(route, context)
+        |> Keyword.put(:coordinator, coordinator)
+        |> Keyword.put(:agent_tool_context, %{
+          route: route,
+          guard_evidence: [%{class: :mechanical_guard, name: :dispatch_guard}]
+        })
+      )
+
+    assert response["success"]
+
+    assert_received {:transition_context_loaded, intent}
+    assert_received :transition_submitted
+    refute Enum.any?(intent.guard_evidence, &match?(%{class: :semantic_attestation}, &1))
+    assert Enum.any?(intent.guard_evidence, &match?(%{class: :mechanical_guard, name: :dispatch_guard}, &1))
+    assert is_nil(intent.runtime_attempt_id)
+    assert is_nil(intent.lineage_generation)
+    GenServer.stop(coordinator)
+  end
+
   test "catalogue accepts a valid planning route and rejects a forged route" do
     planning_route = route(:backlog, "planning")
 
@@ -1703,6 +1732,7 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
         case state do
           :done -> :completed
           :canceled -> :cancelled
+          state when state in [:planning, :ready] -> :unstarted
           _other -> :started
         end,
       updated_at: ~U[2026-09-20 00:00:00Z]
