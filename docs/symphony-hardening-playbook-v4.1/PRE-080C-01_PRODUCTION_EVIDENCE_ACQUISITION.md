@@ -1,6 +1,8 @@
 # PRE-080C-01 — Production Evidence Acquisition
 
-**Status:** Implementation complete — independent review pending (not accepted in programme ledger)
+**Status:** Implementation stopped at frozen-plan boundary — `dispatch_guard` production gap reproduced on candidate `acd59d8`; awaiting fresh Planner/Master authorization for Ready→In Progress acquisition ownership. Not accepted for Master Gate.
+
+**PR #34 disposition:** Open; do not merge until dispatch ownership is replanned and PRE-080C-01 scope is re-authorized.
 
 ## Accepted baseline
 
