@@ -322,7 +322,8 @@ defmodule SymphonyElixir.Plane.AgentTool do
     requirements = WorkflowLifecycle.guard_requirements(source, target) || []
 
     with :ok <- reject_supplied_semantic_attestations(host_context),
-         {:ok, semantic} <- host_semantic_attestation_if_required(source, target, work_item, host_context, requirements),
+         {:ok, semantic} <-
+           host_semantic_attestation_if_required(source, target, work_item, host_context, requirements),
          mechanical <- mechanical_host_guard_evidence(host_context, work_item) do
       {:ok, semantic ++ mechanical}
     end
