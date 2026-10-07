@@ -618,7 +618,7 @@ defmodule SymphonyElixir.TransitionCoordinator do
     requirements = WorkflowLifecycle.guard_requirements(intent.requested_from, intent.requested_to) || []
     evidence = Map.get(context, :guard_evidence, intent.guard_evidence)
 
-    case runtime_guard_identity(intent) do
+    case guard_identity(intent, requirements) do
       {:ok, runtime_attempt_id, lineage_generation} ->
         guard_context = %{
           subject: {:work_item, intent.work_item_id},
@@ -639,18 +639,26 @@ defmodule SymphonyElixir.TransitionCoordinator do
     end
   end
 
-  defp runtime_guard_identity(%SemanticTransitionIntent{responsibility: responsibility} = intent) do
-    if runtime_responsibility?(responsibility) do
-      case {intent.runtime_attempt_id, intent.lineage_generation} do
-        {runtime_attempt_id, lineage_generation}
-        when not is_nil(runtime_attempt_id) and not is_nil(lineage_generation) ->
-          {:ok, runtime_attempt_id, lineage_generation}
-
-        _ ->
-          {:error, {:pre_submit, :required_guard_missing}}
-      end
+  defp guard_identity(%SemanticTransitionIntent{} = intent, requirements) when is_list(requirements) do
+    if semantic_attestation_required?(requirements) do
+      required_runtime_attempt_identity(intent)
     else
       {:ok, intent.runtime_attempt_id || :transition_coordinator, intent.lineage_generation || 0}
+    end
+  end
+
+  defp semantic_attestation_required?(requirements) do
+    Enum.any?(requirements, &match?(%{class: :semantic_attestation}, &1))
+  end
+
+  defp required_runtime_attempt_identity(%SemanticTransitionIntent{} = intent) do
+    case {intent.runtime_attempt_id, intent.lineage_generation} do
+      {runtime_attempt_id, lineage_generation}
+      when not is_nil(runtime_attempt_id) and not is_nil(lineage_generation) ->
+        {:ok, runtime_attempt_id, lineage_generation}
+
+      _ ->
+        {:error, {:pre_submit, :required_guard_missing}}
     end
   end
 

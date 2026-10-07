@@ -11,6 +11,7 @@ defmodule SymphonyElixir.RuntimeTransitionAuthorityBindingTest do
   use ExUnit.Case, async: false
 
   alias SymphonyElixir.AgentRuntime.{Profile, Route}
+  alias SymphonyElixir.AgentRuntime.RuntimeAttempt.Identity, as: RuntimeAttemptIdentity
   alias SymphonyElixir.Plane.Adapter
   alias SymphonyElixir.Tracker
   alias SymphonyElixir.Tracker.Issue
@@ -175,7 +176,7 @@ defmodule SymphonyElixir.RuntimeTransitionAuthorityBindingTest do
                Tracker.controlled_transition(work_item_id, target,
                  coordinator: coordinator,
                  route: route,
-                 intent_attrs: intent_attrs(source, responsibility, target, work_item_id)
+                 intent_attrs: intent_attrs(source, responsibility, target, work_item_id, route)
                )
 
       assert_received :context_loaded
@@ -329,16 +330,43 @@ defmodule SymphonyElixir.RuntimeTransitionAuthorityBindingTest do
     GenServer.stop(coordinator)
   end
 
-  defp intent_attrs(source, responsibility, target \\ nil, work_item_id \\ "work-1") do
+  defp intent_attrs(source, responsibility, target \\ nil, work_item_id \\ "work-1", route \\ nil) do
     target = target || target_for(source, responsibility)
+    identity = runtime_identity_for_transition(work_item_id, source, target, route)
 
-    %{
+    attrs = %{
       work_item_id: work_item_id,
       requested_from: source,
       requested_to: target,
       responsibility: responsibility,
-      guard_evidence: guard_evidence(source, target, work_item_id, responsibility)
+      guard_evidence: guard_evidence(source, target, work_item_id, responsibility, identity)
     }
+
+    case identity do
+      %RuntimeAttemptIdentity{} = runtime_identity ->
+        Map.merge(attrs, %{
+          runtime_attempt_id: runtime_identity.runtime_attempt_id,
+          lineage_generation: runtime_identity.lineage_generation
+        })
+
+      nil ->
+        attrs
+    end
+  end
+
+  defp runtime_identity_for_transition(work_item_id, source, target, %Route{} = route) do
+    if semantic_transition?(source, target) do
+      RuntimeAttemptIdentity.allocate(work_item_id, route, "lineage-h050a-grant")
+    else
+      nil
+    end
+  end
+
+  defp runtime_identity_for_transition(_work_item_id, _source, _target, _route), do: nil
+
+  defp semantic_transition?(source, target) do
+    guard_evidence_names(source, target)
+    |> Enum.any?(fn {class, _name} -> class == :semantic_attestation end)
   end
 
   defp target_for(:planning, "planning"), do: :ready
@@ -348,10 +376,10 @@ defmodule SymphonyElixir.RuntimeTransitionAuthorityBindingTest do
   defp target_for(:in_review, "review"), do: :ready_to_merge
   defp target_for(:ready_to_merge, "merge"), do: :merging
 
-  defp guard_evidence(source, target, work_item_id, responsibility) do
+  defp guard_evidence(source, target, work_item_id, responsibility, identity) do
     source
     |> guard_evidence_names(target)
-    |> Enum.map(fn {class, name} -> evidence(class, name, work_item_id, responsibility) end)
+    |> Enum.map(fn {class, name} -> evidence(class, name, work_item_id, responsibility, identity) end)
   end
 
   defp guard_evidence_names(:planning, :ready), do: [{:semantic_attestation, :plan_attested}, {:mechanical_guard, :planning_requirements_verified}]
@@ -376,12 +404,21 @@ defmodule SymphonyElixir.RuntimeTransitionAuthorityBindingTest do
 
   defp guard_evidence_names(:ready_to_merge, :merging), do: [{:human_decision, :merge_approved}, {:mechanical_guard, :merge_guard_verified}]
 
-  defp evidence(:semantic_attestation, name, work_item_id, responsibility) do
+  defp evidence(:semantic_attestation, name, work_item_id, responsibility, identity) do
+    {runtime_attempt_id, lineage_generation} =
+      case identity do
+        %RuntimeAttemptIdentity{} = runtime_identity ->
+          {runtime_identity.runtime_attempt_id, runtime_identity.lineage_generation}
+
+        nil ->
+          {:transition_coordinator, 0}
+      end
+
     {:ok, evidence} =
       GuardClass.semantic_attestation(name, %{
         responsibility: responsibility,
-        runtime_attempt_id: :transition_coordinator,
-        lineage_generation: 0,
+        runtime_attempt_id: runtime_attempt_id,
+        lineage_generation: lineage_generation,
         subject: {:work_item, work_item_id},
         timestamp: DateTime.utc_now()
       })
@@ -389,7 +426,7 @@ defmodule SymphonyElixir.RuntimeTransitionAuthorityBindingTest do
     evidence
   end
 
-  defp evidence(class, name, _work_item_id, _responsibility) do
+  defp evidence(class, name, _work_item_id, _responsibility, _identity) do
     entry = %{class: class, name: name}
 
     if name in [:candidate_state_verified, :review_acceptance_verified] do
