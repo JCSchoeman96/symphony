@@ -38,9 +38,15 @@ mix test test/symphony_elixir/plane_agent_tool_test.exs test/symphony_elixir/tra
 
 ## Negative proofs covered
 
-- Stale runtime attempt identity rejects semantic binding.
-- Runtime-supplied semantic attestations in host `guard_evidence` are rejected.
+- Stale / mismatched / wrong-generation RuntimeAttempt identity fails closed before semantic minting.
+- Prior retry or rearm lineage cannot satisfy a replacement RuntimeAttempt.
+- Forged **current-transition** semantic attestation in trusted host context is rejected; historical semantic evidence from prior verified transitions is ignored, not treated as forgery.
 - Failed required GitHub checks block Builder candidate enrichment.
+- Sequential Builder→Reviewer handoff retains full prior-role evidence (including `implementation_attested`) while minting fresh reviewer semantic evidence.
+
+## Documented production gap (frozen-plan STOP boundary)
+
+- Reproducer `pre_080c` test tagged `:documented_production_gap`: after Planner→Ready, a production-shape Ready WorkItem does **not** supply `dispatch_guard` for unseeded Ready→In Progress via `AgentTool` + `canonical_host_guard_evidence/1`. No fourth production owner was added; Master/Planner scope is required before inventing a dispatch producer.
 
 ## Final gates (run on candidate)
 

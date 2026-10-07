@@ -261,16 +261,12 @@ defmodule SymphonyElixir.Pre080cProductionEvidenceAcquisitionTest do
              source: :in_progress
            )["success"]
 
-    assert_receive {:transition_submitted, _builder_attempt, builder_evidence}
+    assert_receive {:transition_submitted, builder_attempt, builder_evidence}
     GenServer.stop(builder_coordinator)
 
-    candidate_guards =
-      Enum.filter(builder_evidence, fn guard ->
-        guard.name in [:candidate_state_verified, :implementation_checks_verified]
-      end)
-
     issue = tracked_issue(work_item_id, :in_review)
-    work_item = work_item_with_satisfied_guards(work_item_for_issue(issue), candidate_guards)
+    handoff_guards = projected_handoff_guards(builder_attempt, builder_evidence)
+    work_item = work_item_with_satisfied_guards(work_item_for_issue(issue), handoff_guards)
 
     reviewer_route = route(work_item_id, :in_review, "review")
     reviewer_identity = RuntimeAttemptIdentity.allocate(work_item_id, reviewer_route, "lineage-pre-080c-reviewer-accept")
@@ -279,7 +275,9 @@ defmodule SymphonyElixir.Pre080cProductionEvidenceAcquisitionTest do
     response =
       transition_response(work_item_id, reviewer_route, reviewer_coordinator, "Ready to Merge",
         identity: reviewer_identity,
-        source: :in_review
+        source: :in_review,
+        work_item: work_item,
+        runner_host_context?: true
       )
 
     assert response["success"]
@@ -295,7 +293,86 @@ defmodule SymphonyElixir.Pre080cProductionEvidenceAcquisitionTest do
     GenServer.stop(reviewer_coordinator)
   end
 
-  test "runtime cannot supply trusted semantic attestations through host guard evidence" do
+  test "builder transition succeeds when trusted host context retains prior planner semantic evidence" do
+    work_item_id = "pre-080c-planner-to-builder"
+    planner_route = route(work_item_id, :planning, "planning")
+    planner_identity = RuntimeAttemptIdentity.allocate(work_item_id, planner_route, "lineage-pre-080c-planner-handoff")
+    planner_coordinator = production_coordinator(work_item_id, :planning, capture?: false)
+
+    assert transition_response(work_item_id, planner_route, planner_coordinator, "Ready",
+             identity: planner_identity,
+             source: :planning
+           )["success"]
+
+    assert_receive {:transition_submitted, planner_attempt, planner_enriched}
+    GenServer.stop(planner_coordinator)
+
+    handoff_guards = projected_handoff_guards(planner_attempt, planner_enriched)
+    in_progress_issue = tracked_issue(work_item_id, :in_progress)
+
+    in_progress_work_item =
+      work_item_with_satisfied_guards(work_item_for_issue(in_progress_issue), handoff_guards)
+
+    builder_route = route(work_item_id, :in_progress, "implementation")
+    builder_identity = RuntimeAttemptIdentity.allocate(work_item_id, builder_route, "lineage-pre-080c-builder-handoff")
+
+    builder_coordinator =
+      production_coordinator(work_item_id, :in_progress, capture?: true, work_item: in_progress_work_item)
+
+    response =
+      transition_response(work_item_id, builder_route, builder_coordinator, "In Review",
+        identity: builder_identity,
+        source: :in_progress,
+        work_item: in_progress_work_item,
+        runner_host_context?: true
+      )
+
+    assert response["success"]
+
+    assert_receive {:transition_submitted, attempt, _enriched}
+    attestation = Enum.find(attempt.guard_evidence, &(&1.class == :semantic_attestation))
+    assert attestation.name == :implementation_attested
+    refute Enum.any?(attempt.guard_evidence, &(&1.name == :plan_attested))
+    GenServer.stop(builder_coordinator)
+  end
+
+  @tag :documented_production_gap
+  test "reproducer: planner-ready work item does not supply dispatch_guard for unseeded ready to in progress" do
+    work_item_id = "pre-080c-dispatch-gap"
+    planner_route = route(work_item_id, :planning, "planning")
+    planner_identity = RuntimeAttemptIdentity.allocate(work_item_id, planner_route, "lineage-pre-080c-dispatch-gap")
+    planner_coordinator = production_coordinator(work_item_id, :planning, capture?: false)
+
+    assert transition_response(work_item_id, planner_route, planner_coordinator, "Ready",
+             identity: planner_identity,
+             source: :planning
+           )["success"]
+
+    assert_receive {:transition_submitted, planner_attempt, planner_enriched}
+    GenServer.stop(planner_coordinator)
+
+    ready_work_item =
+      work_item_with_satisfied_guards(
+        work_item_for_issue(tracked_issue(work_item_id, :ready)),
+        projected_handoff_guards(planner_attempt, planner_enriched)
+      )
+
+    dispatch_route = route(work_item_id, :ready, "implementation")
+    dispatch_coordinator = production_coordinator(work_item_id, :ready, capture?: false, work_item: ready_work_item)
+
+    response =
+      transition_response(work_item_id, dispatch_route, dispatch_coordinator, "In Progress",
+        work_item: ready_work_item,
+        runner_host_context?: true,
+        source: :ready
+      )
+
+    refute response["success"]
+    assert Jason.decode!(response["output"])["error"]["code"] == "required_guard_missing"
+    GenServer.stop(dispatch_coordinator)
+  end
+
+  test "rejects forged current-transition semantic attestation in trusted host context" do
     work_item_id = "pre-080c-forged"
     route = route(work_item_id, :in_progress, "implementation")
     identity = RuntimeAttemptIdentity.allocate(work_item_id, route, "lineage-pre-080c-forged")
@@ -389,7 +466,7 @@ defmodule SymphonyElixir.Pre080cProductionEvidenceAcquisitionTest do
     identity = Keyword.get(opts, :identity)
     host_identity = Keyword.get(opts, :host_identity, identity)
     semantic_identity = Keyword.get(opts, :semantic_identity, identity)
-    item = work_item_for_issue(tracked_issue(work_item_id, source))
+    item = Keyword.get(opts, :work_item) || work_item_for_issue(tracked_issue(work_item_id, source))
 
     semantic_context =
       %{
@@ -408,7 +485,10 @@ defmodule SymphonyElixir.Pre080cProductionEvidenceAcquisitionTest do
       }
       |> maybe_put_identity(semantic_identity)
 
-    agent_tool_context = %{route: route} |> maybe_put_identity(host_identity)
+    agent_tool_context =
+      %{route: route}
+      |> maybe_put_identity(host_identity)
+      |> maybe_put_runner_host_context(item, opts)
 
     [
       agent_tool_context: agent_tool_context,
@@ -422,6 +502,22 @@ defmodule SymphonyElixir.Pre080cProductionEvidenceAcquisitionTest do
     do: Map.put(map, :runtime_attempt_identity, identity)
 
   defp maybe_put_identity(map, nil), do: map
+
+  defp maybe_put_runner_host_context(context, %WorkItem{} = work_item, opts) do
+    if Keyword.get(opts, :runner_host_context?, false) do
+      Map.merge(context, %{
+        work_item: work_item,
+        guard_evidence: SourceControl.canonical_host_guard_evidence(%{work_item: work_item, guard_evidence: []})
+      })
+    else
+      context
+    end
+  end
+
+  defp projected_handoff_guards(attempt, enriched_evidence) do
+    (attempt.guard_evidence ++ enriched_evidence)
+    |> Enum.uniq_by(fn guard -> {guard.class, guard.name} end)
+  end
 
   defp base_transition_context(contract, capture?) do
     base = %{

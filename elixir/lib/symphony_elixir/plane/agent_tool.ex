@@ -321,7 +321,7 @@ defmodule SymphonyElixir.Plane.AgentTool do
   defp acquired_transition_guard_evidence(host_context, _route, source, target, work_item) do
     requirements = WorkflowLifecycle.guard_requirements(source, target) || []
 
-    with :ok <- reject_supplied_semantic_attestations(host_context),
+    with :ok <- reject_forged_current_semantic_attestation(host_context, source, target),
          {:ok, semantic} <-
            host_semantic_attestation_if_required(source, target, work_item, host_context, requirements),
          mechanical <- mechanical_host_guard_evidence(host_context, work_item) do
@@ -344,17 +344,24 @@ defmodule SymphonyElixir.Plane.AgentTool do
     Enum.any?(requirements, &match?(%{class: :semantic_attestation}, &1))
   end
 
-  defp reject_supplied_semantic_attestations(context) when is_map(context) do
-    supplied =
-      case Map.get(context, :guard_evidence) do
-        evidence when is_list(evidence) -> evidence
-        evidence when is_map(evidence) -> [evidence]
-        _ -> []
-      end
+  defp reject_forged_current_semantic_attestation(context, source, target) when is_map(context) do
+    case semantic_guard_name(source, target) do
+      {:ok, required_name} ->
+        supplied = host_context_guard_evidence(context)
 
-    if Enum.any?(supplied, &match?(%{class: :semantic_attestation}, &1)),
-      do: {:error, :forged_guard_evidence},
-      else: :ok
+        if Enum.any?(supplied, &match?(%{class: :semantic_attestation, name: ^required_name}, &1)) do
+          {:error, :forged_guard_evidence}
+        else
+          :ok
+        end
+
+      {:error, :unsupported_semantic_transition} ->
+        :ok
+    end
+  end
+
+  defp host_context_guard_evidence(context) when is_map(context) do
+    SourceControl.canonical_host_guard_evidence(context)
   end
 
   defp host_semantic_attestation(source, target, %WorkItem{} = work_item, host_context) do
