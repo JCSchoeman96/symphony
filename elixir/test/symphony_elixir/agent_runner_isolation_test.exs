@@ -161,8 +161,37 @@ defmodule SymphonyElixir.AgentRunnerIsolationTest do
 
   alias SymphonyElixir.AgentRuntime.Router
   alias SymphonyElixir.AgentRuntime.RuntimeAttempt.Identity
-  alias SymphonyElixir.WorkControl.{GuardClass, WorkItem}
+  alias SymphonyElixir.WorkControl.WorkItem
   alias SymphonyElixir.Workspace.OwnershipLedger
+
+  defp dispatch_guard_evidence(route, %Identity{} = runtime_identity) do
+    %{
+      class: :mechanical_guard,
+      name: :dispatch_guard,
+      outcome: :verified,
+      subject: {:work_item, runtime_identity.work_item_id},
+      transition: {:ready, :in_progress},
+      responsibility: route.responsibility,
+      runtime_attempt_id: runtime_identity.runtime_attempt_id,
+      lineage_generation: runtime_identity.lineage_generation,
+      runtime_profile: route.profile_name,
+      route_fingerprint: route.fingerprint,
+      verified_at: DateTime.utc_now()
+    }
+  end
+
+  defp dispatch_guard_assessment_context(route, %Identity{} = runtime_identity) do
+    %{
+      trusted_route: route,
+      subject: {:work_item, runtime_identity.work_item_id},
+      transition: {:ready, :in_progress},
+      responsibility: route.responsibility,
+      runtime_attempt_id: runtime_identity.runtime_attempt_id,
+      lineage_generation: runtime_identity.lineage_generation,
+      runtime_profile: route.profile_name,
+      route_fingerprint: route.fingerprint
+    }
+  end
 
   test "routed local command validation blocks before workspace creation" do
     write_workflow_file!(Workflow.workflow_file_path(),
@@ -564,15 +593,20 @@ defmodule SymphonyElixir.AgentRunnerIsolationTest do
       })
 
     assert {:ok, route} = Router.resolve(work_item, Config.settings!().agent.profiles)
+    runtime_identity = Identity.allocate(issue.id, route, "lineage-runner-restart-isolation")
+    dispatch_evidence = dispatch_guard_evidence(route, runtime_identity)
+    assessment_context = dispatch_guard_assessment_context(route, runtime_identity)
     admission = fn _worker_host, _executable, _opts -> {:ok, :admitted} end
 
     assert :ok =
              AgentRunner.run(issue, self(),
                runtime: SymphonyElixir.AgentRunnerRestartIsolationFailureRuntime,
                test_pid: self(),
+               runtime_attempt_identity: runtime_identity,
                route: route,
                work_item: work_item,
-               guard_evidence: [GuardClass.requirement(:mechanical_guard, :dispatch_guard)],
+               guard_evidence: [dispatch_evidence],
+               assessment_context: assessment_context,
                issue_state_fetcher: fn [_issue_id] -> {:ok, [refreshed_issue]} end,
                test_runtime_isolation_admit: admission,
                ownership_ledger: workspace_ownership_ledger()
@@ -582,7 +616,7 @@ defmodule SymphonyElixir.AgentRunnerIsolationTest do
     assert_receive :restart_runtime_turn
     assert_receive :restart_runtime_stopped
     assert_receive {:restart_runtime_started, 2}
-    assert_receive {:runtime_isolation_blocked, "runner-restart-isolation", reason}
+    assert_receive {:runtime_isolation_blocked, "runner-restart-isolation", ^runtime_identity, reason}
     assert reason == {:runtime_isolation_unavailable, :restart_boundary_unproven}
   end
 
@@ -621,6 +655,9 @@ defmodule SymphonyElixir.AgentRunnerIsolationTest do
       runtime_profile: "builder"
     }
 
+    dispatch_evidence = dispatch_guard_evidence(route, identity)
+    assessment_context = dispatch_guard_assessment_context(route, identity)
+
     assert :ok =
              AgentRunner.run(issue, self(),
                runtime: SymphonyElixir.AgentRunnerSuccessfulRestartRuntime,
@@ -628,7 +665,8 @@ defmodule SymphonyElixir.AgentRunnerIsolationTest do
                runtime_attempt_identity: identity,
                route: route,
                work_item: work_item,
-               guard_evidence: [GuardClass.requirement(:mechanical_guard, :dispatch_guard)],
+               guard_evidence: [dispatch_evidence],
+               assessment_context: assessment_context,
                issue_state_fetcher: fn [_issue_id] -> {:ok, [refreshed_issue]} end,
                test_runtime_isolation_admit: fn _worker_host, _executable, _opts -> {:ok, :admitted} end,
                ownership_ledger: workspace_ownership_ledger()
@@ -676,6 +714,9 @@ defmodule SymphonyElixir.AgentRunnerIsolationTest do
       })
 
     assert {:ok, route} = Router.resolve(work_item, Config.settings!().agent.profiles)
+    runtime_identity = Identity.allocate(issue.id, route, "lineage-runner-restart-residue")
+    dispatch_evidence = dispatch_guard_evidence(route, runtime_identity)
+    assessment_context = dispatch_guard_assessment_context(route, runtime_identity)
     ledger = workspace_ownership_ledger()
     test_pid = self()
 
@@ -683,9 +724,11 @@ defmodule SymphonyElixir.AgentRunnerIsolationTest do
              AgentRunner.run(issue, test_pid,
                runtime: SymphonyElixir.AgentRunnerTestRestartResidueRuntime,
                test_pid: test_pid,
+               runtime_attempt_identity: runtime_identity,
                route: route,
                work_item: work_item,
-               guard_evidence: [GuardClass.requirement(:mechanical_guard, :dispatch_guard)],
+               guard_evidence: [dispatch_evidence],
+               assessment_context: assessment_context,
                issue_state_fetcher: fn [_issue_id] ->
                  {:ok, [record]} = OwnershipLedger.list_for_work_item(ledger, issue.id)
                  File.mkdir_p!(Path.join(record.canonical_workspace_path, ".git"))
@@ -703,6 +746,7 @@ defmodule SymphonyElixir.AgentRunnerIsolationTest do
     assert_receive {
       :runtime_isolation_blocked,
       "runner-restart-residue",
+      ^runtime_identity,
       {:runtime_isolation_unavailable, :workspace_scm_boundary_unproven}
     }
 

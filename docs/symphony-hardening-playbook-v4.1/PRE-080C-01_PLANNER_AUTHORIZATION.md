@@ -16,7 +16,7 @@ CURRENT_MAIN_TREE
 1b1a78af2ba1e0157ff046eaf818861f0b069096
 ```
 
-`main` remains protected. The required checks remain `make-all` and `validate-pr-description`, both under GitHub Actions app ID `15368`. The Unified Roadmap, Master Roadmap, and Skills Adoption/Routing Matrix all remain present at the frozen baseline. 
+`main` remains protected. The required checks remain `make-all` and `validate-pr-description`, both under GitHub Actions app ID `15368`. The Unified Roadmap, Master Roadmap, and Skills Adoption/Routing Matrix all remain present at the frozen baseline.
 
 The planning brief explicitly authorizes PRE-080C-01 planning while leaving H-080C unauthorized. Pasted text No authority ambiguity exists, so the STOP condition does not fire.
 
@@ -50,19 +50,19 @@ This is not an architectural suspicion. There is enough evidence in the current 
 
 The decisive findings are:
 
-1. `WorkflowLifecycle` correctly demands distinct evidence families. Planner needs `plan_attested` plus `planning_requirements_verified`; Builder needs `implementation_attested`, `implementation_checks_verified`, and `candidate_state_verified`; Fixer has the analogous correction guards; Reviewer requires semantic reviewer evidence plus, for acceptance, `review_acceptance_verified`. 
+1. `WorkflowLifecycle` correctly demands distinct evidence families. Planner needs `plan_attested` plus `planning_requirements_verified`; Builder needs `implementation_attested`, `implementation_checks_verified`, and `candidate_state_verified`; Fixer has the analogous correction guards; Reviewer requires semantic reviewer evidence plus, for acceptance, `review_acceptance_verified`.
 
-2. `Plane.AgentTool` exposes only the semantic target state to the runtime. That is good: the runtime cannot submit arbitrary guard maps. But when it builds `SemanticTransitionIntent`, it merely copies whatever `guard_evidence` is already present in trusted host context. It does **not acquire the missing role evidence**.  
+2. `Plane.AgentTool` exposes only the semantic target state to the runtime. That is good: the runtime cannot submit arbitrary guard maps. But when it builds `SemanticTransitionIntent`, it merely copies whatever `guard_evidence` is already present in trusted host context. It does **not acquire the missing role evidence**.
 
-3. Ordinary `AgentRunner` execution does not create these guards on turn completion. Runtime output is not automatically converted to trusted lifecycle evidence, which is also correct from a trust perspective. 
+3. Ordinary `AgentRunner` execution does not create these guards on turn completion. Runtime output is not automatically converted to trusted lifecycle evidence, which is also correct from a trust perspective.
 
-4. Existing successful transition tests manually construct the missing semantic and mechanical guards and inject them into host context. The corresponding unseeded path fails with `required_guard_missing`. That is precisely the test-only shortcut PRE-080C-01 warned against. 
+4. Existing successful transition tests manually construct the missing semantic and mechanical guards and inject them into host context. The corresponding unseeded path fails with `required_guard_missing`. That is precisely the test-only shortcut PRE-080C-01 warned against.
 
-5. Source control is only partially affected. Candidate capture already produces the exact `candidate_state_verified` evidence. Reviewer acceptance already revalidates the candidate and required GitHub checks. But Builder/Fixer candidate capture does **not** currently convert successful required-check verification into the required `implementation_checks_verified` / `correction_checks_verified` lifecycle guard. 
+5. Source control is only partially affected. Candidate capture already produces the exact `candidate_state_verified` evidence. Reviewer acceptance already revalidates the candidate and required GitHub checks. But Builder/Fixer candidate capture does **not** currently convert successful required-check verification into the required `implementation_checks_verified` / `correction_checks_verified` lifecycle guard.
 
 So the correct conclusion is **not** “replace the evidence model.” The current validators and trust model are substantially correct. The missing piece is the **normal production acquisition path**.
 
-The Master Roadmap explicitly distinguishes machine facts from semantic attestations: CI/candidate/dependency facts are `MechanicalGuard`s, while bounded Planner/Reviewer judgments are `SemanticAttestation`s. Agent claims such as “tests passed” are not machine evidence.  
+The Master Roadmap explicitly distinguishes machine facts from semantic attestations: CI/candidate/dependency facts are `MechanicalGuard`s, while bounded Planner/Reviewer judgments are `SemanticAttestation`s. Agent claims such as “tests passed” are not machine evidence.
 
 ---
 
@@ -90,7 +90,7 @@ The Master Roadmap explicitly distinguishes machine facts from semantic attestat
 | Runtime output | `AgentRunner` / runtime adapter | Ephemeral runtime result | Runtime → host | **Not trusted evidence by itself** |
 | Recovery state | `WorkControl.RecoveryLedger` | DETS checkpoint, validated lifecycle state, bounded durable evidence/suspension context | Work-control → startup reconciliation | Host durable recovery |
 
-`RuntimeAttempt` is explicitly host-owned and bound to `runtime_attempt_id`, WorkItem, lineage generation, responsibility, and runtime profile.  `RecoveryLedger` explicitly does not become a second runtime-authority store. 
+`RuntimeAttempt` is explicitly host-owned and bound to `runtime_attempt_id`, WorkItem, lineage generation, responsibility, and runtime profile.  `RecoveryLedger` explicitly does not become a second runtime-authority store.
 
 This satisfies the requirement to locate existing owners before considering changes. Pasted text
 
@@ -195,7 +195,7 @@ Merging → Done
   CompletionProof required
 ```
 
-No guard is to be removed or weakened. 
+No guard is to be removed or weakened.
 
 ## 2. RuntimeAttempt — preserve unchanged
 
@@ -217,7 +217,7 @@ Queued
            └─ terminal outcome
 ```
 
-A replacement RuntimeAttempt must never inherit the previous attempt's semantic evidence. The roadmap says `Running → Completed` requires responsibility-specific completion criteria and emits a bounded semantic result to the trusted Symphony boundary. 
+A replacement RuntimeAttempt must never inherit the previous attempt's semantic evidence. The roadmap says `Running → Completed` requires responsibility-specific completion criteria and emits a bounded semantic result to the trusted Symphony boundary.
 
 PRE-080C-01 supplies the currently missing acquisition side of that doctrine without introducing Programme-B Execution.
 
@@ -231,7 +231,7 @@ Absent
 → SupersededByNewObservation
 ```
 
-Observation can reduce authority but cannot grant a forward transition. 
+Observation can reduce authority but cannot grant a forward transition.
 
 ## 4. TransitionAttempt — preserve unchanged
 
@@ -249,7 +249,7 @@ Requested
    └─ Indeterminate
 ```
 
-`Prepared` remains the final point before provider side effects and the durable submission fence remains mandatory. 
+`Prepared` remains the final point before provider side effects and the durable submission fence remains mandatory.
 
 ## 5. CompletionProof — preserve unchanged
 
@@ -267,7 +267,7 @@ merge_verified   → completion_merge_verified
 completed        → completion_proof_verified
 ```
 
- 
+
 
 ## 6. Candidate-bound evidence
 
@@ -285,7 +285,7 @@ CandidateCaptured/Verified/ReviewVerified
                            → reacquisition / re-review required
 ```
 
-Candidate identity is already properly defined by immutable `CandidateRef`. 
+Candidate identity is already properly defined by immutable `CandidateRef`.
 
 ## 7. PRE-080C-01 acquisition chain
 
@@ -677,7 +677,7 @@ host-bound semantic request  can produce semantic attestation
 runtime-supplied evidence    cannot enter the trusted boundary
 ```
 
-No sleeps should be added merely to synchronize the characterization; use process messages, synchronous calls, or stable state/effects in line with repository testing doctrine. 
+No sleeps should be added merely to synchronize the characterization; use process messages, synchronous calls, or stable state/effects in line with repository testing doctrine.
 
 ---
 
@@ -694,7 +694,7 @@ make all
 git diff --check
 ```
 
-`make all` is the repository's full local gate and includes build, format checking, lint, partitioned coverage, H-070A scaling coverage, Dialyzer, and the Codex isolation proof. 
+`make all` is the repository's full local gate and includes build, format checking, lint, partitioned coverage, H-070A scaling coverage, Dialyzer, and the Codex isolation proof.
 
 After the PR exists, the implementation agent must report but **must not self-approve or merge**:
 

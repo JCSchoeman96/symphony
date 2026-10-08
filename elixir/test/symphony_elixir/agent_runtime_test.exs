@@ -73,7 +73,7 @@ defmodule SymphonyElixir.AgentRuntimeTest do
   alias SymphonyElixir.AgentRuntime
   alias SymphonyElixir.AgentRuntime.{Codex, Router, RuntimeAttempt}
   alias SymphonyElixir.Codex.AppServer
-  alias SymphonyElixir.WorkControl.{GuardClass, WorkItem}
+  alias SymphonyElixir.WorkControl.WorkItem
 
   @work_control_now ~U[2026-09-16 00:00:00Z]
 
@@ -86,6 +86,35 @@ defmodule SymphonyElixir.AgentRuntimeTest do
       })
 
     work_item
+  end
+
+  defp dispatch_guard_evidence(route, runtime_identity) do
+    %{
+      class: :mechanical_guard,
+      name: :dispatch_guard,
+      outcome: :verified,
+      subject: {:work_item, runtime_identity.work_item_id},
+      transition: {:ready, :in_progress},
+      responsibility: route.responsibility,
+      runtime_attempt_id: runtime_identity.runtime_attempt_id,
+      lineage_generation: runtime_identity.lineage_generation,
+      runtime_profile: route.profile_name,
+      route_fingerprint: route.fingerprint,
+      verified_at: DateTime.utc_now()
+    }
+  end
+
+  defp dispatch_guard_assessment_context(route, runtime_identity) do
+    %{
+      trusted_route: route,
+      subject: {:work_item, runtime_identity.work_item_id},
+      transition: {:ready, :in_progress},
+      responsibility: route.responsibility,
+      runtime_attempt_id: runtime_identity.runtime_attempt_id,
+      lineage_generation: runtime_identity.lineage_generation,
+      runtime_profile: route.profile_name,
+      route_fingerprint: route.fingerprint
+    }
   end
 
   test "the runtime contract includes lifecycle and observational callbacks" do
@@ -397,15 +426,20 @@ defmodule SymphonyElixir.AgentRuntimeTest do
     profiles = Config.settings!().agent.profiles
     work_item = trusted_work_item(issue)
     assert {:ok, route} = Router.resolve(work_item, profiles)
+    runtime_identity = RuntimeAttempt.Identity.allocate(issue.id, route, "lineage-refreshed-work-item")
+    dispatch_evidence = dispatch_guard_evidence(route, runtime_identity)
+    assessment_context = dispatch_guard_assessment_context(route, runtime_identity)
 
     assert :ok =
              AgentRunner.run(issue, test_pid,
                runtime: SymphonyElixir.AgentRuntimeTestFake,
                test_pid: test_pid,
+               runtime_attempt_identity: runtime_identity,
                route: route,
                work_item: work_item,
                ownership_ledger: workspace_ownership_ledger(),
-               guard_evidence: [GuardClass.requirement(:mechanical_guard, :dispatch_guard)],
+               guard_evidence: [dispatch_evidence],
+               assessment_context: assessment_context,
                issue_state_fetcher: fn [_issue_id] -> {:ok, [refreshed_issue]} end
              )
 
@@ -456,16 +490,19 @@ defmodule SymphonyElixir.AgentRuntimeTest do
       })
 
     assert {:ok, route} = Router.resolve(work_item, Config.settings!().agent.profiles)
+    runtime_identity = RuntimeAttempt.Identity.allocate(issue.id, route, "lineage-catalogue-refresh")
+    dispatch_evidence = dispatch_guard_evidence(route, runtime_identity)
+    assessment_context = dispatch_guard_assessment_context(route, runtime_identity)
 
     {:ok, refreshed_work_item} =
       WorkItem.from_issue(refreshed_issue, %{
         provider: :plane,
         observed_at: @work_control_now,
         prior_validated_lifecycle_state: issue.state,
-        evidence: [GuardClass.requirement(:mechanical_guard, :dispatch_guard)]
+        evidence: [dispatch_evidence],
+        assessment_context: assessment_context
       })
 
-    runtime_identity = RuntimeAttempt.Identity.allocate(issue.id, route, "lineage-catalogue-refresh")
     snapshot_reads = :atomics.new(1, [])
     provider_reads = :atomics.new(1, [])
 
@@ -491,7 +528,6 @@ defmodule SymphonyElixir.AgentRuntimeTest do
                  work_item: work_item,
                  ownership_ledger: workspace_ownership_ledger(),
                  runtime_attempt_identity: runtime_identity,
-                 guard_evidence: [GuardClass.requirement(:mechanical_guard, :dispatch_guard)],
                  issue_state_fetcher: fn [_issue_id] ->
                    :atomics.add(provider_reads, 1, 1)
                    {:ok, [refreshed_issue]}

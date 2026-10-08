@@ -102,11 +102,12 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
     assert AgentTool.agent_tool_specs(:not_a_context) == []
   end
 
-  test "ready to in progress executes through AgentTool with dispatch guard only and no semantic identity" do
+  test "ready to in progress delegates RuntimeAttempt identity without minting guards" do
     parent = self()
     route = route(:ready, "implementation")
+    identity = runtime_attempt_identity(route)
     coordinator = transition_coordinator(parent)
-    context = semantic_context(work_item(:ready), contract())
+    context = semantic_context(work_item(:ready), contract(), %{runtime_attempt_identity: identity})
 
     response =
       AgentTool.execute(
@@ -116,18 +117,23 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
         |> Keyword.put(:coordinator, coordinator)
         |> Keyword.put(:agent_tool_context, %{
           route: route,
-          guard_evidence: [%{class: :mechanical_guard, name: :dispatch_guard}]
+          runtime_attempt_identity: identity,
+          guard_evidence: []
         })
       )
 
-    assert response["success"]
+    refute response["success"]
+    assert Jason.decode!(response["output"])["error"]["code"] == "required_guard_missing"
 
     assert_received {:transition_context_loaded, intent}
-    assert_received :transition_submitted
+    refute_received :transition_submitted
     refute Enum.any?(intent.guard_evidence, &match?(%{class: :semantic_attestation}, &1))
-    assert Enum.any?(intent.guard_evidence, &match?(%{class: :mechanical_guard, name: :dispatch_guard}, &1))
-    assert is_nil(intent.runtime_attempt_id)
-    assert is_nil(intent.lineage_generation)
+    refute Enum.any?(intent.guard_evidence, &match?(%{name: :dispatch_guard}, &1))
+    assert intent.work_item_id == route.issue_id
+    assert intent.responsibility == route.responsibility
+    assert intent.runtime_attempt_id == identity.runtime_attempt_id
+    assert intent.lineage_generation == identity.lineage_generation
+    refute Map.has_key?(Map.from_struct(intent), :runtime_profile)
     GenServer.stop(coordinator)
   end
 
@@ -1578,9 +1584,7 @@ defmodule SymphonyElixir.PlaneAgentToolTest do
     |> Keyword.put(:agent_tool_context, agent_tool_context(route, identity))
   end
 
-  defp agent_tool_context(route, identity \\ nil) do
-    identity = identity || runtime_attempt_identity(route)
-
+  defp agent_tool_context(route, identity) do
     %{
       route: route,
       runtime_attempt_identity: identity,

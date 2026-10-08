@@ -20,8 +20,8 @@
 
 ## Frozen reproducer (production shape)
 
-**Test:** `SymphonyElixir.Pre080cProductionEvidenceAcquisitionTest`  
-`"reproducer: planner-ready work item does not supply dispatch_guard for unseeded ready to in progress"`  
+**Test:** `SymphonyElixir.Pre080cProductionEvidenceAcquisitionTest`
+`"reproducer: planner-ready work item does not supply dispatch_guard for unseeded ready to in progress"`
 (tag `:documented_production_gap`)
 
 **Steps exercised:**

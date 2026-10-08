@@ -6,6 +6,7 @@ defmodule SymphonyElixir.WorkControl.GuardClass do
   cannot satisfy the requirement, even when its name is the same.
   """
 
+  alias SymphonyElixir.AgentRuntime.Route
   alias SymphonyElixir.WorkControl.CompletionProof
 
   @classes [:mechanical_guard, :semantic_attestation, :human_decision]
@@ -138,6 +139,15 @@ defmodule SymphonyElixir.WorkControl.GuardClass do
        when name in @completion_proof_guards,
        do: false
 
+  defp evidence_satisfies?(:mechanical_guard, :dispatch_guard, evidence, context) do
+    if dispatch_guard_context_required?(context) do
+      valid_evidence?(evidence) and dispatch_guard_context_matches?(evidence, context)
+    else
+      match?(%{class: :mechanical_guard, name: :dispatch_guard}, evidence) and
+        valid_evidence?(evidence)
+    end
+  end
+
   defp evidence_satisfies?(class, name, evidence, _context) do
     match?(%{class: ^class, name: ^name}, evidence) and valid_evidence?(evidence) and
       verified_outcome_satisfied?(name, evidence)
@@ -148,6 +158,58 @@ defmodule SymphonyElixir.WorkControl.GuardClass do
   defp verified_outcome_satisfied?(name, _evidence) when name in @verified_outcome_guards, do: false
 
   defp verified_outcome_satisfied?(_name, _evidence), do: true
+
+  defp dispatch_guard_context_matches?(evidence, context) do
+    with %Route{} = route <- Map.get(context, :trusted_route),
+         {:work_item, work_item_id} <- Map.get(context, :subject),
+         true <- is_binary(work_item_id) and work_item_id != "",
+         true <- route.issue_id == work_item_id,
+         true <- is_binary(route.starting_state),
+         true <- Route.normalize_state(route.starting_state) == "ready",
+         true <- route.responsibility == "implementation",
+         true <- route.fingerprint == Route.fingerprint(route),
+         true <- route.starting_state_fingerprint == Route.starting_state_fingerprint(route),
+         true <- Map.get(context, :transition) == {:ready, :in_progress},
+         true <- Map.get(evidence, :outcome) == :verified,
+         true <- Map.get(evidence, :subject) == {:work_item, work_item_id},
+         true <- Map.get(evidence, :transition) == {:ready, :in_progress},
+         true <- responsibility_matches?(Map.get(evidence, :responsibility), route.responsibility),
+         true <- responsibility_matches?(Map.get(context, :responsibility), route.responsibility),
+         runtime_attempt_id when is_binary(runtime_attempt_id) <- Map.get(context, :runtime_attempt_id),
+         true <- runtime_attempt_id != "",
+         true <- Map.get(evidence, :runtime_attempt_id) == runtime_attempt_id,
+         lineage_generation when not is_nil(lineage_generation) <- Map.get(context, :lineage_generation),
+         true <- Map.get(evidence, :lineage_generation) == lineage_generation,
+         true <- Map.get(evidence, :runtime_profile) == route.profile_name,
+         true <- Map.get(context, :runtime_profile) == route.profile_name,
+         true <- Map.get(evidence, :route_fingerprint) == route.fingerprint,
+         true <- Map.get(context, :route_fingerprint) == route.fingerprint,
+         %DateTime{} <- Map.get(evidence, :verified_at) do
+      true
+    else
+      _failure -> false
+    end
+  end
+
+  defp dispatch_guard_context_required?(context) do
+    Enum.any?(
+      [
+        :trusted_route,
+        :subject,
+        :transition,
+        :responsibility,
+        :runtime_attempt_id,
+        :lineage_generation,
+        :runtime_profile,
+        :route_fingerprint
+      ],
+      &Map.has_key?(context, &1)
+    )
+  end
+
+  defp responsibility_matches?(left, right) when is_atom(left), do: Atom.to_string(left) == right
+  defp responsibility_matches?(left, right) when is_binary(left), do: String.trim(left) == right
+  defp responsibility_matches?(_left, _right), do: false
 
   defp validate_semantic_attestation(%{class: :semantic_attestation, name: name} = evidence)
        when is_atom(name) do

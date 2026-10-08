@@ -386,6 +386,7 @@ defmodule SymphonyElixir.TransitionCoordinator do
     with {:ok, attempt} <- new_attempt(intent, state.clock),
          {:ok, attempt} <- authorize_attempt(attempt, intent, route),
          {:ok, context} <- load_context_with_attempt(state, intent, attempt),
+         context <- attach_transition_provenance_context(context, intent, route),
          {:ok, attempt} <- ensure_pre_submit(attempt, fn -> authorize_fresh_context(intent, context) end),
          context = apply_fresh_machine_guards(intent, context),
          {:ok, attempt} <- ensure_pre_submit(attempt, fn -> guard_context(intent, context) end),
@@ -395,6 +396,7 @@ defmodule SymphonyElixir.TransitionCoordinator do
          {:ok, attempt} <- persist_attempt(state, attempt),
          {:ok, attempt} <- transition_attempt(attempt, :arm_submission_fence, []),
          {:ok, attempt} <- persist_attempt(state, attempt),
+         {:ok, context} <- final_dispatch_context_with_attempt(state, intent, route, attempt, context),
          {submit_result, attempt} <- submit_once(state, attempt, context),
          {reply, state} <- reconcile_submission(state, attempt, context, submit_result) do
       {reply, state}
@@ -408,6 +410,53 @@ defmodule SymphonyElixir.TransitionCoordinator do
       {:error, reason} ->
         finish_without_submission(state, intent, reason)
     end
+  end
+
+  defp final_dispatch_context_with_attempt(
+         %State{} = state,
+         %SemanticTransitionIntent{requested_from: :ready, requested_to: :in_progress} = intent,
+         route,
+         %TransitionAttempt{} = attempt,
+         _initial_context
+       ) do
+    with {:ok, fresh_context} <- load_context_with_attempt(state, intent, attempt),
+         fresh_context <- attach_transition_provenance_context(fresh_context, intent, route),
+         {:ok, attempt} <- ensure_pre_submit(attempt, fn -> authorize_fresh_context(intent, fresh_context) end),
+         fresh_context <- apply_fresh_machine_guards(intent, fresh_context),
+         {:ok, attempt} <- ensure_pre_submit(attempt, fn -> guard_context(intent, fresh_context) end),
+         {:ok, fresh_context} <- bind_target_with_attempt(fresh_context, intent, attempt),
+         :ok <- prepared_target_binding_matches(fresh_context, attempt) do
+      {:ok, fresh_context}
+    else
+      {:error, {:pre_submit, reason}} ->
+        {:error, {:pre_submit, reason, attempt}}
+
+      {:error, {:pre_submit, reason, %TransitionAttempt{} = current_attempt}} ->
+        {:error, {:pre_submit, reason, current_attempt}}
+
+      {:error, reason} ->
+        {:error, {:pre_submit, reason, attempt}}
+    end
+  end
+
+  defp final_dispatch_context_with_attempt(
+         _state,
+         _intent,
+         _route,
+         _attempt,
+         initial_context
+       ),
+       do: {:ok, initial_context}
+
+  defp prepared_target_binding_matches(context, %TransitionAttempt{} = attempt) do
+    matches? =
+      Map.get(context, :workspace_id) == attempt.workspace_id and
+        Map.get(context, :project_id) == attempt.project_id and
+        Map.get(context, :target_provider_state_id) == attempt.target_provider_state_id and
+        Map.get(context, :target_provider_state_group) == attempt.target_provider_state_group and
+        Map.get(context, :provider_contract_fingerprint) == attempt.provider_contract_fingerprint
+
+    if matches?, do: :ok, else: {:error, {:pre_submit, :provider_contract_drift}}
   end
 
   defp new_attempt(%SemanticTransitionIntent{} = intent, clock) do
@@ -612,19 +661,45 @@ defmodule SymphonyElixir.TransitionCoordinator do
     end)
   end
 
+  defp apply_fresh_machine_guards(
+         %SemanticTransitionIntent{requested_from: :ready, requested_to: :in_progress} = intent,
+         context
+       )
+       when is_map(context) do
+    historical_evidence =
+      (normalize_guard_evidence(Map.get(context, :guard_evidence, [])) ++ intent.guard_evidence)
+      |> strip_dispatch_guard_lookalikes()
+      |> Enum.uniq()
+
+    context = Map.put(context, :guard_evidence, historical_evidence)
+
+    case validated_dispatch_guard(intent, context) do
+      {:ok, dispatch_guard} ->
+        Map.update!(context, :guard_evidence, &(&1 ++ [dispatch_guard]))
+
+      :error ->
+        context
+    end
+  end
+
   defp apply_fresh_machine_guards(_intent, context), do: context
 
   defp guard_context(%SemanticTransitionIntent{} = intent, context) do
     requirements = WorkflowLifecycle.guard_requirements(intent.requested_from, intent.requested_to) || []
     evidence = Map.get(context, :guard_evidence, intent.guard_evidence)
+    trusted_route = Map.get(context, :trusted_route)
 
     case guard_identity(intent, requirements) do
       {:ok, runtime_attempt_id, lineage_generation} ->
         guard_context = %{
           subject: {:work_item, intent.work_item_id},
-          responsibility: intent.responsibility,
+          transition: {intent.requested_from, intent.requested_to},
+          responsibility: canonical_transition_responsibility(intent),
           runtime_attempt_id: runtime_attempt_id,
           lineage_generation: lineage_generation,
+          trusted_route: trusted_route,
+          runtime_profile: Map.get(context, :runtime_profile),
+          route_fingerprint: Map.get(context, :route_fingerprint),
           provider_project_contract: Map.get(context, :provider_project_contract)
         }
 
@@ -640,12 +715,119 @@ defmodule SymphonyElixir.TransitionCoordinator do
   end
 
   defp guard_identity(%SemanticTransitionIntent{} = intent, requirements) when is_list(requirements) do
-    if semantic_attestation_required?(requirements) do
+    if semantic_attestation_required?(requirements) or dispatch_guard_required?(intent, requirements) do
       required_runtime_attempt_identity(intent)
     else
       {:ok, intent.runtime_attempt_id || :transition_coordinator, intent.lineage_generation || 0}
     end
   end
+
+  defp dispatch_guard_required?(
+         %SemanticTransitionIntent{requested_from: :ready, requested_to: :in_progress},
+         requirements
+       ) do
+    Enum.any?(requirements, &match?(%{class: :mechanical_guard, name: :dispatch_guard}, &1))
+  end
+
+  defp dispatch_guard_required?(_intent, _requirements), do: false
+
+  defp attach_transition_provenance_context(context, %SemanticTransitionIntent{} = intent, caller_route)
+       when is_map(context) do
+    context_route = Map.get(context, :route)
+    trusted_route = trusted_transition_route(context_route, caller_route, intent)
+
+    context
+    |> Map.put(:trusted_route, trusted_route)
+    |> Map.put(:transition, {intent.requested_from, intent.requested_to})
+    |> Map.put_new(:route_fingerprint, route_fingerprint(trusted_route))
+    |> Map.put_new(:runtime_profile, route_profile_name(trusted_route))
+  end
+
+  defp trusted_transition_route(
+         nil,
+         _caller_route,
+         %SemanticTransitionIntent{requested_from: :ready, requested_to: :in_progress}
+       ),
+       do: nil
+
+  defp trusted_transition_route(context_route, caller_route, _intent),
+    do: reconcile_transition_route(context_route, caller_route)
+
+  defp reconcile_transition_route(%Route{} = current_route, %Route{} = caller_route) do
+    if Route.same?(current_route, caller_route) and
+         current_route.starting_state_fingerprint == caller_route.starting_state_fingerprint do
+      current_route
+    else
+      nil
+    end
+  end
+
+  defp reconcile_transition_route(%Route{} = current_route, _caller_route), do: current_route
+  defp reconcile_transition_route(nil, %Route{} = caller_route), do: caller_route
+  defp reconcile_transition_route(_context_route, _caller_route), do: nil
+
+  defp route_fingerprint(%Route{fingerprint: fingerprint}), do: fingerprint
+  defp route_fingerprint(_route), do: nil
+
+  defp route_profile_name(%Route{profile_name: profile_name}), do: profile_name
+  defp route_profile_name(_route), do: nil
+
+  defp validated_dispatch_guard(
+         %SemanticTransitionIntent{requested_from: :ready, requested_to: :in_progress} = intent,
+         context
+       ) do
+    route = Map.get(context, :trusted_route)
+    evidence = Map.get(context, :dispatch_authority_evidence)
+
+    with %Route{} = route <- route,
+         %{class: :mechanical_guard, name: :dispatch_guard, outcome: :verified} <- evidence,
+         true <- is_binary(intent.runtime_attempt_id) and intent.runtime_attempt_id != "",
+         true <- not is_nil(intent.lineage_generation),
+         true <- intent.work_item_id == route.issue_id,
+         true <- canonical_transition_responsibility(intent) == "implementation",
+         true <- route.responsibility == "implementation",
+         true <- is_binary(route.starting_state),
+         true <- Route.normalize_state(route.starting_state) == "ready",
+         true <- route.fingerprint == Route.fingerprint(route),
+         true <- route.starting_state_fingerprint == Route.starting_state_fingerprint(route),
+         true <- Map.get(context, :route_fingerprint) == route.fingerprint,
+         true <- Map.get(context, :runtime_profile) == route.profile_name,
+         true <- Map.get(evidence, :subject) == {:work_item, intent.work_item_id},
+         true <- Map.get(evidence, :transition) == {:ready, :in_progress},
+         true <- Map.get(evidence, :responsibility) == "implementation",
+         true <- Map.get(evidence, :runtime_attempt_id) == intent.runtime_attempt_id,
+         true <- Map.get(evidence, :lineage_generation) == intent.lineage_generation,
+         true <- Map.get(evidence, :route_fingerprint) == route.fingerprint,
+         true <- Map.get(evidence, :runtime_profile) == route.profile_name,
+         %DateTime{} = verified_at <- Map.get(evidence, :verified_at) do
+      {:ok,
+       %{
+         class: :mechanical_guard,
+         name: :dispatch_guard,
+         outcome: :verified,
+         subject: {:work_item, intent.work_item_id},
+         transition: {:ready, :in_progress},
+         responsibility: "implementation",
+         runtime_attempt_id: intent.runtime_attempt_id,
+         lineage_generation: intent.lineage_generation,
+         route_fingerprint: route.fingerprint,
+         runtime_profile: route.profile_name,
+         verified_at: verified_at
+       }}
+    else
+      _invalid_or_stale -> :error
+    end
+  end
+
+  defp strip_dispatch_guard_lookalikes(evidence) when is_list(evidence) do
+    Enum.reject(evidence, &dispatch_guard_lookalike?/1)
+  end
+
+  defp dispatch_guard_lookalike?(evidence) when is_map(evidence) do
+    Map.get(evidence, :name) == :dispatch_guard or Map.get(evidence, "name") == "dispatch_guard"
+  end
+
+  defp dispatch_guard_lookalike?(_evidence), do: false
 
   defp semantic_attestation_required?(requirements) do
     Enum.any?(requirements, &match?(%{class: :semantic_attestation}, &1))
@@ -1005,6 +1187,7 @@ defmodule SymphonyElixir.TransitionCoordinator do
   defp pre_submit_outcome(:source_state_changed), do: :conflict
   defp pre_submit_outcome({:context_unavailable, :source_state_changed}), do: :conflict
   defp pre_submit_outcome({:context_unavailable, :provider_contract_drift}), do: :rejected
+  defp pre_submit_outcome({:context_unavailable, :stale_runtime_attempt}), do: :rejected
 
   defp pre_submit_outcome({:context_unavailable, reason})
        when reason in [:work_item_suspended, :dependency_context_unavailable],
@@ -1302,7 +1485,7 @@ defmodule SymphonyElixir.TransitionCoordinator do
            fresh_assessment(
              observation,
              intent.requested_from,
-             intent.guard_evidence,
+             assessment_guard_evidence(intent),
              Map.put(context, :responsibility, canonical_transition_responsibility(intent))
            ),
          true <- fresh_context_assessment_acceptable?(assessment, intent),
@@ -1316,7 +1499,8 @@ defmodule SymphonyElixir.TransitionCoordinator do
              intent,
              source_context,
              transition_guard_evidence(source_context, intent, assessment)
-           ) do
+           ),
+         guard_evidence <- sanitize_transition_guard_evidence(intent, guard_evidence) do
       {:ok,
        source_context
        |> Map.put(:pre_assessment_evidence, assessment)
@@ -1357,8 +1541,23 @@ defmodule SymphonyElixir.TransitionCoordinator do
           end
       end
 
-    normalize_guard_evidence(base_evidence)
+    sanitize_transition_guard_evidence(intent, base_evidence)
   end
+
+  defp assessment_guard_evidence(%SemanticTransitionIntent{} = intent) do
+    sanitize_transition_guard_evidence(intent, intent.guard_evidence)
+  end
+
+  defp sanitize_transition_guard_evidence(
+         %SemanticTransitionIntent{requested_from: :ready, requested_to: :in_progress},
+         evidence
+       ) do
+    evidence
+    |> normalize_guard_evidence()
+    |> strip_dispatch_guard_lookalikes()
+  end
+
+  defp sanitize_transition_guard_evidence(_intent, evidence), do: normalize_guard_evidence(evidence)
 
   defp normalize_guard_evidence(evidence) when is_list(evidence), do: evidence
   defp normalize_guard_evidence(evidence) when is_map(evidence), do: [evidence]
@@ -1374,13 +1573,16 @@ defmodule SymphonyElixir.TransitionCoordinator do
   defp fresh_assessment(observation, prior_state, evidence, context) do
     contract = Map.get(context, :provider_project_contract)
 
-    assessment_context = %{
-      provider_project_contract: contract,
-      subject: {:work_item, observation.work_item_id},
-      responsibility: Map.get(context, :responsibility),
-      runtime_attempt_id: Map.get(context, :runtime_attempt_id, :transition_coordinator),
-      lineage_generation: Map.get(context, :lineage_generation, 0)
-    }
+    assessment_context =
+      context
+      |> Map.take([:trusted_route, :transition, :route_fingerprint, :runtime_profile])
+      |> Map.merge(%{
+        provider_project_contract: contract,
+        subject: {:work_item, observation.work_item_id},
+        responsibility: Map.get(context, :responsibility),
+        runtime_attempt_id: Map.get(context, :runtime_attempt_id, :transition_coordinator),
+        lineage_generation: Map.get(context, :lineage_generation, 0)
+      })
 
     assessment = LifecycleAssessment.assess(observation, prior_state, evidence, assessment_context)
     {:ok, assessment}
@@ -1446,8 +1648,20 @@ defmodule SymphonyElixir.TransitionCoordinator do
       provider_project_contract: Map.get(context, :provider_project_contract),
       post_contract_fingerprint: contract_fingerprint(Map.get(context, :provider_project_contract)),
       work_item: Map.get(context, :work_item),
+      assessment_context: verification_assessment_context(observation, context),
       context_token: Map.get(context, :context_token)
     }
+  end
+
+  defp verification_assessment_context(%ProviderObservation{} = observation, context) do
+    context
+    |> Map.take([:trusted_route, :transition, :route_fingerprint, :runtime_profile])
+    |> Map.merge(%{
+      subject: {:work_item, observation.work_item_id},
+      responsibility: Map.get(context, :responsibility),
+      runtime_attempt_id: Map.get(context, :runtime_attempt_id),
+      lineage_generation: Map.get(context, :lineage_generation)
+    })
   end
 
   defp classify_default_verification(attempt, context, assessment, evidence) do
@@ -1531,7 +1745,8 @@ defmodule SymphonyElixir.TransitionCoordinator do
            assessment: %LifecycleAssessment{} = assessment,
            post_observation_evidence: %ProviderObservation{} = observation,
            provider_project_contract: %ProviderProjectContract{} = contract,
-           work_item: %WorkItem{} = prior
+           work_item: %WorkItem{} = prior,
+           assessment_context: assessment_context
          }
        ) do
     issue = %Issue{
@@ -1571,6 +1786,7 @@ defmodule SymphonyElixir.TransitionCoordinator do
       prior_validated_lifecycle_state: attempt.requested_from,
       prior_authority_disposition: prior.authority_disposition,
       evidence: projected_evidence,
+      assessment_context: assessment_context,
       provider_project_contract: contract
     })
   end

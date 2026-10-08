@@ -20,22 +20,35 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
 
   alias SymphonyElixir.WorkControl.WorkItem
 
-  test "executes one prepared transition and verifies it without resubmitting" do
+  test "a bare incoming dispatch_guard cannot authorize Ready to In Progress" do
     test_pid = self()
+
+    route = runtime_route(%Issue{id: "work-1", state: "Ready"})
 
     {:ok, intent} =
       SemanticTransitionIntent.new(%{
         work_item_id: "work-1",
         requested_from: :ready,
         requested_to: :in_progress,
-        responsibility: "symphony",
+        responsibility: "implementation",
+        runtime_attempt_id: "runtime-bare-dispatch",
+        lineage_generation: "lineage-bare-dispatch",
         guard_evidence: [%{class: :mechanical_guard, name: :dispatch_guard}]
       })
 
     {:ok, coordinator} =
       TransitionCoordinator.start_link(
         name: nil,
-        load_context: fn ^intent -> {:ok, context()} end,
+        load_context: fn ^intent ->
+          {:ok,
+           Map.merge(context(), %{
+             current_state: :ready,
+             route: route,
+             route_fingerprint: route.fingerprint,
+             runtime_profile: route.profile_name,
+             guard_evidence: intent.guard_evidence
+           })}
+        end,
         submit: fn _attempt, _context ->
           send(test_pid, :submitted)
           {:ok, %{status: 204}}
@@ -44,10 +57,168 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
         require_durable?: false
       )
 
-    assert {:ok, attempt} = TransitionCoordinator.request_transition(coordinator, intent)
+    assert {:ok, attempt} = request_transition(coordinator, intent, route: route)
+    assert attempt.state == :rejected
+    assert attempt.outcome_reason == :required_guard_missing
+    refute_received :submitted
+  end
+
+  test "fresh dispatch provenance replaces incoming lookalikes and retains other history" do
+    test_pid = self()
+    route = runtime_route(%Issue{id: "work-1", state: "Ready"})
+    identity = runtime_identity("runtime-current-dispatch", "lineage-current-dispatch")
+    fresh_dispatch = dispatch_guard(route, identity)
+    forged_dispatch = %{fresh_dispatch | runtime_attempt_id: "runtime-forged-dispatch"}
+    historical_guard = %{class: :mechanical_guard, name: :historical_guard, outcome: :verified}
+
+    {:ok, intent} =
+      SemanticTransitionIntent.new(%{
+        work_item_id: "work-1",
+        requested_from: :ready,
+        requested_to: :in_progress,
+        responsibility: "implementation",
+        runtime_attempt_id: identity.runtime_attempt_id,
+        lineage_generation: identity.lineage_generation,
+        guard_evidence: [forged_dispatch]
+      })
+
+    fresh_context =
+      Map.merge(context(), %{
+        current_state: :ready,
+        route: route,
+        route_fingerprint: route.fingerprint,
+        runtime_profile: route.profile_name,
+        runtime_attempt_id: identity.runtime_attempt_id,
+        lineage_generation: identity.lineage_generation,
+        responsibility: "implementation",
+        guard_evidence: [historical_guard, fresh_dispatch],
+        dispatch_authority_evidence: fresh_dispatch
+      })
+
+    {:ok, coordinator} =
+      TransitionCoordinator.start_link(
+        name: nil,
+        load_context: fn _intent -> {:ok, fresh_context} end,
+        submit: fn attempt, _context ->
+          send(test_pid, {:submitted, attempt})
+          {:ok, %{status: 204}}
+        end,
+        verify: fn _attempt, _context -> {:verified, verified_context()} end,
+        require_durable?: false
+      )
+
+    assert {:ok, attempt} = request_transition(coordinator, intent, route: route)
     assert attempt.state == :verified
-    assert attempt.provider_ack_status == {:http, 204}
-    assert_received :submitted
+    assert_received {:submitted, submitted_attempt}
+    assert submitted_attempt.guard_evidence == [historical_guard, fresh_dispatch]
+    assert Enum.count(submitted_attempt.guard_evidence, &match?(%{name: :dispatch_guard}, &1)) == 1
+    refute Enum.any?(submitted_attempt.guard_evidence, &(&1 == forged_dispatch))
+    GenServer.stop(coordinator)
+  end
+
+  test "mismatched fresh dispatch provenance fails before provider submission" do
+    test_pid = self()
+    route = runtime_route(%Issue{id: "work-1", state: "Ready"})
+    identity = runtime_identity("runtime-current-dispatch", "lineage-current-dispatch")
+    valid_dispatch = dispatch_guard(route, identity)
+
+    for forged_dispatch <- [
+          %{valid_dispatch | runtime_attempt_id: "runtime-stale"},
+          %{valid_dispatch | lineage_generation: "lineage-stale"},
+          %{valid_dispatch | route_fingerprint: "sha256:wrong-route"},
+          %{valid_dispatch | runtime_profile: "wrong-profile"},
+          %{valid_dispatch | responsibility: "review"},
+          %{valid_dispatch | transition: {:ready, :in_review}},
+          %{valid_dispatch | subject: {:work_item, "foreign-work-item"}}
+        ] do
+      {:ok, intent} =
+        SemanticTransitionIntent.new(%{
+          work_item_id: "work-1",
+          requested_from: :ready,
+          requested_to: :in_progress,
+          responsibility: "implementation",
+          runtime_attempt_id: identity.runtime_attempt_id,
+          lineage_generation: identity.lineage_generation,
+          guard_evidence: []
+        })
+
+      fresh_context =
+        Map.merge(context(), %{
+          current_state: :ready,
+          route: route,
+          route_fingerprint: route.fingerprint,
+          runtime_profile: route.profile_name,
+          runtime_attempt_id: identity.runtime_attempt_id,
+          lineage_generation: identity.lineage_generation,
+          responsibility: "implementation",
+          guard_evidence: [],
+          dispatch_authority_evidence: forged_dispatch
+        })
+
+      {:ok, coordinator} =
+        TransitionCoordinator.start_link(
+          name: nil,
+          load_context: fn _intent -> {:ok, fresh_context} end,
+          submit: fn _attempt, _context ->
+            send(test_pid, :submitted)
+            {:ok, %{status: 204}}
+          end,
+          require_durable?: false
+        )
+
+      assert {:ok, %{state: :rejected, outcome_reason: :required_guard_missing}} =
+               request_transition(coordinator, intent, route: route)
+
+      refute_received :submitted
+      GenServer.stop(coordinator)
+    end
+  end
+
+  test "caller route cannot replace the missing current Orchestrator route" do
+    test_pid = self()
+    route = runtime_route(%Issue{id: "work-1", state: "Ready"})
+    identity = runtime_identity("runtime-current-dispatch", "lineage-current-dispatch")
+
+    {:ok, intent} =
+      SemanticTransitionIntent.new(%{
+        work_item_id: "work-1",
+        requested_from: :ready,
+        requested_to: :in_progress,
+        responsibility: "implementation",
+        runtime_attempt_id: identity.runtime_attempt_id,
+        lineage_generation: identity.lineage_generation,
+        guard_evidence: []
+      })
+
+    fresh_context =
+      context()
+      |> Map.merge(%{
+        route: route,
+        route_fingerprint: route.fingerprint,
+        runtime_profile: route.profile_name,
+        runtime_attempt_id: identity.runtime_attempt_id,
+        lineage_generation: identity.lineage_generation,
+        responsibility: identity.responsibility,
+        dispatch_authority_evidence: dispatch_guard(route, identity)
+      })
+      |> Map.delete(:route)
+
+    {:ok, coordinator} =
+      TransitionCoordinator.start_link(
+        name: nil,
+        load_context: fn _intent -> {:ok, fresh_context} end,
+        submit: fn _attempt, _context ->
+          send(test_pid, :submitted)
+          {:ok, %{status: 204}}
+        end,
+        require_durable?: false
+      )
+
+    assert {:ok, %{state: :rejected, outcome_reason: :required_guard_missing}} =
+             request_transition(coordinator, intent, route: route)
+
+    refute_received :submitted
+    GenServer.stop(coordinator)
   end
 
   test "refuses a provider mutation when no durable ledger is available" do
@@ -68,7 +239,7 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
     assert {:ok, intent} = SemanticTransitionIntent.new(intent_attrs())
 
     assert {:error, :transitions_disabled} =
-             TransitionCoordinator.request_transition(coordinator, intent)
+             request_transition(coordinator, intent)
 
     refute_received :submitted
   end
@@ -78,13 +249,13 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
     unavailable_server = String.to_atom("missing-transition-coordinator-#{System.unique_integer([:positive])}")
 
     assert {:error, :invalid_request_options} =
-             TransitionCoordinator.request_transition(unavailable_server, intent, :invalid_options)
+             request_transition(unavailable_server, intent, :invalid_options)
 
     assert {:error, :coordinator_unavailable} =
-             TransitionCoordinator.request_transition(unavailable_server, intent)
+             request_transition(unavailable_server, intent)
 
     assert {:error, :coordinator_unavailable} =
-             TransitionCoordinator.request_transition(unavailable_server, intent)
+             request_transition(unavailable_server, intent)
 
     assert {:error, :coordinator_unavailable} =
              TransitionCoordinator.list_reconciliation_candidates(unavailable_server)
@@ -124,7 +295,7 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
     assert {:error, {:reconciliation_marker, :invalid_marker_attributes}} =
              TransitionCoordinator.reconcile_candidate(coordinator, %{}, %{})
 
-    assert {:error, :transition_in_progress} = TransitionCoordinator.request_transition(coordinator, intent)
+    assert {:error, :transition_in_progress} = request_transition(coordinator, intent)
     GenServer.stop(coordinator)
   end
 
@@ -136,7 +307,7 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
     invalid = %{valid | requested_to: :done}
 
     assert {:error, {:rejected, :invalid_transition}} =
-             TransitionCoordinator.request_transition(coordinator, invalid)
+             request_transition(coordinator, invalid)
   end
 
   test "does not start with an unreadable attempt ledger" do
@@ -166,7 +337,7 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
              )
 
     {:ok, intent} = SemanticTransitionIntent.new(intent_attrs())
-    assert {:error, :transitions_disabled} = TransitionCoordinator.request_transition(coordinator, intent)
+    assert {:error, :transitions_disabled} = request_transition(coordinator, intent)
 
     refute_received :submitted
   end
@@ -232,7 +403,7 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
       )
 
     assert {:ok, %{state: :rejected}} =
-             TransitionCoordinator.request_transition(coordinator, %{
+             request_transition(coordinator, %{
                work_item_id: "work-1",
                requested_from: :ready,
                requested_to: :in_progress,
@@ -261,7 +432,7 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
       )
 
     {:ok, intent} = SemanticTransitionIntent.new(intent_attrs())
-    assert {:ok, %{state: :conflict}} = TransitionCoordinator.request_transition(coordinator, intent)
+    assert {:ok, %{state: :conflict}} = request_transition(coordinator, intent)
     refute_received :submitted
   end
 
@@ -269,7 +440,7 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
     cases = [
       {:context_unavailable, {:error, :transport}, :provider_failed},
       {:missing_dependency, {:ok, Map.delete(context(), :dependency_decision)}, :rejected},
-      {:missing_guard, {:ok, Map.put(context(), :guard_evidence, [])}, :rejected},
+      {:missing_guard, {:ok, context() |> Map.put(:guard_evidence, []) |> Map.put(:dispatch_authority_evidence, nil)}, :rejected},
       {:non_canonical_source, {:ok, Map.put(context(), :current_state, "Ready")}, :rejected},
       {:contract_drift, {:ok, Map.put(context(), :provider_contract_fingerprint, "sha256:old")}, :rejected},
       {:dependency_denied, {:ok, Map.put(context(), :dependency_decision, %{allowed?: false})}, :rejected},
@@ -293,7 +464,7 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
         )
 
       {:ok, intent} = SemanticTransitionIntent.new(intent_attrs())
-      assert {:ok, %{state: ^expected_state}} = TransitionCoordinator.request_transition(coordinator, intent)
+      assert {:ok, %{state: ^expected_state}} = request_transition(coordinator, intent)
       refute_received :submitted
     end
   end
@@ -309,7 +480,7 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
       )
 
     assert {:ok, %{state: :rejected}} =
-             TransitionCoordinator.request_transition(coordinator, intent_attrs())
+             request_transition(coordinator, intent_attrs())
   end
 
   test "rejects a target missing from the trusted project contract" do
@@ -330,7 +501,7 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
       )
 
     {:ok, intent} = SemanticTransitionIntent.new(intent_attrs())
-    assert {:ok, %{state: :rejected}} = TransitionCoordinator.request_transition(coordinator, intent)
+    assert {:ok, %{state: :rejected}} = request_transition(coordinator, intent)
     refute_received :submitted
   end
 
@@ -359,11 +530,11 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
       )
 
     assert {:ok, intent} = SemanticTransitionIntent.new(intent_attrs())
-    assert {:ok, attempt} = TransitionCoordinator.request_transition(coordinator, intent)
+    assert {:ok, attempt} = request_transition(coordinator, intent)
     assert attempt.state == :indeterminate
     assert_received :submitted
 
-    assert {:error, :transition_fenced} = TransitionCoordinator.request_transition(coordinator, intent)
+    assert {:error, :transition_fenced} = request_transition(coordinator, intent)
     refute_received :submitted
   end
 
@@ -443,7 +614,11 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
     runtime_ledger = :sys.get_state(orchestrator).attempt_ledger
     assert %AttemptLedger{} = runtime_ledger
 
-    {:ok, old_runtime_record} = AttemptLedger.begin_attempt(runtime_ledger, issue.id)
+    route = runtime_route(issue)
+
+    {:ok, old_runtime_record} =
+      AttemptLedger.begin_attempt(runtime_ledger, issue.id, route_fingerprint: route.fingerprint)
+
     old_identity = runtime_identity("runtime-old", old_runtime_record.lineage_id)
     {:ok, _old_runtime_record} = AttemptLedger.bind_runtime_attempt(runtime_ledger, issue.id, old_identity)
 
@@ -481,10 +656,8 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
         })
       )
 
-    route = runtime_route(issue)
-
     assert {:ok, %{state: :indeterminate} = old_attempt} =
-             TransitionCoordinator.request_transition(coordinator, old_intent, route: route)
+             request_transition(coordinator, old_intent, route: route)
 
     assert Agent.get(submissions, & &1) == 1
     assert {:ok, [candidate]} = TransitionCoordinator.list_reconciliation_candidates(coordinator)
@@ -492,14 +665,17 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
 
     assert :ok = AttemptLedger.release_authority_fence(runtime_ledger, issue.id, old_identity)
     assert :ok = AttemptLedger.clear_in_flight(runtime_ledger, issue.id)
-    {:ok, new_runtime_record} = AttemptLedger.begin_attempt(runtime_ledger, issue.id)
+
+    {:ok, new_runtime_record} =
+      AttemptLedger.begin_attempt(runtime_ledger, issue.id, route_fingerprint: route.fingerprint)
+
     new_identity = runtime_identity("runtime-new", new_runtime_record.lineage_id)
     {:ok, _new_runtime_record} = AttemptLedger.bind_runtime_attempt(runtime_ledger, issue.id, new_identity)
 
     replace_runtime_context(orchestrator, issue, work_item, provider_contract, new_identity)
 
     assert {:error, :transition_fenced} =
-             TransitionCoordinator.request_transition(coordinator, old_intent, route: route)
+             request_transition(coordinator, old_intent, route: route)
 
     assert Agent.get(submissions, & &1) == 1
 
@@ -511,11 +687,13 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
                "old-runtime-reconciled"
              )
 
-    assert {:ok, %{state: :provider_failed} = stale_attempt} =
-             TransitionCoordinator.request_transition(coordinator, old_intent, route: route)
+    submissions_before_stale_attempt = Agent.get(submissions, & &1)
 
-    assert stale_attempt.outcome_reason.reason == {:context_unavailable, :stale_runtime_attempt}
-    assert Agent.get(submissions, & &1) == 1
+    assert {:ok, %{state: :rejected} = stale_attempt} =
+             request_transition(coordinator, old_intent, route: route)
+
+    assert stale_attempt.outcome_reason == {:context_unavailable, :stale_runtime_attempt}
+    assert Agent.get(submissions, & &1) == submissions_before_stale_attempt
 
     assert {:ok, %{in_flight: true, authority_fence: %{state: :bound, runtime_attempt: ^new_identity}}} =
              AttemptLedger.current(runtime_ledger, issue.id)
@@ -530,7 +708,7 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
       )
 
     assert {:ok, %{state: :indeterminate}} =
-             TransitionCoordinator.request_transition(coordinator, current_intent, route: route)
+             request_transition(coordinator, current_intent, route: route)
 
     assert Agent.get(submissions, & &1) == 2
 
@@ -563,12 +741,12 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
 
     {:ok, first} = TransitionCoordinator.start_link(coordinator_opts)
     {:ok, intent} = SemanticTransitionIntent.new(intent_attrs())
-    assert {:ok, %{state: :indeterminate}} = TransitionCoordinator.request_transition(first, intent)
+    assert {:ok, %{state: :indeterminate}} = request_transition(first, intent)
     assert Agent.get(submissions, & &1) == 1
     assert :ok = GenServer.stop(first)
 
     {:ok, second} = TransitionCoordinator.start_link(coordinator_opts)
-    assert {:error, :transition_fenced} = TransitionCoordinator.request_transition(second, intent)
+    assert {:error, :transition_fenced} = request_transition(second, intent)
     assert Agent.get(submissions, & &1) == 1
   end
 
@@ -614,7 +792,7 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
         end
       )
 
-    assert {:error, :transition_fenced} = TransitionCoordinator.request_transition(coordinator, intent)
+    assert {:error, :transition_fenced} = request_transition(coordinator, intent)
     assert Agent.get(submissions, & &1) == 0
   end
 
@@ -725,11 +903,11 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
         require_durable?: false
       )
 
-    first = Task.async(fn -> TransitionCoordinator.request_transition(coordinator, intent) end)
+    first = Task.async(fn -> request_transition(coordinator, intent) end)
     assert_receive :first_submit_started
 
     assert {:error, :transition_in_progress} =
-             Task.await(Task.async(fn -> TransitionCoordinator.request_transition(coordinator, intent) end))
+             Task.await(Task.async(fn -> request_transition(coordinator, intent) end))
 
     send(coordinator, :release_first_submit)
     assert {:ok, %{state: :verified}} = Task.await(first)
@@ -772,10 +950,10 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
     {:ok, intent} = SemanticTransitionIntent.new(intent_attrs())
 
     assert {:error, {:durability_failed, {:ledger_write_failed, :disk_full}}} =
-             TransitionCoordinator.request_transition(coordinator, intent)
+             request_transition(coordinator, intent)
 
     assert_received :submitted
-    assert {:error, :transition_fenced} = TransitionCoordinator.request_transition(coordinator, intent)
+    assert {:error, :transition_fenced} = request_transition(coordinator, intent)
     refute_received :submitted
   end
 
@@ -793,10 +971,10 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
     {:ok, intent} = SemanticTransitionIntent.new(intent_attrs())
 
     assert {:error, {:suspension_failed, :authority_unavailable}} =
-             TransitionCoordinator.request_transition(coordinator, intent)
+             request_transition(coordinator, intent)
 
     assert {:error, :transitions_disabled} =
-             TransitionCoordinator.request_transition(coordinator, intent)
+             request_transition(coordinator, intent)
   end
 
   test "a Prepared ledger write failure issues zero provider mutations" do
@@ -818,7 +996,7 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
       )
 
     {:ok, intent} = SemanticTransitionIntent.new(intent_attrs())
-    assert {:error, _reason} = TransitionCoordinator.request_transition(coordinator, intent)
+    assert {:error, _reason} = request_transition(coordinator, intent)
     refute_received :submitted
   end
 
@@ -841,7 +1019,7 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
       )
 
     {:ok, intent} = SemanticTransitionIntent.new(intent_attrs())
-    assert {:error, _reason} = TransitionCoordinator.request_transition(coordinator, intent)
+    assert {:error, _reason} = request_transition(coordinator, intent)
     refute_received :submitted
   end
 
@@ -862,7 +1040,7 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
       )
 
     {:ok, intent} = SemanticTransitionIntent.new(intent_attrs())
-    assert {:ok, %{state: :provider_failed}} = TransitionCoordinator.request_transition(coordinator, intent)
+    assert {:ok, %{state: :provider_failed}} = request_transition(coordinator, intent)
     assert_received {:verification_result, true}
   end
 
@@ -893,7 +1071,7 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
       )
 
     {:ok, intent} = SemanticTransitionIntent.new(intent_attrs())
-    assert {:ok, %{state: :conflict}} = TransitionCoordinator.request_transition(coordinator, intent)
+    assert {:ok, %{state: :conflict}} = request_transition(coordinator, intent)
   end
 
   test "never turns a weak verification callback into Verified" do
@@ -908,7 +1086,7 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
       )
 
     {:ok, intent} = SemanticTransitionIntent.new(intent_attrs())
-    assert {:ok, %{state: :indeterminate}} = TransitionCoordinator.request_transition(coordinator, intent)
+    assert {:ok, %{state: :indeterminate}} = request_transition(coordinator, intent)
   end
 
   test "rejects malformed intents and unavailable coordinator calls" do
@@ -920,13 +1098,13 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
         load_context: fn _intent -> {:ok, context()} end
       )
 
-    assert {:error, {:rejected, :invalid_intent}} = TransitionCoordinator.request_transition(coordinator, :invalid)
+    assert {:error, {:rejected, :invalid_intent}} = request_transition(coordinator, :invalid)
 
     assert {:error, {:rejected, :invalid_intent_field}} =
-             TransitionCoordinator.request_transition(coordinator, %{unexpected: true})
+             request_transition(coordinator, %{unexpected: true})
 
     assert :ok = GenServer.stop(coordinator)
-    assert {:error, :coordinator_unavailable} = TransitionCoordinator.request_transition(coordinator, intent_attrs())
+    assert {:error, :coordinator_unavailable} = request_transition(coordinator, intent_attrs())
   end
 
   test "initialization fails closed for invalid callbacks and ledgers" do
@@ -954,7 +1132,7 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
              )
 
     assert {:ok, %{state: :provider_failed}} =
-             TransitionCoordinator.request_transition(coordinator, intent_attrs())
+             request_transition(coordinator, intent_attrs())
   end
 
   test "normalizes callbacks with unsupported arities" do
@@ -970,7 +1148,7 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
       )
 
     assert {:ok, %{state: :indeterminate}} =
-             TransitionCoordinator.request_transition(coordinator, intent_attrs())
+             request_transition(coordinator, intent_attrs())
   end
 
   test "accepts structured verification responses wrapped in an ok tuple" do
@@ -986,7 +1164,7 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
       )
 
     assert {:ok, %{state: :verified}} =
-             TransitionCoordinator.request_transition(coordinator, intent_attrs())
+             request_transition(coordinator, intent_attrs())
   end
 
   test "fails closed when required durability is lost after initialization" do
@@ -1004,7 +1182,7 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
     end)
 
     assert {:error, {:durability_failed, :ledger_unavailable}} =
-             TransitionCoordinator.request_transition(coordinator, intent_attrs())
+             request_transition(coordinator, intent_attrs())
   end
 
   test "reports a configured durable ledger opening failure when durability is required" do
@@ -1041,7 +1219,7 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
         )
 
       assert {:ok, %{state: :provider_failed}} =
-               TransitionCoordinator.request_transition(coordinator, intent_attrs())
+               request_transition(coordinator, intent_attrs())
     end
 
     GenServer.stop(unavailable)
@@ -1061,7 +1239,7 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
       )
 
     assert {:ok, %{state: :provider_failed}} =
-             TransitionCoordinator.request_transition(coordinator, intent_attrs())
+             request_transition(coordinator, intent_attrs())
   end
 
   test "fails closed when verification durability fails after the submission fence" do
@@ -1079,7 +1257,7 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
         )
 
       assert {:error, {:durability_failed, {:ledger_sync_failed, :sync_failed}}} =
-               TransitionCoordinator.request_transition(coordinator, intent_attrs())
+               request_transition(coordinator, intent_attrs())
 
       GenServer.stop(coordinator)
       Agent.stop(counter)
@@ -1102,7 +1280,7 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
     :sys.replace_state(coordinator, fn state -> %{state | suspend: nil} end)
 
     assert {:ok, %{state: :indeterminate}} =
-             TransitionCoordinator.request_transition(coordinator, intent_attrs())
+             request_transition(coordinator, intent_attrs())
   end
 
   test "fences a definite provider failure carrying a durability reason" do
@@ -1118,7 +1296,7 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
       )
 
     assert {:ok, %{state: :indeterminate}} =
-             TransitionCoordinator.request_transition(coordinator, intent_attrs())
+             request_transition(coordinator, intent_attrs())
   end
 
   test "reports terminal rejection when its durable record cannot be synced" do
@@ -1133,7 +1311,7 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
       )
 
     assert {:error, {:durability_failed, {:ledger_sync_failed, :sync_failed}}} =
-             TransitionCoordinator.request_transition(coordinator, intent_attrs())
+             request_transition(coordinator, intent_attrs())
 
     GenServer.stop(coordinator)
     Agent.stop(counter)
@@ -1164,7 +1342,7 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
           suspend: fn _work_item_id, _reason, _attempt -> :ok end
         )
 
-      assert {:ok, %{state: :indeterminate}} = TransitionCoordinator.request_transition(coordinator, intent_attrs())
+      assert {:ok, %{state: :indeterminate}} = request_transition(coordinator, intent_attrs())
       GenServer.stop(coordinator)
     end
 
@@ -1179,7 +1357,7 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
         suspend: fn _work_item_id, _reason, _attempt -> :ok end
       )
 
-    assert {:ok, %{state: :indeterminate}} = TransitionCoordinator.request_transition(coordinator, intent_attrs())
+    assert {:ok, %{state: :indeterminate}} = request_transition(coordinator, intent_attrs())
   end
 
   test "fences a contradictory verified envelope when its authoritative assessment is Conflict" do
@@ -1215,10 +1393,10 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
         end
       )
 
-    assert {:ok, %{state: :conflict}} = TransitionCoordinator.request_transition(coordinator, intent_attrs())
+    assert {:ok, %{state: :conflict}} = request_transition(coordinator, intent_attrs())
     assert_received {:suspended, :conflict}
     assert Agent.get(submissions, & &1) == 1
-    assert {:error, :transition_fenced} = TransitionCoordinator.request_transition(coordinator, intent_attrs())
+    assert {:error, :transition_fenced} = request_transition(coordinator, intent_attrs())
     assert Agent.get(submissions, & &1) == 1
   end
 
@@ -1234,7 +1412,7 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
         suspend: fn _work_item_id, _reason, _attempt -> {:ok, :suspended} end
       )
 
-    assert {:ok, %{state: :indeterminate}} = TransitionCoordinator.request_transition(accepted, intent_attrs())
+    assert {:ok, %{state: :indeterminate}} = request_transition(accepted, intent_attrs())
     GenServer.stop(accepted)
 
     for suspend_result <- [:unavailable, :unexpected] do
@@ -1250,7 +1428,7 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
         )
 
       assert {:error, {:suspension_failed, _reason}} =
-               TransitionCoordinator.request_transition(coordinator, intent_attrs())
+               request_transition(coordinator, intent_attrs())
 
       GenServer.stop(coordinator)
     end
@@ -1268,7 +1446,7 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
         suspend: fn _work_item_id -> :ok end
       )
 
-    assert {:ok, %{state: :indeterminate}} = TransitionCoordinator.request_transition(one_arg, intent_attrs())
+    assert {:ok, %{state: :indeterminate}} = request_transition(one_arg, intent_attrs())
     GenServer.stop(one_arg)
 
     {:ok, zero_arg} =
@@ -1282,7 +1460,7 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
         suspend: fn -> :ok end
       )
 
-    assert {:ok, %{state: :indeterminate}} = TransitionCoordinator.request_transition(zero_arg, intent_attrs())
+    assert {:ok, %{state: :indeterminate}} = request_transition(zero_arg, intent_attrs())
     GenServer.stop(zero_arg)
 
     {:ok, failing} =
@@ -1293,7 +1471,7 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
         load_context: fn _intent -> raise "load failed" end
       )
 
-    assert {:ok, %{state: :provider_failed}} = TransitionCoordinator.request_transition(failing, intent_attrs())
+    assert {:ok, %{state: :provider_failed}} = request_transition(failing, intent_attrs())
     GenServer.stop(failing)
   end
 
@@ -1307,7 +1485,7 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
       )
 
     assert {:ok, %{state: :provider_failed}} =
-             TransitionCoordinator.request_transition(malformed_context, intent_attrs())
+             request_transition(malformed_context, intent_attrs())
 
     GenServer.stop(malformed_context)
 
@@ -1320,7 +1498,7 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
         suspend: fn _work_item_id, _reason, _attempt -> :ok end
       )
 
-    assert {:ok, %{state: :rejected}} = TransitionCoordinator.request_transition(malformed_target, intent_attrs())
+    assert {:ok, %{state: :rejected}} = request_transition(malformed_target, intent_attrs())
     GenServer.stop(malformed_target)
 
     for verification <- [{:conflict, :known, :non_commit}, {:provider_failed, :definite, :non_commit}] do
@@ -1336,7 +1514,7 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
         )
 
       assert {:ok, %{state: :indeterminate}} =
-               TransitionCoordinator.request_transition(coordinator, intent_attrs())
+               request_transition(coordinator, intent_attrs())
 
       GenServer.stop(coordinator)
     end
@@ -1351,7 +1529,7 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
       )
 
     assert {:error, {:rejected, {:new_attempt_failed, :invalid_timestamp}}} =
-             TransitionCoordinator.request_transition(bad_clock, intent_attrs())
+             request_transition(bad_clock, intent_attrs())
 
     GenServer.stop(bad_clock)
   end
@@ -1372,10 +1550,38 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
           suspend: fn _work_item_id, _reason, _attempt -> :ok end
         )
 
-      assert {:ok, %{state: ^expected}} = TransitionCoordinator.request_transition(coordinator, intent_attrs())
+      assert {:ok, %{state: ^expected}} = request_transition(coordinator, intent_attrs())
       refute_received :submitted
       GenServer.stop(coordinator)
     end
+  end
+
+  defp request_transition(server, intent, opts \\ [])
+
+  defp request_transition(server, intent, opts) when is_map(intent) and is_list(opts) do
+    responsibility = Map.get(intent, :responsibility)
+    requested_from = Map.get(intent, :requested_from)
+    work_item_id = Map.get(intent, :work_item_id)
+
+    opts =
+      if Keyword.has_key?(opts, :route) or responsibility != "implementation" or
+           is_nil(requested_from) or not is_binary(work_item_id) do
+        opts
+      else
+        route =
+          runtime_route(%Issue{
+            id: work_item_id,
+            state: WorkflowLifecycle.display(requested_from)
+          })
+
+        Keyword.put(opts, :route, route)
+      end
+
+    TransitionCoordinator.request_transition(server, intent, opts)
+  end
+
+  defp request_transition(server, intent, opts) do
+    TransitionCoordinator.request_transition(server, intent, opts)
   end
 
   defp intent_attrs do
@@ -1383,13 +1589,26 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
       work_item_id: "work-1",
       requested_from: :ready,
       requested_to: :in_progress,
-      responsibility: "symphony",
-      guard_evidence: [%{class: :mechanical_guard, name: :dispatch_guard}]
+      responsibility: "implementation",
+      runtime_attempt_id: "runtime-coordinator-test",
+      lineage_generation: "lineage-coordinator-test",
+      guard_evidence: []
     }
   end
 
   defp context do
+    route = runtime_route(%Issue{id: "work-1", state: "Ready"})
+    identity = runtime_identity("runtime-coordinator-test", "lineage-coordinator-test")
+
     %{
+      current_state: :ready,
+      route: route,
+      route_fingerprint: route.fingerprint,
+      runtime_profile: route.profile_name,
+      runtime_attempt_id: identity.runtime_attempt_id,
+      lineage_generation: identity.lineage_generation,
+      responsibility: identity.responsibility,
+      dispatch_authority_evidence: dispatch_guard(route, identity),
       provider_project_contract: contract(),
       dependency_decision: %{allowed?: true, dependency_completeness: :complete, dependency_status: :none},
       dependency_epoch_evidence: %{complete?: true}
@@ -1397,12 +1616,30 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
   end
 
   defp runtime_identity(runtime_attempt_id, lineage_generation) do
+    profile = Profile.default_profiles("codex app-server", 20)["builder"]
+
     %Identity{
       runtime_attempt_id: runtime_attempt_id,
       work_item_id: "work-1",
       lineage_generation: lineage_generation,
       responsibility: "implementation",
-      runtime_profile: "implementation"
+      runtime_profile: profile.name
+    }
+  end
+
+  defp dispatch_guard(route, identity) do
+    %{
+      class: :mechanical_guard,
+      name: :dispatch_guard,
+      outcome: :verified,
+      subject: {:work_item, identity.work_item_id},
+      transition: {:ready, :in_progress},
+      responsibility: identity.responsibility,
+      runtime_attempt_id: identity.runtime_attempt_id,
+      lineage_generation: identity.lineage_generation,
+      runtime_profile: route.profile_name,
+      route_fingerprint: route.fingerprint,
+      verified_at: DateTime.utc_now()
     }
   end
 
@@ -1432,6 +1669,11 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
           running:
             Map.put(state.running, issue.id, %{
               profile_name: "implementation",
+              route: runtime_route(issue),
+              route_fingerprint: runtime_route(issue).fingerprint,
+              responsibility: "implementation",
+              containment_status: :active,
+              lifecycle_suspension: nil,
               runtime_attempt: RuntimeAttempt.new(identity, :running)
             })
       }
@@ -1644,7 +1886,7 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
         suspend: fn _work_item_id, _reason, _attempt -> :ok end
       )
 
-    assert {:ok, attempt} = TransitionCoordinator.request_transition(coordinator, intent, route: route)
+    assert {:ok, attempt} = request_transition(coordinator, intent, route: route)
     assert attempt.state == :verified
     assert_received :context_loaded
     assert_received :submitted
