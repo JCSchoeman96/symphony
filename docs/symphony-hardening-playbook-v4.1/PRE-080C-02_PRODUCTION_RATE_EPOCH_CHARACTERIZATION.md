@@ -10,7 +10,7 @@ This document records the production-rate behavior measured by the PRE-080C-02 c
 |---|---|
 | Baseline commit | `c1ecb653fbbb05e8872d67802c2a3d730c2e653e` |
 | Baseline tree | `41365f1580b8e728b5fe86581b404623082be8e8` |
-| Candidate commit | None; changes remain uncommitted |
+| Candidate commit | `34829a513104bc72cdf7dfd96c416fcdd543d24c` |
 | Candidate source and test tree | `cbc614012fa7fc68ffdc6d7e59cd219d39f2e390`; excludes this evidence document |
 
 ## Measurement setup
