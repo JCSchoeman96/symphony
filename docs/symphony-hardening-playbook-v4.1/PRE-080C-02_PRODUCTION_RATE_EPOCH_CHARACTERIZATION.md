@@ -10,12 +10,12 @@ This document records the production-rate behavior measured by the PRE-080C-02 c
 |---|---|
 | Accepted base commit SHA | `c1ecb653fbbb05e8872d67802c2a3d730c2e653e` |
 | Accepted base Git tree | `41365f1580b8e728b5fe86581b404623082be8e8` |
-| Implementation commit SHA | `35a402f7fcd9cf5de6e0c82db72814082e155e39` |
-| Implementation commit Git tree | `b17dec16d4ebcf24eef89cdc0f4f0dbf321bffdd` |
-| Source/test-only Git tree | `025d453c1e27af0d3058e48e2b58bf1e40496a68`; calculated without this evidence document |
+| Implementation commit SHA | `adb78d48b707c7b162f1ad5c0b7f9d4d5e600674` |
+| Implementation commit Git tree | `977b6f902a8b689e342103efdf6d2aa38f324555` |
+| Source/test-only Git tree | `0f9bd630de7ab53314df77ae7d783bfa136c8c6e`; calculated without this evidence document |
 | Pull request | `#37`; open candidate, not accepted |
 
-The implementation commit identifies the scheduler-seam remediation. The source/test-only tree is a separately calculated tree identity and is not a commit or the PR head tree. The final PR head and synthetic merge identities belong in the PR description after the candidate is frozen; they are intentionally not embedded here.
+The implementation commit identifies the scheduler timing-seam and restart-characterization remediation. The source/test-only tree is a separately calculated tree identity and is not a commit or the PR head tree. The final PR head and synthetic merge identities belong in the PR description after the candidate is frozen; they are intentionally not embedded here.
 
 Programme status: `PRE-080C-02 = AUTHORIZED / ACTIVE / NOT ACCEPTED`; `PRE-080C-03 = NOT STARTED`; `PRE-H080C = NOT REACHED`; `H-080C = NOT AUTHORIZED`.
 
@@ -62,7 +62,7 @@ These samples cover a fresh runtime baseline, acquisition task high-water, graph
 - **Webhook identity:** One repeated delivery and one duplicate event identity produced one targeted read. The 1,000-same-item burst coalesced 1,000 indications. A 1,000-distinct-item burst reached the existing 64-entry pending queue, with two targeted tasks and one full epoch in flight. Overflow dirtied the active epoch and a covering acquisition published a current graph. The run recorded 3,138 provider attempts, including 66 targeted starts, and three full epochs total. Scheduler, targeted work, queues, and task-supervisor children drained to zero.
 - **Signalled edits:** Four full epochs ran serially: two published and two were superseded. Three edit indications arrived during acquisition; only one full acquisition ran at a time. The follow-up graph contained the changed `item-5 → item-999` edge and 5,001 edges total. The run recorded 4,096 provider starts and 4,080,000 ms modeled time from initial acquisition, including 3,060,000 ms from the first edit to current publication.
 - **Provider mutation:** Changing the item set between opening and closing enumeration returned `{:error, :node_set_changed}` after three attempts and published no graph.
-- **Restart:** Stopping after the first 60 starts discarded partial work. The restarted runtime began with empty scheduler history and an unavailable graph; a seeded candidate remained undispatchable. It completed a fresh 1,024-attempt epoch, published a current graph, and started the candidate's runner. The provider log contained 1,084 starts, including the abandoned 60.
+- **Restart:** Stopping after the first 60 starts discarded partial work. The restarted runtime began with empty scheduler history and an unavailable graph; a seeded candidate remained undispatchable. It completed a fresh 1,024-attempt epoch, published a current graph, and started the candidate's runner. The provider log contained 1,084 starts, including the abandoned 60. The combined provider history reached 120 starts in one modeled 60,000 ms window: 60 before restart and 60 after. The configured 60-start window is process-local to a continuously running ReadScheduler; restart resets that local history and can exceed the provider's rolling-window density. This measurement does not propose durable pacing state.
 
 ## H-070 scale comparison
 
@@ -74,12 +74,13 @@ The final H-070A run passed with one test and no failures. It recorded 1,020 cal
 
 **`LIMIT FOUND`** — a complete graph is structurally obtainable at the current 10,000-item ceiling, but the configured global rate limit alone leaves dispatch unavailable for at least 170 minutes at that size. The corresponding lower bounds are 17 minutes at 1k and 85 minutes at 5k. Real provider latency, retries, throttling, shared scheduler use, and CPU work can extend them.
 
-The characterized structural envelope remains the existing 10,000-item ceiling, four concurrent attempts, 64 queued reads, and 60 starts per 60 seconds. A dirty event requires a quiet complete acquisition before a current graph is available again. This evidence does not authorize changing those limits or implementing a throughput optimization.
+The characterized structural envelope remains the existing 10,000-item ceiling, four concurrent attempts, 64 queued reads, and 60 starts per 60 seconds for a continuously running ReadScheduler. Restart discards its rolling start history; the measured immediate restart reached 120 provider starts in one modeled 60-second window. A dirty event requires a quiet complete acquisition before a current graph is available again. This evidence does not authorize durable pacing state, changing those limits, or implementing a throughput optimization.
 
 ## Verification
 
 - Production-rate characterization: 13 tests, 0 failures.
-- Scheduler and scheduler-aware Plane client regression: 47 tests, 0 failures.
+- Scheduler regression: 42 tests, 0 failures.
+- Scheduler and scheduler-aware Plane client regression: 49 tests, 0 failures.
 - H-070A scale test: 1 test, 0 failures.
 - Relevant dependency, epoch, webhook, and project-contract tests: 142 tests, 3 failures. All three were AgentRunner runtime-start tests that timed out waiting for the runner-start message; preflight reproduced these failures against baseline.
 - `mix specs.check`, `mix format --check-formatted`, `mix credo --strict`, and `mix dialyzer`: passed.
