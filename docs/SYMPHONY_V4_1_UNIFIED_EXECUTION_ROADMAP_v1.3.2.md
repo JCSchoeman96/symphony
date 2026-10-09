@@ -7,13 +7,18 @@
 
 **v1.3.2 amendment scope:** Preserves prior architecture decisions, records the 2026-10-07 accepted governance baseline through H-080B, points active companion references to Skills Matrix v1.0.2, and clarifies that registry entries do not become repository law by registration. The current status below records later prerequisite acceptance and the PR #35 baseline remediation. This document does not authorize H-080C or future programme implementation.
 
-## Current Governance Baseline
+## GOV-STATE-SYNC input baseline and current programme state
 
-The current accepted protected-main baseline is `84a2fbfdaece47d5dd87ca37c2e25e85afe39880`, tree `799ef67d3c4124e76f37b4e31251b9c974695455`. PR #35 is an accepted non-phase baseline remediation; protected-main `make-all` run `37931419995` succeeded on this exact merge.
+The accepted protected-main identity entering GOV-STATE-SYNC is PR #35's merge. It is an accepted non-phase baseline remediation, verified by successful protected-main `make-all` run `37931419995`.
+
+```text
+GOV_STATE_SYNC_INPUT_BASELINE_SHA = 84a2fbfdaece47d5dd87ca37c2e25e85afe39880
+GOV_STATE_SYNC_INPUT_BASELINE_TREE = 799ef67d3c4124e76f37b4e31251b9c974695455
+```
 
 Effective 2026-10-07, H-070B, REM-HI21, H-I20 remediation, H-080A, and H-080B are **ACCEPTED**. PRE-080C-01 was accepted effective 2026-10-09 at merge `09b72591d33fbe88243bceb584f85fca1f6fc819`, tree `a9ff9606f52c429f58c9ab59c4e8fb11a43f73b6`, after protected-main `make-all` run `37904661908` succeeded. PRE-080C-02 is **AUTHORIZED / ACTIVE / NOT ACCEPTED**. PRE-080C-03 is **PENDING / NOT STARTED**. H-080C is **NOT AUTHORIZED**.
 
-After this governance synchronization is accepted, PRE-080C-02 must be re-pinned or rebased to the then-current accepted `main`, and its candidate-bound evidence must be regenerated before independent review. This synchronization does not count as PRE-080C-03.
+The accepted GOV-STATE-SYNC merge identity is established only after candidate review, human merge, exact merge resolution, protected-main post-merge verification, and Master Governance acceptance. This candidate cannot record its own future accepted merge identity. After those steps, PRE-080C-02 must be re-pinned or rebased to that verified GOV-STATE-SYNC accepted merge, not to the input baseline above, and its candidate-bound evidence must be regenerated before independent review. This synchronization does not count as PRE-080C-03.
 
 
 ## Roadmap Scope Layers
@@ -1373,7 +1378,7 @@ STOP if:
 # 22. Near-Term Development Workflow
 
 ```text
-CURRENT ACCEPTED BASELINE
+GOV-STATE-SYNC INPUT BASELINE
 PR #35 — NON-PHASE BASELINE REMEDIATION
 84a2fbfdaece47d5dd87ca37c2e25e85afe39880 / 799ef67d3c4124e76f37b4e31251b9c974695455
 

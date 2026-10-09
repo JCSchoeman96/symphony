@@ -10,19 +10,19 @@ The 2026-10-05 reconciliation closes the later ledger drift across H-070B, REM-H
 
 Formal acceptance for those five reconciled rows is established by the 2026-10-07 Master Governance adjudication preserved through [the current reconciliation](GOVERNANCE_RECONCILIATION_2026-10-05.md). Those acceptances are effective 2026-10-07 and are not backdated to the historical merge dates.
 
-## Current accepted baseline
+## GOV-STATE-SYNC input baseline
 
-| Branch | Commit | Tree |
+| Baseline context | Commit | Tree |
 |---|---|---|
-| protected `main` | `84a2fbfdaece47d5dd87ca37c2e25e85afe39880` | `799ef67d3c4124e76f37b4e31251b9c974695455` |
+| Accepted protected-main baseline entering GOV-STATE-SYNC | `84a2fbfdaece47d5dd87ca37c2e25e85afe39880` | `799ef67d3c4124e76f37b4e31251b9c974695455` |
 
 ## Current authorization
 
 ```text
 LATEST_ACCEPTED_V4.1_PHASE = H-080B
 LATEST_ACCEPTED_PREREQUISITE = PRE-080C-01
-CURRENT_ACCEPTED_BASELINE_SHA = 84a2fbfdaece47d5dd87ca37c2e25e85afe39880
-CURRENT_ACCEPTED_BASELINE_TREE = 799ef67d3c4124e76f37b4e31251b9c974695455
+GOV_STATE_SYNC_INPUT_BASELINE_SHA = 84a2fbfdaece47d5dd87ca37c2e25e85afe39880
+GOV_STATE_SYNC_INPUT_BASELINE_TREE = 799ef67d3c4124e76f37b4e31251b9c974695455
 PRE-080C-01 = ACCEPTED effective 2026-10-09
 PRE-080C-02 = AUTHORIZED / ACTIVE / NOT ACCEPTED
 PRE-080C-03 = NOT STARTED
@@ -30,7 +30,7 @@ PRE-H080C = NOT REACHED
 H-080C = NOT AUTHORIZED
 ```
 
-PRE-080C-02 is the only currently authorized implementation prerequisite. Its earlier base-bound candidate evidence must be re-established after this governance synchronization is accepted. PRE-080C-03 has not started. H-080C remains unauthorized until the PRE-H080C gate and separate explicit authorization.
+The SHA/tree above identify the accepted protected-main baseline entering GOV-STATE-SYNC after PR #35. The GOV-STATE-SYNC candidate cannot record its own future accepted merge identity. That identity is established only after candidate review, human merge, exact merge resolution, protected-main post-merge verification, and Master Governance acceptance. PRE-080C-02 must then be re-pinned or rebased to that verified GOV-STATE-SYNC accepted merge, not to this input baseline, and its candidate-bound evidence must be regenerated. PRE-080C-02 is the only currently authorized implementation prerequisite. PRE-080C-03 has not started. H-080C remains unauthorized until the PRE-H080C gate and separate explicit authorization.
 
 ## Phase index
 
@@ -73,6 +73,6 @@ PR #35 corrected AgentRunner lifecycle test isolation. It is accepted as a non-p
 
 ## Current summary
 
-Effective 2026-10-07, H-070B is accepted at `b621d6b1663703253da72b3f822c60f509180e5d`. REM-HI21 is accepted at `7ba76fccaacc5789443c685ed6f1d2bee7f04f9c`. The H-I20 CompletionProof remediation is accepted at `e226b14f409c806ff2bc6841b1f6be34746dd128`. H-080A is accepted at `56798754c8f6fd80d7ec53b604800873e339e030`. H-080B is accepted at `0bdd3960947bb2bafd34a7eb92e970eaae07a82a`. PRE-080C-01 is accepted effective 2026-10-09 at merge `09b72591d33fbe88243bceb584f85fca1f6fc819`. PR #35 is an accepted non-phase baseline remediation at current protected-main baseline `84a2fbfdaece47d5dd87ca37c2e25e85afe39880`.
+Effective 2026-10-07, H-070B is accepted at `b621d6b1663703253da72b3f822c60f509180e5d`. REM-HI21 is accepted at `7ba76fccaacc5789443c685ed6f1d2bee7f04f9c`. The H-I20 CompletionProof remediation is accepted at `e226b14f409c806ff2bc6841b1f6be34746dd128`. H-080A is accepted at `56798754c8f6fd80d7ec53b604800873e339e030`. H-080B is accepted at `0bdd3960947bb2bafd34a7eb92e970eaae07a82a`. PRE-080C-01 is accepted effective 2026-10-09 at merge `09b72591d33fbe88243bceb584f85fca1f6fc819`. PR #35 is an accepted non-phase baseline remediation. Its merge `84a2fbfdaece47d5dd87ca37c2e25e85afe39880` / tree `799ef67d3c4124e76f37b4e31251b9c974695455` is the input baseline for GOV-STATE-SYNC, verified by protected-main `make-all` run `37931419995`.
 
 PRE-080C-02 is **AUTHORIZED / ACTIVE / NOT ACCEPTED**. After this governance synchronization is accepted, re-pin or rebase PRE-080C-02 on the then-current accepted `main` and regenerate candidate-bound evidence before independent review. PRE-080C-03 is **NOT STARTED** and PRE-H080C is **NOT REACHED**. H-080C remains **NOT AUTHORIZED**.
