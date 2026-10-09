@@ -1,8 +1,8 @@
 # PRE-080C-01 — Production Evidence Acquisition
 
-**Status:** PRE-080C-01A implementation candidate is in progress on PR #34. Awaiting final exact-candidate verification and independent review. Not accepted for Master Gate.
+**Status:** PRE-080C-01A was replanned and implementation-authorized. Its implementation remains a candidate on PR #34 and is not Master-accepted. Fresh independent review of candidate `0c58525a30ec741486afae1b1ab581051c7485d4` returned `CHANGES_REQUESTED` because context-free `GuardClass` dispatch validation can accept a dispatch guard without trusted context. Remediation and fresh review remain required.
 
-**PR #34 disposition:** Open; do not merge until dispatch ownership is replanned and PRE-080C-01 scope is re-authorized.
+**PR #34 disposition:** Open and unmerged. Do not merge until the review blocker is corrected, a new exact candidate passes required checks, and fresh independent re-review returns `READY_FOR_MASTER_GATE`. H-080C remains unauthorized.
 
 ## Accepted baseline
 
@@ -52,9 +52,9 @@ mix test test/symphony_elixir/plane_agent_tool_test.exs test/symphony_elixir/tra
 
 That was the candidate state at the PRE-080C-01 frozen-plan STOP boundary. The later PRE-080C-01A authorization resumes this exact gap with the corrected incremental scope below; it does not change the historical finding.
 
-## PRE-080C-01A incremental implementation
+## Historical PRE-080C-01A implementation
 
-PRE-080C-01A starts from PR #34 HEAD `4fe17559aad8c67f76e57d5fac5d7efed48e321f`. Its production delta is limited to `orchestrator.ex`, `transition_coordinator.ex`, and `work_control/guard_class.ex`; the existing PRE-080C-01 production, tests, support, and documentation remain part of the baseline.
+PRE-080C-01A was replanned and implementation-authorized after the historical frozen-plan STOP boundary above. Its accepted implementation scope added the changes described below. The text records that authorization and implementation; it does not authorize merging or acceptance after the independent review finding.
 
 Dispatch authority is produced only by the Orchestrator from the current running RuntimeAttempt and the current open, in-flight AttemptLedger record with an exact `:bound` fence. The fence RuntimeAttempt identity is compared with the running identity. Route fingerprint remains separate from RuntimeAttempt identity and must match the record, fence, running entry, and trusted Route. The running identity runtime profile must match the Route profile.
 
@@ -64,12 +64,27 @@ Recovery serialization excludes `dispatch_guard`. Previously stored checkpoints 
 
 The production-path regression dispatches a planned Ready WorkItem through the Orchestrator, begins and binds the AttemptLedger record, starts AgentRunner with a fake runtime, requests Ready→In Progress through AgentTool and the default Coordinator context loader, then verifies the controlled mutation. It inserts no dispatch guard. Focused tests also cover unseeded/no-dispatch, armed, released, suspension-pending, stale/replaced identity, lineage, WorkItem, responsibility, route, profile, dependency, source-state, historical evidence, and recovery rejection cases.
 
-Final local gate results and exact-candidate required CI identities must be recorded here after the candidate is committed and pushed. Both required checks are `make-all` and `validate-pr-description` under GitHub Actions app ID `15368`; the prior `make-all` workflow run `37642063509` concluded `failure` and does not satisfy this gate.
+## Independent review of candidate `0c58525`
+
+The fresh independent review returned `REVIEW_VERDICT=CHANGES_REQUESTED`. It found that context-free public `GuardClass` APIs could accept a dispatch-shaped guard because dispatch satisfaction fell back to class/name matching whenever the context had no dispatch fields. A dispatch proof cannot authorize itself. The remediation must make every dispatch satisfaction attempt require complete trusted context.
+
+| Evidence | Identity or result |
+|---|---|
+| Reviewed HEAD | `0c58525a30ec741486afae1b1ab581051c7485d4` |
+| Reviewed tree | `eeae30eb4b7d51f6e633ddf897890c84f2596f54` |
+| Reviewed synthetic merge | `f10e456e5ba45a06c7379d37905b0e092b3dc000` |
+| `make-all` | Run `37762756397`, success |
+| `validate-pr-description` | Run `37762759043`, success |
+| Earlier `make-all` run | `37642063509`, failed; historical and superseded |
+
+Both successful checks belonged to the reviewed candidate. Green CI did not close the independent-review GuardClass blocker. The checks required for the remediation candidate are `make-all` and `validate-pr-description`, both from GitHub Actions app ID `15368`; they must succeed on the new exact HEAD. Fresh independent re-review must then return `READY_FOR_MASTER_GATE`. PRE-080C-01 remains unaccepted, and H-080C remains unauthorized.
 
 ## Final gates (run on candidate)
 
 ```bash
-cd elixir && mix specs.check && make all && git diff --check
+cd elixir && mix specs.check && mix format --check-formatted && mix lint
+make -C elixir all
+git diff --check
 ```
 
-Record exact command output in the PR handoff; do not self-accept PRE-080C-01.
+Record the remediation candidate's exact identities and new required-check run IDs in the external implementation and re-review handoff. Do not put the containing commit, tree, or synthetic merge identities in this file because editing it changes those identities. Do not self-accept PRE-080C-01.

@@ -140,12 +140,7 @@ defmodule SymphonyElixir.WorkControl.GuardClass do
        do: false
 
   defp evidence_satisfies?(:mechanical_guard, :dispatch_guard, evidence, context) do
-    if dispatch_guard_context_required?(context) do
-      valid_evidence?(evidence) and dispatch_guard_context_matches?(evidence, context)
-    else
-      match?(%{class: :mechanical_guard, name: :dispatch_guard}, evidence) and
-        valid_evidence?(evidence)
-    end
+    valid_evidence?(evidence) and dispatch_guard_context_matches?(evidence, context)
   end
 
   defp evidence_satisfies?(class, name, evidence, _context) do
@@ -189,22 +184,6 @@ defmodule SymphonyElixir.WorkControl.GuardClass do
     else
       _failure -> false
     end
-  end
-
-  defp dispatch_guard_context_required?(context) do
-    Enum.any?(
-      [
-        :trusted_route,
-        :subject,
-        :transition,
-        :responsibility,
-        :runtime_attempt_id,
-        :lineage_generation,
-        :runtime_profile,
-        :route_fingerprint
-      ],
-      &Map.has_key?(context, &1)
-    )
   end
 
   defp responsibility_matches?(left, right) when is_atom(left), do: Atom.to_string(left) == right

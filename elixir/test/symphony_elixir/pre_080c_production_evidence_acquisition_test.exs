@@ -463,6 +463,88 @@ defmodule SymphonyElixir.Pre080cProductionEvidenceAcquisitionTest do
     refute GuardClass.all_satisfied?([requirement], [bare_guard], context)
   end
 
+  @tag :dispatch_guard_public_api
+  test "dispatch guard cannot satisfy through context-free public APIs" do
+    work_item_id = "pre-080c-public-dispatch-guard"
+    route = route(work_item_id, :ready, "implementation")
+    identity = RuntimeAttemptIdentity.allocate(work_item_id, route, "lineage-public-dispatch-guard")
+    requirement = GuardClass.requirement(:mechanical_guard, :dispatch_guard)
+    bare_guard = %{class: :mechanical_guard, name: :dispatch_guard}
+
+    canonical_dispatch_evidence = %{
+      class: :mechanical_guard,
+      name: :dispatch_guard,
+      outcome: :verified,
+      subject: {:work_item, work_item_id},
+      transition: {:ready, :in_progress},
+      responsibility: "implementation",
+      runtime_attempt_id: identity.runtime_attempt_id,
+      lineage_generation: identity.lineage_generation,
+      runtime_profile: route.profile_name,
+      route_fingerprint: route.fingerprint,
+      verified_at: @now
+    }
+
+    full_context = %{
+      subject: {:work_item, work_item_id},
+      transition: {:ready, :in_progress},
+      responsibility: "implementation",
+      runtime_attempt_id: identity.runtime_attempt_id,
+      lineage_generation: identity.lineage_generation,
+      runtime_profile: route.profile_name,
+      route_fingerprint: route.fingerprint,
+      trusted_route: route
+    }
+
+    refute GuardClass.satisfied?(requirement, bare_guard)
+    refute GuardClass.all_satisfied?([requirement], [bare_guard])
+    assert GuardClass.missing([requirement], [bare_guard]) == [requirement]
+    refute GuardClass.satisfied?(requirement, bare_guard, %{})
+
+    refute GuardClass.satisfied?(requirement, canonical_dispatch_evidence, %{})
+    refute GuardClass.satisfied?(requirement, canonical_dispatch_evidence)
+    refute GuardClass.all_satisfied?([requirement], [canonical_dispatch_evidence])
+
+    assert GuardClass.missing([requirement], [canonical_dispatch_evidence]) == [requirement]
+
+    assert GuardClass.satisfied?(requirement, canonical_dispatch_evidence, full_context)
+
+    for field <- [
+          :trusted_route,
+          :subject,
+          :transition,
+          :responsibility,
+          :runtime_attempt_id,
+          :lineage_generation,
+          :runtime_profile,
+          :route_fingerprint
+        ] do
+      refute GuardClass.satisfied?(
+               requirement,
+               canonical_dispatch_evidence,
+               Map.delete(full_context, field)
+             )
+    end
+
+    for field <- [
+          :outcome,
+          :subject,
+          :transition,
+          :responsibility,
+          :runtime_attempt_id,
+          :lineage_generation,
+          :runtime_profile,
+          :route_fingerprint,
+          :verified_at
+        ] do
+      refute GuardClass.satisfied?(
+               requirement,
+               Map.delete(canonical_dispatch_evidence, field),
+               full_context
+             )
+    end
+  end
+
   test "real Planner to Ready result feeds real Builder dispatch and fresh Coordinator authority" do
     root = Path.join(System.tmp_dir!(), "pre-080c-production-path-#{System.unique_integer([:positive])}")
     workspace_root = Path.join(root, "workspaces")

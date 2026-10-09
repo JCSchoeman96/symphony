@@ -261,8 +261,8 @@ defmodule SymphonyElixir.WorkControlWorkflowLifecycleTest do
     refute GuardClass.all_satisfied?(%{class: :mechanical_guard}, [mechanical])
     assert GuardClass.missing(%{class: :mechanical_guard}, [mechanical]) == []
 
-    assert GuardClass.satisfied?(mechanical, mechanical)
-    assert GuardClass.satisfied?(mechanical, %{class: :mechanical_guard, name: :dispatch_guard})
+    refute GuardClass.satisfied?(mechanical, mechanical)
+    refute GuardClass.satisfied?(mechanical, %{class: :mechanical_guard, name: :dispatch_guard})
     refute GuardClass.satisfied?(mechanical, semantic)
 
     assert GuardClass.classes_for([mechanical, semantic, %{class: :not_a_guard, name: :ignored}]) == [
