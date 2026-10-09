@@ -61,7 +61,8 @@ end
 defmodule SymphonyElixir.AgentRouterDependencyProofTest do
   use SymphonyElixir.TestSupport
 
-  alias SymphonyElixir.AgentRuntime.Router
+  alias SymphonyElixir.AgentRuntime.{Route, Router}
+  alias SymphonyElixir.AgentRuntime.RuntimeAttempt.Identity, as: RuntimeAttemptIdentity
   alias SymphonyElixir.Dependency.{Graph, Guard}
 
   alias SymphonyElixir.WorkControl.{
@@ -107,7 +108,9 @@ defmodule SymphonyElixir.AgentRouterDependencyProofTest do
     ]
 
     stage_evidence =
-      Enum.map(stages, fn {state, profile_name, responsibility, sandbox, refreshed_states, evidence} ->
+      stages
+      |> Enum.with_index()
+      |> Enum.map(fn {{state, profile_name, responsibility, sandbox, refreshed_states, evidence}, stage_index} ->
         stage_issue = %{issue | state: state}
 
         {:ok, work_item} =
@@ -122,18 +125,41 @@ defmodule SymphonyElixir.AgentRouterDependencyProofTest do
         assert route.responsibility == responsibility
         assert route.runtime_name == "codex"
 
+        runtime_identity =
+          RuntimeAttemptIdentity.allocate(stage_issue.id, route, "sym14-stage-#{stage_index + 1}")
+
+        {:ok, source_state} = WorkflowLifecycle.parse(state)
+        {:ok, target_state} = WorkflowLifecycle.parse(List.first(refreshed_states))
+
+        assessment_context = %{
+          subject: {:work_item, stage_issue.id},
+          transition: {source_state, target_state},
+          responsibility: route.responsibility,
+          runtime_attempt_id: runtime_identity.runtime_attempt_id,
+          lineage_generation: runtime_identity.lineage_generation,
+          runtime_profile: route.profile_name,
+          route_fingerprint: route.fingerprint,
+          trusted_route: route
+        }
+
+        guard_evidence =
+          transition_evidence(
+            [state | refreshed_states],
+            stage_issue.id,
+            route,
+            runtime_identity
+          )
+
         assert :ok =
                  AgentRunner.run(stage_issue, test_pid,
                    runtime: SymphonyElixir.FullProofCodexRuntime,
                    test_pid: test_pid,
                    route: route,
                    work_item: work_item,
+                   runtime_attempt_identity: runtime_identity,
                    ownership_ledger: workspace_ownership_ledger(),
-                   guard_evidence: transition_evidence([state | refreshed_states], stage_issue.id),
-                   assessment_context: %{
-                     runtime_attempt_id: "attempt-#{stage_issue.id}",
-                     lineage_generation: 1
-                   },
+                   guard_evidence: guard_evidence,
+                   assessment_context: assessment_context,
                    issue_state_fetcher: sequence_fetcher(stage_issue, refreshed_states)
                  )
 
@@ -141,14 +167,16 @@ defmodule SymphonyElixir.AgentRouterDependencyProofTest do
         assert is_binary(workspace)
         assert start_opts[:profile].name == profile_name
         assert start_opts[:sandbox] == sandbox
-        assert_receive {:worker_runtime_info, "lifecycle-proof", _runtime_info}, 1_000
+        assert_receive {:worker_runtime_info, "lifecycle-proof", ^runtime_identity, _runtime_info}, 1_000
+        assert_receive {:runtime_attempt_session_started, "lifecycle-proof", ^runtime_identity}, 1_000
+        assert_receive {:runtime_attempt_lifecycle, "lifecycle-proof", ^runtime_identity, :runtime_started}, 1_000
 
         turn_states = [state | Enum.take(refreshed_states, max(length(refreshed_states) - 1, 0))]
 
         {session_id, turns, session_ids} =
           Enum.reduce(turn_states, {session_id, [], [session_id]}, fn expected_state, {current_session, turns, session_ids} ->
             {next_session, refreshed_state, prompt} =
-              receive_proof_turn(current_session, expected_state)
+              receive_proof_turn(current_session, expected_state, runtime_identity)
 
             assert is_binary(prompt)
 
@@ -161,16 +189,18 @@ defmodule SymphonyElixir.AgentRouterDependencyProofTest do
           end)
 
         if List.last(refreshed_states) == "Ready to Merge" do
-          assert_receive {:agent_lifecycle_suspended, "lifecycle-proof", assessment}, 1_000
+          assert_receive {:agent_lifecycle_suspended, "lifecycle-proof", ^runtime_identity, assessment}, 1_000
           assert assessment.status == :validated
-          refute_receive {:agent_route_changed, "lifecycle-proof", _previous_route, _next_route}, 100
+          refute_receive {:agent_route_changed, "lifecycle-proof", ^runtime_identity, _previous_route, _next_route}, 100
         else
-          assert_receive {:agent_route_changed, "lifecycle-proof", previous_route, next_route}, 1_000
+          assert_receive {:agent_route_changed, "lifecycle-proof", ^runtime_identity, previous_route, next_route}, 1_000
           assert previous_route.fingerprint == route.fingerprint
           assert next_route.starting_state == List.last(refreshed_states) |> String.downcase()
         end
 
         assert_receive {:proof_session_stopped, ^session_id}, 1_000
+        assert_receive {:runtime_attempt_lifecycle, "lifecycle-proof", ^runtime_identity, :stopping}, 1_000
+        assert_receive {:runtime_attempt_lifecycle, "lifecycle-proof", ^runtime_identity, :containment_proven_dead}, 1_000
 
         %{
           state: state,
@@ -179,10 +209,51 @@ defmodule SymphonyElixir.AgentRouterDependencyProofTest do
           sandbox: sandbox,
           session_ids: session_ids,
           turns: turns,
+          route: route,
           route_fingerprint: route.fingerprint,
+          runtime_identity: runtime_identity,
+          guard_evidence: guard_evidence,
           evidence: evidence
         }
       end)
+
+    builder_stage = Enum.at(stage_evidence, 1)
+    builder_identity = builder_stage.runtime_identity
+
+    assert RuntimeAttemptIdentity.valid?(builder_identity)
+    assert builder_stage.route.starting_state == "ready"
+    assert builder_identity.responsibility == "implementation"
+    assert builder_identity.runtime_profile == "builder"
+
+    assert %{
+             class: :mechanical_guard,
+             name: :dispatch_guard,
+             outcome: :verified,
+             subject: {:work_item, "lifecycle-proof"},
+             transition: {:ready, :in_progress},
+             responsibility: "implementation",
+             runtime_attempt_id: builder_attempt_id,
+             lineage_generation: builder_lineage,
+             runtime_profile: "builder",
+             route_fingerprint: builder_route_fingerprint,
+             verified_at: %DateTime{}
+           } = Enum.find(builder_stage.guard_evidence, &match?(%{name: :dispatch_guard}, &1))
+
+    assert builder_attempt_id == builder_identity.runtime_attempt_id
+    assert builder_lineage == builder_identity.lineage_generation
+    assert builder_route_fingerprint == builder_stage.route.fingerprint
+
+    assert %{
+             class: :semantic_attestation,
+             name: :implementation_attested,
+             responsibility: "implementation",
+             runtime_attempt_id: ^builder_attempt_id,
+             lineage_generation: ^builder_lineage
+           } =
+             Enum.find(
+               builder_stage.guard_evidence,
+               &match?(%{class: :semantic_attestation, name: :implementation_attested}, &1)
+             )
 
     assert Enum.map(stage_evidence, & &1.profile) == [
              "planner",
@@ -256,13 +327,19 @@ defmodule SymphonyElixir.AgentRouterDependencyProofTest do
     refute Map.has_key?(Map.from_struct(Config.settings!().agent), :auto_merge)
   end
 
-  defp receive_proof_turn(session_id, expected_state) do
+  defp receive_proof_turn(session_id, expected_state, runtime_identity) do
     receive do
       {:proof_turn, ^session_id, ^expected_state, prompt} ->
         {session_id, expected_state, prompt}
 
       {:proof_session_stopped, ^session_id} ->
+        work_item_id = runtime_identity.work_item_id
+
+        assert_receive {:runtime_attempt_lifecycle, ^work_item_id, ^runtime_identity, :stopping}, 1_000
+        assert_receive {:runtime_attempt_lifecycle, ^work_item_id, ^runtime_identity, :containment_proven_dead}, 1_000
         assert_receive {:proof_session_started, next_session, _workspace, _start_opts}, 1_000
+        assert_receive {:runtime_attempt_session_started, ^work_item_id, ^runtime_identity}, 1_000
+        assert_receive {:runtime_attempt_lifecycle, ^work_item_id, ^runtime_identity, :runtime_started}, 1_000
         assert_receive {:proof_turn, ^next_session, ^expected_state, prompt}, 1_000
         {next_session, expected_state, prompt}
     after
@@ -552,7 +629,7 @@ defmodule SymphonyElixir.AgentRouterDependencyProofTest do
     end
   end
 
-  defp transition_evidence(states, work_item_id) do
+  defp transition_evidence(states, work_item_id, %Route{} = route, %RuntimeAttemptIdentity{} = runtime_identity) do
     states
     |> Enum.chunk_every(2, 1, :discard)
     |> Enum.flat_map(fn [source, target] ->
@@ -563,13 +640,28 @@ defmodule SymphonyElixir.AgentRouterDependencyProofTest do
           {:ok, evidence} =
             GuardClass.semantic_attestation(name, %{
               responsibility: metadata.responsibility,
-              runtime_attempt_id: "attempt-#{work_item_id}",
-              lineage_generation: 1,
+              runtime_attempt_id: runtime_identity.runtime_attempt_id,
+              lineage_generation: runtime_identity.lineage_generation,
               subject: {:work_item, work_item_id},
               timestamp: DateTime.utc_now()
             })
 
           evidence
+
+        %{class: :mechanical_guard, name: :dispatch_guard} ->
+          %{
+            class: :mechanical_guard,
+            name: :dispatch_guard,
+            outcome: :verified,
+            subject: {:work_item, work_item_id},
+            transition: {metadata.source, metadata.target},
+            responsibility: metadata.responsibility,
+            runtime_attempt_id: runtime_identity.runtime_attempt_id,
+            lineage_generation: runtime_identity.lineage_generation,
+            runtime_profile: route.profile_name,
+            route_fingerprint: route.fingerprint,
+            verified_at: DateTime.utc_now()
+          }
 
         requirement ->
           mechanical_guard_evidence(requirement)

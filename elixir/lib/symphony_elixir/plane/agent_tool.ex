@@ -14,6 +14,7 @@ defmodule SymphonyElixir.Plane.AgentTool do
   alias SymphonyElixir.AgentRuntime.RuntimeAttempt.Identity, as: RuntimeAttemptIdentity
   alias SymphonyElixir.Dependency.Policy
   alias SymphonyElixir.Orchestrator
+  alias SymphonyElixir.SourceControl
   alias SymphonyElixir.Tracker
 
   alias SymphonyElixir.WorkControl.{
@@ -33,6 +34,14 @@ defmodule SymphonyElixir.Plane.AgentTool do
   @transition_request_tool "plane_request_lifecycle_transition"
 
   @max_dependency_blockers 128
+
+  @semantic_transition_guards %{
+    {:planning, :ready} => :plan_attested,
+    {:in_progress, :in_review} => :implementation_attested,
+    {:changes_requested, :in_review} => :correction_attested,
+    {:in_review, :ready_to_merge} => :review_accepted,
+    {:in_review, :changes_requested} => :review_changes_requested
+  }
 
   @read_tool_names [
     @current_work_item_tool,
@@ -211,7 +220,10 @@ defmodule SymphonyElixir.Plane.AgentTool do
          {:ok, source} <- work_item_source(work_item),
          :ok <- Authority.authorize_lifecycle_command(route, source, target),
          :ok <- require_transition_authority(work_item),
-         {:ok, result} <- request_transition(work_item, route, source, target, host_context, opts) do
+         {:ok, guard_evidence} <-
+           acquired_transition_guard_evidence(host_context, route, source, target, work_item),
+         {:ok, result} <-
+           request_transition(work_item, route, source, target, host_context, guard_evidence, opts) do
       transition_result_response(result, target)
     else
       {:error, reason} -> transition_failure_response(reason)
@@ -273,6 +285,7 @@ defmodule SymphonyElixir.Plane.AgentTool do
          source,
          target,
          host_context,
+         guard_evidence,
          opts
        ) do
     intent_attrs =
@@ -281,7 +294,7 @@ defmodule SymphonyElixir.Plane.AgentTool do
         requested_from: source,
         requested_to: target,
         responsibility: route.responsibility,
-        guard_evidence: host_guard_evidence(host_context)
+        guard_evidence: guard_evidence
       }
       |> maybe_put_runtime_attempt_intent_fields(host_context)
 
@@ -305,13 +318,117 @@ defmodule SymphonyElixir.Plane.AgentTool do
     if WorkItem.authority_available?(work_item), do: :ok, else: {:error, :authority_unavailable}
   end
 
-  defp host_guard_evidence(context) when is_map(context) do
-    case Map.get(context, :guard_evidence) do
-      evidence when is_list(evidence) -> evidence
-      evidence when is_map(evidence) -> [evidence]
-      _missing -> []
+  defp acquired_transition_guard_evidence(host_context, _route, source, target, work_item) do
+    requirements = WorkflowLifecycle.guard_requirements(source, target) || []
+
+    with :ok <- reject_forged_current_semantic_attestation(host_context, source, target),
+         {:ok, semantic} <-
+           host_semantic_attestation_if_required(source, target, work_item, host_context, requirements),
+         mechanical <- mechanical_host_guard_evidence(host_context, work_item) do
+      {:ok, semantic ++ mechanical}
     end
   end
+
+  defp host_semantic_attestation_if_required(source, target, work_item, host_context, requirements) do
+    if semantic_attestation_required?(requirements) do
+      case host_semantic_attestation(source, target, work_item, host_context) do
+        {:ok, attestation} -> {:ok, [attestation]}
+        {:error, reason} -> {:error, reason}
+      end
+    else
+      {:ok, []}
+    end
+  end
+
+  defp semantic_attestation_required?(requirements) when is_list(requirements) do
+    Enum.any?(requirements, &match?(%{class: :semantic_attestation}, &1))
+  end
+
+  defp reject_forged_current_semantic_attestation(context, source, target) when is_map(context) do
+    case semantic_guard_name(source, target) do
+      {:ok, required_name} ->
+        supplied = host_context_guard_evidence(context)
+
+        if Enum.any?(supplied, &match?(%{class: :semantic_attestation, name: ^required_name}, &1)) do
+          {:error, :forged_guard_evidence}
+        else
+          :ok
+        end
+
+      {:error, :unsupported_semantic_transition} ->
+        :ok
+    end
+  end
+
+  defp host_context_guard_evidence(context) when is_map(context) do
+    SourceControl.canonical_host_guard_evidence(context)
+  end
+
+  defp host_semantic_attestation(source, target, %WorkItem{} = work_item, host_context) do
+    with {:ok, name} <- semantic_guard_name(source, target),
+         {:ok, runtime_attempt_id} <- required_runtime_attempt_identity_field(host_context, :runtime_attempt_id),
+         {:ok, lineage_generation} <- required_runtime_attempt_identity_field(host_context, :lineage_generation) do
+      attestation_attrs = %{
+        responsibility: semantic_attestation_responsibility(host_context),
+        runtime_attempt_id: runtime_attempt_id,
+        lineage_generation: lineage_generation,
+        subject: {:work_item, work_item.id},
+        timestamp: DateTime.utc_now()
+      }
+
+      case GuardClass.semantic_attestation(name, attestation_attrs) do
+        {:ok, attestation} -> {:ok, attestation}
+        {:error, reason} -> {:error, reason}
+      end
+    end
+  end
+
+  defp semantic_guard_name(source, target) do
+    case Map.fetch(@semantic_transition_guards, {source, target}) do
+      {:ok, name} -> {:ok, name}
+      :error -> {:error, :unsupported_semantic_transition}
+    end
+  end
+
+  defp semantic_attestation_responsibility(host_context) do
+    case Map.get(host_context, :route) do
+      %Route{responsibility: responsibility} when not is_nil(responsibility) -> responsibility
+      _ -> Map.get(host_context, :responsibility)
+    end
+  end
+
+  defp required_runtime_attempt_identity_field(host_context, :runtime_attempt_id) do
+    case Map.get(host_context, :runtime_attempt_identity) do
+      %RuntimeAttemptIdentity{runtime_attempt_id: id} when not is_nil(id) -> {:ok, id}
+      _ -> {:error, :missing_runtime_attempt_identity}
+    end
+  end
+
+  defp required_runtime_attempt_identity_field(host_context, :lineage_generation) do
+    case Map.get(host_context, :runtime_attempt_identity) do
+      %RuntimeAttemptIdentity{lineage_generation: generation} when not is_nil(generation) ->
+        {:ok, generation}
+
+      _ ->
+        {:error, :missing_runtime_attempt_identity}
+    end
+  end
+
+  defp mechanical_host_guard_evidence(host_context, work_item) do
+    context =
+      host_context
+      |> Map.put_new(:work_item, work_item)
+      |> Map.update(:guard_evidence, [], fn evidence ->
+        Enum.reject(normalize_guard_evidence_list(evidence), &match?(%{class: :semantic_attestation}, &1))
+      end)
+
+    SourceControl.canonical_host_guard_evidence(context)
+    |> Enum.reject(&match?(%{class: :semantic_attestation}, &1))
+  end
+
+  defp normalize_guard_evidence_list(evidence) when is_list(evidence), do: evidence
+  defp normalize_guard_evidence_list(evidence) when is_map(evidence), do: [evidence]
+  defp normalize_guard_evidence_list(_), do: []
 
   defp maybe_put_transition_option(options, opts, key) do
     case Keyword.get(opts, key) do
@@ -370,6 +487,7 @@ defmodule SymphonyElixir.Plane.AgentTool do
   end
 
   defp transition_reason_code(_state, :required_guard_missing), do: "required_guard_missing"
+  defp transition_reason_code(_state, :forged_guard_evidence), do: "required_guard_missing"
 
   defp transition_reason_code(_state, :dependency_context_unavailable),
     do: "dependency_context_unavailable"
@@ -386,6 +504,8 @@ defmodule SymphonyElixir.Plane.AgentTool do
   defp transition_reason_code(_state, :invalid_transition_target), do: "invalid_transition_target"
   defp transition_reason_code(_state, :invalid_context), do: "invalid_transition_context"
   defp transition_reason_code(_state, :stale_runtime_attempt), do: "stale_runtime_attempt"
+
+  defp transition_reason_code(_state, :missing_runtime_attempt_identity), do: "stale_runtime_attempt"
   defp transition_reason_code(_state, :authority_unavailable), do: "authority_unavailable"
   defp transition_reason_code(_state, :invalid_intent), do: "invalid_intent"
   defp transition_reason_code(_state, :invalid_transition_result), do: "invalid_transition_result"

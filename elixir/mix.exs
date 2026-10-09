@@ -40,7 +40,8 @@ defmodule SymphonyElixir.MixProject do
       test_ignore_filters: [
         "test/support/snapshot_support.exs",
         "test/support/test_support.exs",
-        "test/support/live_proof_gate.exs"
+        "test/support/live_proof_gate.exs",
+        "test/support/transition_coordinator_default_path_orchestrator.exs"
       ],
       dialyzer: [
         plt_add_apps: [:mix]

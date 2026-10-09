@@ -1,42 +1,7 @@
-defmodule SymphonyElixir.TransitionCoordinatorDefaultPathOrchestrator do
-  use GenServer
-
-  def start_link(opts), do: GenServer.start_link(__MODULE__, opts)
-
-  @impl true
-  def init(opts), do: {:ok, opts}
-
-  @impl true
-  def handle_call({:transition_context, _work_item_id, _opts}, _from, opts) do
-    {:reply, Keyword.get(opts, :transition_context, :unavailable), opts}
-  end
-
-  def handle_call({:suspend_work_item, _work_item_id, _reason}, _from, opts) do
-    {:reply, Keyword.get(opts, :suspend_result, :ok), opts}
-  end
-
-  def handle_call({:apply_transition_result, _work_item_id, work_item, _opts}, _from, opts) do
-    if pid = Keyword.get(opts, :apply_recipient) do
-      send(pid, {:applied, work_item})
-    end
-
-    {:reply, :ok, opts}
-  end
-
-  def handle_call(:request_refresh, _from, opts) do
-    if pid = Keyword.get(opts, :refresh_recipient) do
-      send(pid, :refresh_requested)
-    end
-
-    {:reply, :ok, opts}
-  end
-
-  def handle_call(_message, _from, opts), do: {:reply, :ok, opts}
-end
-
 defmodule SymphonyElixir.TransitionCoordinatorDefaultPathTest do
   use SymphonyElixir.TestSupport
 
+  alias SymphonyElixir.AgentRuntime.{Profile, Route}
   alias SymphonyElixir.SourceControl
   alias SymphonyElixir.SourceControl.CandidateRef
   alias SymphonyElixir.SourceControl.CandidateVerification
@@ -77,7 +42,7 @@ defmodule SymphonyElixir.TransitionCoordinatorDefaultPathTest do
 
     {:ok, orchestrator} =
       SymphonyElixir.TransitionCoordinatorDefaultPathOrchestrator.start_link(
-        transition_context: {:ok, Map.put(context(), :work_item, work_item())},
+        transition_context: {:ok, Map.put(ready_context(), :work_item, work_item())},
         apply_recipient: self()
       )
 
@@ -99,7 +64,7 @@ defmodule SymphonyElixir.TransitionCoordinatorDefaultPathTest do
         require_durable?: false
       )
 
-    assert {:ok, %{state: :verified}} = TransitionCoordinator.request_transition(coordinator, intent())
+    assert {:ok, %{state: :verified}} = request_transition(coordinator, intent())
     assert_received {:applied, %WorkItem{validated_lifecycle_state: :in_progress}}
   end
 
@@ -155,7 +120,7 @@ defmodule SymphonyElixir.TransitionCoordinatorDefaultPathTest do
       requested_at: @now
     }
 
-    assert {:ok, %{state: :verified}} = TransitionCoordinator.request_transition(coordinator, completion_intent)
+    assert {:ok, %{state: :verified}} = request_transition(coordinator, completion_intent)
     assert_received {:applied, %WorkItem{validated_lifecycle_state: :done} = completed}
     assert WorkItem.dependency_satisfying?(completed)
     assert ProviderObservation.valid_tracker_read?(completed.provider_observation)
@@ -225,7 +190,7 @@ defmodule SymphonyElixir.TransitionCoordinatorDefaultPathTest do
     }
 
     assert {:ok, %{state: :provider_failed} = failed_attempt} =
-             TransitionCoordinator.request_transition(coordinator, completion_intent)
+             request_transition(coordinator, completion_intent)
 
     assert failed_attempt.outcome_reason.reason ==
              {:context_unavailable, {:fresh_context_unavailable, {:source_control, :merge_verification_failed}}}
@@ -289,7 +254,7 @@ defmodule SymphonyElixir.TransitionCoordinatorDefaultPathTest do
       requested_at: @now
     }
 
-    assert {:ok, %{state: :provider_failed}} = TransitionCoordinator.request_transition(coordinator, completion_intent)
+    assert {:ok, %{state: :provider_failed}} = request_transition(coordinator, completion_intent)
     refute_received :provider_done_submitted
   end
 
@@ -298,7 +263,7 @@ defmodule SymphonyElixir.TransitionCoordinatorDefaultPathTest do
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue("Ready", "state-ready")])
 
     {:ok, orchestrator} =
-      SymphonyElixir.TransitionCoordinatorDefaultPathOrchestrator.start_link(transition_context: {:ok, context()})
+      SymphonyElixir.TransitionCoordinatorDefaultPathOrchestrator.start_link(transition_context: {:ok, ready_context()})
 
     {:ok, coordinator} =
       TransitionCoordinator.start_link(
@@ -310,7 +275,7 @@ defmodule SymphonyElixir.TransitionCoordinatorDefaultPathTest do
         require_durable?: false
       )
 
-    assert {:ok, %{state: :indeterminate}} = TransitionCoordinator.request_transition(coordinator, intent())
+    assert {:ok, %{state: :indeterminate}} = request_transition(coordinator, intent())
   end
 
   test "default context loading fails closed when the orchestrator is unavailable" do
@@ -322,7 +287,7 @@ defmodule SymphonyElixir.TransitionCoordinatorDefaultPathTest do
         require_durable?: false
       )
 
-    assert {:ok, %{state: :provider_failed}} = TransitionCoordinator.request_transition(coordinator, intent())
+    assert {:ok, %{state: :provider_failed}} = request_transition(coordinator, intent())
   end
 
   test "default context loading preserves provider errors" do
@@ -339,12 +304,12 @@ defmodule SymphonyElixir.TransitionCoordinatorDefaultPathTest do
         require_durable?: false
       )
 
-    assert {:ok, %{state: :provider_failed}} = TransitionCoordinator.request_transition(coordinator, intent())
+    assert {:ok, %{state: :provider_failed}} = request_transition(coordinator, intent())
   end
 
   test "default context loading fails closed when contract refresh is unavailable" do
     {:ok, orchestrator} =
-      SymphonyElixir.TransitionCoordinatorDefaultPathOrchestrator.start_link(transition_context: {:ok, context()})
+      SymphonyElixir.TransitionCoordinatorDefaultPathOrchestrator.start_link(transition_context: {:ok, ready_context()})
 
     {:ok, coordinator} =
       TransitionCoordinator.start_link(
@@ -355,14 +320,14 @@ defmodule SymphonyElixir.TransitionCoordinatorDefaultPathTest do
         require_durable?: false
       )
 
-    assert {:ok, %{state: :provider_failed}} = TransitionCoordinator.request_transition(coordinator, intent())
+    assert {:ok, %{state: :provider_failed}} = request_transition(coordinator, intent())
   end
 
   test "default contract refresh fails closed without a trusted provider snapshot" do
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory", symphony_project_id: "project-1")
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue("Ready", "state-ready")])
 
-    for transition_context <- [{:ok, context()}, {:ok, Map.delete(context(), :provider_project_contract)}] do
+    for transition_context <- [{:ok, ready_context()}, {:ok, Map.delete(ready_context(), :provider_project_contract)}] do
       {:ok, orchestrator} =
         SymphonyElixir.TransitionCoordinatorDefaultPathOrchestrator.start_link(transition_context: transition_context)
 
@@ -374,7 +339,7 @@ defmodule SymphonyElixir.TransitionCoordinatorDefaultPathTest do
           require_durable?: false
         )
 
-      assert {:ok, %{state: :provider_failed}} = TransitionCoordinator.request_transition(coordinator, intent())
+      assert {:ok, %{state: :provider_failed}} = request_transition(coordinator, intent())
 
       GenServer.stop(coordinator)
       GenServer.stop(orchestrator)
@@ -386,7 +351,7 @@ defmodule SymphonyElixir.TransitionCoordinatorDefaultPathTest do
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue("Ready", "state-ready")])
 
     {:ok, orchestrator} =
-      SymphonyElixir.TransitionCoordinatorDefaultPathOrchestrator.start_link(transition_context: {:ok, context()})
+      SymphonyElixir.TransitionCoordinatorDefaultPathOrchestrator.start_link(transition_context: {:ok, ready_context()})
 
     {:ok, coordinator} =
       TransitionCoordinator.start_link(
@@ -398,7 +363,7 @@ defmodule SymphonyElixir.TransitionCoordinatorDefaultPathTest do
         require_durable?: false
       )
 
-    assert {:ok, %{state: :provider_failed}} = TransitionCoordinator.request_transition(coordinator, intent())
+    assert {:ok, %{state: :provider_failed}} = request_transition(coordinator, intent())
   end
 
   test "default verification classifies a proven non-submission after third-state movement as conflict" do
@@ -406,7 +371,7 @@ defmodule SymphonyElixir.TransitionCoordinatorDefaultPathTest do
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue("Ready", "state-ready")])
 
     {:ok, orchestrator} =
-      SymphonyElixir.TransitionCoordinatorDefaultPathOrchestrator.start_link(transition_context: {:ok, context()})
+      SymphonyElixir.TransitionCoordinatorDefaultPathOrchestrator.start_link(transition_context: {:ok, ready_context()})
 
     {:ok, coordinator} =
       TransitionCoordinator.start_link(
@@ -426,7 +391,7 @@ defmodule SymphonyElixir.TransitionCoordinatorDefaultPathTest do
         require_durable?: false
       )
 
-    assert {:ok, %{state: :conflict}} = TransitionCoordinator.request_transition(coordinator, intent())
+    assert {:ok, %{state: :conflict}} = request_transition(coordinator, intent())
   end
 
   test "default verification classifies authoritative third-state movement as conflict after an ambiguous submit" do
@@ -434,7 +399,7 @@ defmodule SymphonyElixir.TransitionCoordinatorDefaultPathTest do
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue("Ready", "state-ready")])
 
     {:ok, orchestrator} =
-      SymphonyElixir.TransitionCoordinatorDefaultPathOrchestrator.start_link(transition_context: {:ok, context()})
+      SymphonyElixir.TransitionCoordinatorDefaultPathOrchestrator.start_link(transition_context: {:ok, ready_context()})
 
     {:ok, coordinator} =
       TransitionCoordinator.start_link(
@@ -454,7 +419,7 @@ defmodule SymphonyElixir.TransitionCoordinatorDefaultPathTest do
         require_durable?: false
       )
 
-    assert {:ok, %{state: :conflict}} = TransitionCoordinator.request_transition(coordinator, intent())
+    assert {:ok, %{state: :conflict}} = request_transition(coordinator, intent())
   end
 
   test "default verification treats a missing post-read as provider failure only when non-submission is proven" do
@@ -462,7 +427,7 @@ defmodule SymphonyElixir.TransitionCoordinatorDefaultPathTest do
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue("Ready", "state-ready")])
 
     {:ok, orchestrator} =
-      SymphonyElixir.TransitionCoordinatorDefaultPathOrchestrator.start_link(transition_context: {:ok, context()})
+      SymphonyElixir.TransitionCoordinatorDefaultPathOrchestrator.start_link(transition_context: {:ok, ready_context()})
 
     {:ok, coordinator} =
       TransitionCoordinator.start_link(
@@ -477,7 +442,7 @@ defmodule SymphonyElixir.TransitionCoordinatorDefaultPathTest do
         require_durable?: false
       )
 
-    assert {:ok, %{state: :provider_failed}} = TransitionCoordinator.request_transition(coordinator, intent())
+    assert {:ok, %{state: :provider_failed}} = request_transition(coordinator, intent())
   end
 
   test "default pre-read rejects missing and incompatible provider observations" do
@@ -490,7 +455,7 @@ defmodule SymphonyElixir.TransitionCoordinatorDefaultPathTest do
       Application.put_env(:symphony_elixir, :memory_tracker_issues, issues)
 
       {:ok, orchestrator} =
-        SymphonyElixir.TransitionCoordinatorDefaultPathOrchestrator.start_link(transition_context: {:ok, context()})
+        DefaultPathOrchestrator.start_link(transition_context: {:ok, ready_context()})
 
       {:ok, coordinator} =
         TransitionCoordinator.start_link(
@@ -501,7 +466,7 @@ defmodule SymphonyElixir.TransitionCoordinatorDefaultPathTest do
           require_durable?: false
         )
 
-      assert {:ok, %{state: ^expected}} = TransitionCoordinator.request_transition(coordinator, intent())
+      assert {:ok, %{state: ^expected}} = request_transition(coordinator, intent())
     end
   end
 
@@ -512,7 +477,7 @@ defmodule SymphonyElixir.TransitionCoordinatorDefaultPathTest do
 
     {:ok, orchestrator} =
       SymphonyElixir.TransitionCoordinatorDefaultPathOrchestrator.start_link(
-        transition_context: {:ok, context()},
+        transition_context: {:ok, ready_context()},
         refresh_recipient: self()
       )
 
@@ -534,7 +499,7 @@ defmodule SymphonyElixir.TransitionCoordinatorDefaultPathTest do
         require_durable?: false
       )
 
-    assert {:ok, %{state: :verified}} = TransitionCoordinator.request_transition(coordinator, intent())
+    assert {:ok, %{state: :verified}} = request_transition(coordinator, intent())
   end
 
   test "default verification classifies an authoritative third-state movement as conflict" do
@@ -543,7 +508,7 @@ defmodule SymphonyElixir.TransitionCoordinatorDefaultPathTest do
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [initial])
 
     {:ok, orchestrator} =
-      SymphonyElixir.TransitionCoordinatorDefaultPathOrchestrator.start_link(transition_context: {:ok, context()})
+      SymphonyElixir.TransitionCoordinatorDefaultPathOrchestrator.start_link(transition_context: {:ok, ready_context()})
 
     {:ok, coordinator} =
       TransitionCoordinator.start_link(
@@ -563,7 +528,7 @@ defmodule SymphonyElixir.TransitionCoordinatorDefaultPathTest do
         require_durable?: false
       )
 
-    assert {:ok, %{state: :conflict}} = TransitionCoordinator.request_transition(coordinator, intent())
+    assert {:ok, %{state: :conflict}} = request_transition(coordinator, intent())
   end
 
   test "default context validation rejects a provider observation outside the contract scope" do
@@ -584,7 +549,7 @@ defmodule SymphonyElixir.TransitionCoordinatorDefaultPathTest do
         require_durable?: false
       )
 
-    assert {:ok, %{state: :provider_failed}} = TransitionCoordinator.request_transition(coordinator, intent())
+    assert {:ok, %{state: :provider_failed}} = request_transition(coordinator, intent())
   end
 
   test "default post-read errors remain indeterminate when submission is ambiguous" do
@@ -593,7 +558,7 @@ defmodule SymphonyElixir.TransitionCoordinatorDefaultPathTest do
     {:ok, counter} = Agent.start_link(fn -> 0 end)
 
     {:ok, orchestrator} =
-      SymphonyElixir.TransitionCoordinatorDefaultPathOrchestrator.start_link(transition_context: {:ok, context()})
+      SymphonyElixir.TransitionCoordinatorDefaultPathOrchestrator.start_link(transition_context: {:ok, ready_context()})
 
     {:ok, coordinator} =
       TransitionCoordinator.start_link(
@@ -601,7 +566,7 @@ defmodule SymphonyElixir.TransitionCoordinatorDefaultPathTest do
         ledger: nil,
         orchestrator: orchestrator,
         refresh_contract: fn value ->
-          if Agent.get_and_update(counter, fn count -> {count, count + 1} end) == 0 do
+          if Agent.get_and_update(counter, fn count -> {count, count + 1} end) < 2 do
             {:ok, value.provider_project_contract}
           else
             {:error, :post_read_unavailable}
@@ -611,7 +576,7 @@ defmodule SymphonyElixir.TransitionCoordinatorDefaultPathTest do
         require_durable?: false
       )
 
-    assert {:ok, %{state: :indeterminate}} = TransitionCoordinator.request_transition(coordinator, intent())
+    assert {:ok, %{state: :indeterminate}} = request_transition(coordinator, intent())
     Agent.stop(counter)
   end
 
@@ -621,11 +586,22 @@ defmodule SymphonyElixir.TransitionCoordinatorDefaultPathTest do
         work_item_id: "work-1",
         requested_from: :ready,
         requested_to: :in_progress,
-        responsibility: "symphony",
-        guard_evidence: [%{class: :mechanical_guard, name: :dispatch_guard}]
+        responsibility: "implementation",
+        runtime_attempt_id: "runtime-default-path",
+        lineage_generation: "lineage-default-path",
+        guard_evidence: []
       })
 
     intent
+  end
+
+  defp request_transition(coordinator, %SemanticTransitionIntent{requested_from: :ready} = intent) do
+    route = ready_route()
+    TransitionCoordinator.request_transition(coordinator, intent, route: route)
+  end
+
+  defp request_transition(coordinator, intent) do
+    TransitionCoordinator.request_transition(coordinator, intent)
   end
 
   defp issue(state, state_id) do
@@ -771,6 +747,40 @@ defmodule SymphonyElixir.TransitionCoordinatorDefaultPathTest do
       dependency_decision: %{allowed?: true, dependency_completeness: :complete, dependency_status: :none},
       dependency_epoch_evidence: %{complete?: true}
     }
+  end
+
+  defp ready_context do
+    route = ready_route()
+
+    dispatch_authority_evidence = %{
+      class: :mechanical_guard,
+      name: :dispatch_guard,
+      outcome: :verified,
+      subject: {:work_item, "work-1"},
+      transition: {:ready, :in_progress},
+      responsibility: "implementation",
+      runtime_attempt_id: "runtime-default-path",
+      lineage_generation: "lineage-default-path",
+      runtime_profile: route.profile_name,
+      route_fingerprint: route.fingerprint,
+      verified_at: DateTime.utc_now()
+    }
+
+    Map.merge(context(), %{
+      route: route,
+      route_fingerprint: route.fingerprint,
+      runtime_profile: route.profile_name,
+      runtime_attempt_id: "runtime-default-path",
+      lineage_generation: "lineage-default-path",
+      responsibility: "implementation",
+      dispatch_authority_evidence: dispatch_authority_evidence
+    })
+  end
+
+  defp ready_route do
+    issue = issue("Ready", "state-ready")
+    profile = Profile.default_profiles("codex app-server", 20)["builder"]
+    Route.new(issue, profile)
   end
 
   defp work_item do

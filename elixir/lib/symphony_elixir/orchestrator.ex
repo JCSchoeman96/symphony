@@ -326,14 +326,14 @@ defmodule SymphonyElixir.Orchestrator do
 
     case RecoveryLedger.open(project_id, tracker_identity, ledger_opts) do
       {:ok, ledger} ->
-        case RecoveryLedger.list(ledger) do
-          {:ok, checkpoints} ->
+        case load_sanitized_recovery_checkpoints(ledger) do
+          {:ok, recovery_checkpoints} ->
             %{
               state
               | recovery_ledger: ledger,
                 recovery_ledger_status: :ready,
                 recovery_ledger_opts: ledger_opts,
-                recovery_checkpoints: Map.new(checkpoints, &{&1.work_item_id, &1})
+                recovery_checkpoints: recovery_checkpoints
             }
 
           {:error, reason} ->
@@ -3410,9 +3410,9 @@ defmodule SymphonyElixir.Orchestrator do
   defp reload_recovery_ledger_records(%State{recovery_ledger: %RecoveryLedger{} = ledger} = state, _config) do
     case resync_recovery_ledger_if_needed(state, ledger) do
       {:ok, state} ->
-        case RecoveryLedger.list(ledger) do
-          {:ok, checkpoints} ->
-            {:ok, %{state | recovery_ledger_status: :ready, recovery_checkpoints: Map.new(checkpoints, &{&1.work_item_id, &1})}}
+        case load_sanitized_recovery_checkpoints(ledger) do
+          {:ok, recovery_checkpoints} ->
+            {:ok, %{state | recovery_ledger_status: :ready, recovery_checkpoints: recovery_checkpoints}}
 
           {:error, reason} ->
             next_state = %{state | recovery_ledger_status: {:blocked, {:recovery_ledger_unavailable, reason}}}
@@ -6254,7 +6254,7 @@ defmodule SymphonyElixir.Orchestrator do
     with {:ok, observation} <- ProviderObservation.from_issue(issue, %{provider: Config.settings!().tracker.kind}),
          {:ok, mapped_state} <- map_observation_state(observation, contract),
          true <- mapped_state == checkpoint.last_validated_lifecycle_state do
-      checkpoint.durable_guard_evidence
+      durable_mechanical_evidence(checkpoint.durable_guard_evidence)
     else
       _changed_or_invalid -> []
     end
@@ -6628,7 +6628,7 @@ defmodule SymphonyElixir.Orchestrator do
       project_namespace: recovery_project_namespace(state),
       work_item_id: work_item_id,
       last_validated_lifecycle_state: lifecycle_state,
-      durable_guard_evidence: evidence,
+      durable_guard_evidence: durable_mechanical_evidence(evidence),
       active_suspension_context: active_context,
       last_terminal_suspension_context: terminal_context,
       updated_at: DateTime.utc_now()
@@ -6646,6 +6646,9 @@ defmodule SymphonyElixir.Orchestrator do
       %CompletionProof{} = proof ->
         if CompletionProof.valid_evidence?(proof), do: [proof], else: []
 
+      %{name: :dispatch_guard} ->
+        []
+
       %{class: :mechanical_guard} = item ->
         if GuardClass.valid_evidence?(item), do: [Map.take(item, [:class, :name, :outcome])], else: []
 
@@ -6655,6 +6658,33 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp durable_mechanical_evidence(_evidence), do: []
+
+  defp sanitize_recovery_checkpoints(%RecoveryLedger{} = ledger, checkpoints) when is_list(checkpoints) do
+    Enum.reduce_while(checkpoints, {:ok, %{}}, fn checkpoint, {:ok, acc} ->
+      sanitized = %{
+        checkpoint
+        | durable_guard_evidence: durable_mechanical_evidence(checkpoint.durable_guard_evidence)
+      }
+
+      persisted =
+        if checkpoint_equivalent?(sanitized, checkpoint) do
+          :ok
+        else
+          RecoveryLedger.put_sync(ledger, sanitized)
+        end
+
+      case persisted do
+        :ok -> {:cont, {:ok, Map.put(acc, sanitized.work_item_id, sanitized)}}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
+
+  defp load_sanitized_recovery_checkpoints(%RecoveryLedger{} = ledger) do
+    with {:ok, checkpoints} <- RecoveryLedger.list(ledger) do
+      sanitize_recovery_checkpoints(ledger, checkpoints)
+    end
+  end
 
   defp persist_recovery_checkpoint(%State{recovery_ledger: %RecoveryLedger{} = ledger} = state, checkpoint) do
     existing = Map.get(state.recovery_checkpoints, checkpoint.work_item_id)
@@ -9720,7 +9750,7 @@ defmodule SymphonyElixir.Orchestrator do
     case Map.get(state.work_control, work_item_id) do
       %WorkItem{} = work_item ->
         with :ok <- transition_context_available?(state, work_item_id, work_item),
-             {:ok, context} <- build_transition_context(state, work_item_id, work_item),
+             {:ok, context} <- build_transition_context(state, work_item_id, work_item, opts),
              {:ok, context} <- validate_transition_context_token(context, opts),
              :ok <- validate_expected_runtime_identity(context, opts) do
           {:ok, context}
@@ -9929,7 +9959,7 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp build_transition_context(%State{} = state, work_item_id, %WorkItem{} = work_item) do
+  defp build_transition_context(%State{} = state, work_item_id, %WorkItem{} = work_item, opts) do
     contract_evidence = state.project_contract_evidence
     dependency_decision = Map.fetch!(state.dependency_diagnostics, work_item_id)
     contract = contract_evidence && contract_evidence.contract
@@ -9948,13 +9978,16 @@ defmodule SymphonyElixir.Orchestrator do
          complete?: Graph.complete?(state.dependency_graph)
        },
        guard_evidence: assessment.satisfied_guards,
+       dispatch_authority_evidence: dispatch_authority_evidence(state, work_item_id, work_item, running, opts),
        provider_observation: observation,
        provider_project_contract: contract,
        provider_contract_fingerprint: provider_contract_fingerprint(contract),
+       route: Map.get(running, :route),
+       route_fingerprint: Map.get(running, :route_fingerprint),
        runtime_attempt_id: transition_context_runtime_attempt_id(running),
        lineage_id: transition_context_lineage_id(running),
        lineage_generation: transition_context_lineage_generation(running),
-       runtime_profile: Map.get(running, :profile_name),
+       runtime_profile: transition_context_runtime_profile(running),
        responsibility: WorkflowLifecycle.responsibility(work_item.validated_lifecycle_state),
        repository_context: %{
          workspace_path: Map.get(running, :workspace_path),
@@ -9962,6 +9995,193 @@ defmodule SymphonyElixir.Orchestrator do
        },
        context_token: transition_context_token(work_item, state, dependency_decision, contract)
      }}
+  end
+
+  defp dispatch_authority_evidence(
+         %State{attempt_ledger_status: :ready, attempt_ledger: %AttemptLedger{} = ledger} = state,
+         work_item_id,
+         %WorkItem{id: work_item_id, validated_lifecycle_state: :ready},
+         %{
+           route: %Route{} = route,
+           route_fingerprint: running_route_fingerprint,
+           runtime_attempt: %RuntimeAttempt{state: :running, identity: %RuntimeAttemptIdentity{} = identity}
+         } = running_entry,
+         opts
+       )
+       when is_binary(work_item_id) do
+    with true <- RuntimeAttemptIdentity.valid?(identity),
+         :ok <- validate_dispatch_route(route, identity, work_item_id, running_route_fingerprint),
+         :ok <- validate_dispatch_running_entry(running_entry, route, identity),
+         :ok <- validate_dispatch_dependencies(state, work_item_id),
+         :ok <- validate_expected_dispatch_identity(Keyword.get(opts, :expected_runtime_identity), identity),
+         {:ok, record} <- AttemptLedger.current(ledger, work_item_id),
+         :ok <- validate_dispatch_ledger_record(record, identity, running_route_fingerprint, route) do
+      %{
+        class: :mechanical_guard,
+        name: :dispatch_guard,
+        outcome: :verified,
+        subject: {:work_item, work_item_id},
+        transition: {:ready, :in_progress},
+        responsibility: "implementation",
+        runtime_attempt_id: identity.runtime_attempt_id,
+        lineage_generation: identity.lineage_generation,
+        runtime_profile: identity.runtime_profile,
+        route_fingerprint: route.fingerprint,
+        verified_at: DateTime.utc_now()
+      }
+    else
+      _invalid_or_stale -> nil
+    end
+  end
+
+  defp dispatch_authority_evidence(_state, _work_item_id, _work_item, _running_entry, _opts), do: nil
+
+  defp validate_dispatch_route(%Route{} = route, identity, work_item_id, running_route_fingerprint) do
+    with :ok <- validate_dispatch_route_scope(route, work_item_id),
+         :ok <- validate_dispatch_runtime_identity(route, identity, work_item_id) do
+      validate_dispatch_route_fingerprints(route, running_route_fingerprint)
+    end
+  end
+
+  defp validate_dispatch_route_scope(route, work_item_id) do
+    cond do
+      route.issue_id != work_item_id ->
+        {:error, :route_work_item_mismatch}
+
+      not is_binary(route.starting_state) ->
+        {:error, :route_state_mismatch}
+
+      Route.normalize_state(route.starting_state) != "ready" ->
+        {:error, :route_state_mismatch}
+
+      route.responsibility != "implementation" ->
+        {:error, :route_responsibility_mismatch}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_dispatch_runtime_identity(route, identity, work_item_id) do
+    cond do
+      identity.work_item_id != work_item_id ->
+        {:error, :runtime_work_item_mismatch}
+
+      identity.responsibility != route.responsibility ->
+        {:error, :runtime_responsibility_mismatch}
+
+      identity.runtime_profile != route.profile_name ->
+        {:error, :runtime_profile_mismatch}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_dispatch_route_fingerprints(route, running_route_fingerprint) do
+    cond do
+      route.fingerprint != Route.fingerprint(route) ->
+        {:error, :route_fingerprint_invalid}
+
+      route.starting_state_fingerprint != Route.starting_state_fingerprint(route) ->
+        {:error, :route_state_fingerprint_invalid}
+
+      running_route_fingerprint != route.fingerprint ->
+        {:error, :running_route_fingerprint_mismatch}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_dispatch_running_entry(running_entry, route, identity) do
+    cond do
+      Map.get(running_entry, :containment_status) != :active ->
+        {:error, :runtime_not_active}
+
+      not is_nil(Map.get(running_entry, :lifecycle_suspension)) ->
+        {:error, :runtime_suspended}
+
+      not is_nil(Map.get(running_entry, :route_change)) ->
+        {:error, :route_change_pending}
+
+      Map.get(running_entry, :route_change_termination, false) ->
+        {:error, :route_change_termination_pending}
+
+      Map.get(running_entry, :responsibility) != route.responsibility ->
+        {:error, :running_responsibility_mismatch}
+
+      not RuntimeAttemptIdentity.same?(Map.get(running_entry, :runtime_attempt).identity, identity) ->
+        {:error, :running_runtime_attempt_mismatch}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_dispatch_dependencies(%State{} = state, work_item_id) do
+    decision = Map.get(state.dependency_diagnostics, work_item_id)
+
+    if match?(%Graph{}, state.dependency_graph) and Graph.complete?(state.dependency_graph) and
+         is_map(decision) and Map.get(decision, :allowed?) == true and
+         Map.get(decision, :dependency_completeness) == :complete do
+      :ok
+    else
+      {:error, :dependency_authority_unavailable}
+    end
+  end
+
+  defp validate_expected_dispatch_identity(expected, %RuntimeAttemptIdentity{} = identity)
+       when is_map(expected) do
+    required_keys = [:runtime_attempt_id, :lineage_generation, :work_item_id, :responsibility] |> Enum.sort()
+
+    actual_keys =
+      expected
+      |> Map.keys()
+      |> Enum.sort()
+
+    if actual_keys == required_keys and
+         Map.get(expected, :runtime_attempt_id) == identity.runtime_attempt_id and
+         Map.get(expected, :lineage_generation) == identity.lineage_generation and
+         Map.get(expected, :work_item_id) == identity.work_item_id and
+         normalize_identity_field(:responsibility, Map.get(expected, :responsibility)) ==
+           normalize_identity_field(:responsibility, identity.responsibility) do
+      :ok
+    else
+      {:error, :expected_runtime_identity_mismatch}
+    end
+  end
+
+  defp validate_expected_dispatch_identity(_expected, _identity),
+    do: {:error, :expected_runtime_identity_missing}
+
+  defp validate_dispatch_ledger_record(record, identity, running_route_fingerprint, route) do
+    case Map.get(record, :authority_fence) do
+      %{
+        state: :bound,
+        runtime_attempt: %RuntimeAttemptIdentity{} = fenced_identity,
+        route_fingerprint: fence_route_fingerprint
+      } ->
+        if record.status == :open and record.in_flight == true and
+             RuntimeAttemptIdentity.same?(fenced_identity, identity) and
+             record.route_fingerprint == fence_route_fingerprint and
+             fence_route_fingerprint == running_route_fingerprint and
+             running_route_fingerprint == route.fingerprint do
+          :ok
+        else
+          {:error, :attempt_ledger_authority_mismatch}
+        end
+
+      _unbound_or_invalid ->
+        {:error, :attempt_ledger_authority_unbound}
+    end
+  end
+
+  defp transition_context_runtime_profile(running) do
+    case Map.get(running, :runtime_attempt) do
+      %RuntimeAttempt{identity: %{runtime_profile: profile}} -> profile
+      _ -> nil
+    end
   end
 
   defp validate_transition_context_token(context, opts) do

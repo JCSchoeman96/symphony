@@ -19,11 +19,40 @@ defmodule SymphonyElixir.ProfileRuntimeTest do
   use SymphonyElixir.TestSupport
 
   alias SymphonyElixir.AgentRuntime.{Profile, Route, Router}
+  alias SymphonyElixir.AgentRuntime.RuntimeAttempt.Identity
   alias SymphonyElixir.Codex.IsolationProfile
   alias SymphonyElixir.Config.Schema
-  alias SymphonyElixir.WorkControl.GuardClass
   alias SymphonyElixir.WorkControl.WorkItem
   alias SymphonyElixir.Workspace.OwnershipLedger
+
+  defp dispatch_guard_evidence(route, %Identity{} = runtime_identity) do
+    %{
+      class: :mechanical_guard,
+      name: :dispatch_guard,
+      outcome: :verified,
+      subject: {:work_item, runtime_identity.work_item_id},
+      transition: {:ready, :in_progress},
+      responsibility: route.responsibility,
+      runtime_attempt_id: runtime_identity.runtime_attempt_id,
+      lineage_generation: runtime_identity.lineage_generation,
+      runtime_profile: route.profile_name,
+      route_fingerprint: route.fingerprint,
+      verified_at: DateTime.utc_now()
+    }
+  end
+
+  defp dispatch_guard_assessment_context(route, %Identity{} = runtime_identity) do
+    %{
+      trusted_route: route,
+      subject: {:work_item, runtime_identity.work_item_id},
+      transition: {:ready, :in_progress},
+      responsibility: route.responsibility,
+      runtime_attempt_id: runtime_identity.runtime_attempt_id,
+      lineage_generation: runtime_identity.lineage_generation,
+      runtime_profile: route.profile_name,
+      route_fingerprint: route.fingerprint
+    }
+  end
 
   test "planner permission profile binds read-only access to the exact workspace" do
     root = Path.join(System.tmp_dir!(), "symphony-profile-runtime-#{System.unique_integer([:positive])}")
@@ -349,6 +378,9 @@ defmodule SymphonyElixir.ProfileRuntimeTest do
       })
 
     assert {:ok, route} = Router.resolve(work_item, Config.settings!().agent.profiles)
+    runtime_identity = Identity.allocate(issue.id, route, "lineage-restart-ownership-drift")
+    dispatch_evidence = dispatch_guard_evidence(route, runtime_identity)
+    assessment_context = dispatch_guard_assessment_context(route, runtime_identity)
     ledger = workspace_ownership_ledger()
     refresh_count = :atomics.new(1, [])
 
@@ -361,10 +393,12 @@ defmodule SymphonyElixir.ProfileRuntimeTest do
              AgentRunner.run(issue, test_pid,
                runtime: SymphonyElixir.ProfileRuntimeTestFake,
                test_pid: test_pid,
+               runtime_attempt_identity: runtime_identity,
                route: route,
                work_item: work_item,
                ownership_ledger: ledger,
-               guard_evidence: [GuardClass.requirement(:mechanical_guard, :dispatch_guard)],
+               guard_evidence: [dispatch_evidence],
+               assessment_context: assessment_context,
                test_runtime_isolation_admit: admission,
                issue_state_fetcher: fn [_issue_id] ->
                  if :atomics.add_get(refresh_count, 1, 1) == 1 do
@@ -393,6 +427,7 @@ defmodule SymphonyElixir.ProfileRuntimeTest do
     assert_receive {
       :runtime_isolation_blocked,
       "restart-ownership-drift",
+      ^runtime_identity,
       {:runtime_isolation_unavailable, :workspace_identity_or_runtime_unproven}
     }
 

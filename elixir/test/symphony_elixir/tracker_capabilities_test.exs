@@ -50,13 +50,31 @@ end
 defmodule SymphonyElixir.TrackerCapabilitiesTest do
   use SymphonyElixir.TestSupport
 
+  alias SymphonyElixir.AgentRuntime.{Profile, Route, RuntimeAttempt}
   alias SymphonyElixir.Config
   alias SymphonyElixir.Config.Schema
   alias SymphonyElixir.Plane.Adapter
   alias SymphonyElixir.Tracker
   alias SymphonyElixir.Tracker.Capabilities
+  alias SymphonyElixir.Tracker.Issue
   alias SymphonyElixir.TransitionCoordinator
   alias SymphonyElixir.WorkControl.{ProviderProjectContract, SemanticTransitionIntent, WorkflowLifecycle}
+
+  defp dispatch_guard_evidence(route, runtime_identity) do
+    %{
+      class: :mechanical_guard,
+      name: :dispatch_guard,
+      outcome: :verified,
+      subject: {:work_item, runtime_identity.work_item_id},
+      transition: {:ready, :in_progress},
+      responsibility: route.responsibility,
+      runtime_attempt_id: runtime_identity.runtime_attempt_id,
+      lineage_generation: runtime_identity.lineage_generation,
+      runtime_profile: route.profile_name,
+      route_fingerprint: route.fingerprint,
+      verified_at: DateTime.utc_now()
+    }
+  end
 
   test "tracker keeps both legacy and contextual catalogue callbacks optional" do
     callbacks = Tracker.behaviour_info(:callbacks)
@@ -300,18 +318,49 @@ defmodule SymphonyElixir.TrackerCapabilitiesTest do
   end
 
   test "controlled_transition routes through the complete coordinator protocol" do
+    issue = %Issue{
+      id: "work-1",
+      identifier: "SYM-WORK-1",
+      title: "Coordinator protocol",
+      state: "Ready",
+      dispatchable: true
+    }
+
+    route = Route.new(issue, Profile.default_profiles("codex app-server", 20)["builder"])
+    runtime_identity = RuntimeAttempt.Identity.allocate(issue.id, route, "lineage-work-1")
+    dispatch_authority_evidence = dispatch_guard_evidence(route, runtime_identity)
+    context_loads = :atomics.new(1, [])
+    submissions = :atomics.new(1, [])
+
     {:ok, coordinator} =
       TransitionCoordinator.start_link(
         name: nil,
         load_context: fn _intent ->
+          :atomics.add(context_loads, 1, 1)
+
           {:ok,
            %{
+             current_state: :ready,
+             route: route,
+             route_fingerprint: route.fingerprint,
+             runtime_profile: route.profile_name,
+             runtime_attempt_id: runtime_identity.runtime_attempt_id,
+             lineage_generation: runtime_identity.lineage_generation,
+             responsibility: route.responsibility,
+             dispatch_authority_evidence: dispatch_authority_evidence,
              provider_project_contract: contract(),
-             dependency_decision: %{allowed?: true, dependency_completeness: :complete, dependency_status: :none},
+             dependency_decision: %{
+               allowed?: true,
+               dependency_completeness: :complete,
+               dependency_status: :none
+             },
              dependency_epoch_evidence: %{complete?: true}
            }}
         end,
-        submit: fn _attempt, _context -> :ok end,
+        submit: fn _attempt, _context ->
+          :atomics.add(submissions, 1, 1)
+          :ok
+        end,
         verify: fn _attempt, _context ->
           {:verified,
            %{
@@ -333,8 +382,12 @@ defmodule SymphonyElixir.TrackerCapabilitiesTest do
              Tracker.controlled_transition("work-1", :in_progress,
                coordinator: coordinator,
                adapter: SymphonyElixir.TrackerCapabilitiesUnknownAdapter,
-               intent_attrs: intent_attrs()
+               route: route,
+               intent_attrs: intent_attrs(runtime_identity)
              )
+
+    assert :atomics.get(context_loads, 1) == 2
+    assert :atomics.get(submissions, 1) == 1
   end
 
   test "controlled transition rejects missing and mismatched semantic intent" do
@@ -394,11 +447,12 @@ defmodule SymphonyElixir.TrackerCapabilitiesTest do
     contract
   end
 
-  defp intent_attrs do
+  defp intent_attrs(runtime_identity) do
     %{
       requested_from: :ready,
       responsibility: "symphony",
-      guard_evidence: [%{class: :mechanical_guard, name: :dispatch_guard}]
+      runtime_attempt_id: runtime_identity.runtime_attempt_id,
+      lineage_generation: runtime_identity.lineage_generation
     }
   end
 end

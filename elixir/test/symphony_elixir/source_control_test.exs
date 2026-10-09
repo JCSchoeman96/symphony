@@ -34,9 +34,7 @@ defmodule SymphonyElixir.SourceControlTest do
     intent = intent(:in_progress, :in_review)
 
     assert {:error, {:source_control, :unconfigured}} =
-             SourceControl.enrich_guard_evidence(intent, %{}, [
-               %{class: :mechanical_guard, name: :implementation_checks_verified}
-             ])
+             SourceControl.enrich_guard_evidence(intent, %{}, [])
   end
 
   test "enrich captures candidate evidence from trusted host facts" do
@@ -64,14 +62,12 @@ defmodule SymphonyElixir.SourceControlTest do
       probe_opts: [command_runner: command_runner]
     }
 
-    assert {:ok, evidence} =
-             SourceControl.enrich_guard_evidence(intent, context, [
-               %{class: :mechanical_guard, name: :implementation_checks_verified}
-             ])
+    assert {:ok, evidence} = SourceControl.enrich_guard_evidence(intent, context, [])
 
     entry = Enum.find(evidence, &(&1.name == :candidate_state_verified))
     assert entry.outcome == :verified
     assert entry.candidate_ref.candidate_sha == @sha_b
+    assert Enum.any?(evidence, &match?(%{name: :implementation_checks_verified, class: :mechanical_guard}, &1))
   end
 
   test "verify merge from evidence returns mismatch when review acceptance is absent" do
@@ -140,6 +136,50 @@ defmodule SymphonyElixir.SourceControlTest do
 
     assert {:ok, evidence} = SourceControl.enrich_guard_evidence(intent, context, [])
     assert Enum.any?(evidence, &match?(%{name: :candidate_state_verified, outcome: :verified}, &1))
+    assert Enum.any?(evidence, &match?(%{name: :correction_checks_verified, class: :mechanical_guard}, &1))
+  end
+
+  test "candidate capture fails when required checks are not successful" do
+    intent = intent(:in_progress, :in_review)
+
+    github_opts = [
+      source_control_config: @config,
+      token: "token",
+      request_fun: fn _token, path, _params, _opts ->
+        payload =
+          if String.contains?(path, "/check-runs") do
+            %{
+              "total_count" => 1,
+              "check_runs" => [
+                %{
+                  "name" => "make-all",
+                  "head_sha" => @sha_b,
+                  "status" => "completed",
+                  "conclusion" => "failure",
+                  "app" => %{"id" => 15_368}
+                }
+              ]
+            }
+          else
+            github_payload(path)
+          end
+
+        {:ok, payload}
+      end
+    ]
+
+    context = %{
+      repository_context: %{workspace_path: "/tmp/workspace"},
+      github_opts: github_opts,
+      probe_opts: [
+        command_runner: fn _workspace, _git, argv ->
+          if Enum.member?(argv, "rev-parse"), do: {:ok, @sha_b <> "\n"}, else: {:ok, ""}
+        end
+      ]
+    }
+
+    assert {:error, {:source_control, _reason}} =
+             SourceControl.enrich_guard_evidence(intent, context, [])
   end
 
   test "enrich fails closed when source control is unconfigured for review acceptance" do
