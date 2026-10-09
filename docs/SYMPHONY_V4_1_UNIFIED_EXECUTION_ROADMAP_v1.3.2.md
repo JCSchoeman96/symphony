@@ -521,8 +521,6 @@ Programme D2 — Remote / Distributed Expansion
 = separate conditional branch only when measured operational need exists
 ```
 
-PR #35 is an accepted non-phase baseline remediation. The current accepted protected-main baseline is `84a2fbfdaece47d5dd87ca37c2e25e85afe39880` / `799ef67d3c4124e76f37b4e31251b9c974695455`.
-
 Programme E, Programme F, and Programme D1 are not a mandatory serial chain. Programme E may begin from trustworthy accepted-candidate/review evidence once its prerequisites exist; Programme F may begin once accepted candidate/artifact identity can be reliably correlated with deployment/production observations; Programme-F outcomes may then strengthen Programme-E learning. Programme D1 remains optional and is not a prerequisite for E or F. Programme D2 remains a separate conditional branch.
 
 ---
