@@ -8,10 +8,16 @@ This document records the production-rate behavior measured by the PRE-080C-02 c
 
 | Field | Value |
 |---|---|
-| Baseline commit | `c1ecb653fbbb05e8872d67802c2a3d730c2e653e` |
-| Baseline tree | `41365f1580b8e728b5fe86581b404623082be8e8` |
-| Candidate commit | `34829a513104bc72cdf7dfd96c416fcdd543d24c` |
-| Candidate source and test tree | `cbc614012fa7fc68ffdc6d7e59cd219d39f2e390`; excludes this evidence document |
+| Accepted base commit SHA | `c1ecb653fbbb05e8872d67802c2a3d730c2e653e` |
+| Accepted base Git tree | `41365f1580b8e728b5fe86581b404623082be8e8` |
+| Implementation commit SHA | `35a402f7fcd9cf5de6e0c82db72814082e155e39` |
+| Implementation commit Git tree | `b17dec16d4ebcf24eef89cdc0f4f0dbf321bffdd` |
+| Source/test-only Git tree | `025d453c1e27af0d3058e48e2b58bf1e40496a68`; calculated without this evidence document |
+| Pull request | `#37`; open candidate, not accepted |
+
+The implementation commit identifies the scheduler-seam remediation. The source/test-only tree is a separately calculated tree identity and is not a commit or the PR head tree. The final PR head and synthetic merge identities belong in the PR description after the candidate is frozen; they are intentionally not embedded here.
+
+Programme status: `PRE-080C-02 = AUTHORIZED / ACTIVE / NOT ACCEPTED`; `PRE-080C-03 = NOT STARTED`; `PRE-H080C = NOT REACHED`; `H-080C = NOT AUTHORIZED`.
 
 ## Measurement setup
 
@@ -78,4 +84,4 @@ The characterized structural envelope remains the existing 10,000-item ceiling, 
 - Relevant dependency, epoch, webhook, and project-contract tests: 142 tests, 3 failures. All three were AgentRunner runtime-start tests that timed out waiting for the runner-start message; preflight reproduced these failures against baseline.
 - `mix specs.check`, `mix format --check-formatted`, `mix credo --strict`, and `mix dialyzer`: passed.
 - `make -C elixir all`: stopped in coverage partition 3 after 346 tests, with 5 failures and 2 skips. The failures were four pinned-Codex identity/runtime tests and one AppServer routed-launch test; all reported unsupported `codex-cli 0.162.0` where the isolation fixtures require `0.159.3`. Remaining coverage partitions, the full H-070A make target, coverage report, Dialyzer make target, and isolation-proof target did not run in that invocation. H-070A, specs, formatting, Credo, and Dialyzer passed independently as listed above.
-- No commit or pull request was created. H-080C remains unauthorized, and this document does not claim programme acceptance.
+- This evidence describes PR #37 as an open, unaccepted candidate. The required GitHub checks for its final remediation candidate must complete before review; no merge or programme acceptance is claimed. H-080C remains unauthorized.
