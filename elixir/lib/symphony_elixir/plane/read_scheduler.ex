@@ -38,6 +38,11 @@ defmodule SymphonyElixir.Plane.ReadScheduler do
   @type request_fun :: (-> {:ok, term()} | {:error, term()})
   @type result :: {:ok, term()} | {:error, term()}
   @type stats :: map()
+  @type time_provider :: %{
+          monotonic_time: (-> integer()),
+          system_time: (-> integer()),
+          send_after: (pid(), term(), non_neg_integer() -> reference())
+        }
 
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts \\ []) when is_list(opts) do
@@ -168,7 +173,11 @@ defmodule SymphonyElixir.Plane.ReadScheduler do
   end
 
   def handle_info({:throttle_expired, token}, %{throttle_token: token} = state) do
-    {:noreply, dispatch(%{state | throttle_until: nil, throttle_token: nil})}
+    if is_integer(state.throttle_until) and state.throttle_until > now_ms(state) do
+      {:noreply, schedule_throttle_timer(%{state | throttle_token: nil})}
+    else
+      {:noreply, dispatch(%{state | throttle_until: nil, throttle_token: nil})}
+    end
   end
 
   def handle_info({:throttle_expired, _stale}, state), do: {:noreply, state}
@@ -287,16 +296,18 @@ defmodule SymphonyElixir.Plane.ReadScheduler do
       start_window_ms: Keyword.get(opts, :start_window_ms, @default_start_window_ms),
       backoff_base_ms: Keyword.get(opts, :backoff_base_ms, @default_backoff_base_ms),
       max_backoff_ms: Keyword.get(opts, :max_backoff_ms, @default_max_backoff_ms),
-      throttle_fallback_ms: Keyword.get(opts, :throttle_fallback_ms, @default_throttle_fallback_ms)
+      throttle_fallback_ms: Keyword.get(opts, :throttle_fallback_ms, @default_throttle_fallback_ms),
+      time_provider: Keyword.get(opts, :time_provider, default_time_provider())
     }
 
-    with :ok <- validate_server_options(values) do
+    with :ok <- validate_server_options(values),
+         :ok <- validate_time_provider(values.time_provider) do
       {:ok, %{values | throttle_fallback_ms: min(values.throttle_fallback_ms, values.max_backoff_ms)}}
     end
   end
 
   defp validate_server_options(values) do
-    with :ok <- validate_nonnegative_options(values),
+    with :ok <- validate_nonnegative_options(Map.delete(values, :time_provider)),
          :ok <- validate_max_concurrency(values.max_concurrency),
          :ok <- validate_start_limit(values.start_limit),
          :ok <- validate_start_window(values.start_window_ms) do
@@ -329,12 +340,13 @@ defmodule SymphonyElixir.Plane.ReadScheduler do
 
   defp can_start_now?(state) do
     map_size(state.in_flight) < state.max_concurrency and
-      not throttle_active?(state, now_ms()) and
+      not throttle_active?(state, now_ms(state)) and
       not pacing_exhausted?(state)
   end
 
   defp dispatch(state) do
-    state = clear_expired_throttle(purge_starts(state, now_ms()))
+    now = now_ms(state)
+    state = clear_expired_throttle(purge_starts(state, now), now)
 
     cond do
       state.queue == [] ->
@@ -343,7 +355,7 @@ defmodule SymphonyElixir.Plane.ReadScheduler do
       map_size(state.in_flight) >= state.max_concurrency ->
         state
 
-      throttle_active?(state, now_ms()) ->
+      throttle_active?(state, now) ->
         schedule_throttle_timer(state)
 
       pacing_exhausted?(state) ->
@@ -381,7 +393,7 @@ defmodule SymphonyElixir.Plane.ReadScheduler do
 
     state
     |> Map.put(:in_flight, Map.put(state.in_flight, entry.ref, entry))
-    |> Map.update!(:starts, &[now_ms() | &1])
+    |> Map.update!(:starts, &[now_ms(state) | &1])
     |> update_in([:metrics, :attempts], &(&1 + 1))
     |> update_in([:metrics, :peak_concurrency], &max(&1, map_size(state.in_flight) + 1))
   end
@@ -399,7 +411,7 @@ defmodule SymphonyElixir.Plane.ReadScheduler do
   end
 
   defp handle_result(state, entry, result) do
-    metadata = response_metadata(result)
+    metadata = response_metadata(result, state.time_provider)
     outcome = classify(result)
     state = observe(state, metadata, outcome)
 
@@ -429,7 +441,7 @@ defmodule SymphonyElixir.Plane.ReadScheduler do
 
   defp retry_entry(state, entry, delay) do
     token = make_ref()
-    Process.send_after(self(), {:retry_ready, entry.ref, token}, delay)
+    schedule_timer(state, {:retry_ready, entry.ref, token}, delay)
 
     state
     |> put_in([:backoff, entry.ref], Map.put(entry, :retry_token, token))
@@ -477,10 +489,11 @@ defmodule SymphonyElixir.Plane.ReadScheduler do
       ])
       |> min(state.max_backoff_ms)
 
-    until = now_ms() + delay
+    now = now_ms(state)
+    until = now + delay
     until = if state.throttle_until, do: max(state.throttle_until, until), else: until
     token = make_ref()
-    Process.send_after(self(), {:throttle_expired, token}, max(until - now_ms(), 1))
+    schedule_timer(state, {:throttle_expired, token}, max(until - now, 1))
 
     state
     |> Map.merge(%{throttle_until: until, throttle_token: token})
@@ -523,7 +536,7 @@ defmodule SymphonyElixir.Plane.ReadScheduler do
   defp known_transport_reason?(%{kind: kind}), do: known_transport_reason?(kind)
   defp known_transport_reason?(_reason), do: false
 
-  defp response_metadata(result) do
+  defp response_metadata(result, time_provider) do
     source = response_source(result)
     headers = response_headers(source)
     retry_value = rate_limit_value(headers, source, "retry-after", [:retry_after_seconds, :retry_after])
@@ -537,7 +550,7 @@ defmodule SymphonyElixir.Plane.ReadScheduler do
       retry_after_seconds: retry_after_seconds,
       retry_after_ms: if(is_number(retry_after_seconds), do: round(retry_after_seconds * 1_000)),
       reset_at_unix: reset_at_unix,
-      reset_delay_ms: reset_delay_ms(reset_at_unix),
+      reset_delay_ms: reset_delay_ms(reset_at_unix, time_provider),
       remaining: remaining,
       throttle?: throttled_result?(result)
     }
@@ -555,11 +568,11 @@ defmodule SymphonyElixir.Plane.ReadScheduler do
     header_value(headers, header) || map_value(source, keys ++ Enum.map(keys, &Atom.to_string/1))
   end
 
-  defp reset_delay_ms(reset_at_unix) when is_integer(reset_at_unix) do
-    max(reset_at_unix * 1_000 - System.system_time(:millisecond), @minimum_delay_ms)
+  defp reset_delay_ms(reset_at_unix, time_provider) when is_integer(reset_at_unix) do
+    max(reset_at_unix * 1_000 - time_provider.system_time.(), @minimum_delay_ms)
   end
 
-  defp reset_delay_ms(_reset_at_unix), do: nil
+  defp reset_delay_ms(_reset_at_unix, _time_provider), do: nil
 
   defp throttled_result?(result), do: status_from(result) == 429 or rate_limited?(result)
 
@@ -666,11 +679,11 @@ defmodule SymphonyElixir.Plane.ReadScheduler do
   defp send_result(caller, ref, result), do: send(caller, {:plane_read_scheduler, ref, result})
   defp all_entries(state), do: state.queue ++ Map.values(state.backoff) ++ Map.values(state.in_flight)
 
-  defp clear_expired_throttle(%{throttle_until: until} = state) when is_integer(until) do
-    if until <= now_ms(), do: %{state | throttle_until: nil, throttle_token: nil}, else: state
+  defp clear_expired_throttle(%{throttle_until: until} = state, now) when is_integer(until) do
+    if until <= now, do: %{state | throttle_until: nil, throttle_token: nil}, else: state
   end
 
-  defp clear_expired_throttle(state), do: state
+  defp clear_expired_throttle(state, _now), do: state
   defp purge_starts(state, now), do: %{state | starts: Enum.filter(state.starts, &(now - &1 < state.start_window_ms))}
   defp pacing_exhausted?(state), do: length(state.starts) >= state.start_limit
   defp throttle_active?(state, now), do: is_integer(state.throttle_until) and state.throttle_until > now
@@ -678,7 +691,7 @@ defmodule SymphonyElixir.Plane.ReadScheduler do
   defp schedule_throttle_timer(state) do
     if is_nil(state.throttle_token) do
       token = make_ref()
-      Process.send_after(self(), {:throttle_expired, token}, max(state.throttle_until - now_ms(), 1))
+      schedule_timer(state, {:throttle_expired, token}, max(state.throttle_until - now_ms(state), 1))
       %{state | throttle_token: token}
     else
       state
@@ -686,16 +699,16 @@ defmodule SymphonyElixir.Plane.ReadScheduler do
   end
 
   defp schedule_pacing_timer(%{pacing_token: nil} = state) do
-    delay = max(Enum.min(state.starts) + state.start_window_ms - now_ms(), 1)
+    delay = max(Enum.min(state.starts) + state.start_window_ms - now_ms(state), 1)
     token = make_ref()
-    Process.send_after(self(), {:pacing_expired, token}, delay)
+    schedule_timer(state, {:pacing_expired, token}, delay)
     %{state | pacing_token: token}
   end
 
   defp schedule_pacing_timer(state), do: state
 
   defp stats_snapshot(state) do
-    now = now_ms()
+    now = now_ms(state)
     metrics = state.metrics
     queued = state.queue ++ Map.values(state.backoff)
     queued_control = Enum.count(queued, &(&1.class == :control))
@@ -789,5 +802,23 @@ defmodule SymphonyElixir.Plane.ReadScheduler do
 
   defp put_if_present(map, _key, nil), do: map
   defp put_if_present(map, key, value), do: Map.put(map, key, value)
-  defp now_ms, do: System.monotonic_time(:millisecond)
+  defp now_ms(state), do: state.time_provider.monotonic_time.()
+
+  defp schedule_timer(state, message, delay) do
+    state.time_provider.send_after.(self(), message, delay)
+  end
+
+  defp default_time_provider do
+    %{
+      monotonic_time: fn -> System.monotonic_time(:millisecond) end,
+      system_time: fn -> System.system_time(:millisecond) end,
+      send_after: fn destination, message, delay -> Process.send_after(destination, message, delay) end
+    }
+  end
+
+  defp validate_time_provider(%{monotonic_time: monotonic_time, system_time: system_time, send_after: send_after})
+       when is_function(monotonic_time, 0) and is_function(system_time, 0) and is_function(send_after, 3),
+       do: :ok
+
+  defp validate_time_provider(_time_provider), do: {:error, :invalid_time_provider}
 end

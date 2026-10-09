@@ -46,6 +46,72 @@ defmodule SymphonyElixir.PlaneReadSchedulerTest do
              ReadScheduler.execute(scheduler, :control, fn -> raise "request_boom" end)
   end
 
+  test "rejects an incomplete injected time provider" do
+    assert {:error, :invalid_time_provider} = ReadScheduler.start_link(time_provider: %{monotonic_time: fn -> 0 end})
+  end
+
+  test "uses production time delegates when the scheduler has no injected provider" do
+    parent = self()
+    reset_at = System.system_time(:second) + 1
+    {:ok, attempt_count} = Agent.start_link(fn -> 0 end)
+
+    {:ok, scheduler} =
+      ReadScheduler.start_link(
+        max_concurrency: 1,
+        start_limit: 1,
+        start_window_ms: 500,
+        throttle_fallback_ms: 5,
+        max_backoff_ms: 4_000
+      )
+
+    on_exit(fn ->
+      stop_process(scheduler)
+      stop_process(attempt_count)
+    end)
+
+    first =
+      Task.async(fn ->
+        ReadScheduler.execute(scheduler, :bulk, fn ->
+          attempt = Agent.get_and_update(attempt_count, &{&1, &1 + 1})
+
+          if attempt == 0 do
+            {:error, {:rate_limited, %{headers: %{"x-ratelimit-reset" => Integer.to_string(reset_at)}}}}
+          else
+            send(parent, {:default_retry_started_at, System.system_time(:millisecond)})
+            {:ok, :recovered}
+          end
+        end)
+      end)
+
+    assert eventually(fn -> ReadScheduler.stats(scheduler).last_rate_limit_reset_at == reset_at end)
+    assert ReadScheduler.stats(scheduler).last_rate_limit_reset_at == reset_at
+    assert_receive {:default_retry_started_at, retry_started_at}, 3_000
+    assert {:ok, :recovered} = Task.await(first, 1_000)
+    assert retry_started_at >= reset_at * 1_000 - 50
+    assert ReadScheduler.stats(scheduler).attempts == 2
+
+    {:ok, pacing_scheduler} = ReadScheduler.start_link(max_concurrency: 1, start_limit: 1, start_window_ms: 500)
+    on_exit(fn -> stop_process(pacing_scheduler) end)
+
+    assert {:ok, :first} = ReadScheduler.execute(pacing_scheduler, :bulk, fn -> {:ok, :first} end)
+
+    second =
+      Task.async(fn ->
+        ReadScheduler.execute(pacing_scheduler, :bulk, fn ->
+          send(parent, {:production_default_timer_fired, System.monotonic_time(:millisecond)})
+          {:ok, :second}
+        end)
+      end)
+
+    assert eventually(fn -> ReadScheduler.stats(pacing_scheduler).queue_length == 1 end)
+    refute_receive {:production_default_timer_fired, _started_at}, 50
+    second_submitted_at = System.monotonic_time(:millisecond)
+    assert_receive {:production_default_timer_fired, second_started_at}, 2_000
+    assert {:ok, :second} = Task.await(second, 1_000)
+    assert second_started_at - second_submitted_at >= 400
+    assert ReadScheduler.stats(pacing_scheduler).attempts == 2
+  end
+
   test "returns unavailable when a scheduler stops before admission" do
     {:ok, scheduler} = ReadScheduler.start_link()
     GenServer.stop(scheduler)
@@ -67,6 +133,151 @@ defmodule SymphonyElixir.PlaneReadSchedulerTest do
     eventually(fn -> Process.info(scheduler, :message_queue_len) |> elem(1) == 0 end)
     assert ReadScheduler.stats(scheduler).logical_requests == 0
     assert {:error, :not_found} = GenServer.call(scheduler, {:cancel, make_ref(), self()})
+  end
+
+  test "uses deterministic production pacing and the scheduled timer message path" do
+    parent = self()
+    {:ok, clock_state} = Agent.start_link(fn -> 0 end)
+    clock = deterministic_clock(parent, clock_state)
+
+    {:ok, scheduler} =
+      ReadScheduler.start_link(
+        max_concurrency: 1,
+        start_limit: 1,
+        start_window_ms: 60_000,
+        time_provider: clock
+      )
+
+    on_exit(fn ->
+      stop_process(scheduler)
+      stop_process(clock_state)
+    end)
+
+    first = Task.async(fn -> ReadScheduler.execute(scheduler, :bulk, fn -> {:ok, :first} end) end)
+    assert {:ok, :first} = Task.await(first, 1_000)
+
+    second =
+      Task.async(fn ->
+        ReadScheduler.execute(scheduler, :bulk, fn ->
+          send(parent, {:second_started, Agent.get(clock_state, & &1)})
+          {:ok, :second}
+        end)
+      end)
+
+    assert_receive {:scheduled_timer, ^scheduler, {:pacing_expired, token}, 60_000}
+
+    send(scheduler, {:pacing_expired, make_ref()})
+    assert ReadScheduler.stats(scheduler).attempts == 1
+    assert ReadScheduler.stats(scheduler).queue_length == 1
+    Agent.update(clock_state, &(&1 + 60_000))
+    send(scheduler, {:pacing_expired, token})
+
+    assert {:ok, :second} = Task.await(second, 1_000)
+    assert_receive {:second_started, 60_000}
+    assert ReadScheduler.stats(scheduler).attempts == 2
+  end
+
+  test "queued control reads jump bulk work after pacing reopens without bypassing the window" do
+    parent = self()
+    {:ok, clock_state} = Agent.start_link(fn -> 0 end)
+    clock = deterministic_clock(parent, clock_state)
+
+    {:ok, scheduler} =
+      ReadScheduler.start_link(
+        max_concurrency: 1,
+        queue_limit: 5,
+        start_limit: 1,
+        start_window_ms: 60_000,
+        time_provider: clock
+      )
+
+    on_exit(fn ->
+      stop_process(scheduler)
+      stop_process(clock_state)
+    end)
+
+    assert {:ok, :initial} = ReadScheduler.execute(scheduler, :bulk, fn -> {:ok, :initial} end)
+
+    bulk =
+      Task.async(fn ->
+        ReadScheduler.execute(scheduler, :bulk, fn ->
+          send(parent, {:bulk_started, Agent.get(clock_state, & &1)})
+          {:ok, :bulk}
+        end)
+      end)
+
+    control =
+      Task.async(fn ->
+        ReadScheduler.execute(scheduler, :control, fn ->
+          send(parent, {:control_started, Agent.get(clock_state, & &1)})
+          {:ok, :control}
+        end)
+      end)
+
+    assert_receive {:scheduled_timer, ^scheduler, {:pacing_expired, pacing_token}, 60_000}
+    eventually(fn -> ReadScheduler.stats(scheduler).queue_length == 2 end)
+    assert ReadScheduler.stats(scheduler).attempts == 1
+
+    Agent.update(clock_state, &(&1 + 60_000))
+    send(scheduler, {:pacing_expired, pacing_token})
+
+    assert_receive {:control_started, 60_000}
+    assert ReadScheduler.stats(scheduler).attempts == 2
+    assert_receive {:scheduled_timer, ^scheduler, {:pacing_expired, bulk_token}, 60_000}
+
+    Agent.update(clock_state, &(&1 + 60_000))
+    send(scheduler, {:pacing_expired, bulk_token})
+
+    assert_receive {:bulk_started, 120_000}
+    assert {:ok, :control} = Task.await(control, 1_000)
+    assert {:ok, :bulk} = Task.await(bulk, 1_000)
+    assert ReadScheduler.stats(scheduler).peak_concurrency == 1
+  end
+
+  test "uses the injected clock for retry and throttle timers" do
+    parent = self()
+    {:ok, clock_state} = Agent.start_link(fn -> 0 end)
+    clock = deterministic_clock(parent, clock_state)
+    attempts = Agent.start_link(fn -> 0 end) |> elem(1)
+
+    {:ok, scheduler} =
+      ReadScheduler.start_link(
+        max_concurrency: 1,
+        throttle_fallback_ms: 5,
+        max_backoff_ms: 100,
+        time_provider: clock
+      )
+
+    on_exit(fn ->
+      stop_process(scheduler)
+      stop_process(clock_state)
+      stop_process(attempts)
+    end)
+
+    request =
+      Task.async(fn ->
+        ReadScheduler.execute(scheduler, :control, fn ->
+          attempt = Agent.get_and_update(attempts, &{&1, &1 + 1})
+
+          if attempt == 0,
+            do: {:error, {:rate_limited, %{headers: %{"retry-after" => "0.02"}}}},
+            else: {:ok, :recovered}
+        end)
+      end)
+
+    assert_receive {:scheduled_timer, ^scheduler, {:throttle_expired, throttle_token}, 20}
+    assert_receive {:scheduled_timer, ^scheduler, {:retry_ready, request_ref, retry_token}, 20}
+    send(scheduler, {:throttle_expired, throttle_token})
+    assert ReadScheduler.stats(scheduler).throttled
+    assert ReadScheduler.stats(scheduler).attempts == 1
+    assert_receive {:scheduled_timer, ^scheduler, {:throttle_expired, rescheduled_throttle_token}, 20}
+    Agent.update(clock_state, &(&1 + 20))
+    send(scheduler, {:throttle_expired, rescheduled_throttle_token})
+    send(scheduler, {:retry_ready, request_ref, retry_token})
+
+    assert {:ok, :recovered} = Task.await(request, 1_000)
+    assert Agent.get(attempts, & &1) == 2
+    assert ReadScheduler.stats(scheduler).throttle_count == 1
   end
 
   test "rejects a duplicate registered scheduler name" do
@@ -286,6 +497,45 @@ defmodule SymphonyElixir.PlaneReadSchedulerTest do
     assert stats.last_rate_limit_reset_at == reset
     assert stats.last_retry_after_ms == 0
     assert stats.retries == 1
+  end
+
+  test "calculates X-RateLimit-Reset delay using injected system time" do
+    parent = self()
+    {:ok, scheduled} = Agent.start_link(fn -> [] end)
+
+    time_provider = %{
+      monotonic_time: fn -> 0 end,
+      system_time: fn ->
+        send(parent, :injected_system_time_read)
+        1_000_000
+      end,
+      send_after: fn destination, message, delay ->
+        Agent.update(scheduled, &[{destination, message, delay} | &1])
+        make_ref()
+      end
+    }
+
+    {:ok, scheduler} =
+      ReadScheduler.start_link(
+        max_backoff_ms: 60_000,
+        throttle_fallback_ms: 1,
+        time_provider: time_provider
+      )
+
+    request =
+      Task.async(fn ->
+        ReadScheduler.execute(scheduler, :control, fn ->
+          {:error, {:rate_limited, %{headers: %{"retry-after" => "0", "x-ratelimit-reset" => "1010"}}}}
+        end)
+      end)
+
+    assert_receive :injected_system_time_read
+    assert eventually(fn -> Enum.any?(Agent.get(scheduled, & &1), fn {_pid, _message, delay} -> delay == 10_000 end) end)
+    assert ReadScheduler.stats(scheduler).last_rate_limit_reset_at == 1_010
+
+    Task.shutdown(request, :brutal_kill)
+    GenServer.stop(scheduler)
+    Agent.stop(scheduled)
   end
 
   test "pauses new reads at the provider remaining-request safety floor" do
@@ -808,6 +1058,27 @@ defmodule SymphonyElixir.PlaneReadSchedulerTest do
       Process.sleep(1)
       wait_for_gate(gate)
     end
+  end
+
+  defp stop_process(pid) do
+    if Process.alive?(pid) do
+      try do
+        GenServer.stop(pid)
+      catch
+        :exit, _reason -> :ok
+      end
+    end
+  end
+
+  defp deterministic_clock(parent, clock_state) do
+    %{
+      monotonic_time: fn -> Agent.get(clock_state, & &1) end,
+      system_time: fn -> 0 end,
+      send_after: fn destination, message, delay ->
+        send(parent, {:scheduled_timer, destination, message, delay})
+        make_ref()
+      end
+    }
   end
 
   defp eventually(fun, attempts \\ 20)
