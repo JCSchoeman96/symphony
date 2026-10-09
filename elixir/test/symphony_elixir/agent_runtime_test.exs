@@ -88,6 +88,9 @@ defmodule SymphonyElixir.AgentRuntimeTest do
     work_item
   end
 
+  defp admit_fake_runtime_for_lifecycle_test(_worker_host, _executable, _opts),
+    do: {:ok, :test_admitted}
+
   defp dispatch_guard_evidence(route, runtime_identity) do
     %{
       class: :mechanical_guard,
@@ -309,6 +312,7 @@ defmodule SymphonyElixir.AgentRuntimeTest do
                route: initial_route,
                work_item: work_item,
                ownership_ledger: workspace_ownership_ledger(),
+               test_runtime_isolation_admit: &admit_fake_runtime_for_lifecycle_test/3,
                issue_state_fetcher: fn [_issue_id] -> {:ok, [%{issue | state: "Ready"}]} end
              )
 
@@ -395,6 +399,7 @@ defmodule SymphonyElixir.AgentRuntimeTest do
                route: initial_route,
                work_item: work_item,
                ownership_ledger: workspace_ownership_ledger(),
+               test_runtime_isolation_admit: &admit_fake_runtime_for_lifecycle_test/3,
                issue_state_fetcher: fn [_issue_id] -> {:ok, [issue]} end
              )
 
@@ -440,6 +445,7 @@ defmodule SymphonyElixir.AgentRuntimeTest do
                ownership_ledger: workspace_ownership_ledger(),
                guard_evidence: [dispatch_evidence],
                assessment_context: assessment_context,
+               test_runtime_isolation_admit: &admit_fake_runtime_for_lifecycle_test/3,
                issue_state_fetcher: fn [_issue_id] -> {:ok, [refreshed_issue]} end
              )
 
@@ -532,6 +538,7 @@ defmodule SymphonyElixir.AgentRuntimeTest do
                    :atomics.add(provider_reads, 1, 1)
                    {:ok, [refreshed_issue]}
                  end,
+                 test_runtime_isolation_admit: &admit_fake_runtime_for_lifecycle_test/3,
                  plane_epoch_snapshot_reader: snapshot_reader
                )
 
@@ -595,6 +602,7 @@ defmodule SymphonyElixir.AgentRuntimeTest do
                  route: route,
                  work_item: work_item,
                  ownership_ledger: workspace_ownership_ledger(),
+                 test_runtime_isolation_admit: &admit_fake_runtime_for_lifecycle_test/3,
                  plane_epoch_snapshot_reader: fn -> {:ok, []} end,
                  issue_state_fetcher: fn _ids ->
                    :atomics.add(provider_reads, 1, 1)
@@ -633,6 +641,7 @@ defmodule SymphonyElixir.AgentRuntimeTest do
           route: route,
           work_item: work_item,
           ownership_ledger: workspace_ownership_ledger(),
+          test_runtime_isolation_admit: &admit_fake_runtime_for_lifecycle_test/3,
           plane_epoch_snapshot_reader: fn -> {:error, :plane_epoch_unavailable} end,
           issue_state_fetcher: fn _ids ->
             :atomics.add(provider_reads, 1, 1)
@@ -671,6 +680,7 @@ defmodule SymphonyElixir.AgentRuntimeTest do
           route: route,
           work_item: work_item,
           ownership_ledger: workspace_ownership_ledger(),
+          test_runtime_isolation_admit: &admit_fake_runtime_for_lifecycle_test/3,
           issue_state_fetcher: fn _ids ->
             :atomics.add(provider_reads, 1, 1)
             {:ok, [issue]}
@@ -717,6 +727,7 @@ defmodule SymphonyElixir.AgentRuntimeTest do
                route: route,
                work_item: work_item,
                ownership_ledger: workspace_ownership_ledger(),
+               test_runtime_isolation_admit: &admit_fake_runtime_for_lifecycle_test/3,
                issue_state_fetcher: fn [_issue_id] -> {:ok, [issue]} end
              )
 
@@ -783,6 +794,7 @@ defmodule SymphonyElixir.AgentRuntimeTest do
                route: route,
                work_item: work_item,
                ownership_ledger: workspace_ownership_ledger(),
+               test_runtime_isolation_admit: &admit_fake_runtime_for_lifecycle_test/3,
                issue_state_fetcher: fn [_issue_id] ->
                  {:ok,
                   [
@@ -831,6 +843,7 @@ defmodule SymphonyElixir.AgentRuntimeTest do
                route: route,
                work_item: work_item,
                ownership_ledger: workspace_ownership_ledger(),
+               test_runtime_isolation_admit: &admit_fake_runtime_for_lifecycle_test/3,
                issue_state_fetcher: fn [_issue_id] -> {:ok, [%{issue | state: "In Review"}]} end
              )
 
@@ -870,6 +883,7 @@ defmodule SymphonyElixir.AgentRuntimeTest do
                route: route,
                work_item: work_item,
                ownership_ledger: workspace_ownership_ledger(),
+               test_runtime_isolation_admit: &admit_fake_runtime_for_lifecycle_test/3,
                issue_state_fetcher: fn [_issue_id] ->
                  {:ok, [%{issue | state: "Blocked", dispatchable: false}]}
                end
