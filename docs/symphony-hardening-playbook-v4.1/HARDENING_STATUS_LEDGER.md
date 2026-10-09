@@ -14,19 +14,23 @@ Formal acceptance for those five reconciled rows is established by the 2026-10-0
 
 | Branch | Commit | Tree |
 |---|---|---|
-| protected `main` | `0bdd3960947bb2bafd34a7eb92e970eaae07a82a` | `1cbb9dfa6a74aaf868ddf6e55b3e54232b4f6b60` |
+| protected `main` | `84a2fbfdaece47d5dd87ca37c2e25e85afe39880` | `799ef67d3c4124e76f37b4e31251b9c974695455` |
 
 ## Current authorization
 
 ```text
-CURRENT_ACCEPTED_PHASE = H-080B
-CURRENT_ACCEPTED_BASELINE_SHA = 0bdd3960947bb2bafd34a7eb92e970eaae07a82a
-CURRENT_ACCEPTED_BASELINE_TREE = 1cbb9dfa6a74aaf868ddf6e55b3e54232b4f6b60
-ACCEPTANCE_EFFECTIVE_DATE = 2026-10-07
+LATEST_ACCEPTED_V4.1_PHASE = H-080B
+LATEST_ACCEPTED_PREREQUISITE = PRE-080C-01
+CURRENT_ACCEPTED_BASELINE_SHA = 84a2fbfdaece47d5dd87ca37c2e25e85afe39880
+CURRENT_ACCEPTED_BASELINE_TREE = 799ef67d3c4124e76f37b4e31251b9c974695455
+PRE-080C-01 = ACCEPTED effective 2026-10-09
+PRE-080C-02 = AUTHORIZED / ACTIVE / NOT ACCEPTED
+PRE-080C-03 = NOT STARTED
+PRE-H080C = NOT REACHED
 H-080C = NOT AUTHORIZED
 ```
 
-The currently authorized follow-on scope is governance/documentation canonicalization only. H-080C must not begin until the current Unified Execution Roadmap is canonically adopted and its prerequisite gates authorize that work.
+PRE-080C-02 is the only currently authorized implementation prerequisite. Its earlier base-bound candidate evidence must be re-established after this governance synchronization is accepted. PRE-080C-03 has not started. H-080C remains unauthorized until the PRE-H080C gate and separate explicit authorization.
 
 ## Phase index
 
@@ -56,14 +60,19 @@ The currently authorized follow-on scope is governance/documentation canonicaliz
 | REM-HI21 | ACCEPTED effective 2026-10-07 | [#25](https://github.com/JCSchoeman96/symphony/pull/25) | `7ba76fccaacc5789443c685ed6f1d2bee7f04f9c` | `ccce54196e30a8c0928feee5639a7e8662f4fa7d` | Protected-main `make-all` run `36431327304`; [2026-10-05 reconciliation + 2026-10-07 Master adjudication](GOVERNANCE_RECONCILIATION_2026-10-05.md) | H-080A characterization history |
 | H-I20 remediation | ACCEPTED effective 2026-10-07 | [#29](https://github.com/JCSchoeman96/symphony/pull/29) | `e226b14f409c806ff2bc6841b1f6be34746dd128` | `75b8ad50d4a641c88c005926b597bcb9b9fd11db` | Protected-main `make-all` run `36852822353`; [2026-10-05 reconciliation + 2026-10-07 Master adjudication](GOVERNANCE_RECONCILIATION_2026-10-05.md) | H-080A final characterization history |
 | H-080A | ACCEPTED effective 2026-10-07 | [#30](https://github.com/JCSchoeman96/symphony/pull/30) | `56798754c8f6fd80d7ec53b604800873e339e030` | `a2770cbd2a5f4b96617b3fe18f324f0376d0cdf1` | Protected-main `make-all` run `36858770612`; [2026-10-05 reconciliation + 2026-10-07 Master adjudication](GOVERNANCE_RECONCILIATION_2026-10-05.md) | H-080B history |
-| H-080B | ACCEPTED effective 2026-10-07 | [#31](https://github.com/JCSchoeman96/symphony/pull/31) | `0bdd3960947bb2bafd34a7eb92e970eaae07a82a` | `1cbb9dfa6a74aaf868ddf6e55b3e54232b4f6b60` | [H-080B evidence](H-080B_IMPLEMENTATION_EVIDENCE.md); protected-main `make-all` run `37227505533`; [2026-10-05 reconciliation + 2026-10-07 Master adjudication](GOVERNANCE_RECONCILIATION_2026-10-05.md) | Governance/documentation canonicalization only; H-080C remains unauthorized |
+| H-080B | ACCEPTED effective 2026-10-07 | [#31](https://github.com/JCSchoeman96/symphony/pull/31) | `0bdd3960947bb2bafd34a7eb92e970eaae07a82a` | `1cbb9dfa6a74aaf868ddf6e55b3e54232b4f6b60` | [H-080B evidence](H-080B_IMPLEMENTATION_EVIDENCE.md); protected-main `make-all` run `37227505533`; [2026-10-05 reconciliation + 2026-10-07 Master adjudication](GOVERNANCE_RECONCILIATION_2026-10-05.md) | PRE-080C-01 bounded prerequisite |
+| PRE-080C-01 | ACCEPTED effective 2026-10-09; bounded prerequisite, not a new roadmap phase | [#34](https://github.com/JCSchoeman96/symphony/pull/34) | `09b72591d33fbe88243bceb584f85fca1f6fc819` | `a9ff9606f52c429f58c9ab59c4e8fb11a43f73b6` | [PRE-080C-01 evidence](PRE-080C-01_PRODUCTION_EVIDENCE_ACQUISITION.md); protected-main `make-all` run `37904661908`; Master Governance adjudication | PRE-080C-02 |
 
 ## Historical H-080A artifacts
 
 PR #26 remains an open draft historical characterization artifact and is not accepted or merged by this ledger. PRs #27 and #28 are preserved as internal H-080A characterization/post-merge test history rather than separate roadmap phase authorities.
 
+## Accepted non-phase baseline remediation
+
+PR #35 corrected AgentRunner lifecycle test isolation. It is accepted as a non-phase baseline remediation on protected `main` at `84a2fbfdaece47d5dd87ca37c2e25e85afe39880`, tree `799ef67d3c4124e76f37b4e31251b9c974695455`, after protected-main `make-all` run `37931419995` completed successfully on 2026-10-09. This remediation does not add a roadmap phase or change governance architecture.
+
 ## Current summary
 
-Effective 2026-10-07, H-070B is accepted at `b621d6b1663703253da72b3f822c60f509180e5d`. REM-HI21 is accepted at `7ba76fccaacc5789443c685ed6f1d2bee7f04f9c`. The H-I20 CompletionProof remediation is accepted at `e226b14f409c806ff2bc6841b1f6be34746dd128`. H-080A is accepted at `56798754c8f6fd80d7ec53b604800873e339e030`. H-080B is accepted on protected `main` at `0bdd3960947bb2bafd34a7eb92e970eaae07a82a`.
+Effective 2026-10-07, H-070B is accepted at `b621d6b1663703253da72b3f822c60f509180e5d`. REM-HI21 is accepted at `7ba76fccaacc5789443c685ed6f1d2bee7f04f9c`. The H-I20 CompletionProof remediation is accepted at `e226b14f409c806ff2bc6841b1f6be34746dd128`. H-080A is accepted at `56798754c8f6fd80d7ec53b604800873e339e030`. H-080B is accepted at `0bdd3960947bb2bafd34a7eb92e970eaae07a82a`. PRE-080C-01 is accepted effective 2026-10-09 at merge `09b72591d33fbe88243bceb584f85fca1f6fc819`. PR #35 is an accepted non-phase baseline remediation at current protected-main baseline `84a2fbfdaece47d5dd87ca37c2e25e85afe39880`.
 
-H-080C remains **NOT AUTHORIZED**. The next allowed work is governance/documentation canonicalization needed to install the reconciled Unified Execution Roadmap and companion authority documents. Future implementation authorization must come from that canonicalized roadmap and its explicit prerequisite gates.
+PRE-080C-02 is **AUTHORIZED / ACTIVE / NOT ACCEPTED**. After this governance synchronization is accepted, re-pin or rebase PRE-080C-02 on the then-current accepted `main` and regenerate candidate-bound evidence before independent review. PRE-080C-03 is **NOT STARTED** and PRE-H080C is **NOT REACHED**. H-080C remains **NOT AUTHORIZED**.

@@ -1,10 +1,10 @@
 # PRE-080C-01 — Production Evidence Acquisition
 
-**Status:** PRE-080C-01A was replanned and implementation-authorized. Its implementation remains a candidate on PR #34 and is not Master-accepted. Fresh independent review of candidate `0c58525a30ec741486afae1b1ab581051c7485d4` returned `CHANGES_REQUESTED` because context-free `GuardClass` dispatch validation can accept a dispatch guard without trusted context. Remediation and fresh review remain required.
+**Current status:** PRE-080C-01 is **ACCEPTED effective 2026-10-09** by Master Governance after fresh independent clean-room review, human merge, and successful protected-main post-merge verification. The final candidate was `a6f542096f0631ac719c1a05417079e88121e49e`; merge `09b72591d33fbe88243bceb584f85fca1f6fc819` has tree `a9ff9606f52c429f58c9ab59c4e8fb11a43f73b6`. Protected-main `make-all` run `37904661908` completed successfully on that merge. H-080C remains **NOT AUTHORIZED**.
 
-**PR #34 disposition:** Open and unmerged. Do not merge until the review blocker is corrected, a new exact candidate passes required checks, and fresh independent re-review returns `READY_FOR_MASTER_GATE`. H-080C remains unauthorized.
+**PR #34 disposition:** Merged. The final Master Governance disposition is recorded below. Earlier candidate dispositions remain in the historical sections.
 
-## Accepted baseline
+## Original characterization baseline (historical)
 
 | Field | Value |
 |---|---|
@@ -54,7 +54,7 @@ That was the candidate state at the PRE-080C-01 frozen-plan STOP boundary. The l
 
 ## Historical PRE-080C-01A implementation
 
-PRE-080C-01A was replanned and implementation-authorized after the historical frozen-plan STOP boundary above. Its accepted implementation scope added the changes described below. The text records that authorization and implementation; it does not authorize merging or acceptance after the independent review finding.
+PRE-080C-01A was replanned and implementation-authorized after the historical frozen-plan STOP boundary above. Its implementation scope added the changes described below. At that point, this authorization record did not itself authorize merging or acceptance. The later final disposition below records the subsequent review and governance outcome.
 
 Dispatch authority is produced only by the Orchestrator from the current running RuntimeAttempt and the current open, in-flight AttemptLedger record with an exact `:bound` fence. The fence RuntimeAttempt identity is compared with the running identity. Route fingerprint remains separate from RuntimeAttempt identity and must match the record, fence, running entry, and trusted Route. The running identity runtime profile must match the Route profile.
 
@@ -66,7 +66,7 @@ The production-path regression dispatches a planned Ready WorkItem through the O
 
 ## Independent review of candidate `0c58525`
 
-The fresh independent review returned `REVIEW_VERDICT=CHANGES_REQUESTED`. It found that context-free public `GuardClass` APIs could accept a dispatch-shaped guard because dispatch satisfaction fell back to class/name matching whenever the context had no dispatch fields. A dispatch proof cannot authorize itself. The remediation must make every dispatch satisfaction attempt require complete trusted context.
+At that review point, the fresh independent review returned `REVIEW_VERDICT=CHANGES_REQUESTED`. It found that context-free public `GuardClass` APIs could accept a dispatch-shaped guard because dispatch satisfaction fell back to class/name matching whenever the context had no dispatch fields. A dispatch proof cannot authorize itself. The remediation had to make every dispatch satisfaction attempt require complete trusted context.
 
 | Evidence | Identity or result |
 |---|---|
@@ -77,9 +77,19 @@ The fresh independent review returned `REVIEW_VERDICT=CHANGES_REQUESTED`. It fou
 | `validate-pr-description` | Run `37762759043`, success |
 | Earlier `make-all` run | `37642063509`, failed; historical and superseded |
 
-Both successful checks belonged to the reviewed candidate. Green CI did not close the independent-review GuardClass blocker. The checks required for the remediation candidate are `make-all` and `validate-pr-description`, both from GitHub Actions app ID `15368`; they must succeed on the new exact HEAD. Fresh independent re-review must then return `READY_FOR_MASTER_GATE`. PRE-080C-01 remains unaccepted, and H-080C remains unauthorized.
+Both successful checks belonged to the reviewed candidate. Green CI did not close that candidate's independent-review GuardClass blocker. At that historical point, the remediation candidate still needed successful `make-all` and `validate-pr-description` checks from GitHub Actions app ID `15368`, followed by fresh independent re-review returning `READY_FOR_MASTER_GATE`. PRE-080C-01 was not yet accepted at that point. The final candidate and later acceptance are recorded below. H-080C remains unauthorized.
 
-## Final gates (run on candidate)
+## Final Master Governance disposition
+
+The initial independent review of candidate `0c58525a30ec741486afae1b1ab581051c7485d4` returned `CHANGES_REQUESTED` for the context-free dispatch-guard behavior described above. Remediation produced final candidate `a6f542096f0631ac719c1a05417079e88121e49e`.
+
+The exact final candidate received fresh independent clean-room approval for Master Governance. Master Governance passed that candidate. Human merge of PR #34 produced `09b72591d33fbe88243bceb584f85fca1f6fc819`, tree `a9ff9606f52c429f58c9ab59c4e8fb11a43f73b6`. Protected-main `make-all` run `37904661908` completed with conclusion `success` on that exact merge SHA as a `push` event.
+
+Master Governance therefore records PRE-080C-01 as **ACCEPTED effective 2026-10-09**. This acceptance date is not backdated to the implementation candidate or PR opening. H-080C remained and remains **NOT AUTHORIZED**.
+
+## Candidate gate instructions (historical)
+
+The following instructions applied to the implementation candidate before the final disposition above. They preserve the original handoff requirements.
 
 ```bash
 cd elixir && mix specs.check && mix format --check-formatted && mix lint
