@@ -5,15 +5,20 @@
 **Purpose:** Reconcile the V4.1 hardening roadmap, current repository reality, governance decisions, the context/model-orchestration architecture, and the locked software-factory architecture into one execution sequence without creating a competing roadmap or authority kernel.\
 **Primary rule:** **V4.1 remains the governing programme.** Evaluation findings and later architecture refinements are reconciled into V4.1 as completed work, bounded prerequisites, acceptance requirements for existing phases, or explicitly deferred Programme B/C/D/E/F requirements.
 
-**v1.3.2 amendment scope:** Preserves prior architecture decisions, records the 2026-10-07 accepted governance baseline through H-080B, updates the current work to governance/documentation canonicalization, points active companion references to Skills Matrix v1.0.2, and clarifies that registry entries do not become repository law by registration. This amendment does not authorize H-080C or future programme implementation.
+**v1.3.2 amendment scope:** Preserves prior architecture decisions, records the 2026-10-07 accepted governance baseline through H-080B, points active companion references to Skills Matrix v1.0.2, and clarifies that registry entries do not become repository law by registration. The current status below records later prerequisite acceptance and the PR #35 baseline remediation. This document does not authorize H-080C or future programme implementation.
 
-## Current Governance Baseline
+## GOV-STATE-SYNC input baseline and current programme state
 
-PR #32 merged to protected `main` at `023b2269c93763a07fce0aeda541ec1adb7e0273`, tree `8be1aec5627f2b0672e44e6c53460383c3fe3110`.
+The accepted protected-main identity entering GOV-STATE-SYNC is PR #35's merge. It is an accepted non-phase baseline remediation, verified by successful protected-main `make-all` run `37931419995`.
 
-Effective 2026-10-07, H-070B, REM-HI21, H-I20 remediation, H-080A, and H-080B are **ACCEPTED**. H-080C is **NOT AUTHORIZED**.
+```text
+GOV_STATE_SYNC_INPUT_BASELINE_SHA = 84a2fbfdaece47d5dd87ca37c2e25e85afe39880
+GOV_STATE_SYNC_INPUT_BASELINE_TREE = 799ef67d3c4124e76f37b4e31251b9c974695455
+```
 
-Until this roadmap and its companion Skills Matrix are canonicalized, the allowed scope is governance/documentation canonicalization only.
+Effective 2026-10-07, H-070B, REM-HI21, H-I20 remediation, H-080A, and H-080B are **ACCEPTED**. PRE-080C-01 was accepted effective 2026-10-09 at merge `09b72591d33fbe88243bceb584f85fca1f6fc819`, tree `a9ff9606f52c429f58c9ab59c4e8fb11a43f73b6`, after protected-main `make-all` run `37904661908` succeeded. PRE-080C-02 is **AUTHORIZED / ACTIVE / NOT ACCEPTED**. PRE-080C-03 is **PENDING / NOT STARTED**. H-080C is **NOT AUTHORIZED**.
+
+The accepted GOV-STATE-SYNC merge identity is established only after candidate review, human merge, exact merge resolution, protected-main post-merge verification, and Master Governance acceptance. This candidate cannot record its own future accepted merge identity. After those steps, PRE-080C-02 must be re-pinned or rebased to that verified GOV-STATE-SYNC accepted merge, not to the input baseline above, and its candidate-bound evidence must be regenerated before independent review. This synchronization does not count as PRE-080C-03.
 
 
 ## Roadmap Scope Layers
@@ -463,14 +468,15 @@ V4.1 remains the governing roadmap.
 ```text
 H-080B ACCEPTED
               ↓
-CURRENT — GOVERNANCE/DOCUMENTATION CANONICALIZATION ONLY
-   Unified Roadmap / companion canonicalization
+PRE-080C-01 ACCEPTED
               ↓
-   Future PRE-080C prerequisite work, after canonicalization and normal issue authorization
+PRE-080C-02 AUTHORIZED / ACTIVE / NOT ACCEPTED
               ↓
-   PRE-H080C RECONCILIATION GATE
+PRE-080C-03 PENDING / NOT STARTED
               ↓
-   H-080C, only after separate authorization
+PRE-H080C RECONCILIATION GATE — NOT REACHED
+              ↓
+H-080C — NOT AUTHORIZED; requires separate authorization after the gate
                    ↓
         ┌──────────┼──────────┐
         ↓          ↓          ↓
@@ -582,7 +588,7 @@ H-080B ACCEPTED — effective 2026-10-07
 H-080C NOT AUTHORIZED
 ```
 
-Roadmap and companion canonicalization precedes the future PRE-080C prerequisite work. Passing the PRE-H080C gate is necessary but does not authorize H-080C; H-080C requires separate explicit authorization.
+PRE-080C-01 is accepted. PRE-080C-02 is the active authorized prerequisite and is not accepted. PRE-080C-03 has not started, and PRE-H080C has not been reached. Passing the PRE-H080C gate does not authorize H-080C; separate explicit authorization is required.
 
 ---
 
@@ -1372,17 +1378,21 @@ STOP if:
 # 22. Near-Term Development Workflow
 
 ```text
+GOV-STATE-SYNC INPUT BASELINE
+PR #35 — NON-PHASE BASELINE REMEDIATION
+84a2fbfdaece47d5dd87ca37c2e25e85afe39880 / 799ef67d3c4124e76f37b4e31251b9c974695455
+
 NOW
-1. Canonicalize this roadmap and its companion Skills Matrix against the accepted PR #32 governance baseline.
+1. Complete GOV-STATE-SYNC review, human merge, and post-merge verification. This synchronization is not PRE-080C-03.
 2. Keep H-080C unauthorized.
 
-NEXT, AFTER CANONICALIZATION AND NORMAL ISSUE AUTHORIZATION
-3. PRE-080C-01 — Production Evidence Acquisition
-4. PRE-080C-02 — Production-Rate Epoch Characterization
-5. PRE-080C-03 — Governance / Authority Reconciliation, including repository-local skill/instruction authority classification
+CURRENT PREREQUISITE STATE
+3. PRE-080C-01 — Production Evidence Acquisition, ACCEPTED effective 2026-10-09.
+4. PRE-080C-02 — Production-Rate Epoch Characterization, AUTHORIZED / ACTIVE / NOT ACCEPTED. After GOV-STATE-SYNC is accepted, re-pin or rebase to that accepted `main` and regenerate candidate-bound evidence before independent review.
+5. PRE-080C-03 — Governance / Authority Reconciliation, PENDING / NOT STARTED. Preserve its existing definition and begin it only in the established sequence.
 
 GATE
-6. Reconcile all three results at the PRE-H080C gate.
+6. Reconcile all three prerequisite results at the PRE-H080C gate. The gate has not been reached.
 
 THEN
 7. Obtain separate explicit H-080C authorization after the gate.
