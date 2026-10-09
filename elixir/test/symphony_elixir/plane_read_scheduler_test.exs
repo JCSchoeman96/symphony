@@ -277,6 +277,82 @@ defmodule SymphonyElixir.PlaneReadSchedulerTest do
     assert ReadScheduler.stats(scheduler).throttle_count == 1
   end
 
+  test "uses a fresh monotonic read when scheduling a throttle deadline" do
+    parent = self()
+    {:ok, clock_reads} = Agent.start_link(fn -> 0 end)
+
+    time_provider = %{
+      monotonic_time: fn -> Agent.get_and_update(clock_reads, &{&1, &1 + 1}) end,
+      system_time: fn -> 0 end,
+      send_after: fn destination, message, delay ->
+        send(parent, {:scheduled_timer, destination, message, delay})
+        make_ref()
+      end
+    }
+
+    {:ok, scheduler} =
+      ReadScheduler.start_link(
+        max_concurrency: 1,
+        throttle_fallback_ms: 1,
+        max_backoff_ms: 100,
+        time_provider: time_provider
+      )
+
+    on_exit(fn ->
+      stop_process(scheduler)
+      stop_process(clock_reads)
+    end)
+
+    request =
+      Task.async(fn ->
+        ReadScheduler.execute(scheduler, :control, fn ->
+          {:error, {:rate_limited, %{headers: %{"retry-after" => "0.02"}}}}
+        end)
+      end)
+
+    assert_receive {:scheduled_timer, ^scheduler, {:throttle_expired, _token}, throttle_delay}, 1_000
+    assert throttle_delay == 19
+    Task.shutdown(request, :brutal_kill)
+  end
+
+  test "checks throttle expiry with a fresh clock read during dispatch" do
+    parent = self()
+    {:ok, clock_reads} = Agent.start_link(fn -> 0 end)
+
+    time_provider = %{
+      monotonic_time: fn -> Agent.get_and_update(clock_reads, &{&1, &1 + 1}) end,
+      system_time: fn -> 0 end,
+      send_after: fn destination, message, delay ->
+        send(parent, {:scheduled_timer, destination, message, delay})
+        make_ref()
+      end
+    }
+
+    {:ok, scheduler} =
+      ReadScheduler.start_link(
+        max_concurrency: 1,
+        throttle_fallback_ms: 1,
+        max_backoff_ms: 100,
+        time_provider: time_provider
+      )
+
+    on_exit(fn ->
+      stop_process(scheduler)
+      stop_process(clock_reads)
+    end)
+
+    request =
+      Task.async(fn ->
+        ReadScheduler.execute(scheduler, :control, fn ->
+          {:error, {:rate_limited, %{headers: %{"retry-after" => "0.003"}}}}
+        end)
+      end)
+
+    assert_receive {:scheduled_timer, ^scheduler, {:throttle_expired, _token}, _delay}, 1_000
+    assert eventually(fn -> :sys.get_state(scheduler).throttle_until == nil end)
+    Task.shutdown(request, :brutal_kill)
+  end
+
   test "rejects a duplicate registered scheduler name" do
     name = String.to_atom("read_scheduler_duplicate_#{System.unique_integer([:positive])}")
     {:ok, scheduler} = ReadScheduler.start_link(name: name)

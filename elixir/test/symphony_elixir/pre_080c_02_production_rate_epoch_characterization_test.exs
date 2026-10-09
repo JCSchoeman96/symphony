@@ -1110,6 +1110,9 @@ defmodule SymphonyElixir.Pre080C02ProductionRateEpochCharacterizationTest do
 
     all_requests = Agent.get(restarted.provider, & &1.starts)
     assert length(all_requests) == partial_count + 1_024
+    provider_window_high_water = max_rolling_starts(Enum.map(all_requests, & &1.timestamp), 60_000)
+    assert provider_window_high_water == 120
+
     restarted_requests = Enum.take(all_requests, 1_024)
     assert Enum.count(restarted_requests, &String.ends_with?(&1.path, "/work-items/")) == 20
     final_state = :sys.get_state(restarted.orchestrator)
@@ -1125,6 +1128,8 @@ defmodule SymphonyElixir.Pre080C02ProductionRateEpochCharacterizationTest do
         Jason.encode!([
           ["scenario", "runtime_restart"],
           ["partial_requests_discarded", partial_count],
+          ["provider_max_starts_per_rolling_60s_across_restart", provider_window_high_water],
+          ["scheduler_pacing_history", "process-local; reset by scheduler restart"],
           ["full_reenumeration_requests", Enum.count(restarted_requests, &String.ends_with?(&1.path, "/work-items/"))],
           ["total_provider_requests", length(all_requests)],
           ["candidate_dispatchable_before_publication", false],

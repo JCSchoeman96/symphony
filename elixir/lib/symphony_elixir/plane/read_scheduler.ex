@@ -341,8 +341,7 @@ defmodule SymphonyElixir.Plane.ReadScheduler do
   end
 
   defp dispatch(state) do
-    now = now_ms(state)
-    state = clear_expired_throttle(purge_starts(state, now), now)
+    state = clear_expired_throttle(purge_starts(state, now_ms(state)))
 
     cond do
       state.queue == [] ->
@@ -351,7 +350,7 @@ defmodule SymphonyElixir.Plane.ReadScheduler do
       map_size(state.in_flight) >= state.max_concurrency ->
         state
 
-      throttle_active?(state, now) ->
+      throttle_active?(state, now_ms(state)) ->
         schedule_throttle_timer(state)
 
       pacing_exhausted?(state) ->
@@ -485,11 +484,10 @@ defmodule SymphonyElixir.Plane.ReadScheduler do
       ])
       |> min(state.max_backoff_ms)
 
-    now = now_ms(state)
-    until = now + delay
+    until = now_ms(state) + delay
     until = if state.throttle_until, do: max(state.throttle_until, until), else: until
     token = make_ref()
-    schedule_timer(state, {:throttle_expired, token}, max(until - now, 1))
+    schedule_timer(state, {:throttle_expired, token}, max(until - now_ms(state), 1))
 
     state
     |> Map.merge(%{throttle_until: until, throttle_token: token})
@@ -675,11 +673,11 @@ defmodule SymphonyElixir.Plane.ReadScheduler do
   defp send_result(caller, ref, result), do: send(caller, {:plane_read_scheduler, ref, result})
   defp all_entries(state), do: state.queue ++ Map.values(state.backoff) ++ Map.values(state.in_flight)
 
-  defp clear_expired_throttle(%{throttle_until: until} = state, now) when is_integer(until) do
-    if until <= now, do: %{state | throttle_until: nil, throttle_token: nil}, else: state
+  defp clear_expired_throttle(%{throttle_until: until} = state) when is_integer(until) do
+    if until <= now_ms(state), do: %{state | throttle_until: nil, throttle_token: nil}, else: state
   end
 
-  defp clear_expired_throttle(state, _now), do: state
+  defp clear_expired_throttle(state), do: state
   defp purge_starts(state, now), do: %{state | starts: Enum.filter(state.starts, &(now - &1 < state.start_window_ms))}
   defp pacing_exhausted?(state), do: length(state.starts) >= state.start_limit
   defp throttle_active?(state, now), do: is_integer(state.throttle_until) and state.throttle_until > now
