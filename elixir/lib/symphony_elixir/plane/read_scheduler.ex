@@ -173,11 +173,7 @@ defmodule SymphonyElixir.Plane.ReadScheduler do
   end
 
   def handle_info({:throttle_expired, token}, %{throttle_token: token} = state) do
-    if is_integer(state.throttle_until) and state.throttle_until > now_ms(state) do
-      {:noreply, schedule_throttle_timer(%{state | throttle_token: nil})}
-    else
-      {:noreply, dispatch(%{state | throttle_until: nil, throttle_token: nil})}
-    end
+    {:noreply, dispatch(%{state | throttle_until: nil, throttle_token: nil})}
   end
 
   def handle_info({:throttle_expired, _stale}, state), do: {:noreply, state}

@@ -267,16 +267,13 @@ defmodule SymphonyElixir.PlaneReadSchedulerTest do
 
     assert_receive {:scheduled_timer, ^scheduler, {:throttle_expired, throttle_token}, 20}
     assert_receive {:scheduled_timer, ^scheduler, {:retry_ready, request_ref, retry_token}, 20}
-    send(scheduler, {:throttle_expired, throttle_token})
-    assert ReadScheduler.stats(scheduler).throttled
-    assert ReadScheduler.stats(scheduler).attempts == 1
-    assert_receive {:scheduled_timer, ^scheduler, {:throttle_expired, rescheduled_throttle_token}, 20}
     Agent.update(clock_state, &(&1 + 20))
-    send(scheduler, {:throttle_expired, rescheduled_throttle_token})
+    send(scheduler, {:throttle_expired, throttle_token})
     send(scheduler, {:retry_ready, request_ref, retry_token})
 
     assert {:ok, :recovered} = Task.await(request, 1_000)
     assert Agent.get(attempts, & &1) == 2
+    refute ReadScheduler.stats(scheduler).throttled
     assert ReadScheduler.stats(scheduler).throttle_count == 1
   end
 
