@@ -927,7 +927,7 @@ defmodule SymphonyElixir.Governance.Check do
   end
 
   defp json_value(<<"{", rest::binary>>) do
-    json_object(skip_json_whitespace(rest), [], MapSet.new())
+    json_object(skip_json_whitespace(rest), [], %{})
   end
 
   defp json_value(<<"[", rest::binary>>) do
@@ -967,7 +967,7 @@ defmodule SymphonyElixir.Governance.Check do
   end
 
   defp parse_json_object_member(key, value, after_value, pairs, seen) do
-    case MapSet.member?(seen, key) do
+    case Map.has_key?(seen, key) do
       true -> {:error, [diagnostic(:duplicate_key, key, "JSON object key appears more than once")]}
       false -> json_object_tail(skip_json_whitespace(after_value), key, value, pairs, seen)
     end
@@ -978,7 +978,7 @@ defmodule SymphonyElixir.Governance.Check do
 
     case next do
       <<"}">> -> {:error, [diagnostic(:malformed_json, nil, "trailing comma in JSON object")]}
-      _ -> json_object(next, [{key, value} | pairs], MapSet.put(seen, key))
+      _ -> json_object(next, [{key, value} | pairs], Map.put(seen, key, true))
     end
   end
 
@@ -1008,7 +1008,6 @@ defmodule SymphonyElixir.Governance.Check do
     case json_value(binary) do
       {:ok, value, rest} -> json_array_tail(skip_json_whitespace(rest), value, values)
       {:error, diagnostics} -> {:error, diagnostics}
-      _ -> {:error, [diagnostic(:malformed_json, nil, "invalid JSON array")]}
     end
   end
 
