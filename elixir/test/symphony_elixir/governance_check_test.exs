@@ -30,6 +30,10 @@ defmodule SymphonyElixir.GovernanceCheckTest do
   end
 
   describe "projection parsing" do
+    test "rejects an invalid repository argument" do
+      assert_has_code(Check.validate(123, []), :invalid_path)
+    end
+
     test "accepts a valid schema-v1 projection", %{root: root} do
       assert :ok = Check.validate(root)
     end
@@ -117,6 +121,112 @@ defmodule SymphonyElixir.GovernanceCheckTest do
       write_projection(root, Jason.encode!(projection))
 
       assert_has_code(Check.validate(root), :projection_too_large)
+    end
+
+    test "rejects wrong schema value types", %{root: root} do
+      projection = projection_map()
+      projection = put_in(projection, ["schema_version"], "one")
+      projection = put_in(projection, ["projection_role"], true)
+      projection = put_in(projection, ["authority_snapshot", "next_authorized_phase"], 42)
+      projection = put_in(projection, ["known_unresolved_governance_conditions"], [42])
+      write_projection(root, Jason.encode!(projection))
+
+      assert_has_code(Check.validate(root), :wrong_type)
+
+      projection = put_in(projection_map(), ["known_unresolved_governance_conditions"], "not-an-array")
+      write_projection(root, Jason.encode!(projection))
+
+      assert_has_code(Check.validate(root), :wrong_type)
+    end
+
+    test "rejects non-object projections", %{root: root} do
+      write_projection(root, "[]")
+
+      assert_has_code(Check.validate(root), :wrong_type)
+    end
+
+    test "rejects malformed JSON delimiters and escapes", %{root: root} do
+      malformed = [
+        "{\"a\": 1,}",
+        "{\"a\": 1 \"b\": 2}",
+        "{\"a\": 1",
+        "[1,]",
+        "[1 2]",
+        "{\"a\" 1}",
+        "[@]",
+        "{\"\\q\": 1}",
+        "@",
+        "-",
+        "\"unterminated",
+        "\"\\q\"",
+        "\"\\u12G4\"",
+        "{\"x\": \"\\uD800\"}",
+        "1e9999999999999999999999999999999999999",
+        <<34, 1, 34>>
+      ]
+
+      for json <- malformed do
+        write_projection(root, json)
+        assert_has_code(Check.validate(root), :malformed_json)
+      end
+    end
+
+    test "rejects an empty JSON object projection", %{root: root} do
+      write_projection(root, "{}")
+
+      assert_has_code(Check.validate(root), :missing_field)
+    end
+
+    test "parses scalar and escaped JSON values before schema validation", %{root: root} do
+      for json <- ["{\"x\": false}", "{\"x\": \"\\n\"}", "{\"x\": \"\\u0041\"}"] do
+        write_projection(root, json)
+        assert_has_code(Check.validate(root), :unknown_field)
+      end
+    end
+
+    test "reports an invalid root filesystem error" do
+      root = <<"/tmp/governance-invalid-root", 0>>
+
+      assert_has_code(Check.validate(root, []), :projection_read_error)
+    end
+
+    test "rejects a missing and non-regular projection", %{root: root} do
+      path = Path.join(root, @projection_path)
+      File.rm!(path)
+
+      assert_has_code(Check.validate(root), :projection_missing)
+
+      File.mkdir!(path)
+
+      assert_has_code(Check.validate(root), :projection_read_error)
+    end
+
+    test "rejects a symlinked repository root", %{root: root} do
+      alias_path = root <> ".symlink"
+      File.ln_s!(root, alias_path)
+      on_exit(fn -> File.rm!(alias_path) end)
+
+      assert_has_code(Check.validate(alias_path), :projection_symlink)
+
+      assert_has_code(Check.validate(alias_path <> ".missing"), :projection_missing)
+    end
+
+    test "rejects a symlinked skills root", %{root: root} do
+      skills_path = Path.join(root, ".codex/skills")
+      target_path = skills_path <> ".target"
+      File.rename!(skills_path, target_path)
+      File.ln_s!(target_path, skills_path)
+
+      assert_has_code(Check.validate(root), :skill_symlink)
+    end
+
+    test "rejects a symlinked projection parent", %{root: root} do
+      docs_path = Path.join(root, "docs")
+      target_path = docs_path <> ".target"
+      File.rename!(docs_path, target_path)
+      File.ln_s!(target_path, docs_path)
+
+      assert_has_code(Check.validate(root), :projection_symlink)
     end
   end
 
@@ -328,6 +438,31 @@ defmodule SymphonyElixir.GovernanceCheckTest do
 
       assert_has_code(Check.validate(root), :status_document_symlink)
     end
+
+    test "rejects missing and non-regular status documents", %{root: root} do
+      path = Path.join(root, "docs/symphony-hardening-playbook-v4.1/README.md")
+      File.rm!(path)
+
+      assert_has_code(Check.validate(root), :status_document_missing)
+
+      File.mkdir!(path)
+
+      assert_has_code(Check.validate(root), :status_document_read_error)
+    end
+
+    test "rejects malformed and incomplete status blocks", %{root: root} do
+      path = Path.join(root, "docs/symphony-hardening-playbook-v4.1/README.md")
+      content = File.read!(path)
+      malformed = String.replace(content, "DECISION_REFERENCE=", "malformed\nDECISION_REFERENCE=", global: false)
+      File.write!(path, malformed)
+
+      assert_has_code(Check.validate(root), :status_block_malformed)
+
+      incomplete = String.replace(content, ~r/GOVERNANCE_PROJECTION_PATH=.*\n/, "", global: false)
+      File.write!(path, incomplete)
+
+      assert_has_code(Check.validate(root), :status_block_missing_key)
+    end
   end
 
   describe "immutable artifacts" do
@@ -356,6 +491,17 @@ defmodule SymphonyElixir.GovernanceCheckTest do
       File.ln_s!(target, path)
 
       assert_has_code(Check.validate(root), :immutable_blob_symlink)
+    end
+
+    test "rejects missing and non-regular immutable artifacts", %{root: root} do
+      path = Path.join(root, @roadmap_path)
+      File.rm!(path)
+
+      assert_has_code(Check.validate(root), :immutable_blob_missing)
+
+      File.mkdir!(path)
+
+      assert_has_code(Check.validate(root), :immutable_blob_read_error)
     end
 
     test "rejects immutable artifacts with special permission bits", %{root: root} do
@@ -422,6 +568,36 @@ defmodule SymphonyElixir.GovernanceCheckTest do
       assert_has_code(Check.validate(root, candidate_phase: "PRE-080C-03", freeze: true), :dirty_worktree)
     end
 
+    test "rejects an index that differs from candidate HEAD", %{root: root} do
+      init_git!(root)
+      path = Path.join(root, @roadmap_path)
+      File.write!(path, File.read!(path) <> "\nindex edit\n")
+      git!(root, ["add", @roadmap_path])
+
+      assert_has_code(Check.validate(root, candidate_phase: "PRE-080C-03", freeze: true), :dirty_worktree)
+    end
+
+    test "rejects a missing tracked worktree file during freeze", %{root: root} do
+      init_git!(root)
+      File.rm!(Path.join(root, @roadmap_path))
+
+      assert_has_code(Check.validate(root, candidate_phase: "PRE-080C-03", freeze: true), :dirty_worktree)
+    end
+
+    test "rejects a symlinked tracked parent during freeze", %{root: root} do
+      init_git!(root)
+      tracked_path = Path.join(root, "tracked")
+      File.mkdir!(tracked_path)
+      File.write!(Path.join(tracked_path, "entry.txt"), "tracked entry\n")
+      git!(root, ["add", "tracked/entry.txt"])
+      git!(root, ["commit", "-qm", "add tracked entry"])
+      target_path = tracked_path <> ".target"
+      File.rename!(tracked_path, target_path)
+      File.ln_s!(target_path, tracked_path)
+
+      assert_has_code(Check.validate(root, candidate_phase: "PRE-080C-03", freeze: true), :dirty_worktree)
+    end
+
     test "rejects tracked edits hidden by assume-unchanged", %{root: root} do
       init_git!(root)
       path = Path.join(root, @roadmap_path)
@@ -442,6 +618,70 @@ defmodule SymphonyElixir.GovernanceCheckTest do
 
     test "rejects a candidate phase supplied without freeze mode", %{root: root} do
       assert_has_code(Check.validate(root, candidate_phase: "PRE-080C-03"), :candidate_phase_requires_freeze)
+    end
+
+    test "rejects a candidate without a HEAD", %{root: root} do
+      init_git!(root)
+      File.rm!(Path.join(root, ".git/HEAD"))
+
+      assert_has_code(Check.validate(root, candidate_phase: "PRE-080C-03", freeze: true), :candidate_head_missing)
+    end
+
+    test "rejects a missing tracked immutable tree entry", %{root: root} do
+      init_git!(root)
+      git!(root, ["rm", "--cached", "-q", @roadmap_path])
+      git!(root, ["commit", "-qm", "remove immutable entry"])
+
+      assert_has_code(
+        Check.validate(root, candidate_phase: "PRE-080C-03", freeze: true),
+        :immutable_tree_entry_missing
+      )
+    end
+
+    test "rejects a changed tracked immutable tree entry", %{root: root} do
+      init_git!(root)
+      path = Path.join(root, @roadmap_path)
+      File.write!(path, File.read!(path) <> "\nchanged tree entry\n")
+      git!(root, ["add", @roadmap_path])
+      git!(root, ["commit", "-qm", "change immutable entry"])
+
+      assert_has_code(
+        Check.validate(root, candidate_phase: "PRE-080C-03", freeze: true),
+        :immutable_tree_entry_mismatch
+      )
+    end
+
+    test "rejects a tracked file replaced by a directory during freeze", %{root: root} do
+      init_git!(root)
+      path = Path.join(root, @roadmap_path)
+      File.rm!(path)
+      File.mkdir!(path)
+
+      assert_has_code(Check.validate(root, candidate_phase: "PRE-080C-03", freeze: true), :dirty_worktree)
+    end
+
+    test "rejects a tracked file replaced by a symlink during freeze", %{root: root} do
+      init_git!(root)
+      path = Path.join(root, @roadmap_path)
+      File.rm!(path)
+      File.ln_s!("other-roadmap", path)
+
+      assert_has_code(Check.validate(root, candidate_phase: "PRE-080C-03", freeze: true), :dirty_worktree)
+    end
+
+    test "checks tracked symlink content during freeze", %{root: root} do
+      init_git!(root)
+      link = Path.join(root, "tracked-link")
+      File.ln_s!("target", link)
+      git!(root, ["add", "tracked-link"])
+      git!(root, ["commit", "-qm", "add tracked symlink"])
+
+      assert :ok = Check.validate(root, candidate_phase: "PRE-080C-03", freeze: true)
+
+      File.rm!(link)
+      File.ln_s!("changed-target", link)
+
+      assert_has_code(Check.validate(root, candidate_phase: "PRE-080C-03", freeze: true), :dirty_worktree)
     end
   end
 
@@ -708,6 +948,12 @@ defmodule SymphonyElixir.GovernanceCheckTest do
       assert_has_code(Check.validate(root), :land_watch_marker_missing)
     end
 
+    test "rejects a missing land watcher", %{root: root} do
+      File.rm!(Path.join(root, ".codex/skills/land/land_watch.py"))
+
+      assert_has_code(Check.validate(root), :land_watch_marker_missing)
+    end
+
     test "requires the land watcher marker to be a Python comment line", %{root: root} do
       path = Path.join(root, ".codex/skills/land/land_watch.py")
       File.write!(path, "MARKER = \"# SYMPHONY_AUTHORITY_CLASS: ADVISORY_NON_AUTHORITY\"\n")
@@ -773,6 +1019,62 @@ defmodule SymphonyElixir.GovernanceCheckTest do
       )
 
       assert_has_code(Check.validate(root), :skill_policy_violation)
+    end
+
+    test "rejects generated Checks passed output without a literal passed token", %{root: root} do
+      path = Path.join(root, ".codex/skills/land/land_watch.py")
+
+      File.write!(
+        path,
+        File.read!(path) <> "\nprefix = \"Checks \"; suffix = \"pas\" + \"sed\"; print(prefix + suffix, flush=True)\n"
+      )
+
+      assert_has_code(Check.validate(root), :skill_policy_violation)
+    end
+
+    test "rejects generated Checks passed output from a positional format", %{root: root} do
+      path = Path.join(root, ".codex/skills/land/land_watch.py")
+
+      File.write!(
+        path,
+        File.read!(path) <> "\nprint(\"{} {}\".format(\"Checks\", \"pas\" + \"sed\"))\n"
+      )
+
+      assert_has_code(Check.validate(root), :skill_policy_violation)
+    end
+
+    test "rejects generated Checks passed output from an f-string", %{root: root} do
+      path = Path.join(root, ".codex/skills/land/land_watch.py")
+
+      File.write!(
+        path,
+        File.read!(path) <> "\nprefix = \"Checks\"; suffix = \"pas\" + \"sed\"; print(f\"{prefix} {suffix}\")\n"
+      )
+
+      assert_has_code(Check.validate(root), :skill_policy_violation)
+    end
+
+    test "evaluates a watcher conditional expression", %{root: root} do
+      path = Path.join(root, ".codex/skills/land/land_watch.py")
+
+      File.write!(
+        path,
+        File.read!(path) <> "\nprint(\"Checks\" if ready else \"failed\")\n"
+      )
+
+      assert :ok = Check.validate(root)
+    end
+
+    test "ignores watcher expressions with unresolved values", %{root: root} do
+      path = Path.join(root, ".codex/skills/land/land_watch.py")
+
+      File.write!(
+        path,
+        File.read!(path) <>
+          "\nmissing = make_output(); print(\"{} {}\".format(\"Checks\", missing)); print(f\"{missing}\")\n"
+      )
+
+      assert :ok = Check.validate(root)
     end
 
     test "rejects semicolon-separated assigned Checks passed output", %{root: root} do
@@ -908,6 +1210,39 @@ defmodule SymphonyElixir.GovernanceCheckTest do
       on_exit(fn -> File.rm(path) end)
 
       assert_has_code(Check.validate(root), :skill_entry_invalid)
+    end
+
+    test "rejects a symlinked skill directory", %{root: root} do
+      path = Path.join(root, ".codex/skills/commit")
+      target = path <> ".target"
+      File.rename!(path, target)
+      File.ln_s!(target, path)
+
+      assert_has_code(Check.validate(root), :skill_symlink)
+    end
+
+    test "rejects a non-directory skills root", %{root: root} do
+      path = Path.join(root, ".codex/skills")
+      target = path <> ".target"
+      File.rename!(path, target)
+      File.write!(path, "not a directory")
+
+      assert_has_code(Check.validate(root), :skill_entry_invalid)
+    end
+
+    test "rejects a non-regular required skill file", %{root: root} do
+      path = Path.join(root, ".codex/skills/commit/SKILL.md")
+      File.rm!(path)
+      File.mkdir!(path)
+
+      assert_has_code(Check.validate(root), :required_skill_missing)
+    end
+
+    test "rejects a one-line watcher without the fixed marker position", %{root: root} do
+      path = Path.join(root, ".codex/skills/land/land_watch.py")
+      File.write!(path, "#!/usr/bin/env python3")
+
+      assert_has_code(Check.validate(root), :land_watch_marker_missing)
     end
 
     test "rejects a symlinked skill instruction file", %{root: root} do
