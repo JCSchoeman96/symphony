@@ -836,9 +836,17 @@ defmodule SymphonyElixir.Governance.Check do
 
   defp watcher_diagnostics(root) do
     case safe_regular_file(root, @watcher_relative_path) do
-      {:ok, path, _stat} -> read_skill_file(path, @watcher_relative_path)
-      {:error, :enoent} -> [diagnostic(:land_watch_marker_missing, @watcher_relative_path, "land watcher does not exist")]
-      {:error, _reason} -> []
+      {:ok, path, _stat} ->
+        read_skill_file(path, @watcher_relative_path)
+
+      {:error, :enoent} ->
+        [diagnostic(:land_watch_marker_missing, @watcher_relative_path, "land watcher does not exist")]
+
+      {:error, {:not_regular, type}} ->
+        [diagnostic(:skill_entry_invalid, @watcher_relative_path, "land watcher is not a regular file: #{type}")]
+
+      {:error, _reason} ->
+        []
     end
   end
 
@@ -856,30 +864,17 @@ defmodule SymphonyElixir.Governance.Check do
   end
 
   defp watcher_marker_present?(content) do
-    content
-    |> String.split(~r/\r?\n/, trim: false)
-    |> Enum.take(12)
-    |> Enum.reduce_while(nil, fn line, triple_quote ->
-      if triple_quote == nil and Regex.match?(~r/^[[:blank:]]*#[[:blank:]]*SYMPHONY_AUTHORITY_CLASS:[[:blank:]]*ADVISORY_NON_AUTHORITY[[:blank:]]*$/, line) do
-        {:halt, true}
-      else
-        {:cont, watcher_triple_quote_state(line, triple_quote)}
-      end
-    end) == true
-  end
+    case String.split(content, ~r/\r?\n/, trim: false) do
+      [first_line, marker_line | _rest] ->
+        String.starts_with?(first_line, "#!") and watcher_marker_line?(marker_line)
 
-  defp watcher_triple_quote_state(line, nil) do
-    case Regex.run(~r/("""|''')/, line) do
-      [delimiter | _captures] ->
-        if rem(length(:binary.matches(line, delimiter)), 2) == 1, do: delimiter, else: nil
-
-      nil ->
-        nil
+      _ ->
+        false
     end
   end
 
-  defp watcher_triple_quote_state(line, delimiter) do
-    if rem(length(:binary.matches(line, delimiter)), 2) == 1, do: nil, else: delimiter
+  defp watcher_marker_line?(line) do
+    Regex.match?(~r/^[[:blank:]]*#[[:blank:]]*SYMPHONY_AUTHORITY_CLASS:[[:blank:]]*ADVISORY_NON_AUTHORITY[[:blank:]]*$/, line)
   end
 
   defp watcher_output_diagnostics(content, relative_path) do
@@ -994,16 +989,15 @@ defmodule SymphonyElixir.Governance.Check do
   defp active_connector_claim?(content) do
     patterns = [
       ~r/\bci\s+passed\s*(?:,|;)\s*(?:so|therefore)\s+[^.!?;]+/i,
-      ~r/\b(?:green\s+(?:ci|checks?)|(?:ci|checks?)\s+(?:is\s+)?green)\s*(?:,|;)\s*(?:so|therefore)\s+[^.!?;]+/i
+      ~r/\b(?:green\s+(?:ci|checks?)|(?:ci|checks?)\s+(?:is\s+)?green)\s*(?:,|;)\s*(?:so|therefore)\s+[^.!?;]+/i,
+      ~r/\bci\s+passed\s*;\s*(?:acceptance|approval|merge|landing)\s+(?:is\s+)?(?:permitted|allowed|authorized|approved)\b[^.!?;]*/i
     ]
 
     content = normalize_policy_content(content)
 
     Enum.any?(patterns, fn pattern ->
-      case Regex.run(pattern, content) do
-        [match | _captures] -> not authority_claim_prohibited?(match)
-        nil -> false
-      end
+      Regex.scan(pattern, content)
+      |> Enum.any?(fn [match | _captures] -> not authority_claim_prohibited?(match) end)
     end)
   end
 
@@ -1063,7 +1057,11 @@ defmodule SymphonyElixir.Governance.Check do
   defp assigned_watcher_output?(content) do
     assignments = watcher_string_assignments(content)
 
-    Regex.scan(~r/\bprint\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\+\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)/i, content, capture: :all_but_first)
+    Regex.scan(
+      ~r/\bprint\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\+\s*([A-Za-z_][A-Za-z0-9_]*)(?:\s*,\s*[A-Za-z_][A-Za-z0-9_]*\s*=\s*[^)\r\n]+)?\s*\)/i,
+      content,
+      capture: :all_but_first
+    )
     |> Enum.any?(fn [left, right] ->
       case {Map.get(assignments, left), Map.get(assignments, right)} do
         {left_value, right_value} when is_binary(left_value) and is_binary(right_value) ->

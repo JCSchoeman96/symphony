@@ -525,6 +525,24 @@ defmodule SymphonyElixir.GovernanceCheckTest do
       assert_has_code(Check.validate(root), :skill_policy_violation)
     end
 
+    test "rejects a later CI acceptance claim after an earlier disclaimer", %{root: root} do
+      path = Path.join(root, ".codex/skills/land/SKILL.md")
+      File.write!(path, File.read!(path) <> "\nCI passed does not permit acceptance; CI passed; acceptance is permitted.\n")
+
+      assert_has_code(Check.validate(root), :skill_policy_violation)
+    end
+
+    test "checks every CI connector claim after an earlier prohibited connector", %{root: root} do
+      path = Path.join(root, ".codex/skills/land/SKILL.md")
+
+      File.write!(
+        path,
+        File.read!(path) <> "\nCI passed, so it does not permit acceptance; CI passed, so acceptance is permitted.\n"
+      )
+
+      assert_has_code(Check.validate(root), :skill_policy_violation)
+    end
+
     test "rejects a no-required-checks claim", %{root: root} do
       path = Path.join(root, ".codex/skills/land/SKILL.md")
       File.write!(path, File.read!(path) <> "\nThis repository has no required checks.\n")
@@ -632,6 +650,20 @@ defmodule SymphonyElixir.GovernanceCheckTest do
       assert_has_code(Check.validate(root), :land_watch_marker_missing)
     end
 
+    test "rejects an advisory marker inside a docstring with escaped quotes", %{root: root} do
+      path = Path.join(root, ".codex/skills/land/land_watch.py")
+
+      File.write!(
+        path,
+        ~S|"""escaped \"""
+# SYMPHONY_AUTHORITY_CLASS: ADVISORY_NON_AUTHORITY
+"""
+|
+      )
+
+      assert_has_code(Check.validate(root), :land_watch_marker_missing)
+    end
+
     test "rejects the old unqualified watcher output", %{root: root} do
       path = Path.join(root, ".codex/skills/land/land_watch.py")
       File.write!(path, File.read!(path) <> "\nprint(\"Checks passed\")\n")
@@ -680,6 +712,25 @@ defmodule SymphonyElixir.GovernanceCheckTest do
       )
 
       assert_has_code(Check.validate(root), :skill_policy_violation)
+    end
+
+    test "rejects assigned Checks passed output with print options", %{root: root} do
+      path = Path.join(root, ".codex/skills/land/land_watch.py")
+
+      File.write!(
+        path,
+        File.read!(path) <> "\nprefix = \"Checks \"; suffix = \"passed\"; print(prefix + suffix, flush=True)\n"
+      )
+
+      assert_has_code(Check.validate(root), :skill_policy_violation)
+    end
+
+    test "rejects a non-regular land watcher entry", %{root: root} do
+      path = Path.join(root, ".codex/skills/land/land_watch.py")
+      File.rm!(path)
+      File.mkdir!(path)
+
+      assert_has_code(Check.validate(root), :skill_entry_invalid)
     end
 
     test "accepts explicit green-check authority prohibition", %{root: root} do
@@ -901,7 +952,7 @@ defmodule SymphonyElixir.GovernanceCheckTest do
 
     File.write!(
       Path.join(root, ".codex/skills/land/land_watch.py"),
-      "# SYMPHONY_AUTHORITY_CLASS: ADVISORY_NON_AUTHORITY\n"
+      "#!/usr/bin/env python3\n# SYMPHONY_AUTHORITY_CLASS: ADVISORY_NON_AUTHORITY\n"
     )
   end
 
