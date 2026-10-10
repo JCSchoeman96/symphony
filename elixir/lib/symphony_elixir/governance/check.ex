@@ -844,7 +844,7 @@ defmodule SymphonyElixir.Governance.Check do
 
   defp watcher_content_diagnostics(content, relative_path) do
     marker_diagnostics =
-      if Regex.match?(~r/^[[:blank:]]*#[[:blank:]]*SYMPHONY_AUTHORITY_CLASS:[[:blank:]]*ADVISORY_NON_AUTHORITY[[:blank:]]*$/m, content) do
+      if watcher_marker_present?(content) do
         []
       else
         [diagnostic(:land_watch_marker_missing, relative_path, "advisory marker is required")]
@@ -853,6 +853,33 @@ defmodule SymphonyElixir.Governance.Check do
     marker_diagnostics ++
       watcher_output_diagnostics(content, relative_path) ++
       skill_policy_diagnostics(content, relative_path)
+  end
+
+  defp watcher_marker_present?(content) do
+    content
+    |> String.split(~r/\r?\n/, trim: false)
+    |> Enum.take(12)
+    |> Enum.reduce_while(nil, fn line, triple_quote ->
+      if triple_quote == nil and Regex.match?(~r/^[[:blank:]]*#[[:blank:]]*SYMPHONY_AUTHORITY_CLASS:[[:blank:]]*ADVISORY_NON_AUTHORITY[[:blank:]]*$/, line) do
+        {:halt, true}
+      else
+        {:cont, watcher_triple_quote_state(line, triple_quote)}
+      end
+    end) == true
+  end
+
+  defp watcher_triple_quote_state(line, nil) do
+    case Regex.run(~r/("""|''')/, line) do
+      [delimiter | _captures] ->
+        if rem(length(:binary.matches(line, delimiter)), 2) == 1, do: delimiter, else: nil
+
+      nil ->
+        nil
+    end
+  end
+
+  defp watcher_triple_quote_state(line, delimiter) do
+    if rem(length(:binary.matches(line, delimiter)), 2) == 1, do: nil, else: delimiter
   end
 
   defp watcher_output_diagnostics(content, relative_path) do
@@ -966,8 +993,8 @@ defmodule SymphonyElixir.Governance.Check do
 
   defp active_connector_claim?(content) do
     patterns = [
-      ~r/\bci\s+passed\s*,\s*(?:so|therefore)\s+[^.!?;]+/i,
-      ~r/\b(?:green\s+(?:ci|checks?)|(?:ci|checks?)\s+(?:is\s+)?green)\s*,\s*(?:so|therefore)\s+[^.!?;]+/i
+      ~r/\bci\s+passed\s*(?:,|;)\s*(?:so|therefore)\s+[^.!?;]+/i,
+      ~r/\b(?:green\s+(?:ci|checks?)|(?:ci|checks?)\s+(?:is\s+)?green)\s*(?:,|;)\s*(?:so|therefore)\s+[^.!?;]+/i
     ]
 
     content = normalize_policy_content(content)
@@ -1028,9 +1055,36 @@ defmodule SymphonyElixir.Governance.Check do
   defp watcher_checks_passed_output?(content) do
     content = normalize_policy_content(content)
 
-    content = Regex.replace(~r/["'`+<>]/, content, "")
+    collapsed_content = Regex.replace(~r/["'`+<>]/, content, "")
 
-    Regex.match?(~r/\bchecks\s+passed\b/i, content)
+    Regex.match?(~r/\bchecks\s+passed\b/i, collapsed_content) or assigned_watcher_output?(content)
+  end
+
+  defp assigned_watcher_output?(content) do
+    assignments = watcher_string_assignments(content)
+
+    Regex.scan(~r/\bprint\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\+\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)/i, content, capture: :all_but_first)
+    |> Enum.any?(fn [left, right] ->
+      case {Map.get(assignments, left), Map.get(assignments, right)} do
+        {left_value, right_value} when is_binary(left_value) and is_binary(right_value) ->
+          Regex.match?(~r/\bchecks\s+passed\b/i, left_value <> right_value)
+
+        _ ->
+          false
+      end
+    end)
+  end
+
+  defp watcher_string_assignments(content) do
+    content = Regex.replace(~r/[;\r\n]+/, content, "\n")
+
+    double_quoted =
+      Regex.scan(~r/^[[:blank:]]*([A-Za-z_][A-Za-z0-9_]*)[[:blank:]]*=[[:blank:]]*"([^"\r\n]*)"[[:blank:]]*$/m, content, capture: :all_but_first)
+
+    single_quoted =
+      Regex.scan(~r/^[[:blank:]]*([A-Za-z_][A-Za-z0-9_]*)[[:blank:]]*=[[:blank:]]*'([^'\r\n]*)'[[:blank:]]*$/m, content, capture: :all_but_first)
+
+    Map.new(double_quoted ++ single_quoted, fn [name, value] -> {name, value} end)
   end
 
   defp active_no_required_checks_claim?(content) do
