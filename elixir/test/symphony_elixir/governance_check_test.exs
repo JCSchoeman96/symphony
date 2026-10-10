@@ -606,6 +606,17 @@ defmodule SymphonyElixir.GovernanceCheckTest do
       assert_has_code(Check.validate(root), :skill_policy_violation)
     end
 
+    test "rejects protected-main pushes with attached short Git option values", %{root: root} do
+      path = Path.join(root, ".codex/skills/push/SKILL.md")
+
+      File.write!(
+        path,
+        File.read!(path) <> "\ngit -C/tmp push origin main\ngit -pC/tmp push origin main\n"
+      )
+
+      assert_has_code(Check.validate(root), :skill_policy_violation)
+    end
+
     test "rejects inline protected-main push instructions", %{root: root} do
       path = Path.join(root, ".codex/skills/push/SKILL.md")
       File.write!(path, File.read!(path) <> "\nThen run git push origin main.\n")

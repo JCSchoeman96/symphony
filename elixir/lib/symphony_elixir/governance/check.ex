@@ -961,7 +961,7 @@ defmodule SymphonyElixir.Governance.Check do
 
   defp active_protected_push_instruction?(content) do
     command_pattern =
-      ~r/\bgit(?:\s+(?:-[A-Za-z]+(?:[=\s]+[^\s!?;]+)?|--[A-Za-z0-9][A-Za-z0-9_-]*(?:[=\s]+[^\s!?;]+)?))*\s+push\b[^.!?;]*\b(?:HEAD:(?:main|master)|main|master)\b|\bpush\s+(?:(?:this|the)\s+branch)\s+to\s+(?:protected\s+)?(?:main|master)\b/i
+      ~r/\bgit(?:\s+(?:-[A-Za-z]+(?:[=\s]+[^\s!?;]+|[^\s!?;]+)?|--[A-Za-z0-9][A-Za-z0-9_-]*(?:[=\s]+[^\s!?;]+)?))*\s+push\b[^.!?;]*\b(?:HEAD:(?:main|master)|main|master)\b|\bpush\s+(?:(?:this|the)\s+branch)\s+to\s+(?:protected\s+)?(?:main|master)\b/i
 
     Enum.any?(command_policy_clauses(content), &active_command_clause?(&1, command_pattern))
   end
