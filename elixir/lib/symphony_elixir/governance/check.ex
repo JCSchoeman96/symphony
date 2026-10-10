@@ -951,16 +951,17 @@ defmodule SymphonyElixir.Governance.Check do
   end
 
   defp active_merge_instruction?(content) do
-    command_pattern = ~r/\bgh\s+pr\s+merge\b|\bmerge\s+(?:(?:the|this|a)\s+)?(?:pull\s+request|pr)\b/i
+    command_pattern =
+      ~r/\bgh(?:\s+--[A-Za-z0-9][A-Za-z0-9_-]*(?:[=\s]+[^\s!?;]+)?)*\s+pr\s+merge\b|\bmerge\s+(?:(?:the|this|a)\s+)?(?:pull\s+request|pr)\b/i
 
-    Enum.any?(policy_clauses(content), &active_command_clause?(&1, command_pattern))
+    Enum.any?(command_policy_clauses(content), &active_command_clause?(&1, command_pattern))
   end
 
   defp active_protected_push_instruction?(content) do
     command_pattern =
-      ~r/\bgit\s+push\b[^.!?;]*\b(?:HEAD:(?:main|master)|main|master)\b|\bpush\s+(?:(?:this|the)\s+branch)\s+to\s+(?:protected\s+)?(?:main|master)\b/i
+      ~r/\bgit(?:\s+-c\s+[^\s!?;]+|\s+--[A-Za-z0-9][A-Za-z0-9_-]*(?:[=\s]+[^\s!?;]+)?)*\s+push\b[^.!?;]*\b(?:HEAD:(?:main|master)|main|master)\b|\bpush\s+(?:(?:this|the)\s+branch)\s+to\s+(?:protected\s+)?(?:main|master)\b/i
 
-    Enum.any?(policy_clauses(content), &active_command_clause?(&1, command_pattern))
+    Enum.any?(command_policy_clauses(content), &active_command_clause?(&1, command_pattern))
   end
 
   defp unqualified_checks_passed_output?(content) do
@@ -988,7 +989,7 @@ defmodule SymphonyElixir.Governance.Check do
 
   defp active_connector_claim?(content) do
     patterns = [
-      ~r/\bci\s+passed\s*(?:,|;)\s*(?:so|therefore)\s+[^.!?;]+/i,
+      ~r/\bci\s+passed\s*(?:,|;|\.)\s*(?:so|therefore|and)\s+[^.!?;]+/i,
       ~r/\b(?:green\s+(?:ci|checks?)|(?:ci|checks?)\s+(?:is\s+)?green)\s*(?:,|;)\s*(?:so|therefore)\s+[^.!?;]+/i,
       ~r/\bci\s+passed\s*;\s*(?:acceptance|approval|merge|landing)\s+(?:is\s+)?(?:permitted|allowed|authorized|approved)\b[^.!?;]*/i
     ]
@@ -1006,6 +1007,12 @@ defmodule SymphonyElixir.Governance.Check do
     |> normalize_policy_content()
     |> String.split(~r/\r?\n+/, trim: true)
     |> Enum.flat_map(&Regex.split(~r/[.!?;]+|,\s*(?=(?:but|however|so|then|and)\b)/i, &1, trim: true))
+  end
+
+  defp command_policy_clauses(content) do
+    content
+    |> normalize_policy_content()
+    |> String.split(~r/\r?\n+|[!?;]+/, trim: true)
   end
 
   defp normalize_policy_content(content) do
@@ -1055,34 +1062,225 @@ defmodule SymphonyElixir.Governance.Check do
   end
 
   defp assigned_watcher_output?(content) do
-    assignments = watcher_string_assignments(content)
+    assignments = watcher_constant_assignments(content)
 
-    Regex.scan(
-      ~r/\bprint\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\+\s*([A-Za-z_][A-Za-z0-9_]*)(?:\s*,\s*[A-Za-z_][A-Za-z0-9_]*\s*=\s*[^)\r\n]+)?\s*\)/i,
-      content,
-      capture: :all_but_first
-    )
-    |> Enum.any?(fn [left, right] ->
-      case {Map.get(assignments, left), Map.get(assignments, right)} do
-        {left_value, right_value} when is_binary(left_value) and is_binary(right_value) ->
-          Regex.match?(~r/\bchecks\s+passed\b/i, left_value <> right_value)
+    content
+    |> watcher_print_expressions()
+    |> Enum.any?(fn expression ->
+      expression
+      |> watcher_print_value_expression()
+      |> watcher_expression_values(assignments)
+      |> Enum.any?(&Regex.match?(~r/\bchecks\s+passed\b/i, &1))
+    end)
+  end
 
-        _ ->
-          false
+  defp watcher_print_expressions(content) do
+    content
+    |> watcher_statement_lines()
+    |> Enum.flat_map(fn statement ->
+      case Regex.run(~r/^\s*print\s*\((.*)\)\s*$/s, statement, capture: :all_but_first) do
+        [expression] -> [expression]
+        nil -> []
       end
     end)
   end
 
-  defp watcher_string_assignments(content) do
-    content = Regex.replace(~r/[;\r\n]+/, content, "\n")
+  defp watcher_print_value_expression(expression) do
+    expression = String.trim(expression)
 
-    double_quoted =
-      Regex.scan(~r/^[[:blank:]]*([A-Za-z_][A-Za-z0-9_]*)[[:blank:]]*=[[:blank:]]*"([^"\r\n]*)"[[:blank:]]*$/m, content, capture: :all_but_first)
+    case Regex.run(~r/^(.+),\s*[A-Za-z_][A-Za-z0-9_]*\s*=\s*[^,]+$/s, expression, capture: :all_but_first) do
+      [value] -> watcher_print_value_expression(value)
+      nil -> expression
+    end
+  end
 
-    single_quoted =
-      Regex.scan(~r/^[[:blank:]]*([A-Za-z_][A-Za-z0-9_]*)[[:blank:]]*=[[:blank:]]*'([^'\r\n]*)'[[:blank:]]*$/m, content, capture: :all_but_first)
+  defp watcher_constant_assignments(content) do
+    content
+    |> watcher_statement_lines()
+    |> Enum.reduce(%{}, &watcher_assign_constant(&1, &2))
+  end
 
-    Map.new(double_quoted ++ single_quoted, fn [name, value] -> {name, value} end)
+  defp watcher_assign_constant(statement, assignments) do
+    case Regex.run(~r/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+?)\s*$/s, statement, capture: :all_but_first) do
+      [name, expression] -> watcher_put_constant(name, expression, assignments)
+      nil -> assignments
+    end
+  end
+
+  defp watcher_put_constant(name, expression, assignments) do
+    case watcher_expression_values(expression, assignments) do
+      [] -> assignments
+      values -> Map.put(assignments, name, values)
+    end
+  end
+
+  defp watcher_statement_lines(content) do
+    content
+    |> then(&Regex.replace(~r/[;\r\n]+/, &1, "\n"))
+    |> String.split("\n", trim: true)
+  end
+
+  defp watcher_expression_values(expression, assignments) do
+    expression = expression |> String.trim() |> watcher_unwrap_expression()
+
+    case watcher_expression_kind(expression) do
+      {:format, template, arguments} ->
+        watcher_format_values(template, arguments, assignments)
+
+      {:f_string, template} ->
+        watcher_interpolated_values(template, assignments)
+
+      {:literal, value} ->
+        [value]
+
+      {:conditional, when_true, when_false} ->
+        watcher_expression_values(when_true, assignments) ++ watcher_expression_values(when_false, assignments)
+
+      {:variable, name} ->
+        Map.get(assignments, name, [])
+
+      :concat ->
+        watcher_concat_values(expression, assignments)
+    end
+  end
+
+  defp watcher_unwrap_expression(expression) do
+    if String.starts_with?(expression, "(") and String.ends_with?(expression, ")") do
+      expression
+      |> String.slice(1, byte_size(expression) - 2)
+      |> String.trim()
+    else
+      expression
+    end
+  end
+
+  defp watcher_expression_kind(expression) do
+    cond do
+      Regex.match?(~r/^(?:"[^"]*"\.format\(.*\)|'[^']*'\.format\(.*\))$/s, expression) ->
+        watcher_format_kind(expression)
+
+      Regex.match?(~r/^f(?:"[^"]*"|'[^']*')$/s, expression) ->
+        watcher_f_string_kind(expression)
+
+      Regex.match?(~r/^(?:"[^"]*"|'[^']*')$/s, expression) ->
+        watcher_literal_kind(expression)
+
+      true ->
+        watcher_simple_expression_kind(expression)
+    end
+  end
+
+  defp watcher_format_kind(expression) do
+    patterns = [~r/^"([^"]*)"\.format\((.*)\)$/s, ~r/^'([^']*)'\.format\((.*)\)$/s]
+
+    case Enum.find_value(patterns, &Regex.run(&1, expression, capture: :all_but_first)) do
+      [template, arguments] -> {:format, template, arguments}
+      nil -> :concat
+    end
+  end
+
+  defp watcher_f_string_kind(expression) do
+    patterns = [~r/^f"([^"]*)"$/s, ~r/^f'([^']*)'$/s]
+
+    case Enum.find_value(patterns, &Regex.run(&1, expression, capture: :all_but_first)) do
+      [template] -> {:f_string, template}
+      nil -> :concat
+    end
+  end
+
+  defp watcher_literal_kind(expression) do
+    patterns = [~r/^"([^"]*)"$/s, ~r/^'([^']*)'$/s]
+
+    case Enum.find_value(patterns, &Regex.run(&1, expression, capture: :all_but_first)) do
+      [value] -> {:literal, value}
+      nil -> :concat
+    end
+  end
+
+  defp watcher_simple_expression_kind(expression) do
+    conditional_pattern = ~r/^(.+?)\s+if\s+[A-Za-z_][A-Za-z0-9_]*\s+else\s+(.+)$/s
+
+    cond do
+      Regex.match?(~r/\s+\+\s+/, expression) ->
+        :concat
+
+      Regex.match?(conditional_pattern, expression) ->
+        [when_true, when_false] = watcher_expression_captures(conditional_pattern, expression)
+        {:conditional, when_true, when_false}
+
+      Regex.match?(~r/^[A-Za-z_][A-Za-z0-9_]*$/, expression) ->
+        {:variable, expression}
+
+      true ->
+        :concat
+    end
+  end
+
+  defp watcher_concat_values(expression, assignments) do
+    parts = Regex.split(~r/\s*\+\s*/, expression, trim: true)
+
+    if length(parts) > 1 do
+      Enum.reduce(parts, [""], &watcher_concat_part(&1, &2, assignments))
+    else
+      []
+    end
+  end
+
+  defp watcher_concat_part(part, values, assignments) do
+    part_values = watcher_expression_values(part, assignments)
+
+    for prefix <- values, suffix <- part_values, do: prefix <> suffix
+  end
+
+  defp watcher_expression_captures(pattern, expression) do
+    case Regex.run(pattern, expression, capture: :all_but_first) do
+      captures when is_list(captures) -> captures
+      nil -> []
+    end
+  end
+
+  defp watcher_format_values(template, arguments, assignments) do
+    argument_values =
+      arguments
+      |> String.split(",", trim: true)
+      |> Enum.map(&watcher_expression_values(&1, assignments))
+
+    if Enum.any?(argument_values, &(&1 == [])) do
+      []
+    else
+      Enum.reduce(argument_values, [template], &watcher_format_arguments(&1, &2))
+    end
+  end
+
+  defp watcher_format_arguments(values, templates) do
+    Enum.flat_map(templates, fn current ->
+      Enum.map(values, &String.replace(current, "{}", &1, global: false))
+    end)
+  end
+
+  defp watcher_interpolated_values(template, assignments) do
+    names =
+      Regex.scan(~r/\{([A-Za-z_][A-Za-z0-9_]*)\}/, template, capture: :all_but_first)
+      |> List.flatten()
+      |> Enum.uniq()
+
+    Enum.reduce_while(names, [template], &watcher_interpolate_name(&1, &2, assignments))
+  end
+
+  defp watcher_interpolate_name(name, values, assignments) do
+    case Map.get(assignments, name) do
+      nil ->
+        {:halt, []}
+
+      replacements ->
+        {:cont, watcher_replace_interpolation(values, name, replacements)}
+    end
+  end
+
+  defp watcher_replace_interpolation(values, name, replacements) do
+    Enum.flat_map(values, fn current ->
+      Enum.map(replacements, &String.replace(current, "{" <> name <> "}", &1, global: false))
+    end)
   end
 
   defp active_no_required_checks_claim?(content) do
@@ -1102,12 +1300,12 @@ defmodule SymphonyElixir.Governance.Check do
     unfenced_content = Regex.replace(~r/~~~[^\r\n]*\r?\n.*?~~~/is, unfenced_content, "")
 
     Enum.any?(fenced_blocks, &raw_lifecycle_mutation_block?/1) or
-      Regex.match?(~r/^\s*mutation\b.{0,1200}\bissueUpdate\b.{0,400}\bstateId\b/ims, unfenced_content) or
-      Regex.match?(~r/issueUpdate\s*[({][^\n]{0,160}\bstateId\s*:/is, unfenced_content)
+      Regex.match?(~r/^\s*mutation\b.*?\bissueUpdate\s*[({].*?\bstateId\s*:/ims, unfenced_content) or
+      Regex.match?(~r/issueUpdate\s*[({].*?\bstateId\s*:/is, unfenced_content)
   end
 
   defp raw_lifecycle_mutation_block?(block) do
-    Regex.match?(~r/^\s*mutation\b.{0,1200}\bissueUpdate\b.{0,400}\bstateId\b/ims, block)
+    Regex.match?(~r/^\s*mutation\b.*?\bissueUpdate\s*[({].*?\bstateId\s*:/ims, block)
   end
 
   defp validate_freeze(root, projection, opts) do
