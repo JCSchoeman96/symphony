@@ -1127,6 +1127,8 @@ defmodule SymphonyElixir.GovernanceCheckTest do
   end
 
   defp init_git!(root) do
+    ensure_accepted_commit_available!()
+
     git!(root, ["init", "-q"])
     git!(root, ["config", "user.email", "governance-test@example.invalid"])
     git!(root, ["config", "user.name", "Governance Test"])
@@ -1139,6 +1141,19 @@ defmodule SymphonyElixir.GovernanceCheckTest do
     git!(root, ["add", "."])
     git!(root, ["commit", "-qm", "candidate"])
     :ok
+  end
+
+  defp ensure_accepted_commit_available! do
+    case System.cmd("git", ["-C", @repo_root, "cat-file", "-e", "#{@accepted_sha}^{commit}"], stderr_to_stdout: true) do
+      {_output, 0} ->
+        :ok
+
+      {_output, _status} ->
+        case System.cmd("git", ["-C", @repo_root, "fetch", "--no-tags", "origin", @accepted_sha], stderr_to_stdout: true) do
+          {_output, 0} -> :ok
+          {output, status} -> raise "unable to fetch accepted governance baseline (git exit #{status}): #{String.trim(output)}"
+        end
+    end
   end
 
   defp git!(root, args) do
