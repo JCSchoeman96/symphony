@@ -9,6 +9,12 @@ description:
 
 # Pull
 
+<!-- SYMPHONY_AUTHORITY_CLASS: PROCEDURAL_NON_AUTHORITY -->
+
+This skill synchronizes feature or candidate branches only. It does not authorize direct changes to
+protected `main`. If base movement changes the accepted governance baseline, stop and get a new
+governance decision; do not silently rebase around the decision.
+
 ## Workflow
 
 1. Verify git status is clean or commit/stash changes before merging.
@@ -30,7 +36,7 @@ description:
 7. If conflicts appear, resolve them (see conflict guidance below), then:
    - `git add <files>`
    - `git commit` (or `git merge --continue` if the merge is paused)
-8. Verify with project checks (follow repo policy in `AGENTS.md`).
+8. Verify with project checks (follow repo policy in `elixir/AGENTS.md`).
 9. Summarize the merge:
    - Call out the most challenging conflicts/files and how they were resolved.
    - Note any assumptions or follow-ups.

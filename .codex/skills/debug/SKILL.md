@@ -8,6 +8,11 @@ description:
 
 # Debug
 
+<!-- SYMPHONY_AUTHORITY_CLASS: PROCEDURAL_NON_AUTHORITY -->
+
+This skill is diagnostic unless separate repair authority exists. Provider and runtime examples do
+not grant access. Observations remain observations until the trusted evidence path validates them.
+
 ## Goals
 
 - Find why a run is stuck, retrying, or failing.

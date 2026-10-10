@@ -7,6 +7,12 @@ description: |
 
 # Linear GraphQL
 
+<!-- SYMPHONY_AUTHORITY_CLASS: LEGACY_COMPATIBILITY_PROCEDURE -->
+
+This skill applies only under pre-existing authority for the legacy Linear compatibility adapter.
+It permits read queries, comments, comment edits, attachments/uploads, and other non-lifecycle
+operations already allowed by the active capability envelope. It does not grant lifecycle authority.
+
 Use this skill for raw Linear GraphQL work during Symphony app-server sessions.
 
 ## Primary tool
@@ -181,30 +187,6 @@ query IssueDetails($id: String!) {
 }
 ```
 
-### Query team workflow states for an issue
-
-Use this before changing issue state when you need the exact `stateId`:
-
-```graphql
-query IssueTeamStates($id: String!) {
-  issue(id: $id) {
-    id
-    team {
-      id
-      key
-      name
-      states {
-        nodes {
-          id
-          name
-          type
-        }
-      }
-    }
-  }
-}
-```
-
 ### Edit an existing comment
 
 Use `commentUpdate` through `linear_graphql`:
@@ -237,25 +219,8 @@ mutation CreateComment($issueId: String!, $body: String!) {
 }
 ```
 
-### Move an issue to a different state
-
-Use `issueUpdate` with the destination `stateId`:
-
-```graphql
-mutation MoveIssueToState($id: String!, $stateId: String!) {
-  issueUpdate(id: $id, input: { stateId: $stateId }) {
-    success
-    issue {
-      id
-      identifier
-      state {
-        id
-        name
-      }
-    }
-  }
-}
-```
+Do not use `linear_graphql` `issueUpdate` or `stateId` mutations to perform Symphony lifecycle
+transitions. Use the authorized Symphony transition boundary where the legacy adapter exposes one.
 
 ### Attach a GitHub PR to an issue
 
@@ -379,8 +344,7 @@ mutation FileUpload(
   queries.
 - Prefer the narrowest issue lookup that matches what you already know:
   key -> identifier search -> internal id.
-- For state transitions, fetch team states first and use the exact `stateId`
-  instead of hardcoding names inside mutations.
+- Do not perform lifecycle transitions through raw GraphQL mutations.
 - Prefer `attachmentLinkGitHubPR` over a generic URL attachment when linking a
   GitHub PR to a Linear issue.
 - Do not introduce new raw-token shell helpers for GraphQL access.
