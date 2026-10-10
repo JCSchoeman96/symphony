@@ -115,9 +115,11 @@ human status blocks in the ledger, playbook README, and Unified Execution Roadma
 records a decision; it does not create one.
 
 A projection moves from Prepared to Current only after schema, metadata, immutable-roadmap,
-accepted-identity, current-status, and non-escalation checks pass. A failed projection is Invalid.
-A later explicit human decision may supersede a Current projection; CI, tracker movement, PR merge,
-or agent edits cannot. A later decision creates a new projection snapshot.
+accepted-identity, current-status, and non-escalation checks pass. Current is the steady state for
+one governance snapshot. A failed projection is Invalid; Invalid is terminal for that projection
+instance. A later explicit human decision may supersede a Current projection; Superseded is terminal
+for that instance. CI, tracker movement, PR merge, or agent edits cannot change either terminal
+state. A later decision creates a new projection snapshot.
 
 One governance gate assessment is Unassessed and then Passed or Rejected. Those results are terminal
 for that assessment. A later validation is a new assessment. The checker reads, validates, reports,
