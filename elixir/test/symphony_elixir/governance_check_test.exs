@@ -357,6 +357,16 @@ defmodule SymphonyElixir.GovernanceCheckTest do
 
       assert_has_code(Check.validate(root), :immutable_blob_symlink)
     end
+
+    test "rejects immutable artifacts with special permission bits", %{root: root} do
+      path = Path.join(root, @roadmap_path)
+
+      for mode <- [0o1644, 0o2644, 0o4644] do
+        {_, 0} = System.cmd("chmod", [Integer.to_string(mode, 8), path])
+
+        assert_has_code(Check.validate(root), :immutable_blob_mode_mismatch)
+      end
+    end
   end
 
   describe "freeze mode" do
@@ -589,6 +599,13 @@ defmodule SymphonyElixir.GovernanceCheckTest do
       assert_has_code(Check.validate(root), :skill_policy_violation)
     end
 
+    test "rejects a protected-main push with short Git global flags", %{root: root} do
+      path = Path.join(root, ".codex/skills/push/SKILL.md")
+      File.write!(path, File.read!(path) <> "\ngit -p --no-pager -C /tmp push origin main\n")
+
+      assert_has_code(Check.validate(root), :skill_policy_violation)
+    end
+
     test "rejects inline protected-main push instructions", %{root: root} do
       path = Path.join(root, ".codex/skills/push/SKILL.md")
       File.write!(path, File.read!(path) <> "\nThen run git push origin main.\n")
@@ -776,6 +793,39 @@ defmodule SymphonyElixir.GovernanceCheckTest do
       assert_has_code(Check.validate(root), :skill_policy_violation)
     end
 
+    test "rejects Checks passed output from keyword format arguments", %{root: root} do
+      path = Path.join(root, ".codex/skills/land/land_watch.py")
+
+      File.write!(
+        path,
+        File.read!(path) <> "\nprint(\"{prefix} {suffix}\".format(prefix=\"Checks\", suffix=\"passed\"))\n"
+      )
+
+      assert_has_code(Check.validate(root), :skill_policy_violation)
+    end
+
+    test "rejects Checks passed output from positional print arguments", %{root: root} do
+      path = Path.join(root, ".codex/skills/land/land_watch.py")
+
+      File.write!(
+        path,
+        File.read!(path) <> "\nprefix = \"Checks\"; suffix = \"passed\"; print(prefix, suffix, sep=\" \")\n"
+      )
+
+      assert_has_code(Check.validate(root), :skill_policy_violation)
+    end
+
+    test "rejects Checks passed output from fr-string assignments", %{root: root} do
+      path = Path.join(root, ".codex/skills/land/land_watch.py")
+
+      File.write!(
+        path,
+        File.read!(path) <> "\nprefix = \"Checks\"; suffix = \"passed\"; print(fr\"{prefix} {suffix}\")\n"
+      )
+
+      assert_has_code(Check.validate(root), :skill_policy_violation)
+    end
+
     test "rejects Checks passed output from f-string assignments", %{root: root} do
       path = Path.join(root, ".codex/skills/land/land_watch.py")
 
@@ -879,6 +929,14 @@ defmodule SymphonyElixir.GovernanceCheckTest do
       path = Path.join(root, ".codex/skills/nested/custom/SKILL.md")
       File.mkdir_p!(Path.dirname(path))
       File.write!(path, "nested skill without an authority marker\n")
+
+      assert_has_code(Check.validate(root), :skill_marker_missing)
+    end
+
+    test "requires the legacy Linear marker for nested Linear skill files", %{root: root} do
+      path = Path.join(root, ".codex/skills/linear/nested/SKILL.md")
+      File.mkdir_p!(Path.dirname(path))
+      File.write!(path, "nested Linear skill without the legacy marker\n")
 
       assert_has_code(Check.validate(root), :skill_marker_missing)
     end

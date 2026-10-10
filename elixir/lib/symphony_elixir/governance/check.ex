@@ -551,7 +551,7 @@ defmodule SymphonyElixir.Governance.Check do
   end
 
   defp immutable_mode_diagnostics(mode, relative_path) do
-    if regular_git_mode(mode) == "100644" do
+    if regular_git_mode(mode) == "100644" and Bitwise.band(mode, 0o7000) == 0 do
       []
     else
       [diagnostic(:immutable_blob_mode_mismatch, relative_path, "immutable file must have regular 0644 mode")]
@@ -897,13 +897,15 @@ defmodule SymphonyElixir.Governance.Check do
       Enum.any?(markers, &(&1 not in ["PROCEDURAL_NON_AUTHORITY", "LEGACY_COMPATIBILITY_PROCEDURE"])) ->
         [diagnostic(:skill_marker_invalid, relative_path, "authority-class marker is not allowed")]
 
-      Path.basename(Path.dirname(relative_path)) == "linear" and markers != ["LEGACY_COMPATIBILITY_PROCEDURE"] ->
+      linear_skill_path?(relative_path) and markers != ["LEGACY_COMPATIBILITY_PROCEDURE"] ->
         [diagnostic(:skill_marker_invalid, relative_path, "linear must use the legacy compatibility marker")]
 
       true ->
         []
     end
   end
+
+  defp linear_skill_path?(relative_path), do: String.starts_with?(relative_path, ".codex/skills/linear/")
 
   defp skill_policy_diagnostics(content, relative_path) do
     diagnostics = []
@@ -959,7 +961,7 @@ defmodule SymphonyElixir.Governance.Check do
 
   defp active_protected_push_instruction?(content) do
     command_pattern =
-      ~r/\bgit(?:\s+-c\s+[^\s!?;]+|\s+--[A-Za-z0-9][A-Za-z0-9_-]*(?:[=\s]+[^\s!?;]+)?)*\s+push\b[^.!?;]*\b(?:HEAD:(?:main|master)|main|master)\b|\bpush\s+(?:(?:this|the)\s+branch)\s+to\s+(?:protected\s+)?(?:main|master)\b/i
+      ~r/\bgit(?:\s+(?:-[A-Za-z]+(?:[=\s]+[^\s!?;]+)?|--[A-Za-z0-9][A-Za-z0-9_-]*(?:[=\s]+[^\s!?;]+)?))*\s+push\b[^.!?;]*\b(?:HEAD:(?:main|master)|main|master)\b|\bpush\s+(?:(?:this|the)\s+branch)\s+to\s+(?:protected\s+)?(?:main|master)\b/i
 
     Enum.any?(command_policy_clauses(content), &active_command_clause?(&1, command_pattern))
   end
@@ -1054,11 +1056,7 @@ defmodule SymphonyElixir.Governance.Check do
   end
 
   defp watcher_checks_passed_output?(content) do
-    content = normalize_policy_content(content)
-
-    collapsed_content = Regex.replace(~r/["'`+<>]/, content, "")
-
-    Regex.match?(~r/\bchecks\s+passed\b/i, collapsed_content) or assigned_watcher_output?(content)
+    Regex.match?(~r/\bpassed\b/i, content) or assigned_watcher_output?(content)
   end
 
   defp assigned_watcher_output?(content) do
