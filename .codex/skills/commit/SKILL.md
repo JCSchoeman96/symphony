@@ -8,6 +8,12 @@ description:
 
 # Commit
 
+<!-- SYMPHONY_AUTHORITY_CLASS: PROCEDURAL_NON_AUTHORITY -->
+
+This skill applies only inside an already-authorized writable role and workspace. A commit does not
+create task scope or approval. Stage only intended, authorized files. Do not commit directly to a
+protected branch.
+
 ## Goals
 
 - Produce a commit that reflects the actual code changes and the session

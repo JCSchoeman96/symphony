@@ -7,6 +7,12 @@ description:
 
 # Push
 
+<!-- SYMPHONY_AUTHORITY_CLASS: PROCEDURAL_NON_AUTHORITY -->
+
+Branch pushes and PR creation/update require pre-existing source-control authority. This skill does
+not authorize merging, direct protected-main pushes, or remote/protocol changes to bypass policy.
+Creating a PR does not establish programme acceptance.
+
 ## Prerequisites
 
 - `gh` CLI is installed and available in `PATH`.
