@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "projection_role": "MACHINE_PROJECTION_OF_ACCEPTED_AUTHORITY",
+  "governing_roadmap": {
+    "id": "docs/symphony-hardening-playbook-v4.1/V4_1_MASTER_ROADMAP.md",
+    "version": "V4.1",
+    "blob_sha": "4b0528bdc0647d889b42ebc478081d5b873898fe"
+  },
+  "authority_snapshot": {
+    "accepted_protected_main_at_decision": {
+      "sha": "0640bf1135f8b5000ea29518c2c456272379e9c6",
+      "tree": "5c6f10cc88c41f395837a930fb7ea20e0bdae0cc"
+    },
+    "current_accepted_phase": "H-080B",
+    "current_accepted_prerequisite": "PRE-080C-02",
+    "pre_080c_02_outcome": "LIMIT_FOUND",
+    "currently_authorized_work": {
+      "id": "PRE-080C-03",
+      "status": "AUTHORIZED_ACTIVE_NOT_ACCEPTED",
+      "scope": "GOVERNANCE_DOCUMENTATION_RECONCILIATION_ONLY"
+    },
+    "pre_h080c": "NOT_REACHED",
+    "h_080c": "NOT_AUTHORIZED",
+    "next_governance_step": "PRE-H080C",
+    "next_authorized_phase": null
+  },
+  "decision": {
+    "authority": "Master Governance",
+    "reference": "MG-2026-10-10-PRE-080C-03-AUTH-01",
+    "timestamp": "2026-10-10T16:35:00+02:00"
+  },
+  "known_unresolved_governance_conditions": [
+    "PRE080C02_LIMIT_FOUND_REQUIRES_PRE_H080C_ADJUDICATION",
+    "PRE080C03_NOT_ACCEPTED",
+    "PRE_H080C_NOT_REACHED",
+    "H080C_NOT_AUTHORIZED"
+  ]
+}
