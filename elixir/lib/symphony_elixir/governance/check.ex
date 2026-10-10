@@ -76,24 +76,9 @@ defmodule SymphonyElixir.Governance.Check do
 
   @spec validate(Path.t(), keyword()) :: :ok | {:error, [diagnostic()]}
   def validate(root, opts) when is_binary(root) and is_list(opts) do
-    projection_relative_path = Keyword.get(opts, :projection_path, @projection_path)
-    projection_path = Path.join(root, projection_relative_path)
-
-    case read_projection(projection_path) do
-      {:ok, projection} ->
-        diagnostics =
-          []
-          |> append_validation_result(validate_projection(projection))
-          |> append_validation_result(validate_immutable_blobs(root))
-          |> append_validation_result(validate_status_documents(root, projection, opts))
-          |> append_validation_result(validate_skills(root))
-          |> append_validation_result(validate_freeze(root, projection, opts))
-
-        if diagnostics == [] do
-          :ok
-        else
-          {:error, sort_diagnostics(diagnostics)}
-        end
+    case validate_options(opts) do
+      :ok ->
+        validate_repository(root, opts)
 
       {:error, diagnostics} ->
         {:error, sort_diagnostics(diagnostics)}
@@ -107,26 +92,100 @@ defmodule SymphonyElixir.Governance.Check do
   defp append_validation_result(diagnostics, :ok), do: diagnostics
   defp append_validation_result(diagnostics, {:error, new_diagnostics}), do: diagnostics ++ new_diagnostics
 
-  defp read_projection(path) do
-    case File.stat(path) do
-      {:ok, %{size: size}} when size > @max_projection_bytes ->
+  defp validate_repository(root, opts) do
+    projection_relative_path = Keyword.get(opts, :projection_path, @projection_path)
+
+    case read_projection(root, projection_relative_path) do
+      {:ok, projection} -> validate_repository_contents(root, projection, opts)
+      {:error, diagnostics} -> {:error, sort_diagnostics(diagnostics)}
+    end
+  end
+
+  defp validate_repository_contents(root, projection, opts) do
+    diagnostics =
+      []
+      |> append_validation_result(validate_projection(projection))
+      |> append_validation_result(validate_immutable_blobs(root))
+      |> append_validation_result(validate_status_documents(root, projection, opts))
+      |> append_validation_result(validate_skills(root))
+      |> append_validation_result(validate_freeze(root, projection, opts))
+
+    if diagnostics == [], do: :ok, else: {:error, sort_diagnostics(diagnostics)}
+  end
+
+  defp validate_options(opts) do
+    if Keyword.has_key?(opts, :candidate_phase) and Keyword.get(opts, :freeze) != true do
+      {:error, [diagnostic(:candidate_phase_requires_freeze, "candidate_phase", "candidate phase requires freeze mode")]}
+    else
+      :ok
+    end
+  end
+
+  defp read_projection(root, relative_path) do
+    path = Path.join(root, relative_path)
+
+    case safe_regular_file(root, relative_path) do
+      {:ok, _file_path, %{size: size}} when size > @max_projection_bytes ->
         {:error, [diagnostic(:projection_too_large, path, "projection exceeds 64 KiB")]}
 
-      {:ok, _stat} ->
-        read_projection_file(path)
+      {:ok, file_path, _stat} ->
+        case File.read(file_path) do
+          {:ok, content} -> parse_projection_content(path, content)
+          {:error, reason} -> {:error, [diagnostic(:projection_read_error, path, inspect(reason))]}
+        end
+
+      {:error, {:symlink, symlink_path}} ->
+        {:error, [diagnostic(:projection_symlink, symlink_path, "projection path cannot contain a symlink")]}
 
       {:error, :enoent} ->
         {:error, [diagnostic(:projection_missing, path, "projection file does not exist")]}
+
+      {:error, {:not_regular, type}} ->
+        {:error, [diagnostic(:projection_read_error, path, "projection path is not a regular file: #{type}")]}
 
       {:error, reason} ->
         {:error, [diagnostic(:projection_read_error, path, inspect(reason))]}
     end
   end
 
-  defp read_projection_file(path) do
-    case File.read(path) do
-      {:ok, content} -> parse_projection_content(path, content)
-      {:error, reason} -> {:error, [diagnostic(:projection_read_error, path, inspect(reason))]}
+  defp safe_regular_file(root, relative_path) do
+    path = Path.join(root, relative_path)
+
+    case safe_lstat(root, relative_path) do
+      {:ok, %File.Stat{type: :regular} = stat} -> {:ok, path, stat}
+      {:ok, %File.Stat{type: :symlink}} -> {:error, {:symlink, relative_path}}
+      {:ok, %File.Stat{type: type}} -> {:error, {:not_regular, type}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp safe_lstat(root, relative_path) do
+    root = Path.expand(root)
+
+    case File.lstat(root) do
+      {:ok, %File.Stat{type: :symlink}} -> {:error, {:symlink, "."}}
+      {:ok, _stat} -> safe_lstat_components(root, Path.split(relative_path), root)
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp safe_lstat_components(_root, [], current), do: File.lstat(current)
+
+  defp safe_lstat_components(root, [component | rest], current) do
+    path = Path.join(current, component)
+
+    case File.lstat(path) do
+      {:ok, %File.Stat{type: :symlink}} when rest != [] ->
+        {:error, {:symlink, Path.relative_to(path, root)}}
+
+      {:ok, _stat} when rest == [] ->
+        File.lstat(path)
+
+      {:ok, _stat} ->
+        safe_lstat_components(root, rest, path)
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -463,12 +522,40 @@ defmodule SymphonyElixir.Governance.Check do
   end
 
   defp validate_immutable_blob(root, {relative_path, expected_blob}) do
-    path = Path.join(root, relative_path)
+    case safe_regular_file(root, relative_path) do
+      {:ok, path, %{mode: mode}} ->
+        validate_immutable_file(path, mode, relative_path, expected_blob)
 
+      {:error, {:symlink, symlink_path}} ->
+        [diagnostic(:immutable_blob_symlink, symlink_path, "immutable path cannot contain a symlink")]
+
+      {:error, :enoent} ->
+        [diagnostic(:immutable_blob_missing, relative_path, "immutable file does not exist")]
+
+      {:error, {:not_regular, type}} ->
+        [diagnostic(:immutable_blob_read_error, relative_path, "immutable path is not a regular file: #{type}")]
+
+      {:error, reason} ->
+        [diagnostic(:immutable_blob_read_error, relative_path, inspect(reason))]
+    end
+  end
+
+  defp validate_immutable_file(path, mode, relative_path, expected_blob) do
     case File.read(path) do
-      {:ok, content} -> immutable_blob_diagnostics(relative_path, content, expected_blob)
-      {:error, :enoent} -> [diagnostic(:immutable_blob_missing, relative_path, "immutable file does not exist")]
-      {:error, reason} -> [diagnostic(:immutable_blob_read_error, relative_path, inspect(reason))]
+      {:ok, content} ->
+        immutable_mode_diagnostics(mode, relative_path) ++
+          immutable_blob_diagnostics(relative_path, content, expected_blob)
+
+      {:error, reason} ->
+        [diagnostic(:immutable_blob_read_error, relative_path, inspect(reason))]
+    end
+  end
+
+  defp immutable_mode_diagnostics(mode, relative_path) do
+    if regular_git_mode(mode) == "100644" do
+      []
+    else
+      [diagnostic(:immutable_blob_mode_mismatch, relative_path, "immutable file must have regular 0644 mode")]
     end
   end
 
@@ -484,17 +571,35 @@ defmodule SymphonyElixir.Governance.Check do
     expected = status_values(projection, @projection_path)
 
     diagnostics =
-      Enum.flat_map(@status_paths, fn relative_path ->
-        path = Path.join(root, relative_path)
-
-        case File.read(path) do
-          {:ok, content} -> parse_status_block(content, relative_path, expected)
-          {:error, :enoent} -> [diagnostic(:status_document_missing, relative_path, "status document does not exist")]
-          {:error, reason} -> [diagnostic(:status_document_read_error, relative_path, inspect(reason))]
-        end
-      end)
+      Enum.flat_map(@status_paths, &validate_status_document(root, &1, expected))
 
     if diagnostics == [], do: :ok, else: {:error, diagnostics}
+  end
+
+  defp validate_status_document(root, relative_path, expected) do
+    case safe_regular_file(root, relative_path) do
+      {:ok, path, _stat} ->
+        read_status_document(path, relative_path, expected)
+
+      {:error, {:symlink, symlink_path}} ->
+        [diagnostic(:status_document_symlink, symlink_path, "status document path cannot contain a symlink")]
+
+      {:error, :enoent} ->
+        [diagnostic(:status_document_missing, relative_path, "status document does not exist")]
+
+      {:error, {:not_regular, type}} ->
+        [diagnostic(:status_document_read_error, relative_path, "status document is not a regular file: #{type}")]
+
+      {:error, reason} ->
+        [diagnostic(:status_document_read_error, relative_path, inspect(reason))]
+    end
+  end
+
+  defp read_status_document(path, relative_path, expected) do
+    case File.read(path) do
+      {:ok, content} -> parse_status_block(content, relative_path, expected)
+      {:error, reason} -> [diagnostic(:status_document_read_error, relative_path, inspect(reason))]
+    end
   end
 
   defp status_values(projection, projection_relative_path) do
@@ -613,59 +718,109 @@ defmodule SymphonyElixir.Governance.Check do
 
   defp validate_skills(root) do
     skill_root = Path.join(root, ".codex/skills")
-    skill_paths = Path.wildcard(Path.join(skill_root, "**/SKILL.md")) |> Enum.sort()
+    readme_path = Path.join(skill_root, "README.md")
 
-    required_diagnostics =
-      Enum.flat_map(@required_skill_names, fn skill_name ->
-        relative_path = Path.join(".codex/skills", skill_name <> "/SKILL.md")
-        path = Path.join(root, relative_path)
+    skill_paths =
+      [readme_path | Path.wildcard(Path.join(skill_root, "**/SKILL.md")) ++ Path.wildcard(Path.join(skill_root, "**/README.md"))]
+      |> Enum.uniq()
+      |> Enum.sort()
 
-        if File.regular?(path) do
-          []
-        else
-          [diagnostic(:required_skill_missing, relative_path, "required current skill file does not exist")]
-        end
-      end)
+    required_paths =
+      [".codex/skills/README.md" | Enum.map(@required_skill_names, &Path.join([".codex/skills", &1, "SKILL.md"]))]
 
-    skill_diagnostics =
-      Enum.flat_map(skill_paths, fn path ->
-        relative_path = Path.relative_to(path, root)
+    diagnostics =
+      required_skill_diagnostics(root, required_paths) ++
+        Enum.flat_map(skill_paths, &skill_file_diagnostics(root, &1)) ++
+        watcher_diagnostics(root) ++
+        skill_symlink_diagnostics(skill_root, root)
 
-        case File.read(path) do
-          {:ok, content} ->
-            marker_diagnostics = skill_marker_diagnostics(content, relative_path)
-            policy_diagnostics = skill_policy_diagnostics(content, relative_path)
-            marker_diagnostics ++ policy_diagnostics
+    if diagnostics == [], do: :ok, else: {:error, diagnostics}
+  end
 
-          {:error, reason} ->
-            [diagnostic(:skill_read_error, relative_path, inspect(reason))]
-        end
-      end)
+  defp required_skill_diagnostics(root, required_paths) do
+    Enum.flat_map(required_paths, fn relative_path ->
+      case safe_regular_file(root, relative_path) do
+        {:ok, _path, _stat} -> []
+        {:error, {:symlink, symlink_path}} -> [diagnostic(:skill_symlink, symlink_path, "skill instruction path cannot contain a symlink")]
+        {:error, :enoent} -> [diagnostic(:required_skill_missing, relative_path, "required current skill file does not exist")]
+        {:error, _reason} -> [diagnostic(:required_skill_missing, relative_path, "required current skill file is not a regular file")]
+      end
+    end)
+  end
 
-    watcher_path = Path.join(skill_root, "land/land_watch.py")
+  defp skill_file_diagnostics(root, path) do
+    relative_path = Path.relative_to(path, root)
 
-    watcher_diagnostics =
-      case File.read(watcher_path) do
-        {:ok, content} ->
-          marker_diagnostics =
-            if String.contains?(content, "# SYMPHONY_AUTHORITY_CLASS: ADVISORY_NON_AUTHORITY") do
-              []
-            else
-              [diagnostic(:land_watch_marker_missing, Path.relative_to(watcher_path, root), "advisory marker is required")]
-            end
+    case safe_regular_file(root, relative_path) do
+      {:ok, file_path, _stat} -> read_skill_file(file_path, relative_path)
+      {:error, {:symlink, symlink_path}} -> [diagnostic(:skill_symlink, symlink_path, "skill instruction path cannot contain a symlink")]
+      {:error, reason} -> [diagnostic(:skill_read_error, relative_path, inspect(reason))]
+    end
+  end
 
-          policy_diagnostics = skill_policy_diagnostics(content, Path.relative_to(watcher_path, root))
-          marker_diagnostics ++ policy_diagnostics
+  defp read_skill_file(path, relative_path) do
+    case File.read(path) do
+      {:ok, content} ->
+        skill_marker_diagnostics(content, relative_path) ++ skill_policy_diagnostics(content, relative_path)
 
-        {:error, :enoent} ->
-          [diagnostic(:land_watch_marker_missing, Path.relative_to(watcher_path, root), "land watcher does not exist")]
+      {:error, reason} ->
+        [diagnostic(:skill_read_error, relative_path, inspect(reason))]
+    end
+  end
 
-        {:error, reason} ->
-          [diagnostic(:skill_read_error, Path.relative_to(watcher_path, root), inspect(reason))]
+  defp watcher_diagnostics(root) do
+    relative_path = ".codex/skills/land/land_watch.py"
+
+    case safe_regular_file(root, relative_path) do
+      {:ok, path, _stat} -> read_watcher_file(path, relative_path)
+      {:error, {:symlink, symlink_path}} -> [diagnostic(:skill_symlink, symlink_path, "skill instruction path cannot contain a symlink")]
+      {:error, :enoent} -> [diagnostic(:land_watch_marker_missing, relative_path, "land watcher does not exist")]
+      {:error, reason} -> [diagnostic(:skill_read_error, relative_path, inspect(reason))]
+    end
+  end
+
+  defp read_watcher_file(path, relative_path) do
+    case File.read(path) do
+      {:ok, content} -> watcher_content_diagnostics(content, relative_path)
+      {:error, reason} -> [diagnostic(:skill_read_error, relative_path, inspect(reason))]
+    end
+  end
+
+  defp watcher_content_diagnostics(content, relative_path) do
+    marker_diagnostics =
+      if String.contains?(content, "# SYMPHONY_AUTHORITY_CLASS: ADVISORY_NON_AUTHORITY") do
+        []
+      else
+        [diagnostic(:land_watch_marker_missing, relative_path, "advisory marker is required")]
       end
 
-    diagnostics = required_diagnostics ++ skill_diagnostics ++ watcher_diagnostics
-    if diagnostics == [], do: :ok, else: {:error, diagnostics}
+    marker_diagnostics ++ skill_policy_diagnostics(content, relative_path)
+  end
+
+  defp skill_symlink_diagnostics(directory, root) do
+    directory
+    |> skill_symlink_paths(root)
+    |> Enum.map(&diagnostic(:skill_symlink, &1, "skill tree cannot contain a symlink"))
+  end
+
+  defp skill_symlink_paths(directory, root) do
+    case File.ls(directory) do
+      {:ok, entries} ->
+        Enum.flat_map(entries, &skill_symlink_entry(directory, root, &1))
+
+      {:error, _reason} ->
+        []
+    end
+  end
+
+  defp skill_symlink_entry(directory, root, entry) do
+    path = Path.join(directory, entry)
+
+    case File.lstat(path) do
+      {:ok, %File.Stat{type: :symlink}} -> [Path.relative_to(path, root)]
+      {:ok, %File.Stat{type: :directory}} -> skill_symlink_paths(path, root)
+      _ -> []
+    end
   end
 
   defp skill_marker_diagnostics(content, relative_path) do
@@ -736,46 +891,51 @@ defmodule SymphonyElixir.Governance.Check do
   end
 
   defp active_merge_instruction?(content) do
-    mentioned? = Regex.match?(~r/\bgh\s+pr\s+merge\b/i, content)
-
-    prohibited? =
-      Regex.match?(~r/(?:do\s+not|does\s+not|must\s+not|cannot|never|forbidden|prohibited|avoid|removed).{0,80}\bgh\s+pr\s+merge\b/is, content)
-
-    mentioned? and not prohibited?
+    Enum.any?(policy_sentences(content), fn sentence ->
+      Regex.match?(~r/\bgh\s+pr\s+merge\b/i, sentence) and not policy_prohibition?(sentence, "gh\\s+pr\\s+merge")
+    end)
   end
 
   defp active_protected_push_instruction?(content) do
-    mentioned? = Regex.match?(~r/\bgit\s+push\b[^\n]*(?:\s|\/)(?:main|master)\b/i, content)
-
-    prohibited? =
-      Regex.match?(~r/(?:do\s+not|does\s+not|must\s+not|cannot|never|forbidden|prohibited|avoid|removed).{0,80}\bgit\s+push\b[^\n]*(?:\s|\/)(?:main|master)\b/is, content)
-
-    mentioned? and not prohibited?
+    Enum.any?(policy_sentences(content), fn sentence ->
+      Regex.match?(~r/\bgit\s+push\b.*\b(?:HEAD:(?:main|master)|main|master)\b/i, sentence) and
+        not policy_prohibition?(sentence, "git\\s+push")
+    end)
   end
 
   defp unqualified_checks_passed_output?(content) do
     content
     |> String.split("\n")
     |> Enum.any?(fn line ->
-      String.contains?(line, "Checks passed") and
+      Regex.match?(~r/\bchecks\s+passed\b/i, line) and
         not Regex.match?(~r/advisory|observation|informational|not\s+authority|not\s+proof|does\s+not\s+prove/i, line)
     end)
   end
 
   defp active_green_authority_claim?(content) do
-    positive_claim? =
-      Regex.match?(
-        ~r/green\s+(?:ci|checks?).{0,100}(?:grant|authoriz|permit|prove|mean|allow).{0,60}(?:merge|accept)|(?:merge|accept).{0,100}green\s+(?:ci|checks?).{0,60}(?:grant|authoriz|permit|prove|mean|allow)|(?:ci|checks?).{0,40}green.{0,100}(?:grant|authoriz|permit|prove|mean|allow).{0,60}(?:merge|accept)/is,
-        content
-      )
+    Enum.any?(policy_sentences(content), fn sentence ->
+      positive_claim =
+        Regex.match?(
+          ~r/green\s+(?:ci|checks?).{0,100}(?:grant|authoriz|permit|prove|mean|allow).{0,60}(?:merge|accept)|(?:merge|accept).{0,100}green\s+(?:ci|checks?).{0,60}(?:grant|authoriz|permit|prove|mean|allow)|(?:ci|checks?).{0,40}green.{0,100}(?:grant|authoriz|permit|prove|mean|allow).{0,60}(?:merge|accept)/is,
+          sentence
+        ) or
+          Regex.match?(~r/ci\s+passed.{0,100}(?:accept|approv|merge|ship|land)|(?:accept|approv|merge|ship|land).{0,100}ci\s+passed/is, sentence)
 
-    prohibition? =
-      Regex.match?(
-        ~r/(?:green\s+(?:ci|checks?)|(?:ci|checks?).{0,40}green).{0,100}(?:do\s+not|does\s+not|cannot|must\s+not|is\s+not|are\s+not).{0,100}(?:grant|authoriz|permit|prove|mean|allow)/is,
-        content
-      )
+      positive_claim and not policy_prohibition?(sentence, "(?:grant|authoriz|permit|prove|mean|allow|accept|approv|merge|ship|land)")
+    end)
+  end
 
-    positive_claim? and not prohibition?
+  defp policy_sentences(content) do
+    content
+    |> String.split(~r/\r?\n+/, trim: true)
+    |> Enum.flat_map(&Regex.split(~r/(?<=[.!?])\s+/, &1, trim: true))
+  end
+
+  defp policy_prohibition?(sentence, term_pattern) do
+    Regex.match?(
+      ~r/\b(?:do\s+not|does\s+not|must\s+not|cannot|never|forbidden|prohibited|avoid|removed|is\s+not|are\s+not|not)\b.*(?:#{term_pattern})/is,
+      sentence
+    )
   end
 
   defp active_no_required_checks_claim?(content) do
@@ -786,8 +946,8 @@ defmodule SymphonyElixir.Governance.Check do
   end
 
   defp raw_lifecycle_recipe?(content) do
-    fenced_blocks = Regex.scan(~r/```(?:graphql)?\s*\n(.*?)```/is, content, capture: :all_but_first) |> List.flatten()
-    unfenced_content = Regex.replace(~r/```.*?```/is, content, "")
+    fenced_blocks = Regex.scan(~r/```[^\r\n]*\r?\n(.*?)```/is, content, capture: :all_but_first) |> List.flatten()
+    unfenced_content = Regex.replace(~r/```[^\r\n]*\r?\n.*?```/is, content, "")
 
     Enum.any?(fenced_blocks, &raw_lifecycle_mutation_block?/1) or
       Regex.match?(~r/^\s*mutation\b.{0,1200}\bissueUpdate\b.{0,400}\bstateId\b/ims, unfenced_content) or
@@ -839,6 +999,7 @@ defmodule SymphonyElixir.Governance.Check do
         check_baseline_tree(root, accepted_sha, accepted_tree),
         check_candidate_head(root),
         check_candidate_ancestry(root, accepted_sha),
+        check_immutable_tree_entries(root),
         check_candidate_worktree(root)
       ]
       |> List.flatten()
@@ -881,17 +1042,209 @@ defmodule SymphonyElixir.Governance.Check do
     end
   end
 
+  defp check_immutable_tree_entries(root) do
+    checks = [{@roadmap_path, @roadmap_blob}, {@pre_080c_02_path, @pre_080c_02_blob}]
+
+    Enum.flat_map(checks, &check_immutable_tree_entry(root, &1))
+  end
+
+  defp check_immutable_tree_entry(root, {relative_path, expected_blob}) do
+    case git(root, ["ls-tree", "-z", "HEAD", "--", relative_path]) do
+      {output, 0} -> immutable_tree_entry_diagnostics(output, relative_path, expected_blob)
+      _ -> [diagnostic(:immutable_tree_entry_missing, relative_path, "could not inspect candidate HEAD immutable entry")]
+    end
+  end
+
+  defp immutable_tree_entry_diagnostics(output, relative_path, expected_blob) do
+    case parse_git_tree_entries(output) do
+      {:ok, [%{mode: "100644", path: ^relative_path, sha: ^expected_blob}]} -> []
+      {:ok, []} -> [diagnostic(:immutable_tree_entry_missing, relative_path, "immutable path is missing from candidate HEAD")]
+      {:ok, _entries} -> [diagnostic(:immutable_tree_entry_mismatch, relative_path, "candidate HEAD immutable entry does not match the accepted blob and mode")]
+      {:error, _reason} -> [diagnostic(:immutable_tree_entry_mismatch, relative_path, "candidate HEAD immutable entry is malformed")]
+    end
+  end
+
   defp check_candidate_worktree(root) do
-    case git(root, ["status", "--porcelain", "--untracked-files=all"]) do
-      {output, 0} ->
-        if String.trim(output) == "" do
+    with {index_output, 0} <- git(root, ["ls-files", "--stage", "-z"]),
+         {head_output, 0} <- git(root, ["ls-tree", "-r", "-z", "HEAD"]),
+         {flags_output, 0} <- git(root, ["ls-files", "-v", "-z"]),
+         {status_output, 0} <- git(root, ["status", "--porcelain", "--untracked-files=all"]),
+         {:ok, index_entries} <- parse_git_index_entries(index_output),
+         {:ok, head_entries} <- parse_git_tree_entries(head_output) do
+      diagnostics =
+        []
+        |> Kernel.++(index_flag_diagnostics(flags_output))
+        |> Kernel.++(compare_index_to_head(index_entries, head_entries))
+        |> Kernel.++(compare_index_to_worktree(root, index_entries))
+        |> append_unless(
+          String.trim(status_output) == "",
+          diagnostic(:dirty_worktree, nil, "freeze mode requires a clean candidate worktree")
+        )
+
+      if diagnostics == [], do: [], else: diagnostics
+    else
+      _ -> [diagnostic(:git_status_error, nil, "could not inspect candidate index or worktree")]
+    end
+  end
+
+  defp index_flag_diagnostics(output) do
+    flagged =
+      output
+      |> nul_records()
+      |> Enum.filter(fn
+        <<flag, " ", _path::binary>> -> flag in ?a..?z or flag == ?S
+        _ -> true
+      end)
+
+    if flagged == [] do
+      []
+    else
+      [diagnostic(:dirty_worktree, nil, "freeze mode cannot trust assume-unchanged or skip-worktree index entries")]
+    end
+  end
+
+  defp compare_index_to_head(index_entries, head_entries) do
+    cond do
+      Enum.any?(index_entries, &(&1.stage != "0")) ->
+        [diagnostic(:dirty_worktree, nil, "freeze mode requires a resolved candidate index")]
+
+      git_entry_state(index_entries) == git_entry_state(head_entries) ->
+        []
+
+      true ->
+        [diagnostic(:dirty_worktree, nil, "freeze mode requires an index matching candidate HEAD")]
+    end
+  end
+
+  defp compare_index_to_worktree(root, index_entries) do
+    index_entries
+    |> Enum.filter(&(&1.stage == "0"))
+    |> Enum.uniq_by(& &1.path)
+    |> Enum.sort_by(& &1.path)
+    |> Enum.flat_map(&compare_worktree_entry(root, &1))
+  end
+
+  defp compare_worktree_entry(root, %{path: relative_path, mode: expected_mode, sha: expected_sha}) do
+    path = Path.join(root, relative_path)
+
+    case safe_lstat(root, relative_path) do
+      {:ok, %File.Stat{type: :regular, mode: mode}} ->
+        compare_regular_worktree_entry(path, relative_path, mode, expected_mode, expected_sha)
+
+      {:ok, %File.Stat{type: :symlink}} ->
+        compare_symlink_worktree_entry(path, relative_path, expected_mode, expected_sha)
+
+      {:ok, %File.Stat{type: type}} ->
+        [diagnostic(:dirty_worktree, relative_path, "tracked entry is not a regular file or symlink: #{type}")]
+
+      {:error, {:symlink, symlink_path}} ->
+        [diagnostic(:dirty_worktree, symlink_path, "tracked path contains a symlinked directory")]
+
+      {:error, :enoent} ->
+        [diagnostic(:dirty_worktree, relative_path, "tracked file is missing from the worktree")]
+
+      {:error, _reason} ->
+        [diagnostic(:dirty_worktree, relative_path, "tracked file cannot be inspected")]
+    end
+  end
+
+  defp compare_regular_worktree_entry(path, relative_path, mode, expected_mode, expected_sha) do
+    mode_diagnostics =
+      if regular_git_mode(mode) == expected_mode do
+        []
+      else
+        [diagnostic(:dirty_worktree, relative_path, "tracked file mode differs from candidate index")]
+      end
+
+    mode_diagnostics ++ worktree_content_diagnostics(path, relative_path, expected_sha)
+  end
+
+  defp worktree_content_diagnostics(path, relative_path, expected_sha) do
+    case File.read(path) do
+      {:ok, content} ->
+        if git_blob_sha(content) == expected_sha do
           []
         else
-          [diagnostic(:dirty_worktree, nil, "freeze mode requires a clean candidate worktree")]
+          [diagnostic(:dirty_worktree, relative_path, "tracked file content differs from candidate index")]
         end
 
-      _ ->
-        [diagnostic(:git_status_error, nil, "could not inspect candidate worktree")]
+      {:error, _reason} ->
+        [diagnostic(:dirty_worktree, relative_path, "tracked file cannot be read")]
+    end
+  end
+
+  defp compare_symlink_worktree_entry(path, relative_path, expected_mode, expected_sha) do
+    if expected_mode == "120000" do
+      symlink_content_diagnostics(path, relative_path, expected_sha)
+    else
+      [diagnostic(:dirty_worktree, relative_path, "tracked file type differs from candidate index")]
+    end
+  end
+
+  defp symlink_content_diagnostics(path, relative_path, expected_sha) do
+    case File.read_link(path) do
+      {:ok, target} ->
+        if git_blob_sha(target) == expected_sha do
+          []
+        else
+          [diagnostic(:dirty_worktree, relative_path, "tracked symlink differs from candidate index")]
+        end
+
+      {:error, _reason} ->
+        [diagnostic(:dirty_worktree, relative_path, "tracked symlink cannot be read")]
+    end
+  end
+
+  defp git_entry_state(entries) do
+    Map.new(entries, fn entry -> {entry.path, {entry.mode, entry.sha}} end)
+  end
+
+  defp parse_git_index_entries(output) do
+    parse_git_entries(output, fn record ->
+      with [header, path] <- String.split(record, "\t", parts: 2),
+           [mode, sha, stage] <- String.split(header, " ", parts: 3) do
+        {:ok, %{mode: mode, path: path, sha: sha, stage: stage}}
+      else
+        _ -> :error
+      end
+    end)
+  end
+
+  defp parse_git_tree_entries(output) do
+    parse_git_entries(output, fn record ->
+      with [header, path] <- String.split(record, "\t", parts: 2),
+           [mode, type, sha] <- String.split(header, " ", parts: 3) do
+        {:ok, %{mode: mode, path: path, sha: sha, type: type}}
+      else
+        _ -> :error
+      end
+    end)
+  end
+
+  defp parse_git_entries(output, parser) do
+    output
+    |> nul_records()
+    |> Enum.reduce_while({:ok, []}, fn record, {:ok, entries} ->
+      case parser.(record) do
+        {:ok, entry} -> {:cont, {:ok, [entry | entries]}}
+        :error -> {:halt, {:error, :malformed_git_entry}}
+      end
+    end)
+    |> case do
+      {:ok, entries} -> {:ok, Enum.reverse(entries)}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp nul_records(output), do: :binary.split(output, <<0>>, [:global]) |> Enum.reject(&(&1 == ""))
+
+  defp regular_git_mode(mode) do
+    permissions = rem(mode, 0o1000)
+
+    if Bitwise.band(permissions, 0o111) == 0 do
+      "100644"
+    else
+      "100755"
     end
   end
 

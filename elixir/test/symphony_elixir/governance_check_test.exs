@@ -40,6 +40,15 @@ defmodule SymphonyElixir.GovernanceCheckTest do
       assert_has_code(Check.validate(root), :malformed_json)
     end
 
+    test "rejects a symlinked projection", %{root: root} do
+      path = Path.join(root, @projection_path)
+      target = path <> ".target"
+      File.rename!(path, target)
+      File.ln_s!(target, path)
+
+      assert_has_code(Check.validate(root), :projection_symlink)
+    end
+
     test "rejects duplicate keys at the top level", %{root: root} do
       projection = projection_json() |> String.replace("\"schema_version\": 1", "\"schema_version\": 1, \"schema_version\": 1", global: false)
 
@@ -298,6 +307,15 @@ defmodule SymphonyElixir.GovernanceCheckTest do
 
       assert_has_code(Check.validate(root, status_paths: ["replacement.md"]), :status_block_missing)
     end
+
+    test "rejects a symlinked status document", %{root: root} do
+      path = Path.join(root, "docs/symphony-hardening-playbook-v4.1/README.md")
+      target = path <> ".target"
+      File.rename!(path, target)
+      File.ln_s!(target, path)
+
+      assert_has_code(Check.validate(root), :status_document_symlink)
+    end
   end
 
   describe "immutable artifacts" do
@@ -317,6 +335,15 @@ defmodule SymphonyElixir.GovernanceCheckTest do
       File.write!(path, File.read!(path) <> "\nchanged\n")
 
       assert_has_code(Check.validate(root), :immutable_blob_mismatch)
+    end
+
+    test "rejects a symlinked immutable artifact", %{root: root} do
+      path = Path.join(root, @roadmap_path)
+      target = path <> ".target"
+      File.rename!(path, target)
+      File.ln_s!(target, path)
+
+      assert_has_code(Check.validate(root), :immutable_blob_symlink)
     end
   end
 
@@ -372,6 +399,28 @@ defmodule SymphonyElixir.GovernanceCheckTest do
 
       assert_has_code(Check.validate(root, candidate_phase: "PRE-080C-03", freeze: true), :dirty_worktree)
     end
+
+    test "rejects tracked edits hidden by assume-unchanged", %{root: root} do
+      init_git!(root)
+      path = Path.join(root, @roadmap_path)
+      File.write!(path, File.read!(path) <> "\nhidden edit\n")
+      git!(root, ["update-index", "--assume-unchanged", @roadmap_path])
+
+      assert_has_code(Check.validate(root, candidate_phase: "PRE-080C-03", freeze: true), :dirty_worktree)
+    end
+
+    test "rejects tracked mode changes when core.fileMode is false", %{root: root} do
+      init_git!(root)
+      path = Path.join(root, @roadmap_path)
+      git!(root, ["config", "core.fileMode", "false"])
+      File.chmod!(path, 0o755)
+
+      assert_has_code(Check.validate(root, candidate_phase: "PRE-080C-03", freeze: true), :dirty_worktree)
+    end
+
+    test "rejects a candidate phase supplied without freeze mode", %{root: root} do
+      assert_has_code(Check.validate(root, candidate_phase: "PRE-080C-03"), :candidate_phase_requires_freeze)
+    end
   end
 
   describe "skill policy" do
@@ -400,6 +449,13 @@ defmodule SymphonyElixir.GovernanceCheckTest do
       assert_has_code(Check.validate(root), :skill_policy_violation)
     end
 
+    test "rejects a disclaimer followed by an autonomous merge command", %{root: root} do
+      path = Path.join(root, ".codex/skills/land/SKILL.md")
+      File.write!(path, File.read!(path) <> "\nDo not use gh pr merge in this document. Review can later run gh pr merge --squash.\n")
+
+      assert_has_code(Check.validate(root), :skill_policy_violation)
+    end
+
     test "rejects a green-check authority claim", %{root: root} do
       path = Path.join(root, ".codex/skills/land/SKILL.md")
       File.write!(path, File.read!(path) <> "\nGreen checks grant merge authority.\n")
@@ -410,6 +466,13 @@ defmodule SymphonyElixir.GovernanceCheckTest do
     test "rejects reverse-order green-CI authority claims", %{root: root} do
       path = Path.join(root, ".codex/skills/land/SKILL.md")
       File.write!(path, File.read!(path) <> "\nCI is green and permits acceptance.\n")
+
+      assert_has_code(Check.validate(root), :skill_policy_violation)
+    end
+
+    test "rejects CI-passed acceptance claims", %{root: root} do
+      path = Path.join(root, ".codex/skills/land/SKILL.md")
+      File.write!(path, File.read!(path) <> "\nCI passed, so acceptance is permitted.\n")
 
       assert_has_code(Check.validate(root), :skill_policy_violation)
     end
@@ -435,6 +498,13 @@ defmodule SymphonyElixir.GovernanceCheckTest do
       assert_has_code(Check.validate(root), :skill_policy_violation)
     end
 
+    test "rejects a protected-main push through HEAD", %{root: root} do
+      path = Path.join(root, ".codex/skills/push/SKILL.md")
+      File.write!(path, File.read!(path) <> "\nThen run git push origin HEAD:main.\n")
+
+      assert_has_code(Check.validate(root), :skill_policy_violation)
+    end
+
     test "rejects the legacy Linear raw lifecycle mutation recipe", %{root: root} do
       path = Path.join(root, ".codex/skills/linear/SKILL.md")
       File.write!(path, File.read!(path) <> "\nissueUpdate(stateId: \"done\")\n")
@@ -448,6 +518,17 @@ defmodule SymphonyElixir.GovernanceCheckTest do
       File.write!(
         path,
         File.read!(path) <> "\nmutation UpdateIssue($id: String!) {\n  issueUpdate(\n    id: $id,\n    input: { stateId: \"done\" }\n  ) { success }\n}\n"
+      )
+
+      assert_has_code(Check.validate(root), :skill_policy_violation)
+    end
+
+    test "rejects a Linear lifecycle mutation in a text fence", %{root: root} do
+      path = Path.join(root, ".codex/skills/linear/SKILL.md")
+
+      File.write!(
+        path,
+        File.read!(path) <> "\n```text\nmutation UpdateIssue($id: String!) { issueUpdate(id: $id, input: { stateId: \"done\" }) { success } }\n```\n"
       )
 
       assert_has_code(Check.validate(root), :skill_policy_violation)
@@ -467,6 +548,13 @@ defmodule SymphonyElixir.GovernanceCheckTest do
       assert_has_code(Check.validate(root), :skill_policy_violation)
     end
 
+    test "rejects lowercase unqualified watcher output", %{root: root} do
+      path = Path.join(root, ".codex/skills/land/land_watch.py")
+      File.write!(path, File.read!(path) <> "\nprint(\"checks passed\")\n")
+
+      assert_has_code(Check.validate(root), :skill_policy_violation)
+    end
+
     test "accepts a qualified advisory watcher output", %{root: root} do
       path = Path.join(root, ".codex/skills/land/land_watch.py")
       File.write!(path, File.read!(path) <> "\nprint(\"Checks passed (advisory observation only)\")\n")
@@ -479,6 +567,22 @@ defmodule SymphonyElixir.GovernanceCheckTest do
       File.write!(path, File.read!(path) <> "\nGreen checks do not grant merge or acceptance authority.\n")
 
       assert :ok = Check.validate(root)
+    end
+
+    test "scans the normative skills README", %{root: root} do
+      path = Path.join(root, ".codex/skills/README.md")
+      File.write!(path, File.read!(path) <> "\nRun gh pr merge --squash after review.\n")
+
+      assert_has_code(Check.validate(root), :skill_policy_violation)
+    end
+
+    test "rejects a symlinked skill instruction file", %{root: root} do
+      path = Path.join(root, ".codex/skills/commit/SKILL.md")
+      target = path <> ".target"
+      File.rename!(path, target)
+      File.ln_s!(target, path)
+
+      assert_has_code(Check.validate(root), :skill_symlink)
     end
 
     test "accepts the Linear lifecycle mutation prohibition", %{root: root} do
@@ -647,6 +751,11 @@ defmodule SymphonyElixir.GovernanceCheckTest do
         "<!-- SYMPHONY_AUTHORITY_CLASS: #{marker} -->\n"
       )
     end
+
+    File.write!(
+      Path.join(root, ".codex/skills/README.md"),
+      "# Repository-local skill authority\n\n<!-- SYMPHONY_AUTHORITY_CLASS: PROCEDURAL_NON_AUTHORITY -->\n"
+    )
 
     File.write!(
       Path.join(root, ".codex/skills/land/land_watch.py"),
