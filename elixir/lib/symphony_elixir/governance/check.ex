@@ -36,6 +36,7 @@ defmodule SymphonyElixir.Governance.Check do
   ]
   @status_begin "<!-- BEGIN SYMPHONY_GOVERNANCE_STATUS_V1 -->"
   @status_end "<!-- END SYMPHONY_GOVERNANCE_STATUS_V1 -->"
+  @watcher_relative_path ".codex/skills/land/land_watch.py"
   @sha_pattern ~r/\A[0-9a-f]{40}\z/
   @status_keys [
     "GOVERNANCE_PROJECTION_PATH",
@@ -93,9 +94,7 @@ defmodule SymphonyElixir.Governance.Check do
   defp append_validation_result(diagnostics, {:error, new_diagnostics}), do: diagnostics ++ new_diagnostics
 
   defp validate_repository(root, opts) do
-    projection_relative_path = Keyword.get(opts, :projection_path, @projection_path)
-
-    case read_projection(root, projection_relative_path) do
+    case read_projection(root, @projection_path) do
       {:ok, projection} -> validate_repository_contents(root, projection, opts)
       {:error, diagnostics} -> {:error, sort_diagnostics(diagnostics)}
     end
@@ -717,24 +716,72 @@ defmodule SymphonyElixir.Governance.Check do
   end
 
   defp validate_skills(root) do
-    skill_root = Path.join(root, ".codex/skills")
-    readme_path = Path.join(skill_root, "README.md")
-
-    skill_paths =
-      [readme_path | Path.wildcard(Path.join(skill_root, "**/SKILL.md")) ++ Path.wildcard(Path.join(skill_root, "**/README.md"))]
-      |> Enum.uniq()
-      |> Enum.sort()
+    {skill_paths, tree_diagnostics} = scan_skill_tree(root, ".codex/skills")
+    skill_paths = Enum.reject(skill_paths, &(&1 == @watcher_relative_path))
 
     required_paths =
       [".codex/skills/README.md" | Enum.map(@required_skill_names, &Path.join([".codex/skills", &1, "SKILL.md"]))]
 
     diagnostics =
       required_skill_diagnostics(root, required_paths) ++
+        tree_diagnostics ++
         Enum.flat_map(skill_paths, &skill_file_diagnostics(root, &1)) ++
-        watcher_diagnostics(root) ++
-        skill_symlink_diagnostics(skill_root, root)
+        watcher_diagnostics(root)
 
     if diagnostics == [], do: :ok, else: {:error, diagnostics}
+  end
+
+  defp scan_skill_tree(root, relative_path) do
+    case safe_lstat(root, relative_path) do
+      {:ok, %File.Stat{type: :directory}} ->
+        scan_skill_directory(root, relative_path)
+
+      {:ok, %File.Stat{type: :symlink}} ->
+        {[], [diagnostic(:skill_symlink, relative_path, "skill tree cannot contain a symlink")]}
+
+      {:ok, %File.Stat{type: type}} ->
+        {[], [diagnostic(:skill_entry_invalid, relative_path, "skill tree entry is not a directory: #{type}")]}
+
+      {:error, reason} ->
+        {[], [diagnostic(:skill_read_error, relative_path, inspect(reason))]}
+    end
+  end
+
+  defp scan_skill_directory(root, relative_path) do
+    path = Path.join(root, relative_path)
+
+    case File.ls(path) do
+      {:ok, entries} ->
+        entries
+        |> Enum.sort()
+        |> Enum.reduce({[], []}, &scan_skill_entry(root, relative_path, &1, &2))
+        |> then(fn {paths, diagnostics} -> {Enum.sort(paths), diagnostics} end)
+
+      {:error, reason} ->
+        {[], [diagnostic(:skill_read_error, relative_path, inspect(reason))]}
+    end
+  end
+
+  defp scan_skill_entry(root, relative_path, entry, {paths, diagnostics}) do
+    child = Path.join(relative_path, entry)
+
+    case safe_lstat(root, child) do
+      {:ok, %File.Stat{type: :directory}} ->
+        {nested_paths, nested_diagnostics} = scan_skill_tree(root, child)
+        {nested_paths ++ paths, nested_diagnostics ++ diagnostics}
+
+      {:ok, %File.Stat{type: :regular}} ->
+        {[child | paths], diagnostics}
+
+      {:ok, %File.Stat{type: :symlink}} ->
+        {paths, [diagnostic(:skill_symlink, child, "skill tree cannot contain a symlink") | diagnostics]}
+
+      {:ok, %File.Stat{type: type}} ->
+        {paths, [diagnostic(:skill_entry_invalid, child, "skill tree entry is not a regular file or directory: #{type}") | diagnostics]}
+
+      {:error, reason} ->
+        {paths, [diagnostic(:skill_read_error, child, inspect(reason)) | diagnostics]}
+    end
   end
 
   defp required_skill_diagnostics(root, required_paths) do
@@ -749,77 +796,70 @@ defmodule SymphonyElixir.Governance.Check do
   end
 
   defp skill_file_diagnostics(root, path) do
-    relative_path = Path.relative_to(path, root)
-
-    case safe_regular_file(root, relative_path) do
-      {:ok, file_path, _stat} -> read_skill_file(file_path, relative_path)
+    case safe_regular_file(root, path) do
+      {:ok, file_path, _stat} -> read_skill_file(file_path, path)
       {:error, {:symlink, symlink_path}} -> [diagnostic(:skill_symlink, symlink_path, "skill instruction path cannot contain a symlink")]
-      {:error, reason} -> [diagnostic(:skill_read_error, relative_path, inspect(reason))]
+      {:error, reason} -> [diagnostic(:skill_read_error, path, inspect(reason))]
     end
   end
 
   defp read_skill_file(path, relative_path) do
     case File.read(path) do
       {:ok, content} ->
-        skill_marker_diagnostics(content, relative_path) ++ skill_policy_diagnostics(content, relative_path)
+        if String.valid?(content) do
+          skill_content_diagnostics(content, relative_path)
+        else
+          [diagnostic(:skill_non_text, relative_path, "skill file must be valid UTF-8 text")]
+        end
 
       {:error, reason} ->
         [diagnostic(:skill_read_error, relative_path, inspect(reason))]
     end
   end
 
-  defp watcher_diagnostics(root) do
-    relative_path = ".codex/skills/land/land_watch.py"
-
-    case safe_regular_file(root, relative_path) do
-      {:ok, path, _stat} -> read_watcher_file(path, relative_path)
-      {:error, {:symlink, symlink_path}} -> [diagnostic(:skill_symlink, symlink_path, "skill instruction path cannot contain a symlink")]
-      {:error, :enoent} -> [diagnostic(:land_watch_marker_missing, relative_path, "land watcher does not exist")]
-      {:error, reason} -> [diagnostic(:skill_read_error, relative_path, inspect(reason))]
-    end
+  defp skill_content_diagnostics(content, @watcher_relative_path) do
+    watcher_content_diagnostics(content, @watcher_relative_path)
   end
 
-  defp read_watcher_file(path, relative_path) do
-    case File.read(path) do
-      {:ok, content} -> watcher_content_diagnostics(content, relative_path)
-      {:error, reason} -> [diagnostic(:skill_read_error, relative_path, inspect(reason))]
-    end
-  end
-
-  defp watcher_content_diagnostics(content, relative_path) do
+  defp skill_content_diagnostics(content, relative_path) do
     marker_diagnostics =
-      if String.contains?(content, "# SYMPHONY_AUTHORITY_CLASS: ADVISORY_NON_AUTHORITY") do
-        []
+      if skill_marker_required?(relative_path) do
+        skill_marker_diagnostics(content, relative_path)
       else
-        [diagnostic(:land_watch_marker_missing, relative_path, "advisory marker is required")]
+        []
       end
 
     marker_diagnostics ++ skill_policy_diagnostics(content, relative_path)
   end
 
-  defp skill_symlink_diagnostics(directory, root) do
-    directory
-    |> skill_symlink_paths(root)
-    |> Enum.map(&diagnostic(:skill_symlink, &1, "skill tree cannot contain a symlink"))
-  end
+  defp skill_marker_required?(relative_path), do: Path.extname(relative_path) == ".md"
 
-  defp skill_symlink_paths(directory, root) do
-    case File.ls(directory) do
-      {:ok, entries} ->
-        Enum.flat_map(entries, &skill_symlink_entry(directory, root, &1))
-
-      {:error, _reason} ->
-        []
+  defp watcher_diagnostics(root) do
+    case safe_regular_file(root, @watcher_relative_path) do
+      {:ok, path, _stat} -> read_skill_file(path, @watcher_relative_path)
+      {:error, :enoent} -> [diagnostic(:land_watch_marker_missing, @watcher_relative_path, "land watcher does not exist")]
+      {:error, _reason} -> []
     end
   end
 
-  defp skill_symlink_entry(directory, root, entry) do
-    path = Path.join(directory, entry)
+  defp watcher_content_diagnostics(content, relative_path) do
+    marker_diagnostics =
+      if Regex.match?(~r/^[[:blank:]]*#[[:blank:]]*SYMPHONY_AUTHORITY_CLASS:[[:blank:]]*ADVISORY_NON_AUTHORITY[[:blank:]]*$/m, content) do
+        []
+      else
+        [diagnostic(:land_watch_marker_missing, relative_path, "advisory marker is required")]
+      end
 
-    case File.lstat(path) do
-      {:ok, %File.Stat{type: :symlink}} -> [Path.relative_to(path, root)]
-      {:ok, %File.Stat{type: :directory}} -> skill_symlink_paths(path, root)
-      _ -> []
+    marker_diagnostics ++
+      watcher_output_diagnostics(content, relative_path) ++
+      skill_policy_diagnostics(content, relative_path)
+  end
+
+  defp watcher_output_diagnostics(content, relative_path) do
+    if watcher_checks_passed_output?(content) do
+      [diagnostic(:skill_policy_violation, relative_path, "watcher output must not report Checks passed")]
+    else
+      []
     end
   end
 
@@ -881,30 +921,29 @@ defmodule SymphonyElixir.Governance.Check do
         diagnostics
       end
 
-    raw_lifecycle_recipe? = raw_lifecycle_recipe?(content)
-
-    if Path.basename(Path.dirname(relative_path)) == "linear" and raw_lifecycle_recipe? do
-      diagnostics ++ [diagnostic(:skill_policy_violation, relative_path, "Linear compatibility must not contain a raw lifecycle mutation recipe")]
+    if raw_lifecycle_recipe?(content) do
+      diagnostics ++ [diagnostic(:skill_policy_violation, relative_path, "skills cannot contain a raw Linear lifecycle mutation recipe")]
     else
       diagnostics
     end
   end
 
   defp active_merge_instruction?(content) do
-    Enum.any?(policy_sentences(content), fn sentence ->
-      Regex.match?(~r/\bgh\s+pr\s+merge\b/i, sentence) and not policy_prohibition?(sentence, "gh\\s+pr\\s+merge")
-    end)
+    command_pattern = ~r/\bgh\s+pr\s+merge\b|\bmerge\s+(?:(?:the|this|a)\s+)?(?:pull\s+request|pr)\b/i
+
+    Enum.any?(policy_clauses(content), &active_command_clause?(&1, command_pattern))
   end
 
   defp active_protected_push_instruction?(content) do
-    Enum.any?(policy_sentences(content), fn sentence ->
-      Regex.match?(~r/\bgit\s+push\b.*\b(?:HEAD:(?:main|master)|main|master)\b/i, sentence) and
-        not policy_prohibition?(sentence, "git\\s+push")
-    end)
+    command_pattern =
+      ~r/\bgit\s+push\b[^.!?;]*\b(?:HEAD:(?:main|master)|main|master)\b|\bpush\s+(?:(?:this|the)\s+branch)\s+to\s+(?:protected\s+)?(?:main|master)\b/i
+
+    Enum.any?(policy_clauses(content), &active_command_clause?(&1, command_pattern))
   end
 
   defp unqualified_checks_passed_output?(content) do
     content
+    |> normalize_policy_content()
     |> String.split("\n")
     |> Enum.any?(fn line ->
       Regex.match?(~r/\bchecks\s+passed\b/i, line) and
@@ -913,29 +952,85 @@ defmodule SymphonyElixir.Governance.Check do
   end
 
   defp active_green_authority_claim?(content) do
-    Enum.any?(policy_sentences(content), fn sentence ->
+    Enum.any?(policy_clauses(content), fn clause ->
       positive_claim =
         Regex.match?(
-          ~r/green\s+(?:ci|checks?).{0,100}(?:grant|authoriz|permit|prove|mean|allow).{0,60}(?:merge|accept)|(?:merge|accept).{0,100}green\s+(?:ci|checks?).{0,60}(?:grant|authoriz|permit|prove|mean|allow)|(?:ci|checks?).{0,40}green.{0,100}(?:grant|authoriz|permit|prove|mean|allow).{0,60}(?:merge|accept)/is,
-          sentence
+          ~r/green\s+(?:ci|checks?).{0,100}(?:grant|authoriz|permit|prove|mean|allow).{0,60}(?:merge|accept)|(?:merge|accept).{0,100}green\s+(?:ci|checks?).{0,60}(?:grant|authoriz|permit|prove|mean|allow)|(?:ci|checks?).{0,40}green.{0,100}(?:grant|authoriz|permit|prove|mean|allow).{0,60}(?:merge|accept)|(?:merge|accept).{0,100}(?:grant|authoriz|permit|prove|mean|allow).{0,100}(?:green\s+(?:ci|checks?)|(?:ci|checks?)\s+(?:is\s+)?green)/is,
+          clause
         ) or
-          Regex.match?(~r/ci\s+passed.{0,100}(?:accept|approv|merge|ship|land)|(?:accept|approv|merge|ship|land).{0,100}ci\s+passed/is, sentence)
+          Regex.match?(~r/ci\s+passed.{0,100}(?:accept|approv|merge|ship|land)|(?:accept|approv|merge|ship|land).{0,100}ci\s+passed/is, clause)
 
-      positive_claim and not policy_prohibition?(sentence, "(?:grant|authoriz|permit|prove|mean|allow|accept|approv|merge|ship|land)")
+      positive_claim and not authority_claim_prohibited?(clause)
+    end) or active_connector_claim?(content)
+  end
+
+  defp active_connector_claim?(content) do
+    patterns = [
+      ~r/\bci\s+passed\s*,\s*(?:so|therefore)\s+[^.!?;]+/i,
+      ~r/\b(?:green\s+(?:ci|checks?)|(?:ci|checks?)\s+(?:is\s+)?green)\s*,\s*(?:so|therefore)\s+[^.!?;]+/i
+    ]
+
+    content = normalize_policy_content(content)
+
+    Enum.any?(patterns, fn pattern ->
+      case Regex.run(pattern, content) do
+        [match | _captures] -> not authority_claim_prohibited?(match)
+        nil -> false
+      end
     end)
   end
 
-  defp policy_sentences(content) do
+  defp policy_clauses(content) do
     content
+    |> normalize_policy_content()
     |> String.split(~r/\r?\n+/, trim: true)
-    |> Enum.flat_map(&Regex.split(~r/(?<=[.!?])\s+/, &1, trim: true))
+    |> Enum.flat_map(&Regex.split(~r/[.!?;]+|,\s*(?=(?:but|however|so|then|and)\b)/i, &1, trim: true))
   end
 
-  defp policy_prohibition?(sentence, term_pattern) do
+  defp normalize_policy_content(content) do
+    Regex.replace(~r/\\\r?\n[[:blank:]]*/m, content, "")
+  end
+
+  defp active_command_clause?(clause, command_pattern) do
+    matches = Regex.scan(command_pattern, clause, return: :index)
+
+    Enum.zip([nil | matches], matches)
+    |> Enum.any?(&active_command_occurrence?(clause, &1))
+  end
+
+  defp active_command_occurrence?(clause, {previous_match, [{start, length}]}) do
+    previous_end = command_match_end(previous_match)
+    prefix = binary_part(clause, previous_end, start - previous_end)
+    suffix_start = start + length
+    suffix = binary_part(clause, suffix_start, byte_size(clause) - suffix_start)
+
+    not prohibited_command_occurrence?(prefix, suffix)
+  end
+
+  defp command_match_end(nil), do: 0
+  defp command_match_end([{start, length}]), do: start + length
+
+  defp prohibited_command_occurrence?(prefix, suffix) do
     Regex.match?(
-      ~r/\b(?:do\s+not|does\s+not|must\s+not|cannot|never|forbidden|prohibited|avoid|removed|is\s+not|are\s+not|not)\b.*(?:#{term_pattern})/is,
-      sentence
+      ~r/\b(?:do\s+not|don't|does\s+not|must\s+not|cannot|never|forbidden|prohibited|avoid)\b[^.!?;]{0,48}$/i,
+      prefix
+    ) or
+      Regex.match?(~r/^\s*(?:is|are)\s+(?:not\s+allowed|prohibited|forbidden)\b/i, suffix)
+  end
+
+  defp authority_claim_prohibited?(clause) do
+    Regex.match?(
+      ~r/\b(?:do\s+not|don't|does\s+not|must\s+not|cannot|never|forbidden|prohibited|avoid|is\s+not|are\s+not)\b.{0,100}\b(?:grant|authoriz|permit|prove|mean|allow|accept|approv|merge|ship|land)\b/is,
+      clause
     )
+  end
+
+  defp watcher_checks_passed_output?(content) do
+    content = normalize_policy_content(content)
+
+    content = Regex.replace(~r/["'`+<>]/, content, "")
+
+    Regex.match?(~r/\bchecks\s+passed\b/i, content)
   end
 
   defp active_no_required_checks_claim?(content) do
@@ -946,8 +1041,13 @@ defmodule SymphonyElixir.Governance.Check do
   end
 
   defp raw_lifecycle_recipe?(content) do
-    fenced_blocks = Regex.scan(~r/```[^\r\n]*\r?\n(.*?)```/is, content, capture: :all_but_first) |> List.flatten()
+    fenced_blocks =
+      (Regex.scan(~r/```[^\r\n]*\r?\n(.*?)```/is, content, capture: :all_but_first) ++
+         Regex.scan(~r/~~~[^\r\n]*\r?\n(.*?)~~~/is, content, capture: :all_but_first))
+      |> List.flatten()
+
     unfenced_content = Regex.replace(~r/```[^\r\n]*\r?\n.*?```/is, content, "")
+    unfenced_content = Regex.replace(~r/~~~[^\r\n]*\r?\n.*?~~~/is, unfenced_content, "")
 
     Enum.any?(fenced_blocks, &raw_lifecycle_mutation_block?/1) or
       Regex.match?(~r/^\s*mutation\b.{0,1200}\bissueUpdate\b.{0,400}\bstateId\b/ims, unfenced_content) or
