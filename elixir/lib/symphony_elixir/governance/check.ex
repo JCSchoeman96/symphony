@@ -13,6 +13,27 @@ defmodule SymphonyElixir.Governance.Check do
   @pre_080c_02_path "docs/symphony-hardening-playbook-v4.1/PRE-080C-02_PRODUCTION_RATE_EPOCH_CHARACTERIZATION.md"
   @roadmap_blob "4b0528bdc0647d889b42ebc478081d5b873898fe"
   @pre_080c_02_blob "b69d46676d3286262bf7cab783654c10a08801bf"
+  @accepted_baseline_sha "0640bf1135f8b5000ea29518c2c456272379e9c6"
+  @accepted_baseline_tree "5c6f10cc88c41f395837a930fb7ea20e0bdae0cc"
+  @accepted_phase "H-080B"
+  @accepted_prerequisite "PRE-080C-02"
+  @pre_080c_02_outcome "LIMIT_FOUND"
+  @authorized_work_id "PRE-080C-03"
+  @authorized_work_status "AUTHORIZED_ACTIVE_NOT_ACCEPTED"
+  @authorized_work_scope "GOVERNANCE_DOCUMENTATION_RECONCILIATION_ONLY"
+  @pre_h080c "NOT_REACHED"
+  @h_080c "NOT_AUTHORIZED"
+  @next_governance_step "PRE-H080C"
+  @next_authorized_phase nil
+  @decision_authority "Master Governance"
+  @decision_reference "MG-2026-10-10-PRE-080C-03-AUTH-01"
+  @decision_timestamp "2026-10-10T16:35:00+02:00"
+  @unresolved_conditions [
+    "PRE080C02_LIMIT_FOUND_REQUIRES_PRE_H080C_ADJUDICATION",
+    "PRE080C03_NOT_ACCEPTED",
+    "PRE_H080C_NOT_REACHED",
+    "H080C_NOT_AUTHORIZED"
+  ]
   @status_begin "<!-- BEGIN SYMPHONY_GOVERNANCE_STATUS_V1 -->"
   @status_end "<!-- END SYMPHONY_GOVERNANCE_STATUS_V1 -->"
   @sha_pattern ~r/\A[0-9a-f]{40}\z/
@@ -37,6 +58,12 @@ defmodule SymphonyElixir.Governance.Check do
     "DECISION_TIMESTAMP",
     "KNOWN_UNRESOLVED_GOVERNANCE_CONDITIONS"
   ]
+  @status_paths [
+    "docs/symphony-hardening-playbook-v4.1/HARDENING_STATUS_LEDGER.md",
+    "docs/symphony-hardening-playbook-v4.1/README.md",
+    "docs/SYMPHONY_V4_1_UNIFIED_EXECUTION_ROADMAP_v1.3.2.md"
+  ]
+  @required_skill_names ~w(commit debug land linear pull push release)
 
   @type diagnostic :: %{
           code: atom(),
@@ -52,21 +79,33 @@ defmodule SymphonyElixir.Governance.Check do
     projection_relative_path = Keyword.get(opts, :projection_path, @projection_path)
     projection_path = Path.join(root, projection_relative_path)
 
-    with {:ok, projection} <- read_projection(projection_path),
-         :ok <- validate_projection(projection),
-         :ok <- validate_immutable_blobs(root),
-         :ok <- validate_status_documents(root, projection, opts),
-         :ok <- validate_skills(root),
-         :ok <- validate_freeze(root, projection, opts) do
-      :ok
-    else
-      {:error, diagnostics} -> {:error, sort_diagnostics(diagnostics)}
+    case read_projection(projection_path) do
+      {:ok, projection} ->
+        diagnostics =
+          []
+          |> append_validation_result(validate_projection(projection))
+          |> append_validation_result(validate_immutable_blobs(root))
+          |> append_validation_result(validate_status_documents(root, projection, opts))
+          |> append_validation_result(validate_skills(root))
+          |> append_validation_result(validate_freeze(root, projection, opts))
+
+        if diagnostics == [] do
+          :ok
+        else
+          {:error, sort_diagnostics(diagnostics)}
+        end
+
+      {:error, diagnostics} ->
+        {:error, sort_diagnostics(diagnostics)}
     end
   end
 
   def validate(_root, _opts) do
     {:error, sort_diagnostics([diagnostic(:invalid_path, nil, "repository path and options must be valid")])}
   end
+
+  defp append_validation_result(diagnostics, :ok), do: diagnostics
+  defp append_validation_result(diagnostics, {:error, new_diagnostics}), do: diagnostics ++ new_diagnostics
 
   defp read_projection(path) do
     case File.stat(path) do
@@ -276,6 +315,7 @@ defmodule SymphonyElixir.Governance.Check do
       |> append_identity_diagnostics(projection)
       |> append_decision_diagnostics(projection)
       |> append_condition_diagnostics(projection)
+      |> append_authority_snapshot_diagnostics(projection)
       |> append_gate_diagnostics(projection)
 
     if diagnostics == [], do: :ok, else: {:error, diagnostics}
@@ -334,6 +374,68 @@ defmodule SymphonyElixir.Governance.Check do
     )
   end
 
+  defp append_authority_snapshot_diagnostics(diagnostics, projection) do
+    authority = projection["authority_snapshot"]
+    accepted = authority["accepted_protected_main_at_decision"]
+    authorized = authority["currently_authorized_work"]
+    decision = projection["decision"]
+    conditions = projection["known_unresolved_governance_conditions"]
+
+    diagnostics
+    |> append_exact_diagnostic(
+      accepted["sha"],
+      @accepted_baseline_sha,
+      "projection.authority_snapshot.accepted_protected_main_at_decision.sha",
+      :authority_snapshot_mismatch
+    )
+    |> append_exact_diagnostic(
+      accepted["tree"],
+      @accepted_baseline_tree,
+      "projection.authority_snapshot.accepted_protected_main_at_decision.tree",
+      :authority_snapshot_mismatch
+    )
+    |> append_exact_diagnostic(authority["current_accepted_phase"], @accepted_phase, "projection.authority_snapshot.current_accepted_phase", :authority_snapshot_mismatch)
+    |> append_exact_diagnostic(
+      authority["current_accepted_prerequisite"],
+      @accepted_prerequisite,
+      "projection.authority_snapshot.current_accepted_prerequisite",
+      :authority_snapshot_mismatch
+    )
+    |> append_exact_diagnostic(authority["pre_080c_02_outcome"], @pre_080c_02_outcome, "projection.authority_snapshot.pre_080c_02_outcome", :authority_snapshot_mismatch)
+    |> append_exact_diagnostic(authorized["id"], @authorized_work_id, "projection.authority_snapshot.currently_authorized_work.id", :authority_snapshot_mismatch)
+    |> append_exact_diagnostic(
+      authorized["status"],
+      @authorized_work_status,
+      "projection.authority_snapshot.currently_authorized_work.status",
+      :authority_snapshot_mismatch
+    )
+    |> append_exact_diagnostic(
+      authorized["scope"],
+      @authorized_work_scope,
+      "projection.authority_snapshot.currently_authorized_work.scope",
+      :authority_snapshot_mismatch
+    )
+    |> append_exact_diagnostic(authority["pre_h080c"], @pre_h080c, "projection.authority_snapshot.pre_h080c", :authority_snapshot_mismatch)
+    |> append_exact_diagnostic(authority["h_080c"], @h_080c, "projection.authority_snapshot.h_080c", :authority_snapshot_mismatch)
+    |> append_exact_diagnostic(authority["next_governance_step"], @next_governance_step, "projection.authority_snapshot.next_governance_step", :authority_snapshot_mismatch)
+    |> append_exact_diagnostic(authority["next_authorized_phase"], @next_authorized_phase, "projection.authority_snapshot.next_authorized_phase", :authority_snapshot_mismatch)
+    |> append_exact_diagnostic(decision["authority"], @decision_authority, "projection.decision.authority", :authority_snapshot_mismatch)
+    |> append_exact_diagnostic(decision["reference"], @decision_reference, "projection.decision.reference", :authority_snapshot_mismatch)
+    |> append_exact_diagnostic(decision["timestamp"], @decision_timestamp, "projection.decision.timestamp", :authority_snapshot_mismatch)
+    |> append_unless(
+      Enum.sort(conditions) == Enum.sort(@unresolved_conditions),
+      diagnostic(
+        :authority_snapshot_mismatch,
+        "projection.known_unresolved_governance_conditions",
+        "conditions do not match the approved PRE-080C-03 snapshot"
+      )
+    )
+  end
+
+  defp append_exact_diagnostic(diagnostics, actual, expected, path, code) do
+    append_unless(diagnostics, actual == expected, diagnostic(code, path, "value does not match the approved PRE-080C-03 snapshot"))
+  end
+
   defp append_gate_diagnostics(diagnostics, projection) do
     authority = projection["authority_snapshot"]
 
@@ -378,18 +480,11 @@ defmodule SymphonyElixir.Governance.Check do
     end
   end
 
-  defp validate_status_documents(root, projection, opts) do
-    status_paths =
-      Keyword.get(opts, :status_paths, [
-        "docs/symphony-hardening-playbook-v4.1/HARDENING_STATUS_LEDGER.md",
-        "docs/symphony-hardening-playbook-v4.1/README.md",
-        "docs/SYMPHONY_V4_1_UNIFIED_EXECUTION_ROADMAP_v1.3.2.md"
-      ])
-
-    expected = status_values(projection, Keyword.get(opts, :projection_path, @projection_path))
+  defp validate_status_documents(root, projection, _opts) do
+    expected = status_values(projection, @projection_path)
 
     diagnostics =
-      Enum.flat_map(status_paths, fn relative_path ->
+      Enum.flat_map(@status_paths, fn relative_path ->
         path = Path.join(root, relative_path)
 
         case File.read(path) do
@@ -518,7 +613,19 @@ defmodule SymphonyElixir.Governance.Check do
 
   defp validate_skills(root) do
     skill_root = Path.join(root, ".codex/skills")
-    skill_paths = Path.wildcard(Path.join(skill_root, "*/SKILL.md")) |> Enum.sort()
+    skill_paths = Path.wildcard(Path.join(skill_root, "**/SKILL.md")) |> Enum.sort()
+
+    required_diagnostics =
+      Enum.flat_map(@required_skill_names, fn skill_name ->
+        relative_path = Path.join(".codex/skills", skill_name <> "/SKILL.md")
+        path = Path.join(root, relative_path)
+
+        if File.regular?(path) do
+          []
+        else
+          [diagnostic(:required_skill_missing, relative_path, "required current skill file does not exist")]
+        end
+      end)
 
     skill_diagnostics =
       Enum.flat_map(skill_paths, fn path ->
@@ -557,7 +664,7 @@ defmodule SymphonyElixir.Governance.Check do
           [diagnostic(:skill_read_error, Path.relative_to(watcher_path, root), inspect(reason))]
       end
 
-    diagnostics = skill_diagnostics ++ watcher_diagnostics
+    diagnostics = required_diagnostics ++ skill_diagnostics ++ watcher_diagnostics
     if diagnostics == [], do: :ok, else: {:error, diagnostics}
   end
 
@@ -585,7 +692,7 @@ defmodule SymphonyElixir.Governance.Check do
     diagnostics = []
 
     diagnostics =
-      if Regex.match?(~r/^\s*(?:\$\s*)?gh\s+pr\s+merge\b/im, content) do
+      if active_merge_instruction?(content) do
         diagnostics ++ [diagnostic(:skill_policy_violation, relative_path, "skills cannot contain an autonomous merge command")]
       else
         diagnostics
@@ -606,14 +713,14 @@ defmodule SymphonyElixir.Governance.Check do
       end
 
     diagnostics =
-      if Regex.match?(~r/\bChecks passed\b/, content) do
+      if unqualified_checks_passed_output?(content) do
         diagnostics ++ [diagnostic(:skill_policy_violation, relative_path, "watcher output must identify observations as advisory")]
       else
         diagnostics
       end
 
     diagnostics =
-      if Regex.match?(~r/^\s*(?:\$\s*)?git\s+push\b[^\n]*(?:\s|\/)(?:main|master)\b/im, content) do
+      if active_protected_push_instruction?(content) do
         diagnostics ++ [diagnostic(:skill_policy_violation, relative_path, "skills cannot push directly to protected main")]
       else
         diagnostics
@@ -628,16 +735,43 @@ defmodule SymphonyElixir.Governance.Check do
     end
   end
 
+  defp active_merge_instruction?(content) do
+    mentioned? = Regex.match?(~r/\bgh\s+pr\s+merge\b/i, content)
+
+    prohibited? =
+      Regex.match?(~r/(?:do\s+not|does\s+not|must\s+not|cannot|never|forbidden|prohibited|avoid|removed).{0,80}\bgh\s+pr\s+merge\b/is, content)
+
+    mentioned? and not prohibited?
+  end
+
+  defp active_protected_push_instruction?(content) do
+    mentioned? = Regex.match?(~r/\bgit\s+push\b[^\n]*(?:\s|\/)(?:main|master)\b/i, content)
+
+    prohibited? =
+      Regex.match?(~r/(?:do\s+not|does\s+not|must\s+not|cannot|never|forbidden|prohibited|avoid|removed).{0,80}\bgit\s+push\b[^\n]*(?:\s|\/)(?:main|master)\b/is, content)
+
+    mentioned? and not prohibited?
+  end
+
+  defp unqualified_checks_passed_output?(content) do
+    content
+    |> String.split("\n")
+    |> Enum.any?(fn line ->
+      String.contains?(line, "Checks passed") and
+        not Regex.match?(~r/advisory|observation|informational|not\s+authority|not\s+proof|does\s+not\s+prove/i, line)
+    end)
+  end
+
   defp active_green_authority_claim?(content) do
     positive_claim? =
       Regex.match?(
-        ~r/green\s+(?:ci|checks?).{0,100}(?:grant|authoriz|permit|prove|mean).{0,60}(?:merge|accept)|(?:merge|accept).{0,100}green\s+(?:ci|checks?).{0,60}(?:grant|authoriz|permit|prove|mean)/is,
+        ~r/green\s+(?:ci|checks?).{0,100}(?:grant|authoriz|permit|prove|mean|allow).{0,60}(?:merge|accept)|(?:merge|accept).{0,100}green\s+(?:ci|checks?).{0,60}(?:grant|authoriz|permit|prove|mean|allow)|(?:ci|checks?).{0,40}green.{0,100}(?:grant|authoriz|permit|prove|mean|allow).{0,60}(?:merge|accept)/is,
         content
       )
 
     prohibition? =
       Regex.match?(
-        ~r/green\s+(?:ci|checks?).{0,100}(?:do\s+not|does\s+not|cannot|must\s+not|is\s+not|are\s+not).{0,100}(?:grant|authoriz|permit|prove|mean)/is,
+        ~r/(?:green\s+(?:ci|checks?)|(?:ci|checks?).{0,40}green).{0,100}(?:do\s+not|does\s+not|cannot|must\s+not|is\s+not|are\s+not).{0,100}(?:grant|authoriz|permit|prove|mean|allow)/is,
         content
       )
 
@@ -653,10 +787,11 @@ defmodule SymphonyElixir.Governance.Check do
 
   defp raw_lifecycle_recipe?(content) do
     fenced_blocks = Regex.scan(~r/```(?:graphql)?\s*\n(.*?)```/is, content, capture: :all_but_first) |> List.flatten()
+    unfenced_content = Regex.replace(~r/```.*?```/is, content, "")
 
     Enum.any?(fenced_blocks, &raw_lifecycle_mutation_block?/1) or
-      Regex.match?(~r/^\s*mutation\b[^\n]*\bissueUpdate\b[^\n]*\bstateId\b/im, content) or
-      Regex.match?(~r/issueUpdate\s*[({][^\n]{0,160}\bstateId\s*:/is, content)
+      Regex.match?(~r/^\s*mutation\b.{0,1200}\bissueUpdate\b.{0,400}\bstateId\b/ims, unfenced_content) or
+      Regex.match?(~r/issueUpdate\s*[({][^\n]{0,160}\bstateId\s*:/is, unfenced_content)
   end
 
   defp raw_lifecycle_mutation_block?(block) do

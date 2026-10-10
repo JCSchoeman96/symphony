@@ -23,6 +23,10 @@ defmodule Mix.Tasks.Governance.Check do
       Mix.raise("governance.check: invalid command-line options")
     end
 
+    if Keyword.has_key?(opts, :candidate_phase) and Keyword.get(opts, :freeze) != true do
+      Mix.raise("governance.check: --candidate-phase requires --freeze")
+    end
+
     case Check.validate(repository_root(), opts) do
       :ok ->
         Mix.shell().info("governance.check: PASS")

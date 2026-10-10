@@ -163,6 +163,52 @@ defmodule SymphonyElixir.GovernanceCheckTest do
 
       assert_has_code(Check.validate(root), :invalid_decision_timestamp)
     end
+
+    test "rejects authority values outside the approved PRE-080C-03 snapshot", %{root: root} do
+      mutations = [
+        {[
+           "authority_snapshot",
+           "accepted_protected_main_at_decision",
+           "sha"
+         ], String.duplicate("1", 40)},
+        {[
+           "authority_snapshot",
+           "accepted_protected_main_at_decision",
+           "tree"
+         ], String.duplicate("2", 40)},
+        {["authority_snapshot", "current_accepted_phase"], "PRE-080C-03"},
+        {["authority_snapshot", "current_accepted_prerequisite"], "WRONG"},
+        {["authority_snapshot", "pre_080c_02_outcome"], "NO_LIMIT"},
+        {["authority_snapshot", "currently_authorized_work", "id"], "OTHER"},
+        {["authority_snapshot", "currently_authorized_work", "status"], "AUTHORIZED"},
+        {["authority_snapshot", "currently_authorized_work", "scope"], "OTHER_SCOPE"},
+        {["authority_snapshot", "pre_h080c"], "REACHED"},
+        {["authority_snapshot", "h_080c"], "AUTHORIZED"},
+        {["authority_snapshot", "next_governance_step"], "H-080C"},
+        {["authority_snapshot", "next_authorized_phase"], "PRE-080C-04"}
+      ]
+
+      Enum.each(mutations, fn {path, value} ->
+        projection = put_in(projection_map(), path, value)
+        write_projection(root, Jason.encode!(projection))
+        assert_has_code(Check.validate(root), :authority_snapshot_mismatch)
+      end)
+    end
+
+    test "rejects decision metadata outside the approved governance decision", %{root: root} do
+      mutations = [
+        {["decision", "authority"], "Another Authority"},
+        {["decision", "reference"], "MG-OTHER"},
+        {["decision", "timestamp"], "2026-10-11T16:35:00+02:00"},
+        {["known_unresolved_governance_conditions"], @conditions ++ ["FAKE_CONDITION"]}
+      ]
+
+      Enum.each(mutations, fn {path, value} ->
+        projection = put_in(projection_map(), path, value)
+        write_projection(root, Jason.encode!(projection))
+        assert_has_code(Check.validate(root), :authority_snapshot_mismatch)
+      end)
+    end
   end
 
   describe "logical governance consistency" do
@@ -244,6 +290,13 @@ defmodule SymphonyElixir.GovernanceCheckTest do
       File.write!(path, String.replace(File.read!(path), "DECISION_REFERENCE=#{@decision_reference}", "DECISION_REFERENCE=WRONG", global: false))
 
       assert_has_code(Check.validate(root), :status_mismatch)
+    end
+
+    test "always checks the canonical status documents", %{root: root} do
+      path = Path.join(root, "docs/symphony-hardening-playbook-v4.1/README.md")
+      File.write!(path, String.replace(File.read!(path), "<!-- BEGIN SYMPHONY_GOVERNANCE_STATUS_V1 -->", "", global: false))
+
+      assert_has_code(Check.validate(root, status_paths: ["replacement.md"]), :status_block_missing)
     end
   end
 
@@ -340,9 +393,23 @@ defmodule SymphonyElixir.GovernanceCheckTest do
       assert_has_code(Check.validate(root), :skill_policy_violation)
     end
 
+    test "rejects inline autonomous land merge instructions", %{root: root} do
+      path = Path.join(root, ".codex/skills/land/SKILL.md")
+      File.write!(path, File.read!(path) <> "\nUse gh pr merge --squash after review.\n")
+
+      assert_has_code(Check.validate(root), :skill_policy_violation)
+    end
+
     test "rejects a green-check authority claim", %{root: root} do
       path = Path.join(root, ".codex/skills/land/SKILL.md")
       File.write!(path, File.read!(path) <> "\nGreen checks grant merge authority.\n")
+
+      assert_has_code(Check.validate(root), :skill_policy_violation)
+    end
+
+    test "rejects reverse-order green-CI authority claims", %{root: root} do
+      path = Path.join(root, ".codex/skills/land/SKILL.md")
+      File.write!(path, File.read!(path) <> "\nCI is green and permits acceptance.\n")
 
       assert_has_code(Check.validate(root), :skill_policy_violation)
     end
@@ -361,9 +428,27 @@ defmodule SymphonyElixir.GovernanceCheckTest do
       assert_has_code(Check.validate(root), :skill_policy_violation)
     end
 
+    test "rejects inline protected-main push instructions", %{root: root} do
+      path = Path.join(root, ".codex/skills/push/SKILL.md")
+      File.write!(path, File.read!(path) <> "\nThen run git push origin main.\n")
+
+      assert_has_code(Check.validate(root), :skill_policy_violation)
+    end
+
     test "rejects the legacy Linear raw lifecycle mutation recipe", %{root: root} do
       path = Path.join(root, ".codex/skills/linear/SKILL.md")
       File.write!(path, File.read!(path) <> "\nissueUpdate(stateId: \"done\")\n")
+
+      assert_has_code(Check.validate(root), :skill_policy_violation)
+    end
+
+    test "rejects an unfenced multiline Linear lifecycle mutation recipe", %{root: root} do
+      path = Path.join(root, ".codex/skills/linear/SKILL.md")
+
+      File.write!(
+        path,
+        File.read!(path) <> "\nmutation UpdateIssue($id: String!) {\n  issueUpdate(\n    id: $id,\n    input: { stateId: \"done\" }\n  ) { success }\n}\n"
+      )
 
       assert_has_code(Check.validate(root), :skill_policy_violation)
     end
@@ -382,6 +467,13 @@ defmodule SymphonyElixir.GovernanceCheckTest do
       assert_has_code(Check.validate(root), :skill_policy_violation)
     end
 
+    test "accepts a qualified advisory watcher output", %{root: root} do
+      path = Path.join(root, ".codex/skills/land/land_watch.py")
+      File.write!(path, File.read!(path) <> "\nprint(\"Checks passed (advisory observation only)\")\n")
+
+      assert :ok = Check.validate(root)
+    end
+
     test "accepts explicit green-check authority prohibition", %{root: root} do
       path = Path.join(root, ".codex/skills/land/SKILL.md")
       File.write!(path, File.read!(path) <> "\nGreen checks do not grant merge or acceptance authority.\n")
@@ -398,6 +490,20 @@ defmodule SymphonyElixir.GovernanceCheckTest do
       )
 
       assert :ok = Check.validate(root)
+    end
+
+    test "requires every current skill file", %{root: root} do
+      File.rm!(Path.join(root, ".codex/skills/linear/SKILL.md"))
+
+      assert_has_code(Check.validate(root), :required_skill_missing)
+    end
+
+    test "scans nested skill files", %{root: root} do
+      path = Path.join(root, ".codex/skills/nested/custom/SKILL.md")
+      File.mkdir_p!(Path.dirname(path))
+      File.write!(path, "nested skill without an authority marker\n")
+
+      assert_has_code(Check.validate(root), :skill_marker_missing)
     end
   end
 
@@ -419,6 +525,29 @@ defmodule SymphonyElixir.GovernanceCheckTest do
         File.cd!(root, fn -> Mix.Tasks.Governance.Check.run(["--unknown"]) end)
       end
     end
+
+    test "requires freeze mode with a candidate phase", %{root: root} do
+      assert_raise Mix.Error, ~r/candidate-phase requires --freeze/, fn ->
+        File.cd!(root, fn -> Mix.Tasks.Governance.Check.run(["--candidate-phase", "PRE-080C-03"]) end)
+      end
+    end
+  end
+
+  test "sorts diagnostics deterministically", %{root: root} do
+    projection =
+      projection_map()
+      |> Map.delete("decision")
+      |> Map.put("unexpected", true)
+
+    write_projection(root, Jason.encode!(projection))
+
+    assert {:error, diagnostics} = Check.validate(root)
+    assert length(diagnostics) >= 2
+
+    assert diagnostics ==
+             Enum.sort_by(diagnostics, fn diagnostic ->
+               {Atom.to_string(diagnostic.code), diagnostic.path || "", diagnostic.detail}
+             end)
   end
 
   defp projection_map do
@@ -551,13 +680,11 @@ defmodule SymphonyElixir.GovernanceCheckTest do
     git!(root, ["config", "user.email", "governance-test@example.invalid"])
     git!(root, ["config", "user.name", "Governance Test"])
     git!(root, ["add", "."])
-    git!(root, ["commit", "-qm", "baseline"])
-
-    {sha, 0} = git!(root, ["rev-parse", "HEAD"])
-    {tree, 0} = git!(root, ["rev-parse", "HEAD^{tree}"])
-    projection = put_in(projection_map(), ["authority_snapshot", "accepted_protected_main_at_decision", "sha"], String.trim(sha))
-    projection = put_in(projection, ["authority_snapshot", "accepted_protected_main_at_decision", "tree"], String.trim(tree))
-    write_projection(root, Jason.encode!(projection))
+    git!(root, ["commit", "-qm", "fixture"])
+    git!(root, ["remote", "add", "source", @repo_root])
+    git!(root, ["fetch", "-q", "source", @accepted_sha])
+    git!(root, ["checkout", "-q", "--detach", "--force", @accepted_sha])
+    build_fixture!(root)
     git!(root, ["add", "."])
     git!(root, ["commit", "-qm", "candidate"])
     :ok
