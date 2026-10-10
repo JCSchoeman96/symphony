@@ -1,6 +1,12 @@
-# Symphony Elixir
+# Symphony Elixir agent instructions
 
-This directory contains the Elixir agent orchestration service that polls Linear, creates per-issue workspaces, and runs Codex in app-server mode.
+This directory contains a provider-neutral orchestration service that reads work from its configured adapter, creates per-issue workspaces, and runs Codex in app-server mode. Plane is the hardened V1 primary provider. Linear remains supported for legacy compatibility.
+
+## Governing documents
+
+Follow the V4.1 [Master Roadmap](../docs/symphony-hardening-playbook-v4.1/V4_1_MASTER_ROADMAP.md), then the [Unified Execution Roadmap](../docs/SYMPHONY_V4_1_UNIFIED_EXECUTION_ROADMAP_v1.3.2.md) and the [current governance status](../docs/symphony-hardening-playbook-v4.1/HARDENING_STATUS_LEDGER.md). `SPEC.md` is upstream/generic guidance and is subordinate when it differs from V4.1.
+
+These documents and this file guide authorized work. They do not grant implementation, lifecycle, merge, release, or acceptance authority. Preserve exact scope and evidence requirements.
 
 ## Environment
 
@@ -12,11 +18,8 @@ This directory contains the Elixir agent orchestration service that polls Linear
 ## Codebase-Specific Conventions
 
 - Runtime config is loaded from `WORKFLOW.md` front matter via `SymphonyElixir.Workflow` and `SymphonyElixir.Config`.
-- Keep the implementation aligned with [`../SPEC.md`](../SPEC.md) where practical.
-  - The implementation may be a superset of the spec.
-  - The implementation must not conflict with the spec.
-  - If implementation changes meaningfully alter the intended behavior, update the spec in the same
-    change where practical so the spec stays current.
+- Follow V4.1 repository law and accepted governance where they differ from upstream/generic
+  [`../SPEC.md`](../SPEC.md). Update the spec only when doing so preserves that precedence.
 - Prefer adding config access through `SymphonyElixir.Config` instead of ad-hoc env reads.
 - Workspace safety is critical:
   - Never run Codex turn cwd in source repo.
@@ -66,6 +69,12 @@ mix specs.check
 ```bash
 mix pr_body.check --file /path/to/pr_body.md
 ```
+
+## Merge and acceptance
+
+Green checks prove only that required checks succeeded for a candidate. They do not grant merge
+permission or programme acceptance. Merge authority is human/external. Merge and acceptance are
+separate facts.
 
 ## Docs Update Policy
 

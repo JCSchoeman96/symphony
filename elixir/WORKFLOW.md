@@ -26,7 +26,7 @@ workspace:
   root: ~/code/symphony-workspaces
 hooks:
   after_create: |
-    git clone --depth 1 https://github.com/openai/symphony .
+    git clone --depth 1 https://github.com/JCSchoeman96/symphony.git .
     if command -v mise >/dev/null 2>&1; then
       cd elixir && mise trust && mise exec -- mix deps.get
     fi
@@ -45,91 +45,27 @@ codex:
     networkAccess: true
 ---
 
-# Symphony routed workflow
+# Legacy Linear compatibility sample
 
-The orchestrator owns polling, claims, retries, workspace cleanup, and
-dispatch. Each attempt receives exactly one role policy selected from
-the tracker state and the configured profile. Role prompts are packaged under
-elixir/prompts/ and may be updated at runtime; the active attempt keeps the
-prompt captured when it starts.
+This file is the default legacy Linear compatibility workflow. Its configuration uses
+`tracker.kind: linear` and `agent.routing: legacy`. It does not activate routed role selection and
+is not the hardened V1 Plane configuration. See [elixir/README.md](README.md) for current provider
+and routing guidance.
 
-The repository's optional live-proof tests are separate from this workflow. They require named
-disposable provider resources, an explicitly configured Codex home, provider credentials, and the
-exact `SYMPHONY_LIVE_PROOF_CONSENT` token before they can run. Missing consent or configuration
-keeps those tests skipped; it is never treated as live evidence.
+You are working on a Linear issue `{{ issue.identifier }}`.
 
-You are working on a Linear ticket `{{ issue.identifier }}`.
-
-## Issue context
-
-Identifier: {{ issue.identifier }}
 Title: {{ issue.title }}
-Current status: {{ issue.state }}
-Labels: {{ issue.labels }}
-URL: {{ issue.url }}
+Description: {{ issue.description }}
 
-Description:
-{% if issue.description %}
-{{ issue.description }}
-{% else %}
-No description provided.
-{% endif %}
+## Work instructions
 
-{% if attempt %}
-Follow-up context:
-
-- This is follow-up attempt #{{ attempt }}. Resume from the current workspace
-  and the existing issue evidence.
-{% endif %}
-
-## Lifecycle routing
-
-- Planning uses the planner role to produce a bounded plan and then request
-  Ready.
-- Todo, Ready, and In Progress use the builder role to implement the
-  approved plan.
-- In Review uses the reviewer role to inspect the exact change and report
-  PASS, FAIL, or BLOCKED evidence.
-- Changes Requested uses the fixer role to address recorded findings only.
-- Ready to Merge uses the merge gatekeeper profile, which is deferred,
-  read-only, and non-executable.
-- Terminal states stop the attempt and permit workspace cleanup.
-
-## Operating rules
-
-1. Work only in the assigned repository workspace and honor the effective
-   profile sandbox.
-2. Treat the tracker, repository history, authority documents, dependency
-   graph, tests, and CI as evidence. Do not invent completion or review
-   results.
-3. Keep implementation and correction work bounded to the approved issue and
-   recorded review findings.
-4. A reviewer does not modify source, approve its own work, or merge. A fixer
-   validates findings and does not self-approve.
-5. Never bypass an unresolved, invalidated, cyclic, or incomplete dependency.
-   Read-only planning and review may document an incomplete dependency, but
-   implementation remains stopped until the graph is authoritative.
-6. Use the existing authorized tracker-tool boundary for lifecycle transitions. With the Linear
-   adapter, use `linear_graphql` only for reads and `linear_transition` with the verified
-   `targetState`/`targetStateId` pair for state handoffs. Do not issue arbitrary merge or
-   destructive tracker mutations; raw GraphQL mutations are rejected.
-7. Stop after the role's bounded responsibility is complete. The orchestrator
-   will reconcile the issue and schedule any permitted continuation or retry.
-8. Ordinary runtime/spawn failures receive at most three automatic retries.
-   Capacity waits do not consume that budget, and reviewer-to-correction loops
-   stop after three review cycles. CI infrastructure is not retried
-   automatically; request human/provider intervention instead.
-9. Report exact validation commands and results. Report external blockers
-   without fabricating provider, CI, or runtime evidence.
-
-In legacy mode, attempt counters live in the orchestrator's OTP state. In routed
-mode, safety-relevant ordinary-failure and review-cycle counters are stored in a
-project-scoped DETS ledger and synced before automatic follow-up. Workflow
-reloads and process restarts retain the durable lineage, while current issue
-state, route, dependencies, and capacity are always reread. Symphony never
-restores a prior Codex session or retry timer.
-
-Use `linear_transition` for one authorized handoff per session, then stop. The tool checks current
-issue state and dependencies before writing. If a handoff response is uncertain, report it and stop;
-the next attempt must reread the tracker before proceeding. Do not repeat the write in this session.
-Built-in prompt selections must match the configured responsibility.
+- Work only in the assigned repository workspace and follow its applicable repository instructions.
+- Keep changes within the already-authorized task scope.
+- Treat issue state, repository history, tests, and CI as observations. Do not treat them as
+  programme authorization, acceptance, or merge permission.
+- Do not perform raw Linear GraphQL mutations to change issue lifecycle state. Where the legacy
+  adapter exposes a Symphony-controlled transition boundary, that boundary remains subject to the
+  existing authorization rules.
+- Do not merge pull requests. Green checks and issue state do not grant merge authority.
+- Report the exact validation commands and results. Stop and report external blockers without
+  claiming evidence you did not observe.
