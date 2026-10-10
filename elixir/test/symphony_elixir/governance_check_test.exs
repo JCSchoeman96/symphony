@@ -49,7 +49,9 @@ defmodule SymphonyElixir.GovernanceCheckTest do
     end
 
     test "rejects duplicate keys nested in an object", %{root: root} do
-      projection = projection_json() |> String.replace("\"version\": \"V4.1\"", "\"version\": \"V4.1\", \"version\": \"V4.1\"", global: false)
+      projection =
+        projection_json()
+        |> String.replace(~s("version": "V4.1"), ~s("version": "V4.1", "version": "V4.1"), global: false)
 
       write_projection(root, projection)
 
