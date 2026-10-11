@@ -5,43 +5,43 @@
 **Purpose:** Reconcile the V4.1 hardening roadmap, current repository reality, governance decisions, the context/model-orchestration architecture, and the locked software-factory architecture into one execution sequence without creating a competing roadmap or authority kernel.\
 **Primary rule:** **V4.1 remains the governing programme.** Evaluation findings and later architecture refinements are reconciled into V4.1 as completed work, bounded prerequisites, acceptance requirements for existing phases, or explicitly deferred Programme B/C/D/E/F requirements.
 
-**v1.3.2 amendment scope:** Preserves prior architecture decisions, records the 2026-10-07 accepted governance baseline through H-080B, points active companion references to Skills Matrix v1.0.2, and clarifies that registry entries do not become repository law by registration. Current status below reflects later prerequisite acceptance, the PRE-080C-03 authorization, and PR #35's baseline remediation. This document does not authorize H-080C or future programme implementation.
+**v1.3.2 amendment scope:** Preserves prior architecture decisions, records the 2026-10-07 accepted governance baseline through H-080B, points active companion references to Skills Matrix v1.0.2, and clarifies that registry entries do not become repository law by registration. Current status below also records later prerequisite acceptance, the historical PRE-080C-03 authorization and acceptance, and PR #35's baseline remediation. This document does not authorize H-080C or future programme implementation.
 
 ## Current accepted baseline and programme state
 
-The accepted protected-main identity for the PRE-080C-02 decision is PR #37's merge. Master Governance accepted PRE-080C-02 with outcome `LIMIT_FOUND`.
+The accepted protected-main identity for the PRE-080C-03 acceptance decision is PR #38's merge. Master Governance accepted PRE-080C-03 effective 2026-10-11. The PRE-080C-02 decision remains historically tied to PR #37's merge, with outcome `LIMIT_FOUND`.
 
 ```text
-ACCEPTED_PROTECTED_MAIN_AT_DECISION_SHA = 0640bf1135f8b5000ea29518c2c456272379e9c6
-ACCEPTED_PROTECTED_MAIN_AT_DECISION_TREE = 5c6f10cc88c41f395837a930fb7ea20e0bdae0cc
+ACCEPTED_PROTECTED_MAIN_AT_DECISION_SHA = e0c1592e0fdb678f001a0e5e46e9b17de8a29000
+ACCEPTED_PROTECTED_MAIN_AT_DECISION_TREE = bc9f8a665dd93fc8fe945d070297a3dfb4638d82
 ```
 
-Effective 2026-10-07, H-070B, REM-HI21, H-I20 remediation, H-080A, and H-080B are **ACCEPTED**. PRE-080C-01 was accepted effective 2026-10-09 at merge `09b72591d33fbe88243bceb584f85fca1f6fc819`, tree `a9ff9606f52c429f58c9ab59c4e8fb11a43f73b6`, after protected-main `make-all` run `37904661908` succeeded. PRE-080C-02 is **ACCEPTED / LIMIT_FOUND**. PRE-080C-03 is **AUTHORIZED / ACTIVE / NOT ACCEPTED** by Master Governance decision `MG-2026-10-10-PRE-080C-03-AUTH-01` at `2026-10-10T16:35:00+02:00`. PRE-H080C is **NOT REACHED**. H-080C is **NOT AUTHORIZED**.
+Effective 2026-10-07, H-070B, REM-HI21, H-I20 remediation, H-080A, and H-080B are **ACCEPTED**. PRE-080C-01 was accepted effective 2026-10-09 at merge `09b72591d33fbe88243bceb584f85fca1f6fc819`, tree `a9ff9606f52c429f58c9ab59c4e8fb11a43f73b6`, after protected-main `make-all` run `37904661908` succeeded. PRE-080C-02 is **ACCEPTED / LIMIT_FOUND**. PRE-080C-03 was authorized by decision `MG-2026-10-10-PRE-080C-03-AUTH-01` and later accepted by decision `MG-2026-10-11-PRE-080C-03-ACCEPT-01` at `2026-10-11T18:02:47+02:00`. PRE-H080C remains **NOT REACHED** and is the next governance step, not authorized implementation. H-080C remains **NOT AUTHORIZED**. No programme implementation or next programme phase is currently authorized.
 
-PR #35 remains an accepted non-phase baseline remediation at `84a2fbfdaece47d5dd87ca37c2e25e85afe39880` / tree `799ef67d3c4124e76f37b4e31251b9c974695455`, verified by protected-main `make-all` run `37931419995`. That historical fact does not replace the later PR #37 baseline for PRE-080C-02 acceptance.
+PR #35 remains an accepted non-phase baseline remediation at `84a2fbfdaece47d5dd87ca37c2e25e85afe39880` / tree `799ef67d3c4124e76f37b4e31251b9c974695455`, verified by protected-main `make-all` run `37931419995`. That historical fact does not replace the PR #37 baseline for PRE-080C-02 acceptance or PR #38's baseline for PRE-080C-03 acceptance.
 
-PRE-080C-03 remains not accepted until independent review, Master Gate, human merge, exact post-merge verification, and Master Governance acceptance. This candidate does not record a future accepted merge identity.
+The PRE-080C-03 sequence was authorization, candidate preparation, independent review, Master Gate, human merge, exact post-merge verification, then Master Governance acceptance. The acceptance decision is recorded separately from the merge and CI facts.
 
 <!-- BEGIN SYMPHONY_GOVERNANCE_STATUS_V1 -->
 GOVERNANCE_PROJECTION_PATH=docs/symphony-hardening-playbook-v4.1/V4_1_GOVERNANCE_PROJECTION.json
 GOVERNING_ROADMAP_ID=docs/symphony-hardening-playbook-v4.1/V4_1_MASTER_ROADMAP.md
 GOVERNING_ROADMAP_VERSION=V4.1
 GOVERNING_ROADMAP_BLOB_SHA=4b0528bdc0647d889b42ebc478081d5b873898fe
-ACCEPTED_PROTECTED_MAIN_AT_DECISION_SHA=0640bf1135f8b5000ea29518c2c456272379e9c6
-ACCEPTED_PROTECTED_MAIN_AT_DECISION_TREE=5c6f10cc88c41f395837a930fb7ea20e0bdae0cc
+ACCEPTED_PROTECTED_MAIN_AT_DECISION_SHA=e0c1592e0fdb678f001a0e5e46e9b17de8a29000
+ACCEPTED_PROTECTED_MAIN_AT_DECISION_TREE=bc9f8a665dd93fc8fe945d070297a3dfb4638d82
 CURRENT_ACCEPTED_PHASE=H-080B
-CURRENT_ACCEPTED_PREREQUISITE=PRE-080C-02
+CURRENT_ACCEPTED_PREREQUISITE=PRE-080C-03
 PRE_080C_02_OUTCOME=LIMIT_FOUND
-CURRENTLY_AUTHORIZED_WORK=PRE-080C-03
-CURRENTLY_AUTHORIZED_STATUS=AUTHORIZED_ACTIVE_NOT_ACCEPTED
+CURRENTLY_AUTHORIZED_WORK=NONE
+CURRENTLY_AUTHORIZED_STATUS=NONE
 PRE_H080C=NOT_REACHED
 H_080C=NOT_AUTHORIZED
 NEXT_GOVERNANCE_STEP=PRE-H080C
 NEXT_AUTHORIZED_PHASE=NONE
 DECISION_AUTHORITY=Master Governance
-DECISION_REFERENCE=MG-2026-10-10-PRE-080C-03-AUTH-01
-DECISION_TIMESTAMP=2026-10-10T16:35:00+02:00
-KNOWN_UNRESOLVED_GOVERNANCE_CONDITIONS=PRE080C02_LIMIT_FOUND_REQUIRES_PRE_H080C_ADJUDICATION,PRE080C03_NOT_ACCEPTED,PRE_H080C_NOT_REACHED,H080C_NOT_AUTHORIZED
+DECISION_REFERENCE=MG-2026-10-11-PRE-080C-03-ACCEPT-01
+DECISION_TIMESTAMP=2026-10-11T18:02:47+02:00
+KNOWN_UNRESOLVED_GOVERNANCE_CONDITIONS=PRE080C02_LIMIT_FOUND_REQUIRES_PRE_H080C_ADJUDICATION,PRE_H080C_NOT_REACHED,H080C_NOT_AUTHORIZED
 <!-- END SYMPHONY_GOVERNANCE_STATUS_V1 -->
 
 
@@ -496,9 +496,9 @@ PRE-080C-01 ACCEPTED
               ↓
 PRE-080C-02 ACCEPTED — LIMIT_FOUND
               ↓
-PRE-080C-03 AUTHORIZED / ACTIVE / NOT ACCEPTED
+PRE-080C-03 ACCEPTED effective 2026-10-11
               ↓
-PRE-H080C RECONCILIATION GATE — NOT REACHED
+PRE-H080C RECONCILIATION GATE — NOT REACHED; next governance step
               ↓
 H-080C — NOT AUTHORIZED; requires separate authorization after the gate
                    ↓
@@ -612,7 +612,7 @@ H-080B ACCEPTED — effective 2026-10-07
 H-080C NOT AUTHORIZED
 ```
 
-PRE-080C-01 and PRE-080C-02 are accepted. PRE-080C-02 outcome is `LIMIT_FOUND`. PRE-080C-03 is authorized and active, but not accepted. PRE-H080C has not been reached. Passing the PRE-H080C gate does not authorize H-080C; separate explicit authorization is required.
+PRE-080C-01 and PRE-080C-02 are accepted. PRE-080C-02 outcome is `LIMIT_FOUND`. PRE-080C-03 is accepted effective 2026-10-11. PRE-H080C has not been reached and is a governance step, not authorized implementation. No programme work is currently authorized. Passing the PRE-H080C gate does not authorize H-080C; separate explicit authorization is required.
 
 ---
 
@@ -1402,25 +1402,25 @@ STOP if:
 # 22. Near-Term Development Workflow
 
 ```text
-CURRENT ACCEPTED BASELINE FOR PRE-080C-02
-PR #37 — ACCEPTED / LIMIT_FOUND
-0640bf1135f8b5000ea29518c2c456272379e9c6 / 5c6f10cc88c41f395837a930fb7ea20e0bdae0cc
+HISTORICAL PRE-080C-03 AUTHORIZATION AND ACCEPTANCE
+The authorized candidate baseline was PR #37 merge `0640bf1135f8b5000ea29518c2c456272379e9c6` / tree `5c6f10cc88c41f395837a930fb7ea20e0bdae0cc`. Master Governance authorized PRE-080C-03 under `MG-2026-10-10-PRE-080C-03-AUTH-01`. The sequence was authorization → candidate → independent review → Master Gate → human merge → exact post-merge verification → Master Governance acceptance.
 
-NOW
-1. Implement PRE-080C-03 within its approved governance/documentation scope.
-2. Keep H-080C unauthorized.
+PR #38 reviewed head: `92d95083371767de6e04498df7f59d3cb982f40d`.
+Human merge and accepted decision baseline: `e0c1592e0fdb678f001a0e5e46e9b17de8a29000` / tree `bc9f8a665dd93fc8fe945d070297a3dfb4638d82`.
+Protected-main `make-all` run `38153451643` succeeded. Master Governance accepted PRE-080C-03 effective 2026-10-11 under `MG-2026-10-11-PRE-080C-03-ACCEPT-01` at `2026-10-11T18:02:47+02:00`.
 
 CURRENT PREREQUISITE STATE
-3. PRE-080C-01 — Production Evidence Acquisition, ACCEPTED effective 2026-10-09.
-4. PRE-080C-02 — Production-Rate Epoch Characterization, ACCEPTED with outcome LIMIT_FOUND at `0640bf1135f8b5000ea29518c2c456272379e9c6` / `5c6f10cc88c41f395837a930fb7ea20e0bdae0cc`.
-5. PRE-080C-03 — Governance / Authority Reconciliation, AUTHORIZED / ACTIVE / NOT ACCEPTED under Master Governance decision `MG-2026-10-10-PRE-080C-03-AUTH-01`.
+1. PRE-080C-01 — Production Evidence Acquisition, ACCEPTED effective 2026-10-09.
+2. PRE-080C-02 — Production-Rate Epoch Characterization, ACCEPTED with outcome LIMIT_FOUND at `0640bf1135f8b5000ea29518c2c456272379e9c6` / `5c6f10cc88c41f395837a930fb7ea20e0bdae0cc`.
+3. PRE-080C-03 — Governance / Authority Reconciliation, ACCEPTED effective 2026-10-11.
 
-GATE
-6. Reconcile all three prerequisite results at the PRE-H080C gate. The gate has not been reached.
+NOW
+4. PRE-H080C is the next governance step and remains NOT REACHED. It is not authorized implementation.
+5. No programme implementation or next programme phase is currently authorized.
+6. H-080C remains NOT AUTHORIZED. Obtain separate explicit H-080C authorization only after PRE-H080C adjudication.
 
-THEN
-7. Obtain separate explicit H-080C authorization after the gate.
-8. H-080C — Integrated Security / Authority Reverification, only after separate explicit authorization, including responsibility/context-boundary proof and skill/instruction authority-containment attacks
+AFTER SEPARATE AUTHORIZATION
+7. H-080C — Integrated Security / Authority Reverification, including responsibility/context-boundary proof and skill/instruction authority-containment attacks.
 
 AFTER H-080C
 9.  V1-OPS-01 — Observability / Readiness

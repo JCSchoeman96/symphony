@@ -13,24 +13,23 @@ defmodule SymphonyElixir.Governance.Check do
   @pre_080c_02_path "docs/symphony-hardening-playbook-v4.1/PRE-080C-02_PRODUCTION_RATE_EPOCH_CHARACTERIZATION.md"
   @roadmap_blob "4b0528bdc0647d889b42ebc478081d5b873898fe"
   @pre_080c_02_blob "b69d46676d3286262bf7cab783654c10a08801bf"
-  @accepted_baseline_sha "0640bf1135f8b5000ea29518c2c456272379e9c6"
-  @accepted_baseline_tree "5c6f10cc88c41f395837a930fb7ea20e0bdae0cc"
+  @accepted_baseline_sha "e0c1592e0fdb678f001a0e5e46e9b17de8a29000"
+  @accepted_baseline_tree "bc9f8a665dd93fc8fe945d070297a3dfb4638d82"
   @accepted_phase "H-080B"
-  @accepted_prerequisite "PRE-080C-02"
+  @accepted_prerequisite "PRE-080C-03"
   @pre_080c_02_outcome "LIMIT_FOUND"
-  @authorized_work_id "PRE-080C-03"
-  @authorized_work_status "AUTHORIZED_ACTIVE_NOT_ACCEPTED"
-  @authorized_work_scope "GOVERNANCE_DOCUMENTATION_RECONCILIATION_ONLY"
+  @authorized_work_id "NONE"
+  @authorized_work_status "NONE"
+  @authorized_work_scope "NONE"
   @pre_h080c "NOT_REACHED"
   @h_080c "NOT_AUTHORIZED"
   @next_governance_step "PRE-H080C"
   @next_authorized_phase nil
   @decision_authority "Master Governance"
-  @decision_reference "MG-2026-10-10-PRE-080C-03-AUTH-01"
-  @decision_timestamp "2026-10-10T16:35:00+02:00"
+  @decision_reference "MG-2026-10-11-PRE-080C-03-ACCEPT-01"
+  @decision_timestamp "2026-10-11T18:02:47+02:00"
   @unresolved_conditions [
     "PRE080C02_LIMIT_FOUND_REQUIRES_PRE_H080C_ADJUDICATION",
-    "PRE080C03_NOT_ACCEPTED",
     "PRE_H080C_NOT_REACHED",
     "H080C_NOT_AUTHORIZED"
   ]
@@ -113,11 +112,38 @@ defmodule SymphonyElixir.Governance.Check do
   end
 
   defp validate_options(opts) do
-    if Keyword.has_key?(opts, :candidate_phase) and Keyword.get(opts, :freeze) != true do
-      {:error, [diagnostic(:candidate_phase_requires_freeze, "candidate_phase", "candidate phase requires freeze mode")]}
-    else
-      :ok
-    end
+    diagnostics = option_diagnostics(opts)
+
+    if diagnostics == [], do: :ok, else: {:error, diagnostics}
+  end
+
+  defp option_diagnostics(opts) do
+    candidate_phase? = Keyword.has_key?(opts, :candidate_phase)
+    materialize_decision? = Keyword.has_key?(opts, :materialize_decision)
+    freeze? = Keyword.get(opts, :freeze) == true
+
+    selector_conflict? = candidate_phase? and materialize_decision?
+    candidate_requires_freeze? = candidate_phase? and not freeze?
+    materialization_requires_freeze? = materialize_decision? and not freeze?
+    selector_required? = freeze? and not candidate_phase? and not materialize_decision?
+
+    []
+    |> append_unless(
+      not selector_conflict?,
+      diagnostic(:freeze_selector_conflict, nil, "candidate phase and decision materialization are mutually exclusive")
+    )
+    |> append_unless(
+      not candidate_requires_freeze?,
+      diagnostic(:candidate_phase_requires_freeze, "candidate_phase", "candidate phase requires freeze mode")
+    )
+    |> append_unless(
+      not materialization_requires_freeze?,
+      diagnostic(:materialize_decision_requires_freeze, "materialize_decision", "decision materialization requires freeze mode")
+    )
+    |> append_unless(
+      not selector_required?,
+      diagnostic(:freeze_selector_required, nil, "freeze mode requires a candidate phase or decision materialization selector")
+    )
   end
 
   defp read_projection(root, relative_path) do
@@ -485,13 +511,13 @@ defmodule SymphonyElixir.Governance.Check do
       diagnostic(
         :authority_snapshot_mismatch,
         "projection.known_unresolved_governance_conditions",
-        "conditions do not match the approved PRE-080C-03 snapshot"
+        "conditions do not match the accepted PRE-080C-03 snapshot"
       )
     )
   end
 
   defp append_exact_diagnostic(diagnostics, actual, expected, path, code) do
-    append_unless(diagnostics, actual == expected, diagnostic(code, path, "value does not match the approved PRE-080C-03 snapshot"))
+    append_unless(diagnostics, actual == expected, diagnostic(code, path, "value does not match the accepted PRE-080C-03 snapshot"))
   end
 
   defp append_gate_diagnostics(diagnostics, projection) do
@@ -1316,18 +1342,16 @@ defmodule SymphonyElixir.Governance.Check do
 
   defp validate_freeze_enabled(root, projection, opts) do
     candidate_phase = Keyword.get(opts, :candidate_phase)
+    materialize_decision = Keyword.get(opts, :materialize_decision)
     authorized_work = projection["authority_snapshot"]["currently_authorized_work"]
     baseline = projection["authority_snapshot"]["accepted_protected_main_at_decision"]
 
     diagnostics =
-      []
-      |> append_unless(
-        is_binary(candidate_phase) and nonblank?(candidate_phase),
-        diagnostic(:candidate_phase_required, nil, "freeze mode requires --candidate-phase")
-      )
-      |> append_unless(
-        is_binary(candidate_phase) and candidate_phase == authorized_work["id"],
-        diagnostic(:candidate_phase_mismatch, "candidate_phase", "candidate phase does not match the projection")
+      freeze_selector_diagnostics(
+        candidate_phase,
+        materialize_decision,
+        authorized_work,
+        projection["decision"]["reference"]
       )
 
     if diagnostics != [] do
@@ -1336,6 +1360,48 @@ defmodule SymphonyElixir.Governance.Check do
       freeze_git_diagnostics(root, baseline)
     end
   end
+
+  defp freeze_selector_diagnostics(candidate_phase, nil, authorized_work, _decision_reference) do
+    if is_binary(candidate_phase) and nonblank?(candidate_phase) and
+         candidate_phase == authorized_work["id"] and not no_authorized_work?(authorized_work) do
+      []
+    else
+      [
+        diagnostic(
+          :candidate_phase_mismatch,
+          "candidate_phase",
+          "candidate phase must be nonblank, match authorized work, and not use the NONE snapshot"
+        )
+      ]
+    end
+  end
+
+  defp freeze_selector_diagnostics(nil, materialize_decision, authorized_work, decision_reference) do
+    diagnostics =
+      []
+      |> append_unless(
+        is_binary(materialize_decision) and nonblank?(materialize_decision) and
+          materialize_decision == decision_reference,
+        diagnostic(
+          :materialize_decision_mismatch,
+          "materialize_decision",
+          "decision reference does not match the accepted projection decision"
+        )
+      )
+      |> append_unless(
+        no_authorized_work?(authorized_work),
+        diagnostic(
+          :materialization_requires_no_authorized_work,
+          "authority_snapshot.currently_authorized_work",
+          "decision materialization requires the exact NONE/NONE/NONE tuple"
+        )
+      )
+
+    diagnostics
+  end
+
+  defp no_authorized_work?(%{"id" => "NONE", "status" => "NONE", "scope" => "NONE"}), do: true
+  defp no_authorized_work?(_authorized_work), do: false
 
   defp freeze_git_diagnostics(root, baseline) do
     accepted_sha = baseline["sha"]
