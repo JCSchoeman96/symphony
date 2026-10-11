@@ -1,5 +1,7 @@
 # Symphony Service Specification
 
+> **Fork precedence:** For `JCSchoeman96/symphony` V4.1 hardening, the [V4.1 Master Roadmap](docs/symphony-hardening-playbook-v4.1/V4_1_MASTER_ROADMAP.md) and the [current Unified Execution Roadmap](docs/SYMPHONY_V4_1_UNIFIED_EXECUTION_ROADMAP_v1.3.2.md) govern. `SPEC.md` remains upstream/generic compatibility guidance where it does not conflict with those documents.
+
 Status: Draft v1 (language-agnostic)
 
 Purpose: Define a service that orchestrates coding agents to get project work done.

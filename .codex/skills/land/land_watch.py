@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SYMPHONY_AUTHORITY_CLASS: ADVISORY_NON_AUTHORITY
 import asyncio
 import json
 import random
@@ -566,7 +567,11 @@ async def wait_for_checks(head_sha: str, checks_done: asyncio.Event) -> None:
                 print(f"- {failure}")
             raise SystemExit(3)
         if not pending:
-            print("Checks passed")
+            print(
+                "Observed checks completed without failed conclusions.\n"
+                "Advisory monitor only; required-check and merge-readiness authority "
+                "must be independently verified."
+            )
             checks_done.set()
             return
         await asyncio.sleep(POLL_SECONDS)

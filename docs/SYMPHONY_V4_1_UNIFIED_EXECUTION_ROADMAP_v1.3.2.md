@@ -5,20 +5,44 @@
 **Purpose:** Reconcile the V4.1 hardening roadmap, current repository reality, governance decisions, the context/model-orchestration architecture, and the locked software-factory architecture into one execution sequence without creating a competing roadmap or authority kernel.\
 **Primary rule:** **V4.1 remains the governing programme.** Evaluation findings and later architecture refinements are reconciled into V4.1 as completed work, bounded prerequisites, acceptance requirements for existing phases, or explicitly deferred Programme B/C/D/E/F requirements.
 
-**v1.3.2 amendment scope:** Preserves prior architecture decisions, records the 2026-10-07 accepted governance baseline through H-080B, points active companion references to Skills Matrix v1.0.2, and clarifies that registry entries do not become repository law by registration. The current status below records later prerequisite acceptance and the PR #35 baseline remediation. This document does not authorize H-080C or future programme implementation.
+**v1.3.2 amendment scope:** Preserves prior architecture decisions, records the 2026-10-07 accepted governance baseline through H-080B, points active companion references to Skills Matrix v1.0.2, and clarifies that registry entries do not become repository law by registration. Current status below reflects later prerequisite acceptance, the PRE-080C-03 authorization, and PR #35's baseline remediation. This document does not authorize H-080C or future programme implementation.
 
-## GOV-STATE-SYNC input baseline and current programme state
+## Current accepted baseline and programme state
 
-The accepted protected-main identity entering GOV-STATE-SYNC is PR #35's merge. It is an accepted non-phase baseline remediation, verified by successful protected-main `make-all` run `37931419995`.
+The accepted protected-main identity for the PRE-080C-02 decision is PR #37's merge. Master Governance accepted PRE-080C-02 with outcome `LIMIT_FOUND`.
 
 ```text
-GOV_STATE_SYNC_INPUT_BASELINE_SHA = 84a2fbfdaece47d5dd87ca37c2e25e85afe39880
-GOV_STATE_SYNC_INPUT_BASELINE_TREE = 799ef67d3c4124e76f37b4e31251b9c974695455
+ACCEPTED_PROTECTED_MAIN_AT_DECISION_SHA = 0640bf1135f8b5000ea29518c2c456272379e9c6
+ACCEPTED_PROTECTED_MAIN_AT_DECISION_TREE = 5c6f10cc88c41f395837a930fb7ea20e0bdae0cc
 ```
 
-Effective 2026-10-07, H-070B, REM-HI21, H-I20 remediation, H-080A, and H-080B are **ACCEPTED**. PRE-080C-01 was accepted effective 2026-10-09 at merge `09b72591d33fbe88243bceb584f85fca1f6fc819`, tree `a9ff9606f52c429f58c9ab59c4e8fb11a43f73b6`, after protected-main `make-all` run `37904661908` succeeded. PRE-080C-02 is **AUTHORIZED / ACTIVE / NOT ACCEPTED**. PRE-080C-03 is **PENDING / NOT STARTED**. H-080C is **NOT AUTHORIZED**.
+Effective 2026-10-07, H-070B, REM-HI21, H-I20 remediation, H-080A, and H-080B are **ACCEPTED**. PRE-080C-01 was accepted effective 2026-10-09 at merge `09b72591d33fbe88243bceb584f85fca1f6fc819`, tree `a9ff9606f52c429f58c9ab59c4e8fb11a43f73b6`, after protected-main `make-all` run `37904661908` succeeded. PRE-080C-02 is **ACCEPTED / LIMIT_FOUND**. PRE-080C-03 is **AUTHORIZED / ACTIVE / NOT ACCEPTED** by Master Governance decision `MG-2026-10-10-PRE-080C-03-AUTH-01` at `2026-10-10T16:35:00+02:00`. PRE-H080C is **NOT REACHED**. H-080C is **NOT AUTHORIZED**.
 
-The accepted GOV-STATE-SYNC merge identity is established only after candidate review, human merge, exact merge resolution, protected-main post-merge verification, and Master Governance acceptance. This candidate cannot record its own future accepted merge identity. After those steps, PRE-080C-02 must be re-pinned or rebased to that verified GOV-STATE-SYNC accepted merge, not to the input baseline above, and its candidate-bound evidence must be regenerated before independent review. This synchronization does not count as PRE-080C-03.
+PR #35 remains an accepted non-phase baseline remediation at `84a2fbfdaece47d5dd87ca37c2e25e85afe39880` / tree `799ef67d3c4124e76f37b4e31251b9c974695455`, verified by protected-main `make-all` run `37931419995`. That historical fact does not replace the later PR #37 baseline for PRE-080C-02 acceptance.
+
+PRE-080C-03 remains not accepted until independent review, Master Gate, human merge, exact post-merge verification, and Master Governance acceptance. This candidate does not record a future accepted merge identity.
+
+<!-- BEGIN SYMPHONY_GOVERNANCE_STATUS_V1 -->
+GOVERNANCE_PROJECTION_PATH=docs/symphony-hardening-playbook-v4.1/V4_1_GOVERNANCE_PROJECTION.json
+GOVERNING_ROADMAP_ID=docs/symphony-hardening-playbook-v4.1/V4_1_MASTER_ROADMAP.md
+GOVERNING_ROADMAP_VERSION=V4.1
+GOVERNING_ROADMAP_BLOB_SHA=4b0528bdc0647d889b42ebc478081d5b873898fe
+ACCEPTED_PROTECTED_MAIN_AT_DECISION_SHA=0640bf1135f8b5000ea29518c2c456272379e9c6
+ACCEPTED_PROTECTED_MAIN_AT_DECISION_TREE=5c6f10cc88c41f395837a930fb7ea20e0bdae0cc
+CURRENT_ACCEPTED_PHASE=H-080B
+CURRENT_ACCEPTED_PREREQUISITE=PRE-080C-02
+PRE_080C_02_OUTCOME=LIMIT_FOUND
+CURRENTLY_AUTHORIZED_WORK=PRE-080C-03
+CURRENTLY_AUTHORIZED_STATUS=AUTHORIZED_ACTIVE_NOT_ACCEPTED
+PRE_H080C=NOT_REACHED
+H_080C=NOT_AUTHORIZED
+NEXT_GOVERNANCE_STEP=PRE-H080C
+NEXT_AUTHORIZED_PHASE=NONE
+DECISION_AUTHORITY=Master Governance
+DECISION_REFERENCE=MG-2026-10-10-PRE-080C-03-AUTH-01
+DECISION_TIMESTAMP=2026-10-10T16:35:00+02:00
+KNOWN_UNRESOLVED_GOVERNANCE_CONDITIONS=PRE080C02_LIMIT_FOUND_REQUIRES_PRE_H080C_ADJUDICATION,PRE080C03_NOT_ACCEPTED,PRE_H080C_NOT_REACHED,H080C_NOT_AUTHORIZED
+<!-- END SYMPHONY_GOVERNANCE_STATUS_V1 -->
 
 
 ## Roadmap Scope Layers
@@ -470,9 +494,9 @@ H-080B ACCEPTED
               ↓
 PRE-080C-01 ACCEPTED
               ↓
-PRE-080C-02 AUTHORIZED / ACTIVE / NOT ACCEPTED
+PRE-080C-02 ACCEPTED — LIMIT_FOUND
               ↓
-PRE-080C-03 PENDING / NOT STARTED
+PRE-080C-03 AUTHORIZED / ACTIVE / NOT ACCEPTED
               ↓
 PRE-H080C RECONCILIATION GATE — NOT REACHED
               ↓
@@ -588,7 +612,7 @@ H-080B ACCEPTED — effective 2026-10-07
 H-080C NOT AUTHORIZED
 ```
 
-PRE-080C-01 is accepted. PRE-080C-02 is the active authorized prerequisite and is not accepted. PRE-080C-03 has not started, and PRE-H080C has not been reached. Passing the PRE-H080C gate does not authorize H-080C; separate explicit authorization is required.
+PRE-080C-01 and PRE-080C-02 are accepted. PRE-080C-02 outcome is `LIMIT_FOUND`. PRE-080C-03 is authorized and active, but not accepted. PRE-H080C has not been reached. Passing the PRE-H080C gate does not authorize H-080C; separate explicit authorization is required.
 
 ---
 
@@ -1378,18 +1402,18 @@ STOP if:
 # 22. Near-Term Development Workflow
 
 ```text
-GOV-STATE-SYNC INPUT BASELINE
-PR #35 — NON-PHASE BASELINE REMEDIATION
-84a2fbfdaece47d5dd87ca37c2e25e85afe39880 / 799ef67d3c4124e76f37b4e31251b9c974695455
+CURRENT ACCEPTED BASELINE FOR PRE-080C-02
+PR #37 — ACCEPTED / LIMIT_FOUND
+0640bf1135f8b5000ea29518c2c456272379e9c6 / 5c6f10cc88c41f395837a930fb7ea20e0bdae0cc
 
 NOW
-1. Complete GOV-STATE-SYNC review, human merge, and post-merge verification. This synchronization is not PRE-080C-03.
+1. Implement PRE-080C-03 within its approved governance/documentation scope.
 2. Keep H-080C unauthorized.
 
 CURRENT PREREQUISITE STATE
 3. PRE-080C-01 — Production Evidence Acquisition, ACCEPTED effective 2026-10-09.
-4. PRE-080C-02 — Production-Rate Epoch Characterization, AUTHORIZED / ACTIVE / NOT ACCEPTED. After GOV-STATE-SYNC is accepted, re-pin or rebase to that accepted `main` and regenerate candidate-bound evidence before independent review.
-5. PRE-080C-03 — Governance / Authority Reconciliation, PENDING / NOT STARTED. Preserve its existing definition and begin it only in the established sequence.
+4. PRE-080C-02 — Production-Rate Epoch Characterization, ACCEPTED with outcome LIMIT_FOUND at `0640bf1135f8b5000ea29518c2c456272379e9c6` / `5c6f10cc88c41f395837a930fb7ea20e0bdae0cc`.
+5. PRE-080C-03 — Governance / Authority Reconciliation, AUTHORIZED / ACTIVE / NOT ACCEPTED under Master Governance decision `MG-2026-10-10-PRE-080C-03-AUTH-01`.
 
 GATE
 6. Reconcile all three prerequisite results at the PRE-H080C gate. The gate has not been reached.

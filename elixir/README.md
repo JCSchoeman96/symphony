@@ -1,11 +1,9 @@
 # Symphony Elixir
 
-This directory contains the current Elixir/OTP implementation of Symphony, based on
-[`SPEC.md`](../SPEC.md) at the repository root.
+This directory contains the Elixir/OTP implementation of the `JCSchoeman96/symphony` fork. The V4.1 [Master Roadmap](../docs/symphony-hardening-playbook-v4.1/V4_1_MASTER_ROADMAP.md) and [Unified Execution Roadmap](../docs/SYMPHONY_V4_1_UNIFIED_EXECUTION_ROADMAP_v1.3.2.md) govern hardened V1. [`SPEC.md`](../SPEC.md) remains upstream/generic compatibility guidance where it does not conflict with V4.1.
 
 > [!WARNING]
-> Symphony Elixir is prototype software intended for evaluation only and is presented as-is.
-> We recommend implementing your own hardened version based on `SPEC.md`.
+> This fork contains the hardened V1 implementation described by its V4.1 authority documents. The legacy Linear sample below remains for compatibility and is not the default hardened routed configuration.
 
 ## Screenshot
 
@@ -13,8 +11,9 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 
 ## How it works
 
-1. Polls the configured tracker for candidate work (included adapters: Linear, GitHub Issues, Jira
-   Cloud, Asana, and GitLab)
+1. Reads candidate work through the configured provider-neutral tracker adapter. Plane is the
+   hardened V1 primary; compatibility adapters include Linear, GitHub Issues, Jira Cloud, Asana,
+   and GitLab.
 2. Creates a workspace per issue
 3. Launches Codex in [App Server mode](https://developers.openai.com/codex/app-server/) inside the
    workspace
@@ -22,7 +21,12 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 5. Keeps Codex working on the issue until the work is done
 
 During app-server sessions, the selected tracker adapter may advertise provider-native tools. The
-Linear adapter serves read-only `linear_graphql` plus the workflow-controlled `linear_transition`,
+current Plane routed capability set is `current_issue_refresh`, `dependency_graph`,
+`dependency_completeness`, `controlled_transition`, `transition_verification`, `agent_read_tools`,
+and `agent_transition_tools`. `conditional_transition` remains unsupported. Plane mutation
+acknowledgement is not transition proof; Symphony requires a fresh provider reread and lifecycle
+reassessment. Plane capability does not establish Symphony authority. Linear remains a legacy
+compatibility adapter and serves read-only `linear_graphql` plus the guarded `linear_transition`.
 GitHub Issues serves `github_api`, Jira Cloud serves
 `jira_rest`, Asana serves `asana_api`, and GitLab serves `gitlab_api`. Symphony executes those
 tools with configured host-side auth and removes declared tracker-token environment variables from
@@ -77,29 +81,17 @@ data fails routed dispatch closed until reconciliation succeeds. Review-to-corre
 count even if observed during retry wait or denied by dependencies. Previously counted route
 changes are not charged again when the retry starts.
 
-Legacy adapters retain accepted per-issue blocker checks and do not claim a complete graph epoch.
-Routed implementation/correction remain disabled for providers missing their required capabilities.
+Legacy adapters retain their supported per-issue blocker checks and do not claim a complete graph epoch. Routed implementation/correction remain disabled for providers missing their required capabilities. Plane satisfies the seven current routed capability requirements listed above.
 Built-in role prompt names must match the profile responsibility, including `.md` names. Custom
 prompt text and files are trusted operator configuration and require manual role-policy review.
 
 ## How to use it
 
-1. Make sure your codebase is set up to work well with agents: see
-   [Harness engineering](https://openai.com/index/harness-engineering/).
-2. Get a new personal token in Linear via Settings → Security & access → Personal API keys, and
-   set it as the `LINEAR_API_KEY` environment variable.
-3. Copy this directory's `WORKFLOW.md` to your repo.
-4. Optionally copy the `commit`, `push`, `pull`, `land`, and `linear` skills to your repo.
-   - The `linear` skill can use Symphony's `linear_graphql` app-server tool for read-only Linear
-     GraphQL queries. Workflow state changes must use `linear_transition`; raw GraphQL mutations
-     are rejected at the Linear boundary.
-5. Customize the copied `WORKFLOW.md` file for your project.
-   - To get your project's slug, right-click the project and copy its URL. The slug is part of the
-     URL.
-   - When creating a workflow based on this repo, configure the lifecycle states used by your team.
-     The shipped routed example uses Planning, Todo, Ready, In Progress, In Review,
-     Changes Requested, and Ready to Merge; merge remains a deferred, read-only gate.
-6. Follow the instructions below to install the required runtime dependencies and start the service.
+1. Set up your codebase to work well with agents. The [upstream OpenAI harness engineering article](https://openai.com/index/harness-engineering/) is reference material.
+2. Clone this governed fork with `git clone https://github.com/JCSchoeman96/symphony.git`.
+3. Use the sample in `WORKFLOW.md` only for legacy Linear compatibility. For hardened routed use, configure Plane and follow the V4.1 authority and operator guidance.
+4. If using the legacy Linear adapter, set `LINEAR_API_KEY` for its configured compatibility profile. Do not use raw GraphQL lifecycle mutations.
+5. Follow the instructions below to install the required runtime dependencies and start the service.
 
 ## Prerequisites
 
@@ -113,7 +105,7 @@ mise exec -- elixir --version
 ## Run
 
 ```bash
-git clone https://github.com/openai/symphony
+git clone https://github.com/JCSchoeman96/symphony.git
 cd symphony/elixir
 mise trust
 mise install
@@ -195,8 +187,7 @@ Notes:
 - If a value is missing, defaults are used.
 - `agent.routing: routed` opts into explicit responsibility-aware profiles and
   state routes and requires `symphony.project_id`. The shipped `WORKFLOW.md` is a
-  legacy Linear compatibility sample; use the deterministic `memory` adapter in
-  tests until a provider passes the complete routed capability contract. Workflows
+  legacy Linear compatibility sample. Plane is the hardened V1 primary routed provider. Workflows
   without `agent.profiles` retain the legacy compatibility path.
 - Routed safety lineage is stored in a deterministic DETS file outside the
   repository, workspace, and default `/tmp` directory. The namespace is keyed by
@@ -338,12 +329,14 @@ codex:
   path, an explicit stable `tracker.provider.workspace_id`, and `tracker.provider.project_id`.
   `tracker.provider.api_key` must be `$PLANE_API_KEY` (or be supplied host-side); literal tokens
   are rejected. The endpoint is the host-controlled `https://api.plane.so` default.
-- P-040 is read-only and supports fresh issue refresh plus bounded, complete dependency graph
-  epochs. Plane enumerates the configured project, reads each item's fixed relations endpoint with
-  bounded concurrency, rejects incomplete or cross-project data, and publishes a new immutable
-  epoch only after the closing node set remains stable. Routed configuration remains fail-closed
-  because later transition and agent-tool capabilities are still unsupported. Plane reads never
-  grant lifecycle authority or completion proof.
+- The current routed Plane capability set includes `current_issue_refresh`, `dependency_graph`,
+  `dependency_completeness`, `controlled_transition`, `transition_verification`,
+  `agent_read_tools`, and `agent_transition_tools`. `conditional_transition` remains unsupported.
+  Plane enumerates the configured project, reads each item's fixed relations endpoint with bounded
+  concurrency, rejects incomplete or cross-project data, and publishes an immutable epoch only
+  after the closing node set remains stable. A provider mutation acknowledgement is not transition
+  proof. Symphony rereads the provider and reassesses lifecycle authority. Plane capability does
+  not establish Symphony authority or completion proof.
 - Webhook wake-ups are optional. Set the host environment variable `PLANE_WEBHOOK_SECRET` to the
   secret from the Plane v2 webhook; it is not a `WORKFLOW.md` setting. The endpoint verifies the
   HMAC-SHA256 signature over the exact raw request bytes before decoding JSON and rejects bodies
