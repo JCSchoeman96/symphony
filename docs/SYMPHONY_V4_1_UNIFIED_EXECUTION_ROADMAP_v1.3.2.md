@@ -1423,24 +1423,24 @@ AFTER SEPARATE AUTHORIZATION
 7. H-080C — Integrated Security / Authority Reverification, including responsibility/context-boundary proof and skill/instruction authority-containment attacks.
 
 AFTER H-080C
-9.  V1-OPS-01 — Observability / Readiness
-10. V1-OPS-02 — Durable Safety-State Recovery
-11. V1-OPS-03 — Operator Suspension Resolution
+8.  V1-OPS-01 — Observability / Readiness
+9.  V1-OPS-02 — Durable Safety-State Recovery
+10. V1-OPS-03 — Operator Suspension Resolution
 
 THEN
-12. H-090 — Structural Review / Bounded Refactor if justified
-13. H-120A — Freeze
-14. H-100 — Live Lifecycle Proof
-15. H-110 — Failure / Restart Soak
-16. H-120B — Independent Exact-Candidate V1 Acceptance using clean-room review context
+11. H-090 — Structural Review / Bounded Refactor if justified
+12. H-120A — Freeze
+13. H-100 — Live Lifecycle Proof
+14. H-110 — Failure / Restart Soak
+15. H-120B — Independent Exact-Candidate V1 Acceptance using clean-room review context
 
 THEN
-17. Enter Programme B — first run the dedicated Programme-B backward-planning/domain-modeling pass, then implement bounded issue families for engineering intent, Execution/Candidate identity, ValidationContract, EvidenceBundle/Receipt/Profile, handoff and governed SkillContract foundations
-18. Enter Programme C — first derive bounded issue families, then implement supervised execution, Context Broker, deterministic SkillSelectionPolicy, independent validator executions and progressive materialization
-19. Once B/C foundations provide trustworthy accepted-candidate/review telemetry, begin Programme E foundation where prerequisites exist — governed EngineeringExperience, learning proposals and repository invariants
-20. Begin Programme F when accepted Candidate/artifact identity can be reliably correlated with deployment/production observations; feed trustworthy OutcomeAssessments back into Programme E only through the governed learning path
-21. Evaluate Programme D1 runtime/model/adaptive selection independently if measured quality/economics justify it; D1 is optional and is not a prerequisite for E or F
-22. Evaluate Programme D2 distribution only if measured operational need justifies it
+16. Enter Programme B — first run the dedicated Programme-B backward-planning/domain-modeling pass, then implement bounded issue families for engineering intent, Execution/Candidate identity, ValidationContract, EvidenceBundle/Receipt/Profile, handoff and governed SkillContract foundations
+17. Enter Programme C — first derive bounded issue families, then implement supervised execution, Context Broker, deterministic SkillSelectionPolicy, independent validator executions and progressive materialization
+18. Once B/C foundations provide trustworthy accepted-candidate/review telemetry, begin Programme E foundation where prerequisites exist — governed EngineeringExperience, learning proposals and repository invariants
+19. Begin Programme F when accepted Candidate/artifact identity can be reliably correlated with deployment/production observations; feed trustworthy OutcomeAssessments back into Programme E only through the governed learning path
+20. Evaluate Programme D1 runtime/model/adaptive selection independently if measured quality/economics justify it; D1 is optional and is not a prerequisite for E or F
+21. Evaluate Programme D2 distribution only if measured operational need justifies it
 ```
 
 ---

@@ -10,11 +10,17 @@ The 2026-10-05 reconciliation closes the later ledger drift across H-070B, REM-H
 
 Formal acceptance for those five reconciled rows is established by the 2026-10-07 Master Governance adjudication preserved through [the current reconciliation](GOVERNANCE_RECONCILIATION_2026-10-05.md). Those acceptances are effective 2026-10-07 and are not backdated to the historical merge dates.
 
-## Post-acceptance sync input baseline
+## Historical GOV-STATE-SYNC input baseline — 2026-10-09
 
 | Baseline context | Commit | Tree |
 |---|---|---|
-| Accepted protected-main baseline entering the post-acceptance sync | `e0c1592e0fdb678f001a0e5e46e9b17de8a29000` | `bc9f8a665dd93fc8fe945d070297a3dfb4638d82` |
+| Accepted protected-main baseline entering GOV-STATE-SYNC | `84a2fbfdaece47d5dd87ca37c2e25e85afe39880` | `799ef67d3c4124e76f37b4e31251b9c974695455` |
+
+## POST-PRE080C03-GOV-STATE-SYNC input baseline — 2026-10-11
+
+| Baseline context | Commit | Tree |
+|---|---|---|
+| Accepted protected-main baseline entering POST-PRE080C03-GOV-STATE-SYNC | `e0c1592e0fdb678f001a0e5e46e9b17de8a29000` | `bc9f8a665dd93fc8fe945d070297a3dfb4638d82` |
 
 ## Current authorization
 
