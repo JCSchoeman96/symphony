@@ -6,7 +6,7 @@ This record reconciles current governance status, operator/developer guidance, l
 material, repository-local skills, and a derivative machine-readable projection. The scope is
 documentation and repository validation only. No runtime authority or lifecycle behavior changes.
 
-PRE-080C-03 is ACTIVE / NOT ACCEPTED.
+When this reconciliation was prepared for the PR #38 candidate, PRE-080C-03 was ACTIVE / NOT ACCEPTED. That is historical candidate-era state.
 
 PRE-H080C has not been reached.
 
@@ -14,28 +14,59 @@ H-080C is not authorized.
 
 This document does not perform PRE-H080C adjudication.
 
-## Decision baseline
+## Historical authorization baseline — 2026-10-10
 
 Master Governance authorized PRE-080C-03 by decision
 `MG-2026-10-10-PRE-080C-03-AUTH-01`, timestamped `2026-10-10T16:35:00+02:00`.
-The accepted protected-main baseline at that decision is commit
+The accepted protected-main baseline at the authorization decision was commit
 `0640bf1135f8b5000ea29518c2c456272379e9c6`, tree
 `5c6f10cc88c41f395837a930fb7ea20e0bdae0cc`. The immutable V4.1 Master Roadmap blob is
 `4b0528bdc0647d889b42ebc478081d5b873898fe`. The immutable PRE-080C-02 evidence blob is
 `b69d46676d3286262bf7cab783654c10a08801bf`.
 
+## Post-acceptance reconciliation — 2026-10-11
+
+Master Governance accepted PRE-080C-03 under decision
+`MG-2026-10-11-PRE-080C-03-ACCEPT-01`, timestamp
+`2026-10-11T18:02:47+02:00`, effective date `2026-10-11`.
+
+The candidate and post-merge facts are:
+
+```text
+authorized candidate baseline:
+0640bf1135f8b5000ea29518c2c456272379e9c6
+
+PR #38 reviewed head:
+92d95083371767de6e04498df7f59d3cb982f40d
+
+human merge:
+e0c1592e0fdb678f001a0e5e46e9b17de8a29000
+
+merge tree:
+bc9f8a665dd93fc8fe945d070297a3dfb4638d82
+
+protected-main make-all:
+38153451643 = success
+```
+
+The sequence was PRE-080C-03 authorization, candidate preparation, independent review, Master Gate, human merge, exact post-merge verification, and Master Governance acceptance. The merge did not itself establish acceptance. The governance projection did not establish acceptance. The POST-PRE080C03-GOV-STATE-SYNC implementation does not establish acceptance; it materializes the already-issued Master Governance decision.
+
+Master Governance separately authorized the bounded state-sync implementation under
+`MG-2026-10-11-POST-PRE080C03-GOV-SYNC-AUTH-01` at
+`2026-10-11T18:02:47+02:00`. That authorization does not create a programme phase or authorize later programme work.
+
 ## Current programme state
 
 - H-080B is accepted.
 - PRE-080C-01 is accepted.
-- PRE-080C-02 is accepted with outcome `LIMIT_FOUND` at the baseline above.
-- PRE-080C-03 is authorized and active, but not accepted.
+- PRE-080C-02 is accepted with outcome `LIMIT_FOUND` at PR #37 merge `0640bf1135f8b5000ea29518c2c456272379e9c6` / tree `5c6f10cc88c41f395837a930fb7ea20e0bdae0cc`.
+- PRE-080C-03 is accepted effective 2026-10-11.
 - PRE-H080C is not reached. It is the next governance step, not authorized implementation.
 - H-080C is not authorized.
-- The next authorized phase is none.
+- No programme work or next programme phase is currently authorized.
 
-The decision authorizes only implementation of PRE-080C-03 within its approved scope. It does not
-amend the Master Roadmap or grant future authority.
+The acceptance decision does not amend the Master Roadmap or grant future authority. This state sync
+does not perform PRE-H080C adjudication or authorize H-080C.
 
 ## Authority hierarchy and ownership
 
@@ -62,9 +93,9 @@ skill text or agent output is not trusted evidence.
 
 ### PR #26
 
-PR #26 remains open and unmerged as historical superseded characterization material. Do not merge
-or close it during PRE-080C-03. Preserve its branch and history. Consider closure only after
-PRE-080C-03 acceptance under separate authorization.
+PR #26 remains open and unmerged as historical superseded characterization material. The earlier
+instruction not to merge or close it during PRE-080C-03 is historical. This state sync does not
+authorize action on PR #26. Preserve its branch and history.
 
 ### PR #31
 
@@ -129,19 +160,19 @@ source-control state.
 ## Known unresolved conditions
 
 - PRE-080C-02's `LIMIT_FOUND` outcome requires PRE-H080C adjudication.
-- PRE-080C-03 is not accepted.
 - PRE-H080C has not been reached.
 - H-080C is not authorized.
 
 ## Explicit non-goals
 
-This phase does not amend the Master Roadmap, perform PRE-H080C adjudication, implement H-080C,
+This state sync does not amend the Master Roadmap, perform PRE-H080C adjudication, implement H-080C,
 change runtime or lifecycle behavior, alter Plane or other provider code, rewrite historical PR
-bodies/evidence, merge a PR, accept PRE-080C-03, or authorize future work.
+bodies/evidence, merge a PR, create PRE-080C-03 acceptance, or authorize future work. PRE-080C-03
+acceptance was issued separately by Master Governance before this sync.
 
 ## Closure path
 
-PRE-080C-03 can be accepted only after implementation, fresh independent review, Master Gate,
-human merge, exact post-merge verification, and Master Governance acceptance. Only then may a
-separately authorized governance sync record its accepted merge identity. PRE-H080C adjudication
-remains a separate later governance step. H-080C still requires separate explicit authorization.
+The candidate-era closure path required implementation, fresh independent review, Master Gate,
+human merge, exact post-merge verification, and Master Governance acceptance. That sequence is
+complete for PRE-080C-03. PRE-H080C adjudication remains a separate next governance step, and H-080C
+still requires separate explicit authorization.

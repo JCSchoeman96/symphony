@@ -8,14 +8,13 @@ defmodule SymphonyElixir.GovernanceCheckTest do
   @pre_080c_02_path "docs/symphony-hardening-playbook-v4.1/PRE-080C-02_PRODUCTION_RATE_EPOCH_CHARACTERIZATION.md"
   @projection_path "docs/symphony-hardening-playbook-v4.1/V4_1_GOVERNANCE_PROJECTION.json"
   @roadmap_blob "4b0528bdc0647d889b42ebc478081d5b873898fe"
-  @accepted_sha "0640bf1135f8b5000ea29518c2c456272379e9c6"
-  @accepted_tree "5c6f10cc88c41f395837a930fb7ea20e0bdae0cc"
-  @decision_reference "MG-2026-10-10-PRE-080C-03-AUTH-01"
-  @decision_timestamp "2026-10-10T16:35:00+02:00"
+  @accepted_sha "e0c1592e0fdb678f001a0e5e46e9b17de8a29000"
+  @accepted_tree "bc9f8a665dd93fc8fe945d070297a3dfb4638d82"
+  @decision_reference "MG-2026-10-11-PRE-080C-03-ACCEPT-01"
+  @decision_timestamp "2026-10-11T18:02:47+02:00"
 
   @conditions [
     "PRE080C02_LIMIT_FOUND_REQUIRES_PRE_H080C_ADJUDICATION",
-    "PRE080C03_NOT_ACCEPTED",
     "PRE_H080C_NOT_REACHED",
     "H080C_NOT_AUTHORIZED"
   ]
@@ -295,7 +294,7 @@ defmodule SymphonyElixir.GovernanceCheckTest do
       assert_has_code(Check.validate(root), :invalid_decision_timestamp)
     end
 
-    test "rejects authority values outside the approved PRE-080C-03 snapshot", %{root: root} do
+    test "rejects authority values outside the accepted PRE-080C-03 snapshot", %{root: root} do
       mutations = [
         {[
            "authority_snapshot",
@@ -308,11 +307,12 @@ defmodule SymphonyElixir.GovernanceCheckTest do
            "tree"
          ], String.duplicate("2", 40)},
         {["authority_snapshot", "current_accepted_phase"], "PRE-080C-03"},
-        {["authority_snapshot", "current_accepted_prerequisite"], "WRONG"},
+        {["authority_snapshot", "current_accepted_prerequisite"], "PRE-080C-02"},
         {["authority_snapshot", "pre_080c_02_outcome"], "NO_LIMIT"},
-        {["authority_snapshot", "currently_authorized_work", "id"], "OTHER"},
-        {["authority_snapshot", "currently_authorized_work", "status"], "AUTHORIZED"},
-        {["authority_snapshot", "currently_authorized_work", "scope"], "OTHER_SCOPE"},
+        {["authority_snapshot", "currently_authorized_work", "id"], "PRE-080C-03"},
+        {["authority_snapshot", "currently_authorized_work", "status"], "AUTHORIZED_ACTIVE_NOT_ACCEPTED"},
+        {["authority_snapshot", "currently_authorized_work", "scope"], "GOVERNANCE_DOCUMENTATION_RECONCILIATION_ONLY"},
+        {["authority_snapshot", "currently_authorized_work", "id"], "POST-PRE080C03-GOV-STATE-SYNC"},
         {["authority_snapshot", "pre_h080c"], "REACHED"},
         {["authority_snapshot", "h_080c"], "AUTHORIZED"},
         {["authority_snapshot", "next_governance_step"], "H-080C"},
@@ -324,6 +324,49 @@ defmodule SymphonyElixir.GovernanceCheckTest do
         write_projection(root, Jason.encode!(projection))
         assert_has_code(Check.validate(root), :authority_snapshot_mismatch)
       end)
+    end
+
+    test "rejects an incomplete no-authorized-work tuple", %{root: root} do
+      projection =
+        put_in(
+          projection_map(),
+          ["authority_snapshot", "currently_authorized_work", "scope"],
+          "GOVERNANCE_DOCUMENTATION_RECONCILIATION_ONLY"
+        )
+
+      write_projection(root, Jason.encode!(projection))
+
+      assert_has_code(Check.validate(root), :authority_snapshot_mismatch)
+    end
+
+    test "rejects the former active PRE-080C-03 work tuple", %{root: root} do
+      projection =
+        put_in(
+          projection_map(),
+          ["authority_snapshot", "currently_authorized_work"],
+          %{
+            "id" => "PRE-080C-03",
+            "status" => "AUTHORIZED_ACTIVE_NOT_ACCEPTED",
+            "scope" => "GOVERNANCE_DOCUMENTATION_RECONCILIATION_ONLY"
+          }
+        )
+
+      write_projection(root, Jason.encode!(projection))
+
+      assert_has_code(Check.validate(root), :authority_snapshot_mismatch)
+    end
+
+    test "rejects PRE080C03_NOT_ACCEPTED after acceptance", %{root: root} do
+      projection =
+        put_in(
+          projection_map(),
+          ["known_unresolved_governance_conditions"],
+          @conditions ++ ["PRE080C03_NOT_ACCEPTED"]
+        )
+
+      write_projection(root, Jason.encode!(projection))
+
+      assert_has_code(Check.validate(root), :authority_snapshot_mismatch)
     end
 
     test "rejects decision metadata outside the approved governance decision", %{root: root} do
@@ -361,6 +404,14 @@ defmodule SymphonyElixir.GovernanceCheckTest do
       write_projection(root, Jason.encode!(projection))
 
       assert_has_code(Check.validate(root), :invalid_gate_state)
+    end
+
+    test "rejects PRE-H080C authorization", %{root: root} do
+      projection = put_in(projection_map(), ["authority_snapshot", "pre_h080c"], "AUTHORIZED")
+
+      write_projection(root, Jason.encode!(projection))
+
+      assert_has_code(Check.validate(root), :authority_snapshot_mismatch)
     end
   end
 
@@ -516,22 +567,90 @@ defmodule SymphonyElixir.GovernanceCheckTest do
   end
 
   describe "freeze mode" do
-    test "requires a candidate phase", %{root: root} do
+    test "accepts the exact decision materialization on a clean descendant", %{root: root} do
       init_git!(root)
 
-      assert_has_code(Check.validate(root, freeze: true), :candidate_phase_required)
+      assert :ok = Check.validate(root, materialization_options())
     end
 
-    test "accepts the exact candidate phase and clean descended baseline", %{root: root} do
-      init_git!(root)
-
-      assert :ok = Check.validate(root, candidate_phase: "PRE-080C-03", freeze: true)
+    test "requires freeze mode for decision materialization", %{root: root} do
+      assert_has_code(
+        Check.validate(root, materialize_decision: @decision_reference),
+        :materialize_decision_requires_freeze
+      )
     end
 
-    test "rejects the wrong candidate phase", %{root: root} do
+    test "requires one selector when freeze mode is enabled", %{root: root} do
+      assert_has_code(Check.validate(root, freeze: true), :freeze_selector_required)
+    end
+
+    test "rejects both freeze selectors together", %{root: root} do
+      assert_has_code(
+        Check.validate(root, freeze: true, candidate_phase: "H-080B", materialize_decision: @decision_reference),
+        :freeze_selector_conflict
+      )
+    end
+
+    test "rejects a materialization decision reference that does not match", %{root: root} do
       init_git!(root)
 
-      assert_has_code(Check.validate(root, candidate_phase: "H-080C", freeze: true), :candidate_phase_mismatch)
+      assert_has_code(
+        Check.validate(root, freeze: true, materialize_decision: "MG-WRONG"),
+        :materialize_decision_mismatch
+      )
+    end
+
+    test "rejects blank materialization decision references", %{root: root} do
+      init_git!(root)
+
+      assert_has_code(
+        Check.validate(root, freeze: true, materialize_decision: " "),
+        :materialize_decision_mismatch
+      )
+    end
+
+    test "rejects materialization when the projection claims active authorized work", %{root: root} do
+      init_git!(root)
+
+      projection =
+        put_in(
+          projection_map(),
+          ["authority_snapshot", "currently_authorized_work"],
+          %{"id" => "PRE-H080C", "status" => "AUTHORIZED", "scope" => "ADJUDICATION"}
+        )
+
+      write_projection(root, Jason.encode!(projection))
+
+      assert_has_code(Check.validate(root, materialization_options()), :materialization_requires_no_authorized_work)
+    end
+
+    test "rejects a synchronization slice claimed as a programme phase", %{root: root} do
+      init_git!(root)
+
+      projection =
+        put_in(
+          projection_map(),
+          ["authority_snapshot", "currently_authorized_work"],
+          %{
+            "id" => "POST-PRE080C03-GOV-STATE-SYNC",
+            "status" => "AUTHORIZED",
+            "scope" => "GOVERNANCE_DOCUMENTATION_RECONCILIATION_ONLY"
+          }
+        )
+
+      write_projection(root, Jason.encode!(projection))
+
+      assert_has_code(Check.validate(root, materialization_options()), :materialization_requires_no_authorized_work)
+    end
+
+    test "rejects candidate-phase freeze against the NONE snapshot", %{root: root} do
+      init_git!(root)
+
+      assert_has_code(Check.validate(root, candidate_phase: "NONE", freeze: true), :candidate_phase_mismatch)
+    end
+
+    test "rejects a candidate phase supplied without freeze mode", %{root: root} do
+      assert_has_code(Check.validate(root, candidate_phase: "PRE-080C-03"), :candidate_phase_requires_freeze)
     end
 
     test "rejects a missing accepted commit", %{root: root} do
@@ -539,16 +658,23 @@ defmodule SymphonyElixir.GovernanceCheckTest do
       projection = put_in(projection_map(), ["authority_snapshot", "accepted_protected_main_at_decision", "sha"], String.duplicate("1", 40))
       write_projection(root, Jason.encode!(projection))
 
-      assert_has_code(Check.validate(root, candidate_phase: "PRE-080C-03", freeze: true), :baseline_commit_missing)
+      assert_has_code(Check.validate(root, materialization_options()), :baseline_commit_missing)
     end
 
     test "rejects a baseline tree mismatch", %{root: root} do
       init_git!(root)
-      projection = Jason.decode!(File.read!(Path.join(root, @projection_path)))
-      projection = put_in(projection, ["authority_snapshot", "accepted_protected_main_at_decision", "tree"], String.duplicate("0", 40))
+      projection = put_in(projection_map(), ["authority_snapshot", "accepted_protected_main_at_decision", "tree"], String.duplicate("0", 40))
       write_projection(root, Jason.encode!(projection))
 
-      assert_has_code(Check.validate(root, candidate_phase: "PRE-080C-03", freeze: true), :baseline_tree_mismatch)
+      assert_has_code(Check.validate(root, materialization_options()), :baseline_tree_mismatch)
+    end
+
+    test "rejects a decision timestamp outside the accepted decision", %{root: root} do
+      init_git!(root)
+      projection = put_in(projection_map(), ["decision", "timestamp"], "2026-10-11T18:03:00+02:00")
+      write_projection(root, Jason.encode!(projection))
+
+      assert_has_code(Check.validate(root, materialization_options()), :authority_snapshot_mismatch)
     end
 
     test "rejects a candidate unrelated to the accepted baseline", %{root: root} do
@@ -558,14 +684,14 @@ defmodule SymphonyElixir.GovernanceCheckTest do
       git!(root, ["add", "."])
       git!(root, ["commit", "-qm", "unrelated"])
 
-      assert_has_code(Check.validate(root, candidate_phase: "PRE-080C-03", freeze: true), :candidate_not_descended)
+      assert_has_code(Check.validate(root, materialization_options()), :candidate_not_descended)
     end
 
     test "rejects a dirty freeze worktree", %{root: root} do
       init_git!(root)
       File.write!(Path.join(root, "dirty.txt"), "dirty")
 
-      assert_has_code(Check.validate(root, candidate_phase: "PRE-080C-03", freeze: true), :dirty_worktree)
+      assert_has_code(Check.validate(root, materialization_options()), :dirty_worktree)
     end
 
     test "rejects an index that differs from candidate HEAD", %{root: root} do
@@ -574,14 +700,14 @@ defmodule SymphonyElixir.GovernanceCheckTest do
       File.write!(path, File.read!(path) <> "\nindex edit\n")
       git!(root, ["add", @roadmap_path])
 
-      assert_has_code(Check.validate(root, candidate_phase: "PRE-080C-03", freeze: true), :dirty_worktree)
+      assert_has_code(Check.validate(root, materialization_options()), :dirty_worktree)
     end
 
     test "rejects a missing tracked worktree file during freeze", %{root: root} do
       init_git!(root)
       File.rm!(Path.join(root, @roadmap_path))
 
-      assert_has_code(Check.validate(root, candidate_phase: "PRE-080C-03", freeze: true), :dirty_worktree)
+      assert_has_code(Check.validate(root, materialization_options()), :dirty_worktree)
     end
 
     test "rejects a symlinked tracked parent during freeze", %{root: root} do
@@ -595,7 +721,7 @@ defmodule SymphonyElixir.GovernanceCheckTest do
       File.rename!(tracked_path, target_path)
       File.ln_s!(target_path, tracked_path)
 
-      assert_has_code(Check.validate(root, candidate_phase: "PRE-080C-03", freeze: true), :dirty_worktree)
+      assert_has_code(Check.validate(root, materialization_options()), :dirty_worktree)
     end
 
     test "rejects tracked edits hidden by assume-unchanged", %{root: root} do
@@ -604,7 +730,14 @@ defmodule SymphonyElixir.GovernanceCheckTest do
       File.write!(path, File.read!(path) <> "\nhidden edit\n")
       git!(root, ["update-index", "--assume-unchanged", @roadmap_path])
 
-      assert_has_code(Check.validate(root, candidate_phase: "PRE-080C-03", freeze: true), :dirty_worktree)
+      assert_has_code(Check.validate(root, materialization_options()), :dirty_worktree)
+    end
+
+    test "rejects skip-worktree index entries", %{root: root} do
+      init_git!(root)
+      git!(root, ["update-index", "--skip-worktree", @roadmap_path])
+
+      assert_has_code(Check.validate(root, materialization_options()), :dirty_worktree)
     end
 
     test "rejects tracked mode changes when core.fileMode is false", %{root: root} do
@@ -613,42 +746,42 @@ defmodule SymphonyElixir.GovernanceCheckTest do
       git!(root, ["config", "core.fileMode", "false"])
       File.chmod!(path, 0o755)
 
-      assert_has_code(Check.validate(root, candidate_phase: "PRE-080C-03", freeze: true), :dirty_worktree)
-    end
-
-    test "rejects a candidate phase supplied without freeze mode", %{root: root} do
-      assert_has_code(Check.validate(root, candidate_phase: "PRE-080C-03"), :candidate_phase_requires_freeze)
+      assert_has_code(Check.validate(root, materialization_options()), :dirty_worktree)
     end
 
     test "rejects a candidate without a HEAD", %{root: root} do
       init_git!(root)
       File.rm!(Path.join(root, ".git/HEAD"))
 
-      assert_has_code(Check.validate(root, candidate_phase: "PRE-080C-03", freeze: true), :candidate_head_missing)
+      assert_has_code(Check.validate(root, materialization_options()), :candidate_head_missing)
     end
 
-    test "rejects a missing tracked immutable tree entry", %{root: root} do
+    test "rejects a missing tracked immutable roadmap tree entry", %{root: root} do
       init_git!(root)
       git!(root, ["rm", "--cached", "-q", @roadmap_path])
       git!(root, ["commit", "-qm", "remove immutable entry"])
 
-      assert_has_code(
-        Check.validate(root, candidate_phase: "PRE-080C-03", freeze: true),
-        :immutable_tree_entry_missing
-      )
+      assert_has_code(Check.validate(root, materialization_options()), :immutable_tree_entry_missing)
     end
 
-    test "rejects a changed tracked immutable tree entry", %{root: root} do
+    test "rejects a changed immutable Master Roadmap tree entry", %{root: root} do
       init_git!(root)
       path = Path.join(root, @roadmap_path)
       File.write!(path, File.read!(path) <> "\nchanged tree entry\n")
       git!(root, ["add", @roadmap_path])
       git!(root, ["commit", "-qm", "change immutable entry"])
 
-      assert_has_code(
-        Check.validate(root, candidate_phase: "PRE-080C-03", freeze: true),
-        :immutable_tree_entry_mismatch
-      )
+      assert_has_code(Check.validate(root, materialization_options()), :immutable_tree_entry_mismatch)
+    end
+
+    test "rejects a changed immutable PRE-080C-02 tree entry", %{root: root} do
+      init_git!(root)
+      path = Path.join(root, @pre_080c_02_path)
+      File.write!(path, File.read!(path) <> "\nchanged tree entry\n")
+      git!(root, ["add", @pre_080c_02_path])
+      git!(root, ["commit", "-qm", "change immutable entry"])
+
+      assert_has_code(Check.validate(root, materialization_options()), :immutable_tree_entry_mismatch)
     end
 
     test "rejects a tracked file replaced by a directory during freeze", %{root: root} do
@@ -657,7 +790,7 @@ defmodule SymphonyElixir.GovernanceCheckTest do
       File.rm!(path)
       File.mkdir!(path)
 
-      assert_has_code(Check.validate(root, candidate_phase: "PRE-080C-03", freeze: true), :dirty_worktree)
+      assert_has_code(Check.validate(root, materialization_options()), :dirty_worktree)
     end
 
     test "rejects a tracked file replaced by a symlink during freeze", %{root: root} do
@@ -666,7 +799,7 @@ defmodule SymphonyElixir.GovernanceCheckTest do
       File.rm!(path)
       File.ln_s!("other-roadmap", path)
 
-      assert_has_code(Check.validate(root, candidate_phase: "PRE-080C-03", freeze: true), :dirty_worktree)
+      assert_has_code(Check.validate(root, materialization_options()), :dirty_worktree)
     end
 
     test "checks tracked symlink content during freeze", %{root: root} do
@@ -676,12 +809,28 @@ defmodule SymphonyElixir.GovernanceCheckTest do
       git!(root, ["add", "tracked-link"])
       git!(root, ["commit", "-qm", "add tracked symlink"])
 
-      assert :ok = Check.validate(root, candidate_phase: "PRE-080C-03", freeze: true)
+      assert :ok = Check.validate(root, materialization_options())
 
       File.rm!(link)
       File.ln_s!("changed-target", link)
 
-      assert_has_code(Check.validate(root, candidate_phase: "PRE-080C-03", freeze: true), :dirty_worktree)
+      assert_has_code(Check.validate(root, materialization_options()), :dirty_worktree)
+    end
+
+    test "rejects PRE-H080C escalation during materialization", %{root: root} do
+      init_git!(root)
+      projection = put_in(projection_map(), ["authority_snapshot", "pre_h080c"], "AUTHORIZED")
+      write_projection(root, Jason.encode!(projection))
+
+      assert_has_code(Check.validate(root, materialization_options()), :authority_snapshot_mismatch)
+    end
+
+    test "rejects H-080C escalation during materialization", %{root: root} do
+      init_git!(root)
+      projection = put_in(projection_map(), ["authority_snapshot", "h_080c"], "AUTHORIZED")
+      write_projection(root, Jason.encode!(projection))
+
+      assert_has_code(Check.validate(root, materialization_options()), :authority_snapshot_mismatch)
     end
   end
 
@@ -1312,6 +1461,30 @@ defmodule SymphonyElixir.GovernanceCheckTest do
         File.cd!(root, fn -> Mix.Tasks.Governance.Check.run(["--candidate-phase", "PRE-080C-03"]) end)
       end
     end
+
+    test "requires freeze mode with a decision materialization selector", %{root: root} do
+      assert_raise Mix.Error, ~r/materialize-decision requires --freeze/, fn ->
+        File.cd!(root, fn -> Mix.Tasks.Governance.Check.run(["--materialize-decision", @decision_reference]) end)
+      end
+    end
+
+    test "rejects both freeze selectors together", %{root: root} do
+      assert_raise Mix.Error, ~r/candidate-phase and --materialize-decision are mutually exclusive/, fn ->
+        File.cd!(root, fn ->
+          Mix.Tasks.Governance.Check.run([
+            "--freeze",
+            "--candidate-phase",
+            "H-080B",
+            "--materialize-decision",
+            @decision_reference
+          ])
+        end)
+      end
+    end
+
+    test "requires a selector for freeze mode", %{root: root} do
+      assert_has_code(Check.validate(root, freeze: true), :freeze_selector_required)
+    end
   end
 
   test "sorts diagnostics deterministically", %{root: root} do
@@ -1331,6 +1504,10 @@ defmodule SymphonyElixir.GovernanceCheckTest do
              end)
   end
 
+  defp materialization_options do
+    [freeze: true, materialize_decision: @decision_reference]
+  end
+
   defp projection_map do
     %{
       "schema_version" => 1,
@@ -1346,12 +1523,12 @@ defmodule SymphonyElixir.GovernanceCheckTest do
           "tree" => @accepted_tree
         },
         "current_accepted_phase" => "H-080B",
-        "current_accepted_prerequisite" => "PRE-080C-02",
+        "current_accepted_prerequisite" => "PRE-080C-03",
         "pre_080c_02_outcome" => "LIMIT_FOUND",
         "currently_authorized_work" => %{
-          "id" => "PRE-080C-03",
-          "status" => "AUTHORIZED_ACTIVE_NOT_ACCEPTED",
-          "scope" => "GOVERNANCE_DOCUMENTATION_RECONCILIATION_ONLY"
+          "id" => "NONE",
+          "status" => "NONE",
+          "scope" => "NONE"
         },
         "pre_h080c" => "NOT_REACHED",
         "h_080c" => "NOT_AUTHORIZED",
@@ -1383,10 +1560,10 @@ defmodule SymphonyElixir.GovernanceCheckTest do
     ACCEPTED_PROTECTED_MAIN_AT_DECISION_SHA=#{accepted_sha}
     ACCEPTED_PROTECTED_MAIN_AT_DECISION_TREE=#{accepted_tree}
     CURRENT_ACCEPTED_PHASE=H-080B
-    CURRENT_ACCEPTED_PREREQUISITE=PRE-080C-02
+    CURRENT_ACCEPTED_PREREQUISITE=PRE-080C-03
     PRE_080C_02_OUTCOME=LIMIT_FOUND
-    CURRENTLY_AUTHORIZED_WORK=PRE-080C-03
-    CURRENTLY_AUTHORIZED_STATUS=AUTHORIZED_ACTIVE_NOT_ACCEPTED
+    CURRENTLY_AUTHORIZED_WORK=NONE
+    CURRENTLY_AUTHORIZED_STATUS=NONE
     PRE_H080C=NOT_REACHED
     H_080C=NOT_AUTHORIZED
     NEXT_GOVERNANCE_STEP=PRE-H080C
