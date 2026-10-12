@@ -8,8 +8,9 @@ This document records candidate evidence for later independent review and Master
 
 ## Authorization and baseline
 
-- Authorization reference: user-provided **PRE-H080C — Bounded Remediation and Gate-Closure Plan** in this thread.
-- Authorization timestamp recorded at execution start: `2026-10-12 13:41:23 UTC`.
+- `MASTER_GOVERNANCE_AUTHORIZATION=MG-2026-10-12-PRE-H080C-REMEDIATION-AUTH-01`.
+- `AUTHORIZATION_TIMESTAMP=2026-10-12T12:33:51+02:00`.
+- `IMPLEMENTATION_START_TIMESTAMP=2026-10-12T13:41:23Z`.
 - Repository: `JCSchoeman96/symphony`.
 - Protected `main` base SHA: `f75c400febbfcbb9b66d017e27d286ff30925e45`.
 - Protected `main` base tree: `6be09bc285c7c8f8356aa9d581a26f3a59ec7531`.
@@ -37,6 +38,21 @@ but not claimed as V1 production-supported.
 ```
 
 This records a support boundary. It adds no production rejection rule.
+
+## PRE-H080C gate answers
+
+These answers record the current candidate's reconciliation evidence. They do not constitute PRE-H080C acceptance or authorize H-080C.
+
+1. **Can the real production path acquire every evidence class needed for V1 lifecycle advancement? YES.** PRE-080C-01 remains accepted and satisfied; its accepted evidence establishes production-path acquisition coverage for the required evidence classes.
+2. **Is the supported project-size and acquisition-latency envelope known? YES.** The supported V1 boundary is at most 1,000 project items and 5,000 dependency edges, with a stable complete epoch at 1,000 items having a production pacing lower bound of at least 17 minutes. Results above that boundary, through 10,000 items, are structural characterization only.
+3. **Can a fresh agent independently identify current authority without relying on stale ledger or README statements? YES.** The machine governance projection still records the last accepted PRE-080C-03 state and no currently authorized programme work; the immutable roadmap and PRE-080C-02 evidence blobs are identified above. This bounded remediation has the separate, exact authorization recorded above. That authorization applies only to this remediation and does not accept PRE-H080C or authorize H-080C.
+4. **Does an unresolved finding require remediation before integrated H-080C testing? NO, based on the reviewed evidence.** The remaining items are classified as follows:
+   - Restart-local pacing history: non-blocking operational debt.
+   - Repeated dirty full epochs: non-blocking operational debt.
+   - Baseline-reproduced epoch-test timeouts and CI nondeterminism: non-blocking reliability debt; the same timeout failures reproduced against the accepted base, while required `make-all` passed on the reviewed candidate checkpoint.
+   - Decimal `2.3.0` advisories: unresolved, separately tracked dependency debt. Current repository review found no Symphony application `Decimal` or `:decimal` usage. Remediation crosses the existing Ecto Decimal 2.x constraint and requires broader, separately authorized dependency work. The advisories are not fixed by this candidate.
+
+These conclusions are bounded to the evidence identified in this document. They do not change any accepted programme status or authorize integrated H-080C testing.
 
 ## Dependency remediation
 
