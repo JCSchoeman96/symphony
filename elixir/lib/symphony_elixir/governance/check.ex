@@ -13,26 +13,22 @@ defmodule SymphonyElixir.Governance.Check do
   @pre_080c_02_path "docs/symphony-hardening-playbook-v4.1/PRE-080C-02_PRODUCTION_RATE_EPOCH_CHARACTERIZATION.md"
   @roadmap_blob "4b0528bdc0647d889b42ebc478081d5b873898fe"
   @pre_080c_02_blob "b69d46676d3286262bf7cab783654c10a08801bf"
-  @accepted_baseline_sha "e0c1592e0fdb678f001a0e5e46e9b17de8a29000"
-  @accepted_baseline_tree "bc9f8a665dd93fc8fe945d070297a3dfb4638d82"
+  @accepted_baseline_sha "81be62410f5ab6c5ac9c7f6aad13e15cd4b8363b"
+  @accepted_baseline_tree "272ac528e83db332060c1b17cc89753021c7cee9"
   @accepted_phase "H-080B"
-  @accepted_prerequisite "PRE-080C-03"
+  @accepted_prerequisite "PRE-H080C"
   @pre_080c_02_outcome "LIMIT_FOUND"
-  @authorized_work_id "NONE"
-  @authorized_work_status "NONE"
-  @authorized_work_scope "NONE"
-  @pre_h080c "NOT_REACHED"
-  @h_080c "NOT_AUTHORIZED"
-  @next_governance_step "PRE-H080C"
+  @authorized_work_id "H-080C"
+  @authorized_work_status "AUTHORIZED_ACTIVE_NOT_ACCEPTED"
+  @authorized_work_scope "Integrated Security / Authority Reverification against the accepted V1 production wiring. One complete issue and one governance candidate."
+  @pre_h080c "ACCEPTED"
+  @h_080c "AUTHORIZED_ACTIVE_NOT_ACCEPTED"
+  @next_governance_step "H-090"
   @next_authorized_phase nil
   @decision_authority "Master Governance"
-  @decision_reference "MG-2026-10-11-PRE-080C-03-ACCEPT-01"
-  @decision_timestamp "2026-10-11T18:02:47+02:00"
-  @unresolved_conditions [
-    "PRE080C02_LIMIT_FOUND_REQUIRES_PRE_H080C_ADJUDICATION",
-    "PRE_H080C_NOT_REACHED",
-    "H080C_NOT_AUTHORIZED"
-  ]
+  @decision_reference "MG-2026-10-12-H080C-AUTH-01"
+  @decision_timestamp "2026-10-12T17:54:02+02:00"
+  @unresolved_conditions ["H080C_NOT_ACCEPTED"]
   @status_begin "<!-- BEGIN SYMPHONY_GOVERNANCE_STATUS_V1 -->"
   @status_end "<!-- END SYMPHONY_GOVERNANCE_STATUS_V1 -->"
   @watcher_relative_path ".codex/skills/land/land_watch.py"
@@ -511,13 +507,13 @@ defmodule SymphonyElixir.Governance.Check do
       diagnostic(
         :authority_snapshot_mismatch,
         "projection.known_unresolved_governance_conditions",
-        "conditions do not match the accepted PRE-080C-03 snapshot"
+        "conditions do not match the accepted governance snapshot"
       )
     )
   end
 
   defp append_exact_diagnostic(diagnostics, actual, expected, path, code) do
-    append_unless(diagnostics, actual == expected, diagnostic(code, path, "value does not match the accepted PRE-080C-03 snapshot"))
+    append_unless(diagnostics, actual == expected, diagnostic(code, path, "value does not match the accepted governance snapshot"))
   end
 
   defp append_gate_diagnostics(diagnostics, projection) do
