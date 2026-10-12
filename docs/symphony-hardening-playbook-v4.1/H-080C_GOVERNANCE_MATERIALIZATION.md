@@ -18,7 +18,7 @@ AUTHORIZED_SCOPE=Integrated Security / Authority Reverification against the acce
 MERGE_AUTHORITY=HUMAN ONLY
 ```
 
-This is the decision represented by [the governance projection](V4_1_GOVERNANCE_PROJECTION.json). The accepted baseline is PR #40's protected-main merge and tree. PRE-H080C is accepted. H-080C is authorized, active, and not accepted. H-090 is the next governance step, and no later phase is authorized.
+This is the decision represented by [the governance projection](V4_1_GOVERNANCE_PROJECTION.json). The accepted baseline is PR #40's protected-main merge and tree. PRE-H080C is accepted. H-080C is authorized, active, and not accepted. `NEXT_GOVERNANCE_STEP=H-090` identifies the next formal V4.1 hardening/governance phase, not the next execution item after H-080C. The accepted execution sequence keeps V1-OPS-01/02/03 after H-080C and before H-090; that sequence does not authorize those workstreams. No later phase is authorized.
 
 ## Authorization to materialize governance state
 

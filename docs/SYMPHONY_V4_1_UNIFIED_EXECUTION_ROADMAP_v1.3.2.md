@@ -16,7 +16,7 @@ ACCEPTED_PROTECTED_MAIN_AT_DECISION_SHA = 81be62410f5ab6c5ac9c7f6aad13e15cd4b836
 ACCEPTED_PROTECTED_MAIN_AT_DECISION_TREE = 272ac528e83db332060c1b17cc89753021c7cee9
 ```
 
-Effective 2026-10-07, H-070B, REM-HI21, H-I20 remediation, H-080A, and H-080B are **ACCEPTED**. PRE-080C-01 was accepted effective 2026-10-09 at merge `09b72591d33fbe88243bceb584f85fca1f6fc819`, tree `a9ff9606f52c429f58c9ab59c4e8fb11a43f73b6`, after protected-main `make-all` run `37904661908` succeeded. PRE-080C-02 is **ACCEPTED / LIMIT_FOUND**. PRE-080C-03 was authorized by decision `MG-2026-10-10-PRE-080C-03-AUTH-01` and later accepted by decision `MG-2026-10-11-PRE-080C-03-ACCEPT-01` at `2026-10-11T18:02:47+02:00`. Master Governance accepted PRE-H080C and authorized H-080C under `MG-2026-10-12-H080C-AUTH-01` at `2026-10-12T17:54:02+02:00`. H-080C is **AUTHORIZED / ACTIVE / NOT ACCEPTED**. H-090 is the next governance step. No later phase is authorized.
+Effective 2026-10-07, H-070B, REM-HI21, H-I20 remediation, H-080A, and H-080B are **ACCEPTED**. PRE-080C-01 was accepted effective 2026-10-09 at merge `09b72591d33fbe88243bceb584f85fca1f6fc819`, tree `a9ff9606f52c429f58c9ab59c4e8fb11a43f73b6`, after protected-main `make-all` run `37904661908` succeeded. PRE-080C-02 is **ACCEPTED / LIMIT_FOUND**. PRE-080C-03 was authorized by decision `MG-2026-10-10-PRE-080C-03-AUTH-01` and later accepted by decision `MG-2026-10-11-PRE-080C-03-ACCEPT-01` at `2026-10-11T18:02:47+02:00`. Master Governance accepted PRE-H080C and authorized H-080C under `MG-2026-10-12-H080C-AUTH-01` at `2026-10-12T17:54:02+02:00`. H-080C is **AUTHORIZED / ACTIVE / NOT ACCEPTED**. `NEXT_GOVERNANCE_STEP=H-090` identifies the next formal V4.1 hardening/governance phase, not the next execution item after H-080C. V1-OPS-01, V1-OPS-02, and V1-OPS-03 remain sequenced after H-080C and before H-090; this sequence does not authorize those workstreams. No later phase is authorized.
 
 PR #35 remains an accepted non-phase baseline remediation at `84a2fbfdaece47d5dd87ca37c2e25e85afe39880` / tree `799ef67d3c4124e76f37b4e31251b9c974695455`, verified by protected-main `make-all` run `37931419995`. That historical fact does not replace the PR #37 baseline for PRE-080C-02 acceptance or PR #38's baseline for PRE-080C-03 acceptance.
 
@@ -502,7 +502,14 @@ PRE-H080C RECONCILIATION GATE — ACCEPTED effective 2026-10-12
               ↓
 H-080C — AUTHORIZED / ACTIVE / NOT ACCEPTED
               ↓
-H-090 — next governance step; not authorized
+        ┌──────────┼──────────┐
+        ↓          ↓          ↓
+   V1-OPS-01   V1-OPS-02   V1-OPS-03
+   Observability Ledger DR   Operator
+   / Readiness  & Rotation   Resolution
+        └──────────┼──────────┘
+                   ↓
+                 H-090
        Orchestrator Structural Review
        / Refactor only if justified
                    ↓
@@ -606,7 +613,7 @@ PRE-H080C ACCEPTED — effective 2026-10-12
 H-080C AUTHORIZED / ACTIVE / NOT ACCEPTED
 ```
 
-PRE-080C-01 and PRE-080C-02 are accepted. PRE-080C-02 outcome is `LIMIT_FOUND`. PRE-080C-03 is accepted effective 2026-10-11. Master Governance accepted PRE-H080C and authorized H-080C under `MG-2026-10-12-H080C-AUTH-01`. The scope is Integrated Security / Authority Reverification against the accepted V1 production wiring, one complete issue and one governance candidate. H-080C has not been accepted, and H-090 is the next governance step.
+PRE-080C-01 and PRE-080C-02 are accepted. PRE-080C-02 outcome is `LIMIT_FOUND`. PRE-080C-03 is accepted effective 2026-10-11. Master Governance accepted PRE-H080C and authorized H-080C under `MG-2026-10-12-H080C-AUTH-01`. The scope is Integrated Security / Authority Reverification against the accepted V1 production wiring, one complete issue and one governance candidate. H-080C has not been accepted. `NEXT_GOVERNANCE_STEP=H-090` identifies the next formal V4.1 hardening/governance phase; it does not make H-090 the next execution item after H-080C. V1-OPS-01, V1-OPS-02, and V1-OPS-03 remain sequenced after H-080C and before H-090, and this sequence does not authorize them.
 
 ---
 
@@ -1412,7 +1419,7 @@ CURRENT PREREQUISITE STATE
 NOW
 5. H-080C is AUTHORIZED / ACTIVE / NOT ACCEPTED under `MG-2026-10-12-H080C-AUTH-01`.
 6. Its authorized scope is Integrated Security / Authority Reverification against the accepted V1 production wiring, one complete issue and one governance candidate.
-7. H-090 is the next governance step. No later phase is authorized.
+7. `NEXT_GOVERNANCE_STEP=H-090` identifies the next formal V4.1 hardening/governance phase. V1-OPS-01/02/03 remain sequenced after H-080C and before H-090, and are not authorized by that sequence or the H-080C decision. No later phase is authorized.
 
 H-080C ACCEPTANCE
 8. H-080C has no accepted merge identity. Authorization does not establish implementation completion or acceptance.
@@ -1421,6 +1428,8 @@ AFTER H-080C
 9.  V1-OPS-01 — Observability / Readiness
 10. V1-OPS-02 — Durable Safety-State Recovery
 11. V1-OPS-03 — Operator Suspension Resolution
+
+These V1-OPS workstreams remain sequenced after H-080C and before H-090. Their placement in this execution sequence does not authorize them; each requires its own authorization.
 
 THEN
 12. H-090 — Structural Review / Bounded Refactor if justified

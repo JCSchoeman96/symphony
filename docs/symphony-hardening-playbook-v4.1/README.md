@@ -29,7 +29,7 @@ PRE-H080C = ACCEPTED
 H-080C = AUTHORIZED / ACTIVE / NOT ACCEPTED
 ```
 
-PR #40's merge at `81be62410f5ab6c5ac9c7f6aad13e15cd4b8363b` / tree `272ac528e83db332060c1b17cc89753021c7cee9` is the accepted baseline for the PRE-H080C acceptance and H-080C authorization decision. Master Governance accepted PRE-H080C and authorized H-080C under `MG-2026-10-12-H080C-AUTH-01`. H-080C is active and not accepted. See the [materialization record](H-080C_GOVERNANCE_MATERIALIZATION.md) for the exact scope and authority boundary.
+PR #40's merge at `81be62410f5ab6c5ac9c7f6aad13e15cd4b8363b` / tree `272ac528e83db332060c1b17cc89753021c7cee9` is the accepted baseline for the PRE-H080C acceptance and H-080C authorization decision. Master Governance accepted PRE-H080C and authorized H-080C under `MG-2026-10-12-H080C-AUTH-01`. H-080C is active and not accepted. `NEXT_GOVERNANCE_STEP=H-090` names the next formal V4.1 hardening/governance phase, not the next execution item after H-080C. V1-OPS-01/02/03 remain sequenced after H-080C and before H-090; this sequence does not authorize those workstreams. See the [materialization record](H-080C_GOVERNANCE_MATERIALIZATION.md) for the exact scope and authority boundary.
 
 The H-070B, REM-HI21, H-I20 remediation, H-080A, and H-080B acceptance states above are current decisions effective 2026-10-07. They are not backdated to the historical merge events. PRE-080C-01 was accepted effective 2026-10-09 after Master Governance adjudication, merge `09b72591d33fbe88243bceb584f85fca1f6fc819`, and successful protected-main `make-all` run `37904661908`.
 
