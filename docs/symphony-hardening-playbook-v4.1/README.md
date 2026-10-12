@@ -8,6 +8,7 @@ This directory contains the accepted V4.1 future-roadmap authority, the current 
 - [Hardening status ledger](HARDENING_STATUS_LEDGER.md) is the concise current phase and authorization index.
 - [Governance projection](V4_1_GOVERNANCE_PROJECTION.json) is a derivative machine snapshot of accepted human governance.
 - [PRE-080C-03 reconciliation](PRE-080C-03_GOVERNANCE_RECONCILIATION.md) preserves its candidate-era record and the post-acceptance reconciliation.
+- [H-080C governance materialization](H-080C_GOVERNANCE_MATERIALIZATION.md) records the PRE-H080C acceptance, the separate H-080C authorization, and their distinct authority references.
 - [Historical governance reconciliation](GOVERNANCE_RECONCILIATION.md) records the reconstructed V4.1-000 through H-060A history, its evidence sources, and provenance gaps.
 - [2026-10-05 governance reconciliation](GOVERNANCE_RECONCILIATION_2026-10-05.md) reconciles H-070B through H-080B against exact Git/CI facts and preserves the 2026-10-07 Master Governance adjudication that establishes their current formal acceptance states.
 - [V3 accepted authority index](V3_ACCEPTED_AUTHORITY.md) links the immutable accepted H-010, H-020, and H-030 authority.
@@ -18,17 +19,17 @@ This directory contains the accepted V4.1 future-roadmap authority, the current 
 
 ```text
 LATEST_ACCEPTED_V4.1_PHASE = H-080B
-LATEST_ACCEPTED_PREREQUISITE = PRE-080C-03
-ACCEPTED_PROTECTED_MAIN_AT_DECISION_SHA = e0c1592e0fdb678f001a0e5e46e9b17de8a29000
-ACCEPTED_PROTECTED_MAIN_AT_DECISION_TREE = bc9f8a665dd93fc8fe945d070297a3dfb4638d82
+LATEST_ACCEPTED_PREREQUISITE = PRE-H080C
+ACCEPTED_PROTECTED_MAIN_AT_DECISION_SHA = 81be62410f5ab6c5ac9c7f6aad13e15cd4b8363b
+ACCEPTED_PROTECTED_MAIN_AT_DECISION_TREE = 272ac528e83db332060c1b17cc89753021c7cee9
 PRE-080C-01 = ACCEPTED effective 2026-10-09
 PRE-080C-02 = ACCEPTED; outcome LIMIT_FOUND
 PRE-080C-03 = ACCEPTED effective 2026-10-11
-PRE-H080C = NOT REACHED
-H-080C = NOT AUTHORIZED
+PRE-H080C = ACCEPTED
+H-080C = AUTHORIZED / ACTIVE / NOT ACCEPTED
 ```
 
-The accepted protected-main baseline for PRE-080C-03 is PR #38's merge at `e0c1592e0fdb678f001a0e5e46e9b17de8a29000` / tree `bc9f8a665dd93fc8fe945d070297a3dfb4638d82`. Master Governance accepted PRE-080C-03 effective 2026-10-11. PRE-H080C remains **NOT REACHED** and is the next governance step, not authorized implementation. H-080C remains **NOT AUTHORIZED**. No next programme phase or programme implementation is currently authorized.
+PR #40's merge at `81be62410f5ab6c5ac9c7f6aad13e15cd4b8363b` / tree `272ac528e83db332060c1b17cc89753021c7cee9` is the accepted baseline for the PRE-H080C acceptance and H-080C authorization decision. Master Governance accepted PRE-H080C and authorized H-080C under `MG-2026-10-12-H080C-AUTH-01`. H-080C is active and not accepted. `NEXT_GOVERNANCE_STEP=H-090` names the next formal V4.1 hardening/governance phase, not the next execution item after H-080C. V1-OPS-01/02/03 remain sequenced after H-080C and before H-090; this sequence does not authorize those workstreams. See the [materialization record](H-080C_GOVERNANCE_MATERIALIZATION.md) for the exact scope and authority boundary.
 
 The H-070B, REM-HI21, H-I20 remediation, H-080A, and H-080B acceptance states above are current decisions effective 2026-10-07. They are not backdated to the historical merge events. PRE-080C-01 was accepted effective 2026-10-09 after Master Governance adjudication, merge `09b72591d33fbe88243bceb584f85fca1f6fc819`, and successful protected-main `make-all` run `37904661908`.
 
@@ -54,19 +55,19 @@ GOVERNANCE_PROJECTION_PATH=docs/symphony-hardening-playbook-v4.1/V4_1_GOVERNANCE
 GOVERNING_ROADMAP_ID=docs/symphony-hardening-playbook-v4.1/V4_1_MASTER_ROADMAP.md
 GOVERNING_ROADMAP_VERSION=V4.1
 GOVERNING_ROADMAP_BLOB_SHA=4b0528bdc0647d889b42ebc478081d5b873898fe
-ACCEPTED_PROTECTED_MAIN_AT_DECISION_SHA=e0c1592e0fdb678f001a0e5e46e9b17de8a29000
-ACCEPTED_PROTECTED_MAIN_AT_DECISION_TREE=bc9f8a665dd93fc8fe945d070297a3dfb4638d82
+ACCEPTED_PROTECTED_MAIN_AT_DECISION_SHA=81be62410f5ab6c5ac9c7f6aad13e15cd4b8363b
+ACCEPTED_PROTECTED_MAIN_AT_DECISION_TREE=272ac528e83db332060c1b17cc89753021c7cee9
 CURRENT_ACCEPTED_PHASE=H-080B
-CURRENT_ACCEPTED_PREREQUISITE=PRE-080C-03
+CURRENT_ACCEPTED_PREREQUISITE=PRE-H080C
 PRE_080C_02_OUTCOME=LIMIT_FOUND
-CURRENTLY_AUTHORIZED_WORK=NONE
-CURRENTLY_AUTHORIZED_STATUS=NONE
-PRE_H080C=NOT_REACHED
-H_080C=NOT_AUTHORIZED
-NEXT_GOVERNANCE_STEP=PRE-H080C
+CURRENTLY_AUTHORIZED_WORK=H-080C
+CURRENTLY_AUTHORIZED_STATUS=AUTHORIZED_ACTIVE_NOT_ACCEPTED
+PRE_H080C=ACCEPTED
+H_080C=AUTHORIZED_ACTIVE_NOT_ACCEPTED
+NEXT_GOVERNANCE_STEP=H-090
 NEXT_AUTHORIZED_PHASE=NONE
 DECISION_AUTHORITY=Master Governance
-DECISION_REFERENCE=MG-2026-10-11-PRE-080C-03-ACCEPT-01
-DECISION_TIMESTAMP=2026-10-11T18:02:47+02:00
-KNOWN_UNRESOLVED_GOVERNANCE_CONDITIONS=PRE080C02_LIMIT_FOUND_REQUIRES_PRE_H080C_ADJUDICATION,PRE_H080C_NOT_REACHED,H080C_NOT_AUTHORIZED
+DECISION_REFERENCE=MG-2026-10-12-H080C-AUTH-01
+DECISION_TIMESTAMP=2026-10-12T17:54:02+02:00
+KNOWN_UNRESOLVED_GOVERNANCE_CONDITIONS=H080C_NOT_ACCEPTED
 <!-- END SYMPHONY_GOVERNANCE_STATUS_V1 -->
