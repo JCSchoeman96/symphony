@@ -37,4 +37,4 @@ This prerequisite changes the derivative governance projection, its fail-closed 
 
 The `--materialize-decision` freeze selector remains limited to a projection with `NONE / NONE / NONE` authorized work. Since this projection records active H-080C work, that selector must fail. The normal H-080C candidate freeze uses `mix governance.check --freeze --candidate-phase H-080C`.
 
-H-080C remains `AUTHORIZED / ACTIVE / NOT ACCEPTED` until its own implementation, independent review, human merge, post-merge verification, and Master Governance acceptance are complete. Only then may a fresh H-080C Planner use the new accepted protected-main SHA and tree.
+H-080C remains `AUTHORIZED / ACTIVE / NOT ACCEPTED` until its own implementation, independent review, human merge, post-merge verification, and Master Governance acceptance are complete. After this governance-materialization prerequisite is human-merged and its post-merge closure is verified, Master Governance must provide the new accepted protected-main SHA and tree. A fresh H-080C Planner must then use that baseline before H-080C implementation proceeds.
