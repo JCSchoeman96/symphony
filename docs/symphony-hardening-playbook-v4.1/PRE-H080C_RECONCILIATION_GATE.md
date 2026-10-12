@@ -88,7 +88,14 @@ Focused regressions also passed: `extensions_test.exs` with `plane_webhook_test.
 
 An additional direct run of `orchestrator_plane_epoch_test.exs` reported 3 timeouts in 71 tests. The same three tests failed when run against the authorized base with its original lockfile, and one failed again when run alone on the candidate. The full `make -C elixir all` passed afterward. Keep this baseline-reproduced test issue visible for review; it is not counted as a passing focused run or silently waived.
 
-GitHub required-check evidence on the frozen PR head: pending. Record each check conclusion, run ID, and tested commit SHA before handoff.
+GitHub required-check evidence for the frozen implementation candidate checkpoint `21e395964e16baf55d9947a9e259074064e1a7ed`, tree `44e1eb50fe9dfdda40689978a440468113f0e25e`:
+
+| Required check | Conclusion | App ID | Workflow run | Check/job ID |
+| --- | --- | --- | --- | --- |
+| `make-all` | success | 15368 | `38261321921` | `114854303373` |
+| `validate-pr-description` | success | 15368 | `38261321919` | `114852254713` |
+
+Both checks tested the SHA above. The final PR head and its fresh required-check evidence are recorded in the PR description after this evidence commit, since recording a new source document changes the PR head identity.
 
 ## Governance state
 
