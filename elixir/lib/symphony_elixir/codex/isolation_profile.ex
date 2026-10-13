@@ -10,7 +10,7 @@ defmodule SymphonyElixir.Codex.IsolationProfile do
     XDG_CONFIG_HOME XDG_STATE_HOME XDG_CACHE_HOME GIT_CONFIG_NOSYSTEM LC_*
   )
 
-  @supported_codex_version "codex-cli 0.159.3"
+  @supported_codex_version "codex-cli 0.162.1"
 
   @credential_environment ~w(
     PLANE_API_KEY PLANE_WEBHOOK_SECRET GITHUB_TOKEN GH_TOKEN
