@@ -3,6 +3,7 @@ defmodule SymphonyElixir.SourceControl do
   Provider-neutral source-control authority seam for H-050C.
   """
 
+  alias SymphonyElixir.AgentRuntime.Route
   alias SymphonyElixir.Config
   alias SymphonyElixir.CredentialBoundary
   alias SymphonyElixir.GitHub.SourceControl, as: GitHubSourceControl
@@ -37,6 +38,23 @@ defmodule SymphonyElixir.SourceControl do
   @merge_authorization_transition {:ready_to_merge, :merging}
   @completion_transition {:merging, :done}
   @candidate_bound_evidence_names [:candidate_state_verified, :review_acceptance_verified]
+  @review_provenance_schema_version 1
+  @review_provenance_fields [
+    :schema_version,
+    :work_item_id,
+    :provider_project_fingerprint,
+    :workspace_id,
+    :project_id,
+    :candidate_ref,
+    :candidate_tree_sha,
+    :policy_fingerprint,
+    :semantic_attestation_fingerprint,
+    :review_responsibility,
+    :review_runtime_attempt_fingerprint,
+    :review_runtime_profile,
+    :review_lineage_generation,
+    :review_attested_at
+  ]
 
   @spec capabilities() :: [atom()]
   def capabilities, do: @capabilities
@@ -54,6 +72,21 @@ defmodule SymphonyElixir.SourceControl do
   end
 
   def valid_completion_proof_signature?(_proof), do: false
+
+  @doc false
+  @spec valid_review_provenance?(term()) :: boolean()
+  def valid_review_provenance?(%{} = provenance) do
+    with :ok <- validate_review_provenance_structure(provenance),
+         {:ok, key} <- review_provenance_signing_key(),
+         {:ok, supplied} <- decode_review_provenance_signature(Map.get(provenance, :signature)) do
+      expected = :crypto.mac(:hmac, :sha256, key, review_provenance_payload(provenance))
+      :crypto.hash_equals(supplied, expected)
+    else
+      _failure -> false
+    end
+  end
+
+  def valid_review_provenance?(_provenance), do: false
 
   @spec configured?() :: boolean()
   def configured? do
@@ -134,16 +167,17 @@ defmodule SymphonyElixir.SourceControl do
          true <- GuardClass.valid_evidence?(evidence),
          true <- Map.has_key?(evidence, :outcome),
          policy_fingerprint when is_binary(policy_fingerprint) <- Map.get(evidence, :policy_fingerprint),
-         true <- String.trim(policy_fingerprint) != "" do
-      {:ok,
-       %{
-         class: :mechanical_guard,
-         name: name,
-         outcome: Map.get(evidence, :outcome),
-         candidate_ref: encode_candidate_ref(candidate_ref),
-         candidate_tree_sha: candidate_tree_sha,
-         policy_fingerprint: policy_fingerprint
-       }}
+         true <- String.trim(policy_fingerprint) != "",
+         durable <- %{
+           class: :mechanical_guard,
+           name: name,
+           outcome: Map.get(evidence, :outcome),
+           candidate_ref: encode_candidate_ref(candidate_ref),
+           candidate_tree_sha: candidate_tree_sha,
+           policy_fingerprint: policy_fingerprint
+         },
+         {:ok, durable} <- add_durable_review_provenance(name, evidence, durable) do
+      {:ok, durable}
     else
       _invalid_candidate_evidence -> :drop
     end
@@ -305,46 +339,60 @@ defmodule SymphonyElixir.SourceControl do
   end
 
   defp enrich_review_acceptance(intent, context, evidence) do
-    case settings_config(github_opts(context)) do
-      {:error, reason} ->
-        {:error, {:source_control, reason}}
+    with {:ok, config} <- settings_config(github_opts(context)),
+         {:ok, candidate_evidence} <- find_candidate_state_evidence(context_evidence(context, intent)),
+         {:ok, candidate_ref} <- decode_candidate_ref(candidate_evidence),
+         :ok <- GitHubSourceControl.validate_candidate_ref_binding(config, candidate_ref),
+         {:ok, settings} <- settings_for_opts(github_opts(context)),
+         :ok <- validate_policy_fingerprint(candidate_evidence, config, settings),
+         {:ok, candidate_tree_sha} <-
+           GitHubSourceControl.verify_candidate_unchanged(config, candidate_ref, github_opts(context)),
+         true <- candidate_tree_sha == Map.get(candidate_evidence, :candidate_tree_sha),
+         :ok <-
+           GitHubSourceControl.verify_required_checks(
+             config,
+             candidate_ref,
+             candidate_tree_sha,
+             github_opts(context)
+           ) do
+      fingerprint = policy_fingerprint_for(config, settings)
 
-      {:ok, config} ->
-        with {:ok, candidate_evidence} <- find_candidate_state_evidence(context_evidence(context, intent)),
-             {:ok, candidate_ref} <- decode_candidate_ref(candidate_evidence),
-             :ok <- GitHubSourceControl.validate_candidate_ref_binding(config, candidate_ref),
-             {:ok, settings} <- settings_for_opts(github_opts(context)),
-             :ok <- validate_policy_fingerprint(candidate_evidence, config, settings),
-             {:ok, candidate_tree_sha} <-
-               GitHubSourceControl.verify_candidate_unchanged(config, candidate_ref, github_opts(context)),
-             :ok <-
-               GitHubSourceControl.verify_required_checks(
-                 config,
-                 candidate_ref,
-                 candidate_tree_sha,
-                 github_opts(context)
-               ) do
-          fingerprint = policy_fingerprint_for(config, settings)
+      issue_review_acceptance(
+        intent,
+        context,
+        evidence,
+        candidate_ref,
+        candidate_tree_sha,
+        fingerprint
+      )
+    else
+      {:error, reason} -> {:error, {:source_control, reason}}
+      false -> {:error, {:source_control, :candidate_tree_mismatch}}
+    end
+  end
 
-          {:ok,
-           evidence ++
-             [
-               review_acceptance_evidence(
-                 :verified,
-                 candidate_ref,
-                 candidate_tree_sha,
-                 fingerprint,
-                 CandidateVerification.new(%{
-                   status: :verified,
-                   candidate_ref: candidate_ref,
-                   candidate_tree_sha: candidate_tree_sha,
-                   policy_fingerprint: fingerprint
-                 })
-               )
-             ]}
-        else
-          {:error, reason} -> {:error, {:source_control, reason}}
-        end
+  defp issue_review_acceptance(intent, context, evidence, candidate_ref, candidate_tree_sha, fingerprint) do
+    with {:ok, provenance} <-
+           issue_review_provenance(intent, context, evidence, candidate_ref, candidate_tree_sha, fingerprint) do
+      verification =
+        CandidateVerification.new(%{
+          status: :verified,
+          candidate_ref: candidate_ref,
+          candidate_tree_sha: candidate_tree_sha,
+          policy_fingerprint: fingerprint
+        })
+
+      review =
+        review_acceptance_evidence(
+          :verified,
+          candidate_ref,
+          candidate_tree_sha,
+          fingerprint,
+          verification,
+          provenance
+        )
+
+      {:ok, evidence ++ [review]}
     end
   end
 
@@ -354,8 +402,9 @@ defmodule SymphonyElixir.SourceControl do
     with {:ok, config} <- settings_config(opts),
          {:ok, settings} <- settings_for_opts(opts),
          {:ok, binding} <- completion_binding(intent, context),
-         {:ok, {source_evidence, review_attestation}} <-
+         {:ok, {source_evidence, review_attestation, provenance}} <-
            merge_authorization_source_evidence(context, intent, evidence),
+         :ok <- validate_review_provenance_binding(provenance, source_evidence, binding, config, settings),
          {:ok, candidate_ref} <- decode_candidate_ref(source_evidence),
          :ok <- GitHubSourceControl.validate_candidate_ref_binding(config, candidate_ref),
          :ok <- validate_policy_fingerprint(source_evidence, config, settings),
@@ -371,17 +420,15 @@ defmodule SymphonyElixir.SourceControl do
              candidate_tree_sha: candidate_tree_sha,
              policy_fingerprint: policy_fingerprint
            }),
-         {:ok, unsigned_proof} <-
-           CompletionProof.new_merge_authorized(
-             Map.merge(binding, %{
-               candidate_ref: candidate_ref,
-               candidate_tree_sha: candidate_tree_sha,
-               policy_fingerprint: policy_fingerprint,
-               review_acceptance_evidence: source_evidence,
-               review_attestation: review_attestation,
-               candidate_verification: candidate_verification
-             })
-           ),
+         proof_attrs <-
+           Map.merge(binding, %{
+             candidate_ref: candidate_ref,
+             candidate_tree_sha: candidate_tree_sha,
+             policy_fingerprint: policy_fingerprint,
+             review_acceptance_evidence: source_evidence,
+             candidate_verification: candidate_verification
+           }),
+         {:ok, unsigned_proof} <- new_merge_authorized_proof(proof_attrs, provenance, review_attestation),
          {:ok, proof} <- sign_completion_proof(unsigned_proof) do
       {:ok, evidence ++ [proof]}
     else
@@ -470,12 +517,46 @@ defmodule SymphonyElixir.SourceControl do
     source_evidence = context_evidence(context, intent)
 
     with {:ok, review} <- extract_review_acceptance_evidence(source_evidence),
-         {:ok, attestation} <- review_attestation(evidence ++ source_evidence, intent.work_item_id),
-         true <- attestation.name == :review_accepted,
-         %{outcome: :verified} <- review do
-      {:ok, {review, attestation}}
+         %{outcome: :verified} <- review,
+         {:ok, provenance} <- review_provenance_from_evidence(review),
+         {:ok, attestation} <-
+           optional_review_attestation(evidence ++ source_evidence, intent.work_item_id, provenance) do
+      {:ok, {review, attestation, provenance}}
     else
       _failure -> {:error, :verified_review_acceptance_required}
+    end
+  end
+
+  defp new_merge_authorized_proof(attrs, provenance, nil),
+    do: CompletionProof.new_merge_authorized_from_review_provenance(attrs, provenance)
+
+  defp new_merge_authorized_proof(attrs, provenance, attestation) do
+    CompletionProof.new_merge_authorized_from_review_provenance(
+      Map.put(attrs, :review_attestation, attestation),
+      provenance
+    )
+  end
+
+  defp optional_review_attestation(evidence, work_item_id, provenance) do
+    attestations =
+      normalize_evidence(evidence)
+      |> Enum.filter(&match?(%{class: :semantic_attestation, name: :review_accepted}, &1))
+      |> Enum.uniq_by(&fingerprint_term/1)
+
+    case attestations do
+      [] ->
+        {:ok, nil}
+
+      [attestation] ->
+        with {:ok, attestation} <- review_attestation([attestation], work_item_id),
+             true <- review_attestation_matches_provenance?(attestation, provenance) do
+          {:ok, attestation}
+        else
+          _invalid -> {:error, :review_attestation_mismatch}
+        end
+
+      _multiple ->
+        {:error, :review_attestation_mismatch}
     end
   end
 
@@ -529,7 +610,14 @@ defmodule SymphonyElixir.SourceControl do
     }
   end
 
-  defp review_acceptance_evidence(outcome, candidate_ref, candidate_tree_sha, policy_fingerprint, verification) do
+  defp review_acceptance_evidence(
+         outcome,
+         candidate_ref,
+         candidate_tree_sha,
+         policy_fingerprint,
+         verification,
+         provenance
+       ) do
     %{
       class: :mechanical_guard,
       name: :review_acceptance_verified,
@@ -537,8 +625,199 @@ defmodule SymphonyElixir.SourceControl do
       candidate_ref: encode_candidate_ref(candidate_ref),
       candidate_tree_sha: candidate_tree_sha,
       policy_fingerprint: policy_fingerprint,
-      verification: verification
+      verification: verification,
+      review_provenance: provenance
     }
+  end
+
+  defp issue_review_provenance(intent, context, evidence, candidate_ref, candidate_tree_sha, policy_fingerprint) do
+    with {:ok, attestation} <- review_attestation(evidence ++ context_evidence(context, intent), intent.work_item_id),
+         {:ok, contract, observation} <- review_provider_binding(context, intent.work_item_id),
+         {:ok, runtime_identity} <- review_runtime_identity(intent, context, attestation),
+         {:ok, key} <- review_provenance_signing_key() do
+      provenance = %{
+        schema_version: @review_provenance_schema_version,
+        work_item_id: intent.work_item_id,
+        provider_project_fingerprint: ProviderProjectContract.fingerprint(contract),
+        workspace_id: observation.workspace_id,
+        project_id: observation.project_id,
+        candidate_ref: encode_candidate_ref(candidate_ref),
+        candidate_tree_sha: candidate_tree_sha,
+        policy_fingerprint: policy_fingerprint,
+        semantic_attestation_fingerprint: fingerprint_term(attestation),
+        review_responsibility: :review,
+        review_runtime_attempt_fingerprint: fingerprint_term(runtime_identity),
+        review_runtime_profile: runtime_identity.runtime_profile,
+        review_lineage_generation: attestation.lineage_generation,
+        review_attested_at: attestation.timestamp
+      }
+
+      signature = :crypto.mac(:hmac, :sha256, key, review_provenance_payload(provenance))
+      signed_provenance = Map.put(provenance, :signature, "sha256:" <> Base.encode16(signature, case: :lower))
+
+      if valid_review_provenance?(signed_provenance),
+        do: {:ok, signed_provenance},
+        else: {:error, :invalid_review_provenance}
+    end
+  end
+
+  defp review_provider_binding(context, work_item_id) do
+    contract = Map.get(context, :provider_project_contract)
+    observation = Map.get(context, :provider_observation)
+
+    case {contract, observation} do
+      {%ProviderProjectContract{} = contract, %ProviderObservation{} = observation} ->
+        validate_review_provider_binding(contract, observation, work_item_id)
+
+      _missing ->
+        {:error, :provider_project_contract_required}
+    end
+  end
+
+  defp validate_review_provider_binding(contract, observation, work_item_id) do
+    cond do
+      contract.provider != :plane or observation.provider != :plane or observation.presence != :present ->
+        {:error, :provider_observation_mismatch}
+
+      observation.work_item_id != work_item_id ->
+        {:error, :provider_work_item_mismatch}
+
+      observation.workspace_id != contract.workspace_id or observation.project_id != contract.project_id ->
+        {:error, :provider_project_mismatch}
+
+      not ProviderObservation.valid_tracker_read?(observation) ->
+        {:error, :provider_observation_untrusted}
+
+      true ->
+        {:ok, contract, observation}
+    end
+  end
+
+  defp review_runtime_identity(intent, context, attestation) do
+    route = Map.get(context, :route) || Map.get(context, :trusted_route)
+    runtime_attempt_id = Map.get(context, :runtime_attempt_id) || intent.runtime_attempt_id
+    lineage_generation = Map.get(context, :lineage_generation) || intent.lineage_generation
+
+    runtime_profile =
+      Map.get(context, :runtime_profile) ||
+        case route do
+          %Route{profile_name: profile_name} -> profile_name
+          _missing -> nil
+        end
+
+    with true <- review_responsibility?(intent.responsibility),
+         true <- review_responsibility?(Map.get(context, :responsibility, intent.responsibility)),
+         :ok <- validate_review_runtime_route(route, intent, context),
+         true <- runtime_attempt_id == intent.runtime_attempt_id,
+         true <- lineage_generation == intent.lineage_generation,
+         true <- is_nil(route) or runtime_profile == route.profile_name,
+         true <- runtime_attempt_id == attestation.runtime_attempt_id,
+         true <- lineage_generation == attestation.lineage_generation,
+         true <- review_responsibility?(attestation.responsibility) do
+      {:ok,
+       %{
+         runtime_attempt_id: runtime_attempt_id,
+         work_item_id: intent.work_item_id,
+         lineage_generation: lineage_generation,
+         responsibility: "review",
+         runtime_profile: runtime_profile
+       }}
+    else
+      _mismatch -> {:error, :review_runtime_attempt_mismatch}
+    end
+  end
+
+  defp validate_review_runtime_route(nil, _intent, context) do
+    if is_nil(Map.get(context, :route)) and is_nil(Map.get(context, :trusted_route)),
+      do: :ok,
+      else: {:error, :review_runtime_attempt_mismatch}
+  end
+
+  defp validate_review_runtime_route(%Route{} = route, intent, context) do
+    with true <- intent.work_item_id == route.issue_id,
+         true <- route.responsibility == "review",
+         {:ok, :in_review} <- WorkflowLifecycle.parse(route.starting_state),
+         true <- route.fingerprint == Route.fingerprint(route),
+         true <- route.starting_state_fingerprint == Route.starting_state_fingerprint(route),
+         true <- is_nil(Map.get(context, :runtime_profile)) or Map.get(context, :runtime_profile) == route.profile_name,
+         true <- is_nil(Map.get(context, :route_fingerprint)) or Map.get(context, :route_fingerprint) == route.fingerprint do
+      :ok
+    else
+      _mismatch -> {:error, :review_runtime_attempt_mismatch}
+    end
+  end
+
+  defp validate_review_runtime_route(_route, _intent, _context),
+    do: {:error, :review_runtime_attempt_mismatch}
+
+  defp review_provenance_from_evidence(%{review_provenance: provenance}) do
+    if valid_review_provenance?(provenance), do: {:ok, provenance}, else: {:error, :review_provenance_invalid}
+  end
+
+  defp review_provenance_from_evidence(_evidence), do: {:error, :review_provenance_missing}
+
+  defp validate_review_provenance_binding(provenance, review, binding, config, settings) do
+    with true <- valid_review_provenance?(provenance),
+         {:ok, provenance_candidate_ref} <- decode_candidate_ref(%{candidate_ref: provenance.candidate_ref}),
+         {:ok, review_candidate_ref} <- decode_candidate_ref(review),
+         true <- provenance.work_item_id == binding.work_item_id,
+         true <- provenance.provider_project_fingerprint == binding.provider_project_fingerprint,
+         true <- provenance.workspace_id == binding.workspace_id,
+         true <- provenance.project_id == binding.project_id,
+         true <- CandidateRef.equal?(provenance_candidate_ref, review_candidate_ref),
+         true <- provenance.candidate_tree_sha == Map.get(review, :candidate_tree_sha),
+         true <- provenance.policy_fingerprint == Map.get(review, :policy_fingerprint),
+         true <- provenance.policy_fingerprint == policy_fingerprint_for(config, settings),
+         :ok <- GitHubSourceControl.validate_candidate_ref_binding(config, provenance_candidate_ref) do
+      :ok
+    else
+      {:error, reason} -> {:error, reason}
+      _mismatch -> {:error, :review_provenance_binding_mismatch}
+    end
+  end
+
+  defp review_attestation_matches_provenance?(attestation, provenance) do
+    fingerprint_term(attestation) == provenance.semantic_attestation_fingerprint and
+      review_responsibility?(attestation.responsibility) and
+      attestation.lineage_generation == provenance.review_lineage_generation and
+      attestation.timestamp == provenance.review_attested_at and
+      fingerprint_term(%{
+        runtime_attempt_id: attestation.runtime_attempt_id,
+        work_item_id: elem(attestation.subject, 1),
+        lineage_generation: attestation.lineage_generation,
+        responsibility: "review",
+        runtime_profile: provenance.review_runtime_profile
+      }) == provenance.review_runtime_attempt_fingerprint
+  rescue
+    _error -> false
+  end
+
+  defp review_responsibility?(value) when value in [:review, "review"], do: true
+  defp review_responsibility?(_value), do: false
+
+  defp add_durable_review_provenance(:candidate_state_verified, _evidence, durable), do: {:ok, durable}
+
+  defp add_durable_review_provenance(:review_acceptance_verified, %{review_provenance: provenance}, durable) do
+    if valid_review_provenance?(provenance) and
+         durable_review_binding_matches?(provenance, durable),
+       do: {:ok, Map.put(durable, :review_provenance, provenance)},
+       else: :drop
+  end
+
+  defp add_durable_review_provenance(:review_acceptance_verified, _evidence, _durable), do: :drop
+
+  defp durable_review_binding_matches?(provenance, durable) do
+    with {:ok, provenance_ref} <- decode_candidate_ref(%{candidate_ref: provenance.candidate_ref}),
+         {:ok, durable_ref} <- decode_candidate_ref(durable),
+         true <- CandidateRef.equal?(provenance_ref, durable_ref),
+         true <- provenance.candidate_tree_sha == durable.candidate_tree_sha,
+         true <- provenance.policy_fingerprint == durable.policy_fingerprint do
+      true
+    else
+      _mismatch -> false
+    end
+  rescue
+    _error -> false
   end
 
   defp reconcile_ready_to_merge_evidence(evidence, opts) do
@@ -577,7 +856,9 @@ defmodule SymphonyElixir.SourceControl do
   end
 
   defp verify_review_acceptance_freshness(entry, config, opts) do
-    with {:ok, candidate_ref} <- decode_candidate_ref(entry),
+    with {:ok, provenance} <- review_provenance_from_evidence(entry),
+         :ok <- validate_review_provenance_recovery_binding(provenance, entry, config, opts),
+         {:ok, candidate_ref} <- decode_candidate_ref(entry),
          :ok <- GitHubSourceControl.validate_candidate_ref_binding(config, candidate_ref),
          :ok <- validate_policy_fingerprint(entry, config, settings_from_opts(opts)),
          {:ok, candidate_tree_sha} <-
@@ -589,6 +870,11 @@ defmodule SymphonyElixir.SourceControl do
         verify_open_review_acceptance_freshness(config, candidate_ref, candidate_tree_sha, opts)
       end
     else
+      {:error, :review_provenance_missing} -> {:stale, :review_provenance_missing}
+      {:error, :review_provenance_invalid} -> {:stale, :review_provenance_invalid}
+      {:error, :review_provenance_binding_mismatch} -> {:stale, :review_provenance_binding_mismatch}
+      {:error, :provider_project_contract_required} -> {:stale, :provider_project_contract_required}
+      {:error, :provider_observation_untrusted} -> {:stale, :provider_observation_untrusted}
       {:error, :policy_fingerprint_mismatch} -> {:stale, :policy_fingerprint_mismatch}
       {:error, :repository_identity_mismatch} -> {:stale, :repository_identity_mismatch}
       {:error, :malformed_candidate_tree} -> {:stale, :malformed_candidate_tree}
@@ -596,8 +882,43 @@ defmodule SymphonyElixir.SourceControl do
     end
   end
 
+  defp validate_review_provenance_recovery_binding(provenance, entry, config, opts) do
+    contract = Keyword.get(opts, :provider_project_contract)
+    observation = Keyword.get(opts, :provider_observation)
+    subject = Keyword.get(opts, :subject)
+
+    with {:work_item, work_item_id} <- subject,
+         %ProviderProjectContract{} = contract <- contract,
+         %ProviderObservation{} = observation <- observation,
+         true <- contract.provider == :plane,
+         true <- ProviderProjectContract.fingerprint(contract) == provenance.provider_project_fingerprint,
+         true <- contract.workspace_id == provenance.workspace_id,
+         true <- contract.project_id == provenance.project_id,
+         true <- observation.provider == :plane and observation.presence == :present,
+         true <- ProviderObservation.valid_tracker_read?(observation),
+         true <- observation.work_item_id == work_item_id,
+         true <- observation.workspace_id == contract.workspace_id,
+         true <- observation.project_id == contract.project_id,
+         true <- provenance.work_item_id == work_item_id,
+         true <- Map.get(entry, :work_item_id, work_item_id) == work_item_id,
+         true <- provenance.candidate_tree_sha == Map.get(entry, :candidate_tree_sha),
+         true <- provenance.policy_fingerprint == Map.get(entry, :policy_fingerprint),
+         {:ok, provenance_ref} <- decode_candidate_ref(%{candidate_ref: provenance.candidate_ref}),
+         {:ok, entry_ref} <- decode_candidate_ref(entry),
+         true <- CandidateRef.equal?(provenance_ref, entry_ref),
+         :ok <- GitHubSourceControl.validate_candidate_ref_binding(config, provenance_ref),
+         :ok <- validate_policy_fingerprint(entry, config, settings_from_opts(opts)) do
+      :ok
+    else
+      {:error, :repository_identity_mismatch} = error -> error
+      {:error, :policy_fingerprint_mismatch} = error -> error
+      _mismatch -> {:error, :review_provenance_binding_mismatch}
+    end
+  end
+
   defp verify_open_review_acceptance_freshness(config, candidate_ref, candidate_tree_sha, opts) do
-    with {:ok, _} <- GitHubSourceControl.verify_candidate_unchanged(config, candidate_ref, opts),
+    with {:ok, current_tree_sha} <- GitHubSourceControl.verify_candidate_unchanged(config, candidate_ref, opts),
+         true <- current_tree_sha == candidate_tree_sha,
          :ok <-
            GitHubSourceControl.verify_required_checks(config, candidate_ref, candidate_tree_sha, opts) do
       :ok
@@ -886,6 +1207,90 @@ defmodule SymphonyElixir.SourceControl do
       {:error, reason} -> {:error, reason}
     end
   end
+
+  defp validate_review_provenance_structure(provenance) do
+    expected_keys = @review_provenance_fields ++ [:signature]
+
+    with true <- Enum.sort(Map.keys(provenance)) == Enum.sort(expected_keys),
+         true <- provenance.schema_version == @review_provenance_schema_version,
+         true <- non_empty_binary?(provenance.work_item_id),
+         true <- valid_fingerprint?(provenance.provider_project_fingerprint),
+         true <- non_empty_binary?(provenance.workspace_id),
+         true <- non_empty_binary?(provenance.project_id),
+         {:ok, candidate_ref} <- CandidateRef.new(provenance.candidate_ref),
+         :ok <- CandidateRef.validate(candidate_ref),
+         {:ok, _tree_sha} <- GitHubSourceControl.validate_tree_sha(provenance.candidate_tree_sha),
+         true <- valid_fingerprint?(provenance.policy_fingerprint),
+         true <- valid_fingerprint?(provenance.semantic_attestation_fingerprint),
+         true <- provenance.review_responsibility == :review,
+         true <- valid_fingerprint?(provenance.review_runtime_attempt_fingerprint),
+         true <- is_nil(provenance.review_runtime_profile) or non_empty_binary?(provenance.review_runtime_profile),
+         true <- valid_lineage_generation?(provenance.review_lineage_generation),
+         %DateTime{} <- provenance.review_attested_at,
+         true <- is_binary(provenance.signature) do
+      :ok
+    else
+      _invalid -> {:error, :invalid_review_provenance}
+    end
+  rescue
+    _error -> {:error, :invalid_review_provenance}
+  end
+
+  defp review_provenance_payload(provenance) do
+    provenance
+    |> Map.take(@review_provenance_fields)
+    |> :erlang.term_to_binary()
+  end
+
+  defp review_provenance_signing_key do
+    with {:ok, secret} <- configured_signing_secret() do
+      {:ok, :crypto.hash(:sha256, "symphony-source-control-review-provenance-v1:" <> secret)}
+    end
+  end
+
+  defp configured_signing_secret do
+    case Application.get_env(:symphony_elixir, :completion_proof_signing_key) do
+      key when is_binary(key) and byte_size(key) >= 32 ->
+        {:ok, key}
+
+      _missing ->
+        case Config.settings() do
+          {:ok, %{tracker: %{kind: kind, api_key: api_key}}}
+          when kind in [:plane, "plane"] and is_binary(api_key) and api_key != "" ->
+            {:ok, api_key}
+
+          _missing ->
+            {:error, :completion_proof_signing_key_required}
+        end
+    end
+  end
+
+  defp decode_review_provenance_signature("sha256:" <> encoded) do
+    case Base.decode16(encoded, case: :lower) do
+      {:ok, signature} when byte_size(signature) == 32 -> {:ok, signature}
+      _ -> :error
+    end
+  end
+
+  defp decode_review_provenance_signature(_signature), do: :error
+
+  defp fingerprint_term(value) do
+    digest = :crypto.hash(:sha256, :erlang.term_to_binary(value))
+    "sha256:" <> Base.encode16(digest, case: :lower)
+  end
+
+  defp valid_fingerprint?(value) when is_binary(value) do
+    String.match?(value, ~r/\Asha256:[0-9a-f]{64}\z/)
+  end
+
+  defp valid_fingerprint?(_value), do: false
+
+  defp valid_lineage_generation?(value) when is_integer(value), do: value >= 0
+  defp valid_lineage_generation?(value) when is_binary(value), do: String.trim(value) != ""
+  defp valid_lineage_generation?(_value), do: false
+
+  defp non_empty_binary?(value) when is_binary(value), do: String.trim(value) != ""
+  defp non_empty_binary?(_value), do: false
 
   defp completion_proof_signing_key do
     case Application.get_env(:symphony_elixir, :completion_proof_signing_key) do

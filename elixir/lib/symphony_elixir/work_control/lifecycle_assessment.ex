@@ -244,7 +244,7 @@ defmodule SymphonyElixir.WorkControl.LifecycleAssessment do
   end
 
   defp corroborate_same_state(assessment, mapped_state, _prior_state, evidence, context) do
-    source_control_opts = Map.get(context, :source_control_opts, [])
+    source_control_opts = source_control_reconciliation_opts(context, assessment)
 
     {:ok, reconciled} =
       SourceControl.reconcile_stored_evidence(mapped_state, evidence, source_control_opts)
@@ -265,6 +265,19 @@ defmodule SymphonyElixir.WorkControl.LifecycleAssessment do
     else
       finalize(assessment, :validated, mapped_state, mapped_state, [], reconciled, :corroborated_state)
     end
+  end
+
+  defp source_control_reconciliation_opts(context, assessment) do
+    opts =
+      case Map.get(context, :source_control_opts, []) do
+        opts when is_list(opts) -> opts
+        _invalid -> []
+      end
+
+    opts
+    |> Keyword.put(:subject, {:work_item, assessment.work_item_id})
+    |> Keyword.put(:provider_project_contract, Map.get(context, :provider_project_contract))
+    |> Keyword.put(:provider_observation, assessment.provider_observation)
   end
 
   defp assess_transition(assessment, prior_state, mapped_state, evidence, context) do

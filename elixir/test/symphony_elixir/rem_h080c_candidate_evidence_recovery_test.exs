@@ -7,6 +7,8 @@ defmodule SymphonyElixir.RemH080CCandidateEvidenceRecoveryTest do
 
   alias SymphonyElixir.WorkControl.{
     CompletionProof,
+    GuardClass,
+    ProviderObservation,
     ProviderProjectContract,
     RecoveryLedger,
     WorkflowLifecycle,
@@ -54,8 +56,20 @@ defmodule SymphonyElixir.RemH080CCandidateEvidenceRecoveryTest do
 
   test "candidate-bound evidence keeps its bounded identity across recovery refresh", %{ledger: ledger} do
     issue = %Issue{id: "rem-h080c01-review", state: "In Review"}
+    settings = %{symphony: %{project_id: "rem-h080c-01"}}
+    contract = provider_contract()
     candidate_state = candidate_evidence(:candidate_state_verified)
-    review_acceptance = candidate_evidence(:review_acceptance_verified) |> Map.put(:verification, %{status: :verified})
+
+    review_acceptance =
+      review_evidence_fixture(
+        issue.id,
+        contract,
+        @github_config,
+        settings,
+        candidate_ref(),
+        @tree_sha
+      )
+
     checkpoint = checkpoint(issue.id, :in_review, [candidate_state, review_acceptance])
 
     assert :ok = RecoveryLedger.put_sync(ledger, checkpoint)
@@ -74,16 +88,22 @@ defmodule SymphonyElixir.RemH080CCandidateEvidenceRecoveryTest do
     assert {:ok, restored_checkpoint} = RecoveryLedger.current(ledger, issue.id)
 
     expected_candidate_state = Map.take(candidate_state, durable_candidate_fields())
-    expected_review_acceptance = Map.take(review_acceptance, durable_candidate_fields())
+    expected_review_acceptance = Map.take(review_acceptance, durable_candidate_fields() ++ [:review_provenance])
 
     assert restored_checkpoint.durable_guard_evidence == [expected_candidate_state, expected_review_acceptance]
     assert work_item.lifecycle_assessment.satisfied_guards == [expected_candidate_state, expected_review_acceptance]
 
     for evidence <- restored_checkpoint.durable_guard_evidence do
-      assert Map.keys(evidence) |> Enum.sort() == Enum.sort(durable_candidate_fields())
+      expected_keys =
+        if evidence.name == :review_acceptance_verified,
+          do: durable_candidate_fields() ++ [:review_provenance],
+          else: durable_candidate_fields()
+
+      assert Map.keys(evidence) |> Enum.sort() == Enum.sort(expected_keys)
       assert is_map(evidence.candidate_ref)
       refute is_struct(evidence.candidate_ref)
       assert evidence.candidate_ref.candidate_sha == @candidate_sha
+      refute Map.has_key?(evidence, :verification)
     end
 
     assert Enum.map(work_item.lifecycle_assessment.satisfied_guards, & &1.candidate_ref.candidate_sha) ==
@@ -164,14 +184,19 @@ defmodule SymphonyElixir.RemH080CCandidateEvidenceRecoveryTest do
 
   test "candidate movement after recovery makes review acceptance stale", %{ledger: ledger} do
     settings = %{symphony: %{project_id: "rem-h080c-01"}}
-    policy_fingerprint = SourceControl.policy_fingerprint_for(@github_config, settings)
+    issue = %Issue{id: "candidate-moved-after-recovery", state: "In Review"}
+    contract = provider_contract()
 
     review_acceptance =
-      candidate_evidence(:review_acceptance_verified)
-      |> Map.put(:policy_fingerprint, policy_fingerprint)
-      |> Map.put(:verification, %{status: :verified})
+      review_evidence_fixture(
+        issue.id,
+        contract,
+        @github_config,
+        settings,
+        candidate_ref(),
+        @tree_sha
+      )
 
-    issue = %Issue{id: "candidate-moved-after-recovery", state: "In Review"}
     checkpoint = checkpoint(issue.id, :in_review, [review_acceptance])
     refreshed_checkpoint = refresh_checkpoint(ledger, issue, checkpoint)
 
@@ -184,6 +209,9 @@ defmodule SymphonyElixir.RemH080CCandidateEvidenceRecoveryTest do
                [recovered_review_acceptance],
                source_control_config: @github_config,
                settings: settings,
+               subject: {:work_item, issue.id},
+               provider_project_contract: contract,
+               provider_observation: provider_observation_fixture(issue.id, :ready_to_merge, contract),
                token: "token",
                request_fun: &moved_candidate_payload/4
              )
@@ -253,6 +281,127 @@ defmodule SymphonyElixir.RemH080CCandidateEvidenceRecoveryTest do
       })
 
     candidate_ref
+  end
+
+  defp provider_contract do
+    state_mappings =
+      Map.new(WorkflowLifecycle.states(), fn state ->
+        {state, %{state_id: "state-#{state}", name: WorkflowLifecycle.display(state)}}
+      end)
+
+    {:ok, contract} =
+      ProviderProjectContract.new(%{
+        schema_version: 1,
+        provider: :plane,
+        workspace_id: "workspace-a-id",
+        project_id: "project-a",
+        state_mappings: state_mappings
+      })
+
+    contract
+  end
+
+  defp review_evidence_fixture(work_item_id, contract, config, settings, candidate_ref, tree_sha) do
+    attested_at = DateTime.utc_now()
+    lineage_generation = "review-fixture-lineage"
+    runtime_attempt_id = "review-fixture-attempt"
+    profile = "reviewer"
+
+    {:ok, semantic} =
+      GuardClass.semantic_attestation(:review_accepted, %{
+        responsibility: "review",
+        runtime_attempt_id: runtime_attempt_id,
+        lineage_generation: lineage_generation,
+        subject: {:work_item, work_item_id},
+        timestamp: attested_at
+      })
+
+    provenance = %{
+      schema_version: 1,
+      work_item_id: work_item_id,
+      provider_project_fingerprint: ProviderProjectContract.fingerprint(contract),
+      workspace_id: contract.workspace_id,
+      project_id: contract.project_id,
+      candidate_ref: Map.from_struct(candidate_ref),
+      candidate_tree_sha: tree_sha,
+      policy_fingerprint: SourceControl.policy_fingerprint_for(config, settings),
+      semantic_attestation_fingerprint: fingerprint_term(semantic),
+      review_responsibility: :review,
+      review_runtime_attempt_fingerprint:
+        fingerprint_term(%{
+          runtime_attempt_id: runtime_attempt_id,
+          work_item_id: work_item_id,
+          lineage_generation: lineage_generation,
+          responsibility: "review",
+          runtime_profile: profile
+        }),
+      review_runtime_profile: profile,
+      review_lineage_generation: lineage_generation,
+      review_attested_at: attested_at
+    }
+
+    signed_provenance = sign_review_provenance(provenance)
+
+    %{
+      class: :mechanical_guard,
+      name: :review_acceptance_verified,
+      outcome: :verified,
+      candidate_ref: Map.from_struct(candidate_ref),
+      candidate_tree_sha: tree_sha,
+      policy_fingerprint: provenance.policy_fingerprint,
+      review_provenance: signed_provenance
+    }
+  end
+
+  defp provider_observation_fixture(work_item_id, state, contract) do
+    {:ok, mapping} = ProviderProjectContract.provider_mapping_for(contract, state)
+
+    {:ok, observation} =
+      ProviderObservation.new(%{
+        provider: :plane,
+        work_item_id: work_item_id,
+        workspace_id: contract.workspace_id,
+        project_id: contract.project_id,
+        provider_state_id: mapping.state_id,
+        provider_state_group: mapping.group,
+        provider_state_name: mapping.name,
+        observed_at: DateTime.utc_now()
+      })
+
+    sign_provider_observation_for_test(observation)
+  end
+
+  defp sign_review_provenance(provenance) do
+    key =
+      Application.get_env(:symphony_elixir, :completion_proof_signing_key) ||
+        Config.settings!().tracker.api_key
+
+    derived_key = :crypto.hash(:sha256, "symphony-source-control-review-provenance-v1:" <> key)
+
+    payload_fields = [
+      :schema_version,
+      :work_item_id,
+      :provider_project_fingerprint,
+      :workspace_id,
+      :project_id,
+      :candidate_ref,
+      :candidate_tree_sha,
+      :policy_fingerprint,
+      :semantic_attestation_fingerprint,
+      :review_responsibility,
+      :review_runtime_attempt_fingerprint,
+      :review_runtime_profile,
+      :review_lineage_generation,
+      :review_attested_at
+    ]
+
+    signature = :crypto.mac(:hmac, :sha256, derived_key, provenance |> Map.take(payload_fields) |> :erlang.term_to_binary())
+    Map.put(provenance, :signature, "sha256:" <> Base.encode16(signature, case: :lower))
+  end
+
+  defp fingerprint_term(term) do
+    digest = :crypto.hash(:sha256, :erlang.term_to_binary(term))
+    "sha256:" <> Base.encode16(digest, case: :lower)
   end
 
   defp checkpoint(work_item_id, lifecycle_state, evidence) do
@@ -337,23 +486,5 @@ defmodule SymphonyElixir.RemH080CCandidateEvidenceRecoveryTest do
       end
 
     {:ok, payload}
-  end
-
-  defp provider_contract do
-    state_mappings =
-      Map.new(WorkflowLifecycle.states(), fn state ->
-        {state, %{state_id: "state-#{state}", name: WorkflowLifecycle.display(state)}}
-      end)
-
-    {:ok, contract} =
-      ProviderProjectContract.new(%{
-        schema_version: 1,
-        provider: :plane,
-        workspace_id: "workspace-a-id",
-        project_id: "project-a",
-        state_mappings: state_mappings
-      })
-
-    contract
   end
 end

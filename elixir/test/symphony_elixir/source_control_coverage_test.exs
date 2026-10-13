@@ -11,7 +11,14 @@ defmodule SymphonyElixir.SourceControlCoverageTest do
   alias SymphonyElixir.SourceControl.CandidateVerification
   alias SymphonyElixir.SourceControl.MergeVerification
   alias SymphonyElixir.SourceControl.RepositoryProbe
-  alias SymphonyElixir.WorkControl.SemanticTransitionIntent
+
+  alias SymphonyElixir.WorkControl.{
+    GuardClass,
+    ProviderObservation,
+    ProviderProjectContract,
+    SemanticTransitionIntent,
+    WorkflowLifecycle
+  }
 
   @sha_a String.duplicate("a", 40)
   @sha_b String.duplicate("b", 40)
@@ -222,7 +229,30 @@ defmodule SymphonyElixir.SourceControlCoverageTest do
         observed_pr_head_sha: @sha_b
       })
 
-    intent = intent(:in_review, :ready_to_merge)
+    runtime_attempt_id = "coverage-review-attempt-1"
+    lineage_generation = 1
+
+    {:ok, intent} =
+      SemanticTransitionIntent.new(%{
+        work_item_id: "work-1",
+        requested_from: :in_review,
+        requested_to: :ready_to_merge,
+        responsibility: "review",
+        runtime_attempt_id: runtime_attempt_id,
+        lineage_generation: lineage_generation,
+        guard_evidence: []
+      })
+
+    {:ok, review_attestation} =
+      GuardClass.semantic_attestation(:review_accepted, %{
+        responsibility: "review",
+        runtime_attempt_id: runtime_attempt_id,
+        lineage_generation: lineage_generation,
+        subject: {:work_item, "work-1"},
+        timestamp: DateTime.utc_now()
+      })
+
+    contract = provider_contract()
 
     context = %{
       github_opts: [
@@ -230,6 +260,11 @@ defmodule SymphonyElixir.SourceControlCoverageTest do
         token: "token",
         request_fun: fn _token, path, _params, _opts -> {:ok, github_payload(path)} end
       ],
+      provider_project_contract: contract,
+      provider_observation: provider_observation("work-1", contract),
+      runtime_attempt_id: runtime_attempt_id,
+      lineage_generation: lineage_generation,
+      responsibility: "review",
       guard_evidence: [
         %{
           class: :mechanical_guard,
@@ -246,11 +281,22 @@ defmodule SymphonyElixir.SourceControlCoverageTest do
              SourceControl.enrich_guard_evidence(
                intent,
                context,
-               [%{class: :semantic_attestation, name: :review_accepted}]
+               [review_attestation]
              )
 
     entry = Enum.find(evidence, &(&1.name == :review_acceptance_verified))
     assert entry.outcome == :verified
+    assert SourceControl.valid_review_provenance?(entry.review_provenance)
+    assert entry.review_provenance.work_item_id == "work-1"
+    assert entry.review_provenance.review_responsibility == :review
+    assert entry.review_provenance.review_lineage_generation == lineage_generation
+
+    assert {:error, :review_attestation_mismatch} =
+             SourceControl.enrich_guard_evidence(
+               intent,
+               context,
+               [%{class: :semantic_attestation, name: :review_accepted}]
+             )
   end
 
   test "candidate verification and merge verification structs expose helpers" do
@@ -430,6 +476,42 @@ defmodule SymphonyElixir.SourceControlCoverageTest do
     profile = Profile.default_profiles("codex app-server", 20)["reviewer"]
 
     Route.new(%SymphonyElixir.Tracker.Issue{id: "work-1", state: "In Review"}, profile)
+  end
+
+  defp provider_contract do
+    state_mappings =
+      Map.new(WorkflowLifecycle.states(), fn state ->
+        {state, %{state_id: "state-#{state}", name: WorkflowLifecycle.display(state)}}
+      end)
+
+    {:ok, contract} =
+      ProviderProjectContract.new(%{
+        schema_version: 1,
+        provider: :plane,
+        workspace_id: "workspace-1",
+        project_id: "project-1",
+        state_mappings: state_mappings
+      })
+
+    contract
+  end
+
+  defp provider_observation(work_item_id, contract) do
+    {:ok, mapping} = ProviderProjectContract.provider_mapping_for(contract, :in_review)
+
+    {:ok, observation} =
+      ProviderObservation.new(%{
+        provider: :plane,
+        work_item_id: work_item_id,
+        workspace_id: contract.workspace_id,
+        project_id: contract.project_id,
+        provider_state_id: mapping.state_id,
+        provider_state_group: mapping.group,
+        provider_state_name: mapping.name,
+        observed_at: DateTime.utc_now()
+      })
+
+    sign_provider_observation_for_test(observation)
   end
 
   defp github_payload(path) do

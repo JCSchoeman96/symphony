@@ -86,6 +86,39 @@ defmodule SymphonyElixir.WorkControl.CompletionProof do
       |> Map.merge(review_attestation_provenance(attrs))
       |> Map.delete(:review_attestation)
 
+    build_merge_authorized(attrs)
+  end
+
+  def new_merge_authorized(_attrs), do: {:error, :invalid_merge_authorization}
+
+  @spec new_merge_authorized_from_review_provenance(map(), map()) :: {:ok, t()} | {:error, atom()}
+  def new_merge_authorized_from_review_provenance(attrs, provenance) when is_map(attrs) and is_map(provenance) do
+    review = Map.get(attrs, :review_acceptance_evidence)
+
+    with true <- SourceControl.valid_review_provenance?(provenance),
+         true <- is_map(review),
+         true <- Map.get(review, :review_provenance) == provenance,
+         true <- review_provenance_matches_attrs?(provenance, attrs, review) do
+      attrs =
+        attrs
+        |> Map.update(:review_acceptance_evidence, nil, &sanitize_review_evidence/1)
+        |> Map.put(:review_attestation_fingerprint, provenance.semantic_attestation_fingerprint)
+        |> Map.put(:review_responsibility, provenance.review_responsibility)
+        |> Map.put(:review_runtime_attempt_fingerprint, provenance.review_runtime_attempt_fingerprint)
+        |> Map.put(:review_lineage_generation, provenance.review_lineage_generation)
+        |> Map.put(:review_attested_at, provenance.review_attested_at)
+        |> Map.delete(:review_attestation)
+
+      build_merge_authorized(attrs)
+    else
+      _invalid -> {:error, :invalid_merge_authorization}
+    end
+  end
+
+  def new_merge_authorized_from_review_provenance(_attrs, _provenance),
+    do: {:error, :invalid_merge_authorization}
+
+  defp build_merge_authorized(attrs) do
     proof =
       struct(
         __MODULE__,
@@ -103,8 +136,6 @@ defmodule SymphonyElixir.WorkControl.CompletionProof do
       {:error, :invalid_merge_authorization}
     end
   end
-
-  def new_merge_authorized(_attrs), do: {:error, :invalid_merge_authorization}
 
   @spec with_merge_verification(t(), MergeVerification.t()) :: {:ok, t()} | {:error, atom()}
   def with_merge_verification(%__MODULE__{} = proof, %MergeVerification{} = verification) do
@@ -246,7 +277,8 @@ defmodule SymphonyElixir.WorkControl.CompletionProof do
       review
     ) and candidate_ref_matches?(Map.get(review, :candidate_ref), proof.candidate_ref) and
       Map.get(review, :candidate_tree_sha) == proof.candidate_tree_sha and
-      Map.get(review, :policy_fingerprint) == proof.policy_fingerprint
+      Map.get(review, :policy_fingerprint) == proof.policy_fingerprint and
+      review_provenance_matches_proof?(review, proof)
   end
 
   defp valid_candidate_verification?(proof) do
@@ -365,6 +397,16 @@ defmodule SymphonyElixir.WorkControl.CompletionProof do
   end
 
   defp review_attestation_fingerprint(attrs) do
+    case matching_review_provenance(attrs) do
+      %{semantic_attestation_fingerprint: fingerprint} ->
+        fingerprint
+
+      _missing ->
+        semantic_review_attestation_fingerprint(attrs)
+    end
+  end
+
+  defp semantic_review_attestation_fingerprint(attrs) do
     work_item_id = Map.get(attrs, :work_item_id)
 
     case Map.get(attrs, :review_attestation) do
@@ -380,24 +422,143 @@ defmodule SymphonyElixir.WorkControl.CompletionProof do
   end
 
   defp review_attestation_provenance(attrs) do
+    case matching_review_provenance(attrs) do
+      provenance when is_map(provenance) ->
+        %{
+          review_responsibility: provenance.review_responsibility,
+          review_runtime_attempt_fingerprint: provenance.review_runtime_attempt_fingerprint,
+          review_lineage_generation: provenance.review_lineage_generation,
+          review_attested_at: provenance.review_attested_at
+        }
+
+      _missing ->
+        review_attestation_provenance_from_semantic(attrs)
+    end
+  end
+
+  defp review_attestation_provenance_from_semantic(attrs) do
     work_item_id = Map.get(attrs, :work_item_id)
 
     case Map.get(attrs, :review_attestation) do
       %{class: :semantic_attestation, name: :review_accepted, subject: {:work_item, ^work_item_id}} = attestation ->
-        if GuardClass.valid_evidence?(attestation) and review_responsibility?(attestation) do
-          %{
-            review_responsibility: Map.get(attestation, :responsibility),
-            review_runtime_attempt_fingerprint: fingerprint_term(Map.get(attestation, :runtime_attempt_id)),
-            review_lineage_generation: Map.get(attestation, :lineage_generation),
-            review_attested_at: Map.get(attestation, :timestamp)
-          }
-        else
-          %{}
-        end
+        semantic_review_provenance(attestation)
 
       _invalid ->
         %{}
     end
+  end
+
+  defp semantic_review_provenance(attestation) do
+    if GuardClass.valid_evidence?(attestation) and review_responsibility?(attestation) do
+      %{
+        review_responsibility: Map.get(attestation, :responsibility),
+        review_runtime_attempt_fingerprint: fingerprint_term(Map.get(attestation, :runtime_attempt_id)),
+        review_lineage_generation: Map.get(attestation, :lineage_generation),
+        review_attested_at: Map.get(attestation, :timestamp)
+      }
+    else
+      %{}
+    end
+  end
+
+  defp matching_review_provenance(attrs) do
+    work_item_id = Map.get(attrs, :work_item_id)
+    review = Map.get(attrs, :review_acceptance_evidence)
+    attestation = Map.get(attrs, :review_attestation)
+    provenance = is_map(review) && Map.get(review, :review_provenance)
+
+    if valid_matching_review_attestation?(provenance, attestation, work_item_id) and
+         GuardClass.valid_evidence?(attestation) and
+         attestation_matches_review_provenance?(attestation, provenance) do
+      provenance
+    end
+  rescue
+    _error -> nil
+  end
+
+  defp valid_matching_review_attestation?(provenance, attestation, work_item_id) do
+    is_map(provenance) and SourceControl.valid_review_provenance?(provenance) and
+      match?(
+        %{class: :semantic_attestation, name: :review_accepted, subject: {:work_item, ^work_item_id}},
+        attestation
+      )
+  end
+
+  defp attestation_matches_review_provenance?(attestation, provenance) do
+    semantic_fingerprint = fingerprint_term(attestation)
+
+    runtime_fingerprint =
+      fingerprint_term(%{
+        runtime_attempt_id: attestation.runtime_attempt_id,
+        work_item_id: elem(attestation.subject, 1),
+        lineage_generation: attestation.lineage_generation,
+        responsibility: "review",
+        runtime_profile: provenance.review_runtime_profile
+      })
+
+    semantic_fingerprint == provenance.semantic_attestation_fingerprint and
+      attestation.responsibility in [:review, "review"] and
+      attestation.lineage_generation == provenance.review_lineage_generation and
+      attestation.timestamp == provenance.review_attested_at and
+      runtime_fingerprint == provenance.review_runtime_attempt_fingerprint
+  rescue
+    _error -> false
+  end
+
+  defp review_provenance_matches_attrs?(provenance, attrs, review) do
+    with {:ok, candidate_ref} <- CandidateRef.new(provenance.candidate_ref),
+         true <- provenance.work_item_id == Map.get(attrs, :work_item_id),
+         true <- provenance.provider_project_fingerprint == Map.get(attrs, :provider_project_fingerprint),
+         true <- provenance.workspace_id == Map.get(attrs, :workspace_id),
+         true <- provenance.project_id == Map.get(attrs, :project_id),
+         true <- CandidateRef.equal?(candidate_ref, Map.get(attrs, :candidate_ref)),
+         true <- provenance.candidate_tree_sha == Map.get(attrs, :candidate_tree_sha),
+         true <- provenance.policy_fingerprint == Map.get(attrs, :policy_fingerprint),
+         true <- Map.get(review, :candidate_tree_sha) == provenance.candidate_tree_sha,
+         true <- Map.get(review, :policy_fingerprint) == provenance.policy_fingerprint,
+         true <- candidate_ref_matches?(Map.get(review, :candidate_ref), candidate_ref) do
+      true
+    else
+      _mismatch -> false
+    end
+  rescue
+    _error -> false
+  end
+
+  defp review_provenance_matches_proof?(review, proof) do
+    case Map.get(review, :review_provenance) do
+      nil ->
+        true
+
+      provenance ->
+        SourceControl.valid_review_provenance?(provenance) and
+          review_provenance_identity_matches?(provenance, proof) and
+          review_provenance_attestation_matches?(provenance, proof) and
+          review_provenance_candidate_matches?(provenance, proof)
+    end
+  rescue
+    _error -> false
+  end
+
+  defp review_provenance_identity_matches?(provenance, proof) do
+    provenance.work_item_id == proof.work_item_id and
+      provenance.provider_project_fingerprint == proof.provider_project_fingerprint and
+      provenance.workspace_id == proof.workspace_id and
+      provenance.project_id == proof.project_id
+  end
+
+  defp review_provenance_attestation_matches?(provenance, proof) do
+    provenance.semantic_attestation_fingerprint == proof.review_attestation_fingerprint and
+      provenance.review_responsibility == proof.review_responsibility and
+      provenance.review_runtime_attempt_fingerprint == proof.review_runtime_attempt_fingerprint and
+      provenance.review_lineage_generation == proof.review_lineage_generation and
+      provenance.review_attested_at == proof.review_attested_at
+  end
+
+  defp review_provenance_candidate_matches?(provenance, proof) do
+    candidate_ref_matches?(provenance.candidate_ref, proof.candidate_ref) and
+      provenance.candidate_tree_sha == proof.candidate_tree_sha and
+      provenance.policy_fingerprint == proof.policy_fingerprint
   end
 
   defp review_responsibility?(attestation),
@@ -486,14 +647,25 @@ defmodule SymphonyElixir.WorkControl.CompletionProof do
   end
 
   defp sanitize_review_evidence(%{} = evidence) do
-    Map.take(evidence, [
-      :class,
-      :name,
-      :outcome,
-      :candidate_ref,
-      :candidate_tree_sha,
-      :policy_fingerprint
-    ])
+    sanitized =
+      Map.take(evidence, [
+        :class,
+        :name,
+        :outcome,
+        :candidate_ref,
+        :candidate_tree_sha,
+        :policy_fingerprint
+      ])
+
+    case Map.get(evidence, :review_provenance) do
+      provenance when is_map(provenance) ->
+        if SourceControl.valid_review_provenance?(provenance),
+          do: Map.put(sanitized, :review_provenance, provenance),
+          else: sanitized
+
+      _missing ->
+        sanitized
+    end
   end
 
   defp sanitize_review_evidence(_evidence), do: nil

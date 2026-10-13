@@ -3,7 +3,14 @@ defmodule SymphonyElixir.SourceControlTest do
 
   alias SymphonyElixir.SourceControl
   alias SymphonyElixir.SourceControl.CandidateRef
-  alias SymphonyElixir.WorkControl.SemanticTransitionIntent
+
+  alias SymphonyElixir.WorkControl.{
+    GuardClass,
+    ProviderObservation,
+    ProviderProjectContract,
+    SemanticTransitionIntent,
+    WorkflowLifecycle
+  }
 
   @sha_a String.duplicate("a", 40)
   @sha_b String.duplicate("b", 40)
@@ -216,34 +223,17 @@ defmodule SymphonyElixir.SourceControlTest do
   end
 
   test "reconcile preserves verified review acceptance when candidate is unchanged" do
-    {:ok, ref} =
-      CandidateRef.new(%{
-        repository_identity: "github:repository:1368436395",
-        base_sha: @sha_a,
-        candidate_sha: @sha_b,
-        pr_identity: "15",
-        observed_pr_head_sha: @sha_b
-      })
-
-    evidence = [
-      %{
-        class: :mechanical_guard,
-        name: :review_acceptance_verified,
-        outcome: :verified,
-        candidate_ref: Map.from_struct(ref),
-        candidate_tree_sha: String.duplicate("c", 40),
-        policy_fingerprint: policy_fingerprint()
-      }
-    ]
+    settings = %{symphony: %{project_id: "project-1"}}
+    contract = provider_contract()
+    evidence = [review_acceptance_evidence(@config, settings, contract)]
 
     assert {:ok, reconciled} =
              SourceControl.reconcile_stored_evidence(
                :ready_to_merge,
                evidence,
-               source_control_config: @config,
-               settings: %{symphony: %{project_id: "project-1"}},
-               token: "token",
-               request_fun: fn _token, path, _params, _opts -> {:ok, github_payload(path)} end
+               reconciliation_opts(@config, settings, contract, fn _token, path, _params, _opts ->
+                 {:ok, github_payload(path)}
+               end)
              )
 
     entry = Enum.find(reconciled, &(&1.name == :review_acceptance_verified))
@@ -272,39 +262,19 @@ defmodule SymphonyElixir.SourceControlTest do
   end
 
   test "reconcile preserves verified review acceptance after exact human merge" do
-    {:ok, ref} =
-      CandidateRef.new(%{
-        repository_identity: "github:repository:1368436395",
-        base_sha: @sha_a,
-        candidate_sha: @sha_b,
-        pr_identity: "15",
-        observed_pr_head_sha: @sha_b
-      })
-
     sha_m = String.duplicate("d", 40)
     tree = String.duplicate("c", 40)
-
-    evidence = [
-      %{
-        class: :mechanical_guard,
-        name: :review_acceptance_verified,
-        outcome: :verified,
-        candidate_ref: Map.from_struct(ref),
-        candidate_tree_sha: tree,
-        policy_fingerprint: policy_fingerprint()
-      }
-    ]
+    settings = %{symphony: %{project_id: "project-1"}}
+    contract = provider_contract()
+    evidence = [review_acceptance_evidence(@config, settings, contract)]
 
     assert {:ok, reconciled} =
              SourceControl.reconcile_stored_evidence(
                :ready_to_merge,
                evidence,
-               source_control_config: @config,
-               settings: %{symphony: %{project_id: "project-1"}},
-               token: "token",
-               request_fun: fn _token, path, _params, _opts ->
+               reconciliation_opts(@config, settings, contract, fn _token, path, _params, _opts ->
                  {:ok, merged_github_payload(path, sha_m, tree)}
-               end
+               end)
              )
 
     entry = Enum.find(reconciled, &(&1.name == :review_acceptance_verified))
@@ -312,40 +282,20 @@ defmodule SymphonyElixir.SourceControlTest do
   end
 
   test "reconcile preserves merged review acceptance for synthetic_merge required checks" do
-    {:ok, ref} =
-      CandidateRef.new(%{
-        repository_identity: "github:repository:1368436395",
-        base_sha: @sha_a,
-        candidate_sha: @sha_b,
-        pr_identity: "15",
-        observed_pr_head_sha: @sha_b
-      })
-
     sha_m = String.duplicate("d", 40)
     tree = String.duplicate("c", 40)
     synthetic_config = synthetic_merge_config()
-
-    evidence = [
-      %{
-        class: :mechanical_guard,
-        name: :review_acceptance_verified,
-        outcome: :verified,
-        candidate_ref: Map.from_struct(ref),
-        candidate_tree_sha: tree,
-        policy_fingerprint: synthetic_policy_fingerprint()
-      }
-    ]
+    settings = %{symphony: %{project_id: "project-1"}}
+    contract = provider_contract()
+    evidence = [review_acceptance_evidence(synthetic_config, settings, contract)]
 
     assert {:ok, reconciled} =
              SourceControl.reconcile_stored_evidence(
                :ready_to_merge,
                evidence,
-               source_control_config: synthetic_config,
-               settings: %{symphony: %{project_id: "project-1"}},
-               token: "token",
-               request_fun: fn _token, path, _params, _opts ->
+               reconciliation_opts(synthetic_config, settings, contract, fn _token, path, _params, _opts ->
                  {:ok, merged_github_payload(path, sha_m, tree, merge_strategy: :squash)}
-               end
+               end)
              )
 
     entry = Enum.find(reconciled, &(&1.name == :review_acceptance_verified))
@@ -353,39 +303,19 @@ defmodule SymphonyElixir.SourceControlTest do
   end
 
   test "reconcile invalidates merged review acceptance when required checks are no longer green" do
-    {:ok, ref} =
-      CandidateRef.new(%{
-        repository_identity: "github:repository:1368436395",
-        base_sha: @sha_a,
-        candidate_sha: @sha_b,
-        pr_identity: "15",
-        observed_pr_head_sha: @sha_b
-      })
-
     sha_m = String.duplicate("d", 40)
     tree = String.duplicate("c", 40)
-
-    evidence = [
-      %{
-        class: :mechanical_guard,
-        name: :review_acceptance_verified,
-        outcome: :verified,
-        candidate_ref: Map.from_struct(ref),
-        candidate_tree_sha: tree,
-        policy_fingerprint: policy_fingerprint()
-      }
-    ]
+    settings = %{symphony: %{project_id: "project-1"}}
+    contract = provider_contract()
+    evidence = [review_acceptance_evidence(@config, settings, contract)]
 
     assert {:ok, reconciled} =
              SourceControl.reconcile_stored_evidence(
                :ready_to_merge,
                evidence,
-               source_control_config: @config,
-               settings: %{symphony: %{project_id: "project-1"}},
-               token: "token",
-               request_fun: fn _token, path, _params, _opts ->
+               reconciliation_opts(@config, settings, contract, fn _token, path, _params, _opts ->
                  {:ok, merged_github_payload(path, sha_m, tree, check_conclusion: "failure")}
-               end
+               end)
              )
 
     entry = Enum.find(reconciled, &(&1.name == :review_acceptance_verified))
@@ -393,34 +323,15 @@ defmodule SymphonyElixir.SourceControlTest do
   end
 
   test "reconcile still invalidates pre-merge candidate movement" do
-    {:ok, ref} =
-      CandidateRef.new(%{
-        repository_identity: "github:repository:1368436395",
-        base_sha: @sha_a,
-        candidate_sha: @sha_b,
-        pr_identity: "15",
-        observed_pr_head_sha: @sha_b
-      })
-
-    evidence = [
-      %{
-        class: :mechanical_guard,
-        name: :review_acceptance_verified,
-        outcome: :verified,
-        candidate_ref: Map.from_struct(ref),
-        candidate_tree_sha: String.duplicate("c", 40),
-        policy_fingerprint: policy_fingerprint()
-      }
-    ]
+    settings = %{symphony: %{project_id: "project-1"}}
+    contract = provider_contract()
+    evidence = [review_acceptance_evidence(@config, settings, contract)]
 
     assert {:ok, reconciled} =
              SourceControl.reconcile_stored_evidence(
                :ready_to_merge,
                evidence,
-               source_control_config: @config,
-               settings: %{symphony: %{project_id: "project-1"}},
-               token: "token",
-               request_fun: fn _token, path, _params, _opts ->
+               reconciliation_opts(@config, settings, contract, fn _token, path, _params, _opts ->
                  {:ok,
                   if String.contains?(path, "/pulls/15") do
                     Map.put(eligible_pull(), "head", %{
@@ -430,7 +341,7 @@ defmodule SymphonyElixir.SourceControlTest do
                   else
                     github_payload(path)
                   end}
-               end
+               end)
              )
 
     entry = Enum.find(reconciled, &(&1.name == :review_acceptance_verified))
@@ -568,14 +479,156 @@ defmodule SymphonyElixir.SourceControlTest do
     SourceControl.policy_fingerprint_for(@config, %{symphony: %{project_id: "project-1"}})
   end
 
+  defp review_acceptance_evidence(config, settings, contract) do
+    work_item_id = "work-1"
+    candidate_ref = candidate_ref()
+    candidate_tree_sha = String.duplicate("c", 40)
+    attested_at = DateTime.utc_now()
+    lineage_generation = 1
+    runtime_attempt_id = "review-attempt"
+
+    {:ok, semantic} =
+      GuardClass.semantic_attestation(:review_accepted, %{
+        responsibility: "review",
+        runtime_attempt_id: runtime_attempt_id,
+        lineage_generation: lineage_generation,
+        subject: {:work_item, work_item_id},
+        timestamp: attested_at
+      })
+
+    provenance = %{
+      schema_version: 1,
+      work_item_id: work_item_id,
+      provider_project_fingerprint: ProviderProjectContract.fingerprint(contract),
+      workspace_id: contract.workspace_id,
+      project_id: contract.project_id,
+      candidate_ref: Map.from_struct(candidate_ref),
+      candidate_tree_sha: candidate_tree_sha,
+      policy_fingerprint: SourceControl.policy_fingerprint_for(config, settings),
+      semantic_attestation_fingerprint: fingerprint_term(semantic),
+      review_responsibility: :review,
+      review_runtime_attempt_fingerprint:
+        fingerprint_term(%{
+          runtime_attempt_id: runtime_attempt_id,
+          work_item_id: work_item_id,
+          lineage_generation: lineage_generation,
+          responsibility: "review",
+          runtime_profile: "reviewer"
+        }),
+      review_runtime_profile: "reviewer",
+      review_lineage_generation: lineage_generation,
+      review_attested_at: attested_at
+    }
+
+    %{
+      class: :mechanical_guard,
+      name: :review_acceptance_verified,
+      outcome: :verified,
+      candidate_ref: Map.from_struct(candidate_ref),
+      candidate_tree_sha: candidate_tree_sha,
+      policy_fingerprint: provenance.policy_fingerprint,
+      review_provenance: sign_review_provenance(provenance)
+    }
+  end
+
+  defp reconciliation_opts(config, settings, contract, request_fun) do
+    [
+      source_control_config: config,
+      settings: settings,
+      subject: {:work_item, "work-1"},
+      provider_project_contract: contract,
+      provider_observation: provider_observation_fixture("work-1", :ready_to_merge, contract),
+      token: "token",
+      request_fun: request_fun
+    ]
+  end
+
+  defp provider_observation_fixture(work_item_id, state, contract) do
+    {:ok, mapping} = ProviderProjectContract.provider_mapping_for(contract, state)
+
+    {:ok, observation} =
+      ProviderObservation.new(%{
+        provider: :plane,
+        work_item_id: work_item_id,
+        workspace_id: contract.workspace_id,
+        project_id: contract.project_id,
+        provider_state_id: mapping.state_id,
+        provider_state_group: mapping.group,
+        provider_state_name: mapping.name,
+        observed_at: DateTime.utc_now()
+      })
+
+    SymphonyElixir.TestSupport.sign_provider_observation_for_test(observation)
+  end
+
+  defp sign_review_provenance(provenance) do
+    key =
+      Application.get_env(:symphony_elixir, :completion_proof_signing_key) ||
+        SymphonyElixir.Config.settings!().tracker.api_key
+
+    derived_key = :crypto.hash(:sha256, "symphony-source-control-review-provenance-v1:" <> key)
+
+    payload_fields = [
+      :schema_version,
+      :work_item_id,
+      :provider_project_fingerprint,
+      :workspace_id,
+      :project_id,
+      :candidate_ref,
+      :candidate_tree_sha,
+      :policy_fingerprint,
+      :semantic_attestation_fingerprint,
+      :review_responsibility,
+      :review_runtime_attempt_fingerprint,
+      :review_runtime_profile,
+      :review_lineage_generation,
+      :review_attested_at
+    ]
+
+    signature = :crypto.mac(:hmac, :sha256, derived_key, provenance |> Map.take(payload_fields) |> :erlang.term_to_binary())
+    Map.put(provenance, :signature, "sha256:" <> Base.encode16(signature, case: :lower))
+  end
+
+  defp fingerprint_term(term) do
+    digest = :crypto.hash(:sha256, :erlang.term_to_binary(term))
+    "sha256:" <> Base.encode16(digest, case: :lower)
+  end
+
+  defp candidate_ref do
+    {:ok, ref} =
+      CandidateRef.new(%{
+        repository_identity: "github:repository:1368436395",
+        base_sha: @sha_a,
+        candidate_sha: @sha_b,
+        pr_identity: "15",
+        observed_pr_head_sha: @sha_b
+      })
+
+    ref
+  end
+
+  defp provider_contract do
+    state_mappings =
+      Map.new(WorkflowLifecycle.states(), fn state ->
+        {state, %{state_id: "state-#{state}", name: WorkflowLifecycle.display(state)}}
+      end)
+
+    {:ok, contract} =
+      ProviderProjectContract.new(%{
+        schema_version: 1,
+        provider: :plane,
+        workspace_id: "workspace-1",
+        project_id: "project-1",
+        state_mappings: state_mappings
+      })
+
+    contract
+  end
+
   defp synthetic_merge_config do
     Map.put(@config, :required_checks, [
       %{context: "make-all", app_id: 15_368, subject: "synthetic_merge"}
     ])
-  end
-
-  defp synthetic_policy_fingerprint do
-    SourceControl.policy_fingerprint_for(synthetic_merge_config(), %{symphony: %{project_id: "project-1"}})
   end
 
   defp eligible_pull do
