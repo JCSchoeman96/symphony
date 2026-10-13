@@ -36,6 +36,7 @@ defmodule SymphonyElixir.SourceControl do
   @review_acceptance_transition {:in_review, :ready_to_merge}
   @merge_authorization_transition {:ready_to_merge, :merging}
   @completion_transition {:merging, :done}
+  @candidate_bound_evidence_names [:candidate_state_verified, :review_acceptance_verified]
 
   @spec capabilities() :: [atom()]
   def capabilities, do: @capabilities
@@ -122,6 +123,33 @@ defmodule SymphonyElixir.SourceControl do
         {:ok, evidence}
     end
   end
+
+  @doc false
+  @spec durable_candidate_evidence(term()) :: {:ok, map()} | :drop | :not_candidate_evidence
+  def durable_candidate_evidence(%{class: :mechanical_guard, name: name} = evidence)
+      when name in @candidate_bound_evidence_names do
+    with {:ok, candidate_ref} <- candidate_ref_for_durability(evidence),
+         {:ok, candidate_tree_sha} <-
+           GitHubSourceControl.validate_tree_sha(Map.get(evidence, :candidate_tree_sha)),
+         true <- GuardClass.valid_evidence?(evidence),
+         true <- Map.has_key?(evidence, :outcome),
+         policy_fingerprint when is_binary(policy_fingerprint) <- Map.get(evidence, :policy_fingerprint),
+         true <- String.trim(policy_fingerprint) != "" do
+      {:ok,
+       %{
+         class: :mechanical_guard,
+         name: name,
+         outcome: Map.get(evidence, :outcome),
+         candidate_ref: encode_candidate_ref(candidate_ref),
+         candidate_tree_sha: candidate_tree_sha,
+         policy_fingerprint: policy_fingerprint
+       }}
+    else
+      _invalid_candidate_evidence -> :drop
+    end
+  end
+
+  def durable_candidate_evidence(_evidence), do: :not_candidate_evidence
 
   @spec enrich_guard_evidence(SemanticTransitionIntent.t(), map(), term()) ::
           {:ok, [map()]} | {:error, term()}
@@ -654,6 +682,12 @@ defmodule SymphonyElixir.SourceControl do
   end
 
   defp decode_candidate_ref(_), do: {:error, :malformed_candidate_ref}
+
+  defp candidate_ref_for_durability(%{candidate_ref: %CandidateRef{} = ref}) do
+    with :ok <- CandidateRef.validate(ref), do: {:ok, ref}
+  end
+
+  defp candidate_ref_for_durability(evidence), do: decode_candidate_ref(evidence)
 
   defp encode_candidate_ref(%CandidateRef{} = ref), do: Map.from_struct(ref)
 

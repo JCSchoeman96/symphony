@@ -8,7 +8,17 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, PathSafety, StatusDashboard, Tracker, TransitionCoordinator, Workspace}
+  alias SymphonyElixir.{
+    AgentRunner,
+    Config,
+    PathSafety,
+    SourceControl,
+    StatusDashboard,
+    Tracker,
+    TransitionCoordinator,
+    Workspace
+  }
+
   alias SymphonyElixir.Workspace.OwnershipLedger
 
   alias SymphonyElixir.AgentRuntime.{
@@ -6650,7 +6660,7 @@ defmodule SymphonyElixir.Orchestrator do
         []
 
       %{class: :mechanical_guard} = item ->
-        if GuardClass.valid_evidence?(item), do: [Map.take(item, [:class, :name, :outcome])], else: []
+        durable_mechanical_guard_evidence(item)
 
       _other ->
         []
@@ -6658,6 +6668,19 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp durable_mechanical_evidence(_evidence), do: []
+
+  defp durable_mechanical_guard_evidence(item) do
+    case SourceControl.durable_candidate_evidence(item) do
+      {:ok, candidate_evidence} ->
+        [candidate_evidence]
+
+      :drop ->
+        []
+
+      :not_candidate_evidence ->
+        if GuardClass.valid_evidence?(item), do: [Map.take(item, [:class, :name, :outcome])], else: []
+    end
+  end
 
   defp sanitize_recovery_checkpoints(%RecoveryLedger{} = ledger, checkpoints) when is_list(checkpoints) do
     Enum.reduce_while(checkpoints, {:ok, %{}}, fn checkpoint, {:ok, acc} ->
