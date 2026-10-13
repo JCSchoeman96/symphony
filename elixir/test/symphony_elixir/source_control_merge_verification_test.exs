@@ -1,6 +1,7 @@
 defmodule SymphonyElixir.SourceControl.MergeVerificationTest do
   use ExUnit.Case, async: true
 
+  alias SymphonyElixir.AgentRuntime.{Profile, Route}
   alias SymphonyElixir.GitHub.SourceControl, as: GitHubSourceControl
   alias SymphonyElixir.SourceControl
   alias SymphonyElixir.SourceControl.CandidateRef
@@ -266,11 +267,23 @@ defmodule SymphonyElixir.SourceControl.MergeVerificationTest do
       }
     ]
 
+    review_route =
+      Route.new(
+        %SymphonyElixir.Tracker.Issue{id: "issue-1", state: "In Review"},
+        Profile.default_profiles("codex app-server", 20)["reviewer"]
+      )
+
     review_context = %{
       provider_project_contract: contract,
-      provider_observation: provider_observation(:in_review, "issue-1", contract),
+      provider_observation: provider_observation(:in_review, "issue-1", contract) |> sign_provider_observation(),
       github_opts: source_control_opts(config, settings, :open),
-      guard_evidence: candidate_evidence
+      guard_evidence: candidate_evidence,
+      route: review_route,
+      trusted_route: review_route,
+      responsibility: "review",
+      runtime_attempt_id: "review-attempt-1",
+      lineage_generation: 1,
+      runtime_profile: review_route.profile_name
     }
 
     review_intent = intent(:in_review, :ready_to_merge, [review_attestation])
@@ -421,7 +434,9 @@ defmodule SymphonyElixir.SourceControl.MergeVerificationTest do
         requested_from: from,
         requested_to: to,
         responsibility: responsibility,
-        guard_evidence: evidence
+        guard_evidence: evidence,
+        runtime_attempt_id: "review-attempt-1",
+        lineage_generation: 1
       })
 
     intent
@@ -443,6 +458,14 @@ defmodule SymphonyElixir.SourceControl.MergeVerificationTest do
       })
 
     observation
+  end
+
+  defp sign_provider_observation(%ProviderObservation{} = observation) do
+    key = Application.fetch_env!(:symphony_elixir, :completion_proof_signing_key)
+    signing_key = :crypto.hash(:sha256, "symphony-tracker-read-v1:" <> key)
+    signature = :crypto.mac(:hmac, :sha256, signing_key, ProviderObservation.tracker_read_payload(observation))
+
+    %{observation | tracker_read_signature: "sha256:" <> Base.encode16(signature, case: :lower)}
   end
 
   defp provider_contract do
