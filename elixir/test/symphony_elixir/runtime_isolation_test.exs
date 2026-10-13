@@ -13,7 +13,7 @@ defmodule SymphonyElixir.RuntimeIsolationTest do
   end
 
   test "admission rejects an invalid test verifier reference" do
-    executable = executable!("codex-cli 0.159.3\n")
+    executable = executable!("codex-cli 0.162.1\n")
 
     assert {:error, {:runtime_isolation_unavailable, :verifier_unavailable}} =
              RuntimeIsolation.admit(nil, executable, server: "not-a-registered-name")
@@ -21,7 +21,7 @@ defmodule SymphonyElixir.RuntimeIsolationTest do
 
   test "evidence and clear can initialize a named verifier server" do
     server_name = String.to_atom("runtime_isolation_lazy_#{System.unique_integer([:positive])}")
-    executable = executable!("codex-cli 0.159.3\n")
+    executable = executable!("codex-cli 0.162.1\n")
     on_exit(fn -> if pid = Process.whereis(server_name), do: GenServer.stop(pid) end)
 
     assert %{id: ^server_name, start: {RuntimeIsolation, :start_link, [[name: ^server_name]]}} =
@@ -34,14 +34,14 @@ defmodule SymphonyElixir.RuntimeIsolationTest do
   end
 
   test "default evidence and clear use the supervised verifier" do
-    executable = executable!("codex-cli 0.159.3\n")
+    executable = executable!("codex-cli 0.162.1\n")
 
     assert RuntimeIsolation.evidence(executable) == nil
     assert :ok = RuntimeIsolation.clear()
   end
 
   test "non-map probe results are reduced to verified evidence" do
-    executable = executable!("codex-cli 0.159.3\n")
+    executable = executable!("codex-cli 0.162.1\n")
     {:ok, server} = RuntimeIsolation.start_link(probe: fn _identity -> {:ok, "private probe detail"} end)
 
     assert {:ok, %{status: :verified, result: :verified}} =
@@ -50,7 +50,7 @@ defmodule SymphonyElixir.RuntimeIsolationTest do
 
   test "admission fails closed when the supervised verifier is missing without starting a fallback" do
     server_name = String.to_atom("runtime_isolation_missing_#{System.unique_integer([:positive])}")
-    executable = executable!("codex-cli 0.159.3\n")
+    executable = executable!("codex-cli 0.162.1\n")
 
     on_exit(fn ->
       case Process.whereis(server_name) do
@@ -66,7 +66,7 @@ defmodule SymphonyElixir.RuntimeIsolationTest do
   end
 
   test "admission rejects an exited verifier pid before runtime execution" do
-    executable = executable!("codex-cli 0.159.3\n")
+    executable = executable!("codex-cli 0.162.1\n")
     {:ok, server} = RuntimeIsolation.start_link(probe: fn _identity -> :ok end)
     GenServer.stop(server)
 
@@ -101,7 +101,7 @@ defmodule SymphonyElixir.RuntimeIsolationTest do
     assert Process.whereis(RuntimeIsolation) == unsupervised_pid
     refute Process.whereis(RuntimeIsolation) == supervised_pid
 
-    executable = executable!("codex-cli 0.159.3\n")
+    executable = executable!("codex-cli 0.162.1\n")
 
     assert {:error, {:runtime_isolation_unavailable, :verifier_unavailable}} =
              RuntimeIsolation.admit(nil, executable, [])
@@ -119,21 +119,21 @@ defmodule SymphonyElixir.RuntimeIsolationTest do
 
     assert Process.whereis(RuntimeIsolation) == child_pid
 
-    executable = executable!("codex-cli 0.159.3\n")
+    executable = executable!("codex-cli 0.162.1\n")
     result = RuntimeIsolation.admit(nil, executable, [])
 
     refute match?({:error, {:runtime_isolation_unavailable, :verifier_unavailable}}, result)
   end
 
   test "runtime identity rejects Codex versions without a proved isolation profile" do
-    executable = executable!("codex-cli 0.160.0\n")
+    executable = executable!("codex-cli 0.159.3\n")
 
-    assert {:error, {:codex_identity_failed, {:unsupported_codex_version, "codex-cli 0.160.0"}}} =
+    assert {:error, {:codex_identity_failed, {:unsupported_codex_version, "codex-cli 0.159.3"}}} =
              IsolationProfile.runtime_identity(executable)
   end
 
   test "concurrent callers share one verification for an executable fingerprint" do
-    executable = executable!("codex-cli 0.159.3\n")
+    executable = executable!("codex-cli 0.162.1\n")
     parent = self()
 
     probe = fn identity ->
@@ -155,7 +155,7 @@ defmodule SymphonyElixir.RuntimeIsolationTest do
   end
 
   test "verification evidence can be read and cleared without exposing extra probe data" do
-    executable = executable!("codex-cli 0.159.3\n")
+    executable = executable!("codex-cli 0.162.1\n")
     parent = self()
 
     probe = fn _identity ->
@@ -196,7 +196,7 @@ defmodule SymphonyElixir.RuntimeIsolationTest do
     ]
 
     Enum.each(probe_cases, fn {probe, expected_reason} ->
-      executable = executable!("codex-cli 0.159.3\n")
+      executable = executable!("codex-cli 0.162.1\n")
       {:ok, server} = RuntimeIsolation.start_link(probe: probe)
 
       try do
@@ -212,7 +212,7 @@ defmodule SymphonyElixir.RuntimeIsolationTest do
   end
 
   test "verifier process failure returns a typed fail-closed admission error" do
-    executable = executable!("codex-cli 0.159.3\\n")
+    executable = executable!("codex-cli 0.162.1\\n")
     parent = self()
 
     probe = fn _identity ->
@@ -240,7 +240,7 @@ defmodule SymphonyElixir.RuntimeIsolationTest do
   end
 
   test "a verified fingerprint becomes stale when the Codex executable changes" do
-    executable = executable!("codex-cli 0.159.3\n")
+    executable = executable!("codex-cli 0.162.1\n")
     parent = self()
 
     probe = fn identity ->
@@ -259,7 +259,7 @@ defmodule SymphonyElixir.RuntimeIsolationTest do
     assert_receive {:verified_probe, first_digest}
     refute_received {:verified_probe, _fingerprint}
 
-    File.write!(executable, "#!/bin/sh\n# changed executable bytes\nprintf 'codex-cli 0.159.3\\n'\n")
+    File.write!(executable, "#!/bin/sh\n# changed executable bytes\nprintf 'codex-cli 0.162.1\\n'\n")
     File.chmod!(executable, 0o700)
 
     assert {:ok, %{status: :verified, fingerprint: second_fingerprint}} =
@@ -274,7 +274,7 @@ defmodule SymphonyElixir.RuntimeIsolationTest do
   end
 
   test "a failed fingerprint stays failed and a changed executable gets a fresh check" do
-    executable = executable!("codex-cli 0.159.3\n")
+    executable = executable!("codex-cli 0.162.1\n")
     parent = self()
 
     probe = fn identity ->
@@ -293,7 +293,7 @@ defmodule SymphonyElixir.RuntimeIsolationTest do
     assert_receive {:probe, first_fingerprint}
     refute_received {:probe, _fingerprint}
 
-    File.write!(executable, "#!/bin/sh\n# changed executable bytes\nprintf 'codex-cli 0.159.3\\n'\n")
+    File.write!(executable, "#!/bin/sh\n# changed executable bytes\nprintf 'codex-cli 0.162.1\\n'\n")
     File.chmod!(executable, 0o700)
 
     assert {:error, {:runtime_isolation_failed, :network_denied_probe_failed}} =
@@ -305,7 +305,7 @@ defmodule SymphonyElixir.RuntimeIsolationTest do
 
   test "permission profile grants only the exact workspace and keeps git metadata read-only" do
     workspace = Path.join(System.tmp_dir!(), "h080b-profile-#{System.unique_integer([:positive])}")
-    native = executable!("codex-cli 0.159.3\n")
+    native = executable!("codex-cli 0.162.1\n")
     File.mkdir_p!(workspace)
 
     on_exit(fn -> File.rm_rf!(workspace) end)
@@ -327,7 +327,7 @@ defmodule SymphonyElixir.RuntimeIsolationTest do
 
   test "session homes separate HOME, XDG, and CODEX_HOME and render a named profile" do
     workspace = Path.join(System.tmp_dir!(), "h080b-session-#{System.unique_integer([:positive])}")
-    native = executable!("codex-cli 0.159.3\n")
+    native = executable!("codex-cli 0.162.1\n")
     File.mkdir_p!(workspace)
 
     assert {:ok, session_home} =
@@ -356,7 +356,7 @@ defmodule SymphonyElixir.RuntimeIsolationTest do
 
   test "session setup never adopts an existing root or cleanup removes an unowned path" do
     workspace = Path.join(System.tmp_dir!(), "h080b-session-workspace-#{System.unique_integer([:positive])}")
-    native = executable!("codex-cli 0.159.3\n")
+    native = executable!("codex-cli 0.162.1\n")
     existing_root = Path.join(System.tmp_dir!(), "h080b-existing-session-#{System.unique_integer([:positive])}")
     protected_file = Path.join(existing_root, "keep.txt")
     File.mkdir_p!(workspace)

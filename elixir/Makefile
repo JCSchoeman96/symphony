@@ -63,8 +63,8 @@ e2e:
 verify-codex:
 	@command -v codex >/dev/null 2>&1 || { echo "Codex is required for the isolation proof"; exit 1; }
 	@codex_version="$$(codex --version)" && \
-		test "$$codex_version" = "codex-cli 0.159.3" || { \
-			echo "Expected codex-cli 0.159.3, got $$codex_version"; \
+		test "$$codex_version" = "codex-cli 0.162.1" || { \
+			echo "Expected codex-cli 0.162.1, got $$codex_version"; \
 			exit 1; \
 		}
 

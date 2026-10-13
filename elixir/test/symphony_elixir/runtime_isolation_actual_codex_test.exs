@@ -4,7 +4,7 @@ defmodule SymphonyElixir.RuntimeIsolationActualCodexTest do
   alias SymphonyElixir.AgentRuntime.RuntimeIsolation
   alias SymphonyElixir.Codex.IsolationProfile
 
-  @codex_version "codex-cli 0.159.3"
+  @codex_version "codex-cli 0.162.1"
 
   test "probe cleanup failures discard otherwise successful isolation evidence" do
     assert {:error, {:runtime_isolation_cleanup_failed, :probe_fixture}} =
@@ -356,8 +356,8 @@ defmodule SymphonyElixir.RuntimeIsolationActualCodexTest do
 
       File.mkdir_p!(Path.dirname(wrapper))
       File.mkdir_p!(Path.dirname(native))
-      File.write!(wrapper, "#!/bin/sh\nprintf 'codex-cli 0.159.3\\n'\n")
-      File.write!(native, "#!/bin/sh\n# native package binary\nprintf 'codex-cli 0.159.3\\n'\n")
+      File.write!(wrapper, "#!/bin/sh\nprintf 'codex-cli 0.162.1\\n'\n")
+      File.write!(native, "#!/bin/sh\n# native package binary\nprintf 'codex-cli 0.162.1\\n'\n")
       File.chmod!(wrapper, 0o700)
       File.chmod!(native, 0o700)
       on_exit(fn -> File.rm_rf(root) end)
@@ -416,12 +416,12 @@ defmodule SymphonyElixir.RuntimeIsolationActualCodexTest do
   end
 
   test "runtime identity records fingerprints for the pinned supported version" do
-    executable = probe_executable!("printf 'codex-cli 0.159.3\\n'\n")
+    executable = probe_executable!("printf 'codex-cli 0.162.1\\n'\n")
 
     assert {:ok, identity} = IsolationProfile.runtime_identity(executable)
     assert identity.executable == Path.expand(executable)
     assert identity.native_executable == Path.expand(executable)
-    assert identity.version == @codex_version
+    assert identity.version == "codex-cli 0.162.1"
     assert identity.size == File.stat!(executable).size
     assert identity.native_size == identity.size
     assert identity.digest == identity.native_digest

@@ -45,7 +45,7 @@ project-scoped DETS ledger; restarting does not restore a Codex session or retry
 Routed runtime isolation is certified for local Linux workers only. Before a session starts,
 Symphony resolves the direct Codex executable, verifies the actual sandbox, creates a session-local
 `HOME`, `CODEX_HOME`, and XDG state, and applies the role's permission profile to the exact issue
-workspace. `make all` runs this proof with `@openai/codex` `0.159.3`. A missing, incompatible, or
+workspace. `make all` runs this proof with `@openai/codex` `0.162.1`. A missing, incompatible, or
 unproven Codex runtime blocks the gate and the session. Unsupported platforms and platforms without
 a passing proof fail closed.
 
