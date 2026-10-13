@@ -3,6 +3,14 @@ defmodule SymphonyElixir.Tracker.TransitionPolicyTest do
 
   alias SymphonyElixir.Tracker.TransitionPolicy
 
+  test "selects scoped planning dependencies only for Backlog to Planning" do
+    assert {:ok, :planning} = TransitionPolicy.dependency_purpose(:backlog, :planning)
+    assert {:ok, :existing} = TransitionPolicy.dependency_purpose(:ready, :in_progress)
+
+    assert {:error, %{code: :invalid_transition_context}} =
+             TransitionPolicy.dependency_purpose(:backlog, :ready)
+  end
+
   test "allows only the handoff owned by each executable responsibility" do
     assert :ok =
              TransitionPolicy.authorize(%{

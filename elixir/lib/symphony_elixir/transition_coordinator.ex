@@ -1365,6 +1365,8 @@ defmodule SymphonyElixir.TransitionCoordinator do
     case Orchestrator.transition_context(
            orchestrator,
            intent.work_item_id,
+           requested_from: intent.requested_from,
+           requested_to: intent.requested_to,
            expected_runtime_identity: expected_runtime_identity_from_intent(intent)
          ) do
       {:ok, context} ->
@@ -1723,7 +1725,9 @@ defmodule SymphonyElixir.TransitionCoordinator do
           orchestrator,
           attempt.work_item_id,
           work_item,
-          expected_context_token: Map.get(context, :context_token)
+          expected_context_token: Map.get(context, :context_token),
+          requested_from: attempt.requested_from,
+          requested_to: attempt.requested_to
         )
 
       {:error, _reason} ->

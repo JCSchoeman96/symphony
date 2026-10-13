@@ -62,6 +62,19 @@ defmodule SymphonyElixir.Tracker.TransitionPolicy do
 
   def transition_metadata(_context), do: {:error, invalid_context_error(:not_a_map)}
 
+  @spec dependency_purpose(term(), term()) ::
+          {:ok, :planning | :existing} | {:error, authorization_error()}
+  def dependency_purpose(source, target) when is_atom(source) and is_atom(target) do
+    case WorkflowLifecycle.transition(source, target) do
+      {:ok, _metadata} when source == :backlog and target == :planning -> {:ok, :planning}
+      {:ok, _metadata} -> {:ok, :existing}
+      {:error, _reason} -> {:error, invalid_context_error(:invalid_transition)}
+    end
+  end
+
+  def dependency_purpose(_source, _target),
+    do: {:error, invalid_context_error(:invalid_transition)}
+
   @spec guard_requirements(map()) ::
           {:ok, [SymphonyElixir.WorkControl.GuardClass.requirement()]}
           | {:error, authorization_error()}
