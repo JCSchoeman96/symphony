@@ -41,7 +41,7 @@ defmodule SymphonyElixir.Orchestrator do
   }
 
   alias SymphonyElixir.Plane.WebhookDelivery.EventIdentity
-  alias SymphonyElixir.Tracker.Issue
+  alias SymphonyElixir.Tracker.{Issue, TransitionPolicy}
 
   alias SymphonyElixir.WorkControl.{
     AuthorityDisposition,
@@ -9772,8 +9772,9 @@ defmodule SymphonyElixir.Orchestrator do
   defp transition_context_for_state(%State{} = state, work_item_id, opts) do
     case Map.get(state.work_control, work_item_id) do
       %WorkItem{} = work_item ->
-        with :ok <- transition_context_available?(state, work_item_id, work_item),
-             {:ok, context} <- build_transition_context(state, work_item_id, work_item, opts),
+        with {:ok, transition_identity} <- transition_context_identity(work_item, opts),
+             :ok <- transition_context_available?(state, work_item_id, work_item, transition_identity),
+             {:ok, context} <- build_transition_context(state, work_item_id, work_item, opts, transition_identity),
              {:ok, context} <- validate_transition_context_token(context, opts),
              :ok <- validate_expected_runtime_identity(context, opts) do
           {:ok, context}
@@ -9781,6 +9782,28 @@ defmodule SymphonyElixir.Orchestrator do
 
       _missing ->
         {:error, :work_item_not_found}
+    end
+  end
+
+  defp transition_context_identity(%WorkItem{} = work_item, opts) do
+    case {Keyword.fetch(opts, :requested_from), Keyword.fetch(opts, :requested_to)} do
+      {:error, :error} when work_item.validated_lifecycle_state == :backlog ->
+        {:error, :transition_identity_unavailable}
+
+      {:error, :error} ->
+        {:ok, %{purpose: :existing, identity: nil}}
+
+      {{:ok, source}, {:ok, target}} when is_atom(source) and is_atom(target) ->
+        with {:ok, purpose} <- TransitionPolicy.dependency_purpose(source, target),
+             true <- source == work_item.validated_lifecycle_state do
+          {:ok, %{purpose: purpose, identity: {source, target}}}
+        else
+          false -> {:error, :transition_identity_mismatch}
+          {:error, _reason} = error -> error
+        end
+
+      _incomplete_identity ->
+        {:error, :transition_identity_unavailable}
     end
   end
 
@@ -9926,10 +9949,10 @@ defmodule SymphonyElixir.Orchestrator do
   defp semantic_tool_project_contract_evidence(_evidence),
     do: ProjectContractEvidence.observability(nil)
 
-  defp transition_context_available?(%State{} = state, work_item_id, %WorkItem{} = work_item) do
+  defp transition_context_available?(%State{} = state, work_item_id, %WorkItem{} = work_item, transition_identity) do
     with :ok <- startup_item_authority_available(state, work_item_id),
          :ok <- validate_transition_work_item(work_item),
-         :ok <- validate_transition_dependency_context(state, work_item_id),
+         :ok <- validate_transition_dependency_context(state, work_item_id, transition_identity),
          :ok <- validate_transition_work_item_context(work_item) do
       validate_transition_contract_context(state.project_contract_evidence)
     end
@@ -9950,19 +9973,53 @@ defmodule SymphonyElixir.Orchestrator do
     if WorkItem.suspended?(work_item), do: {:error, :work_item_suspended}, else: :ok
   end
 
-  defp validate_transition_dependency_context(%State{} = state, work_item_id) do
+  defp validate_transition_dependency_context(%State{} = state, work_item_id, %{purpose: purpose}) do
     cond do
-      not is_map(state.dependency_diagnostics) or
-          not is_map(Map.get(state.dependency_diagnostics, work_item_id)) ->
+      not match?(%Graph{}, state.dependency_graph) or not Graph.complete?(state.dependency_graph) ->
         {:error, :dependency_context_unavailable}
 
-      not match?(%Graph{}, state.dependency_graph) or not Graph.complete?(state.dependency_graph) ->
+      purpose == :planning and is_nil(Graph.incompleteness_reason(state.dependency_graph, work_item_id)) ->
+        :ok
+
+      purpose == :planning ->
+        {:error, :dependency_context_unavailable}
+
+      not is_map(state.dependency_diagnostics) or
+          not is_map(Map.get(state.dependency_diagnostics, work_item_id)) ->
         {:error, :dependency_context_unavailable}
 
       true ->
         :ok
     end
   end
+
+  defp transition_dependency_decision(
+         %State{dependency_graph: %Graph{} = graph} = state,
+         %WorkItem{id: work_item_id, validated_lifecycle_state: :backlog} = work_item,
+         %{purpose: :planning, identity: {:backlog, :planning}}
+       ) do
+    if Graph.complete?(graph) and is_nil(Graph.incompleteness_reason(graph, work_item_id)) do
+      decision =
+        work_item
+        |> Guard.evaluate("planning", dependency_policy_options(state))
+        |> maybe_mark_dependency_incomplete(graph, work_item_id)
+        |> maybe_mark_dependency_cycle(graph, work_item_id)
+
+      {:ok, decision}
+    else
+      {:error, :dependency_context_unavailable}
+    end
+  end
+
+  defp transition_dependency_decision(%State{} = state, %WorkItem{id: work_item_id}, %{purpose: :existing}) do
+    case Map.get(state.dependency_diagnostics, work_item_id) do
+      decision when is_map(decision) -> {:ok, decision}
+      _missing -> {:error, :dependency_context_unavailable}
+    end
+  end
+
+  defp transition_dependency_decision(_state, _work_item, _transition_identity),
+    do: {:error, :transition_identity_mismatch}
 
   defp validate_transition_work_item_context(%WorkItem{} = work_item) do
     if match?(%ProviderObservation{}, work_item.provider_observation) and
@@ -9982,42 +10039,46 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp build_transition_context(%State{} = state, work_item_id, %WorkItem{} = work_item, opts) do
-    contract_evidence = state.project_contract_evidence
-    dependency_decision = Map.fetch!(state.dependency_diagnostics, work_item_id)
-    contract = contract_evidence && contract_evidence.contract
-    running = Map.get(state.running, work_item_id, %{})
-    observation = work_item.provider_observation
-    assessment = work_item.lifecycle_assessment
+  defp build_transition_context(%State{} = state, work_item_id, %WorkItem{} = work_item, opts, transition_identity) do
+    with {:ok, dependency_decision} <- transition_dependency_decision(state, work_item, transition_identity) do
+      contract_evidence = state.project_contract_evidence
+      contract = contract_evidence && contract_evidence.contract
+      running = Map.get(state.running, work_item_id, %{})
+      observation = work_item.provider_observation
+      assessment = work_item.lifecycle_assessment
+      identity = transition_identity.identity
+      context_token = transition_context_token(work_item, state, dependency_decision, contract, identity)
 
-    {:ok,
-     %{
-       work_item: work_item,
-       current_state: work_item.validated_lifecycle_state,
-       dependency_decision: dependency_decision,
-       dependency_epoch_evidence: %{
-         epoch: state.dependency_graph.epoch,
-         completeness: state.dependency_graph.completeness,
-         complete?: Graph.complete?(state.dependency_graph)
-       },
-       guard_evidence: assessment.satisfied_guards,
-       dispatch_authority_evidence: dispatch_authority_evidence(state, work_item_id, work_item, running, opts),
-       provider_observation: observation,
-       provider_project_contract: contract,
-       provider_contract_fingerprint: provider_contract_fingerprint(contract),
-       route: Map.get(running, :route),
-       route_fingerprint: Map.get(running, :route_fingerprint),
-       runtime_attempt_id: transition_context_runtime_attempt_id(running),
-       lineage_id: transition_context_lineage_id(running),
-       lineage_generation: transition_context_lineage_generation(running),
-       runtime_profile: transition_context_runtime_profile(running),
-       responsibility: WorkflowLifecycle.responsibility(work_item.validated_lifecycle_state),
-       repository_context: %{
-         workspace_path: Map.get(running, :workspace_path),
-         worker_host: Map.get(running, :worker_host)
-       },
-       context_token: transition_context_token(work_item, state, dependency_decision, contract)
-     }}
+      {:ok,
+       %{
+         work_item: work_item,
+         current_state: work_item.validated_lifecycle_state,
+         dependency_decision: dependency_decision,
+         dependency_epoch_evidence: %{
+           epoch: state.dependency_graph.epoch,
+           completeness: state.dependency_graph.completeness,
+           complete?: Graph.complete?(state.dependency_graph)
+         },
+         guard_evidence: assessment.satisfied_guards,
+         dispatch_authority_evidence: dispatch_authority_evidence(state, work_item_id, work_item, running, opts),
+         provider_observation: observation,
+         provider_project_contract: contract,
+         provider_contract_fingerprint: provider_contract_fingerprint(contract),
+         route: Map.get(running, :route),
+         route_fingerprint: Map.get(running, :route_fingerprint),
+         runtime_attempt_id: transition_context_runtime_attempt_id(running),
+         lineage_id: transition_context_lineage_id(running),
+         lineage_generation: transition_context_lineage_generation(running),
+         runtime_profile: transition_context_runtime_profile(running),
+         responsibility: WorkflowLifecycle.responsibility(work_item.validated_lifecycle_state),
+         repository_context: %{
+           workspace_path: Map.get(running, :workspace_path),
+           worker_host: Map.get(running, :worker_host)
+         },
+         transition_identity: identity,
+         context_token: context_token
+       }}
+    end
   end
 
   defp dispatch_authority_evidence(
@@ -10220,7 +10281,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp provider_contract_fingerprint(_contract), do: nil
 
-  defp transition_context_token(work_item, %State{} = state, dependency_decision, contract) do
+  defp transition_context_token(work_item, %State{} = state, dependency_decision, contract, transition_identity) do
     token_input = %{
       work_item_id: work_item.id,
       validated_state: work_item.validated_lifecycle_state,
@@ -10235,6 +10296,13 @@ defmodule SymphonyElixir.Orchestrator do
           else: nil
         )
     }
+
+    token_input =
+      if transition_identity == {:backlog, :planning} do
+        Map.put(token_input, :transition_identity, transition_identity)
+      else
+        token_input
+      end
 
     digest = :crypto.hash(:sha256, :erlang.term_to_binary(token_input))
     "sha256:" <> Base.encode16(digest, case: :lower)
@@ -10682,7 +10750,7 @@ defmodule SymphonyElixir.Orchestrator do
       Enum.any?(state.transition_reconciliation_candidates, &(Map.get(&1, :work_item_id) == work_item_id)) ->
         {:reply, {:error, :transition_reconciliation_pending}, state}
 
-      transition_context_token_matches?(state, work_item_id, Keyword.get(opts, :expected_context_token)) ->
+      transition_context_token_matches?(state, work_item_id, Keyword.get(opts, :expected_context_token), opts) ->
         case persist_authoritative_work_item(state, work_item_id, work_item) do
           {:ok, next_state} ->
             {:reply, :ok, %{next_state | work_control: Map.put(next_state.work_control, work_item_id, work_item)}}
@@ -10732,14 +10800,22 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp transition_context_token_matches?(_state, _work_item_id, nil), do: true
+  defp transition_context_token_matches?(_state, _work_item_id, nil, opts) do
+    {Keyword.get(opts, :requested_from), Keyword.get(opts, :requested_to)} != {:backlog, :planning}
+  end
 
-  defp transition_context_token_matches?(%State{} = state, work_item_id, expected) do
+  defp transition_context_token_matches?(%State{} = state, work_item_id, expected, opts) do
     case Map.get(state.work_control, work_item_id) do
       %WorkItem{} = current ->
-        decision = Map.get(state.dependency_diagnostics, work_item_id, %{})
-        contract = state.project_contract_evidence && state.project_contract_evidence.contract
-        transition_context_token(current, state, decision, contract) == expected
+        with {:ok, transition_identity} <- transition_context_identity(current, opts),
+             {:ok, dependency_decision} <- transition_dependency_decision(state, current, transition_identity) do
+          contract = state.project_contract_evidence && state.project_contract_evidence.contract
+
+          transition_context_token(current, state, dependency_decision, contract, transition_identity.identity) ==
+            expected
+        else
+          _invalid_context -> false
+        end
 
       _missing ->
         false
