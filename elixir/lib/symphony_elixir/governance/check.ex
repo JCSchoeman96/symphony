@@ -13,22 +13,22 @@ defmodule SymphonyElixir.Governance.Check do
   @pre_080c_02_path "docs/symphony-hardening-playbook-v4.1/PRE-080C-02_PRODUCTION_RATE_EPOCH_CHARACTERIZATION.md"
   @roadmap_blob "4b0528bdc0647d889b42ebc478081d5b873898fe"
   @pre_080c_02_blob "b69d46676d3286262bf7cab783654c10a08801bf"
-  @accepted_baseline_sha "81be62410f5ab6c5ac9c7f6aad13e15cd4b8363b"
-  @accepted_baseline_tree "272ac528e83db332060c1b17cc89753021c7cee9"
-  @accepted_phase "H-080B"
+  @accepted_baseline_sha "e8d945b70c4bfc2be1db154a22d23f3c5a5f1a27"
+  @accepted_baseline_tree "3a325b8dc8cfd515e14a4f1c6016719d980f64b2"
+  @accepted_phase "H-080C"
   @accepted_prerequisite "PRE-H080C"
   @pre_080c_02_outcome "LIMIT_FOUND"
-  @authorized_work_id "H-080C"
+  @authorized_work_id "H-090"
   @authorized_work_status "AUTHORIZED_ACTIVE_NOT_ACCEPTED"
-  @authorized_work_scope "Integrated Security / Authority Reverification against the accepted V1 production wiring. One complete issue and one governance candidate."
+  @authorized_work_scope "H-090 Structural Hardening planning and seam assessment only; no structural production implementation until a fresh H-090 plan is accepted and separately authorized by Master Governance."
   @pre_h080c "ACCEPTED"
-  @h_080c "AUTHORIZED_ACTIVE_NOT_ACCEPTED"
-  @next_governance_step "H-090"
+  @h_080c "ACCEPTED"
+  @next_governance_step "H-120A"
   @next_authorized_phase nil
   @decision_authority "Master Governance"
-  @decision_reference "MG-2026-10-12-H080C-AUTH-01"
-  @decision_timestamp "2026-10-12T17:54:02+02:00"
-  @unresolved_conditions ["H080C_NOT_ACCEPTED"]
+  @decision_reference "MG-2026-10-17-POST-H080C-PRE-H090-GOV-MATERIALIZATION-AUTH-01"
+  @decision_timestamp "2026-10-17T13:53+02:00"
+  @unresolved_conditions ["H090_NOT_ACCEPTED"]
   @status_begin "<!-- BEGIN SYMPHONY_GOVERNANCE_STATUS_V1 -->"
   @status_end "<!-- END SYMPHONY_GOVERNANCE_STATUS_V1 -->"
   @watcher_relative_path ".codex/skills/land/land_watch.py"
@@ -1869,11 +1869,21 @@ defmodule SymphonyElixir.Governance.Check do
   defp valid_timestamp?(value) when is_binary(value) do
     case DateTime.from_iso8601(value) do
       {:ok, _datetime, _offset} -> true
-      _ -> false
+      _ -> valid_minute_timestamp?(value)
     end
   end
 
   defp valid_timestamp?(_value), do: false
+
+  defp valid_minute_timestamp?(value) do
+    normalized = Regex.replace(~r/(T\d{2}:\d{2})([+-]\d{2}:\d{2}|Z)\z/, value, "\\1:00\\2")
+
+    normalized != value and
+      case DateTime.from_iso8601(normalized) do
+        {:ok, _datetime, _offset} -> true
+        _ -> false
+      end
+  end
 
   defp placeholder?(value), do: is_binary(value) and String.contains?(value, "{{")
   defp nonblank?(value), do: is_binary(value) and String.trim(value) != ""

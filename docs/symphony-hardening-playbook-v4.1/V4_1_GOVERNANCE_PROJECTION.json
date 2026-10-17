@@ -8,28 +8,28 @@
   },
   "authority_snapshot": {
     "accepted_protected_main_at_decision": {
-      "sha": "81be62410f5ab6c5ac9c7f6aad13e15cd4b8363b",
-      "tree": "272ac528e83db332060c1b17cc89753021c7cee9"
+      "sha": "e8d945b70c4bfc2be1db154a22d23f3c5a5f1a27",
+      "tree": "3a325b8dc8cfd515e14a4f1c6016719d980f64b2"
     },
-    "current_accepted_phase": "H-080B",
+    "current_accepted_phase": "H-080C",
     "current_accepted_prerequisite": "PRE-H080C",
     "pre_080c_02_outcome": "LIMIT_FOUND",
     "currently_authorized_work": {
-      "id": "H-080C",
+      "id": "H-090",
       "status": "AUTHORIZED_ACTIVE_NOT_ACCEPTED",
-      "scope": "Integrated Security / Authority Reverification against the accepted V1 production wiring. One complete issue and one governance candidate."
+      "scope": "H-090 Structural Hardening planning and seam assessment only; no structural production implementation until a fresh H-090 plan is accepted and separately authorized by Master Governance."
     },
     "pre_h080c": "ACCEPTED",
-    "h_080c": "AUTHORIZED_ACTIVE_NOT_ACCEPTED",
-    "next_governance_step": "H-090",
+    "h_080c": "ACCEPTED",
+    "next_governance_step": "H-120A",
     "next_authorized_phase": null
   },
   "decision": {
     "authority": "Master Governance",
-    "reference": "MG-2026-10-12-H080C-AUTH-01",
-    "timestamp": "2026-10-12T17:54:02+02:00"
+    "reference": "MG-2026-10-17-POST-H080C-PRE-H090-GOV-MATERIALIZATION-AUTH-01",
+    "timestamp": "2026-10-17T13:53+02:00"
   },
   "known_unresolved_governance_conditions": [
-    "H080C_NOT_ACCEPTED"
+    "H090_NOT_ACCEPTED"
   ]
 }
