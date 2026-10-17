@@ -1008,9 +1008,15 @@ Both paths are absent on the planning base.
 From repository root:
 
 ```bash
+git add --intent-to-add -- \
+  docs/superpowers/plans/2026-10-17-h090-structural-hardening.md \
+  docs/symphony-hardening-playbook-v4.1/H-090_STRUCTURAL_HARDENING_ASSESSMENT.md
 git diff --check
 git diff --name-only
 ```
+
+The intent-to-add entries expose both new files to `git diff` without staging
+their contents.
 
 Expected `git diff --name-only` set exactly:
 
@@ -1145,10 +1151,12 @@ git status --short
 
 git log --show-signature --format=fuller origin/main..HEAD
 
-git rev-parse 'bbe56c871335d6c7db658c1d37e0b2d1a875ae2f:docs/symphony-hardening-playbook-v4.1/V4_1_MASTER_ROADMAP.md'
+git rev-parse 'HEAD:docs/symphony-hardening-playbook-v4.1/V4_1_MASTER_ROADMAP.md'
+test "$(git rev-parse 'HEAD:docs/symphony-hardening-playbook-v4.1/V4_1_MASTER_ROADMAP.md')" = \
+  4b0528bdc0647d889b42ebc478081d5b873898fe
 ```
 
-The last command MUST return:
+The candidate roadmap blob MUST resolve to and match:
 
 ```text
 4b0528bdc0647d889b42ebc478081d5b873898fe
