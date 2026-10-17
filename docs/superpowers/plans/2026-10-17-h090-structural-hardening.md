@@ -1259,7 +1259,7 @@ STOP if:
 | GenServer blocking unchanged | Orchestrator/Coordinator | assessment only | executable diff negative control | same | empty | concurrency behavior may differ; STOP |
 | Task/mailbox behavior unchanged | Orchestrator Plane/runtime tasks | assessment only | executable diff negative control + regressions | same + Orchestrator tests | empty / pass | concurrency behavior may differ; STOP |
 | Governance remains valid | governance checker/projection | none | normal/freeze checks | `mix governance.check`; `mix governance.check --freeze --candidate-phase H-090` | PASS | candidate not authorized under current projection; STOP |
-| Master Roadmap immutable | normative authority | none | blob check | `git rev-parse '<base>:docs/.../V4_1_MASTER_ROADMAP.md'` | pinned blob | authority changed; STOP |
+| Master Roadmap immutable | normative authority | none | candidate blob check | `git rev-parse 'HEAD:docs/symphony-hardening-playbook-v4.1/V4_1_MASTER_ROADMAP.md'`; `test "$(git rev-parse 'HEAD:docs/symphony-hardening-playbook-v4.1/V4_1_MASTER_ROADMAP.md')" = 4b0528bdc0647d889b42ebc478081d5b873898fe` | pinned candidate blob | authority changed; STOP |
 | Repository full gate | all | docs only | CI/all | `make -C elixir ci`; `make -C elixir all` | exit 0 | candidate not review-ready |
 
 ---
