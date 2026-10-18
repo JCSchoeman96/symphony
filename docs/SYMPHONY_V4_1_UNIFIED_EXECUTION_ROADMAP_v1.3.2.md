@@ -1310,7 +1310,7 @@ They converge at the PRE-H080C Reconciliation Gate.
 
 ## After H-080C
 
-These are future roadmap candidates, not authorized work. Each requires separate Master Governance authorization before planning or implementation. They are not prerequisites for H-090 planning:
+At the H-090 planning stage, these were future roadmap candidates and were not prerequisites for that planning. They remain outside the current authorization; any V1-OPS planning or implementation requires separate Master Governance authorization:
 
 ```text
 V1-OPS-01 — Observability / Readiness
