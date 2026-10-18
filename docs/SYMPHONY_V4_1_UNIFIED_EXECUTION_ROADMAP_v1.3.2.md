@@ -610,7 +610,7 @@ H-110 / H-120B NOT_AUTHORIZED
 MERGE_AUTHORITY=HUMAN_ONLY
 ```
 
-PRE-080C-01 and PRE-080C-02 are accepted. PRE-080C-02 outcome is `LIMIT_FOUND`. PRE-080C-03 is accepted effective 2026-10-11. Master Governance accepted PRE-H080C under `MG-2026-10-12-H080C-AUTH-01`. On 2026-10-17, Master Governance accepted H-080C at PR #46 merge `e8d945b70c4bfc2be1db154a22d23f3c5a5f1a27` / tree `3a325b8dc8cfd515e14a4f1c6016719d980f64b2`. On 2026-10-18, Master Governance recorded H-090 as ACCEPTED at PR #48 merge `d8ebad76e34ef13a98bd11e70f4bd657392ff33d` / tree `3c54c625571ac259fa7ecf42d65b22b8e290cf66` under `MG-2026-10-18-H090-ACCEPT-H120A-AUTH-01` at `2026-10-18T12:16:30+02:00`. H-120A is the sole authorized active phase and is not accepted. Its scope is the Governance Pre-Gate only. H-100, H-110, and H-120B remain NOT_AUTHORIZED. H-100 is the next governance step, with no next authorized phase. Merge authority remains human-only. V1-OPS-01/02/03 are not authorized by this decision and are not current prerequisite gates for H-090 planning.
+PRE-080C-01 and PRE-080C-02 are accepted. PRE-080C-02 outcome is `LIMIT_FOUND`. PRE-080C-03 is accepted effective 2026-10-11. Master Governance accepted PRE-H080C under `MG-2026-10-12-H080C-AUTH-01`. On 2026-10-17, Master Governance accepted H-080C at PR #46 merge `e8d945b70c4bfc2be1db154a22d23f3c5a5f1a27` / tree `3a325b8dc8cfd515e14a4f1c6016719d980f64b2`. On 2026-10-18, Master Governance recorded H-090 as ACCEPTED at PR #48 merge `d8ebad76e34ef13a98bd11e70f4bd657392ff33d` / tree `3c54c625571ac259fa7ecf42d65b22b8e290cf66` under `MG-2026-10-18-H090-ACCEPT-H120A-AUTH-01` at `2026-10-18T12:16:30+02:00`. H-120A is the sole authorized active phase and is not accepted. Its scope is the Governance Pre-Gate only. H-100, H-110, and H-120B remain NOT_AUTHORIZED. H-100 is the next governance step, with no next authorized phase. Merge authority remains human-only. V1-OPS-01/02/03 are outside the authorization recorded here; any future work requires separate authorization.
 
 ---
 
@@ -1425,7 +1425,7 @@ CURRENT AUTHORIZED WORK
 9. H-120A is limited to the Governance Pre-Gate. It does not authorize live lifecycle proof, soak, or final acceptance work.
 10. H-100 is the next governance step. No next phase is authorized.
 
-V1-OPS-01, V1-OPS-02, and V1-OPS-03 are not current prerequisites for H-090 planning. Their future work requires separate authorization.
+V1-OPS-01, V1-OPS-02, and V1-OPS-03 are outside the current authorization; work on them requires separate authorization.
 
 FUTURE ROADMAP SEQUENCE
 11. H-120A — Freeze
