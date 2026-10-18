@@ -309,28 +309,26 @@ LEGACY_AMBIGUOUS               # unresolved compatibility condition; not auto-pr
 
 ### 4.4 TransitionAttempt
 
-**States**
+**Legal transitions**
 
-```text
-requested
--> intent_authorized
--> fresh_context_loaded
--> prepared
--> mutation_submitted
--> verifying
--> verified
- | rejected
- | conflict
- | provider_failed
- | indeterminate
-```
+| Current state | Legal next state(s) | Boundary or guard |
+|---|---|---|
+| `requested` | `intent_authorized`, `rejected` | Rejection is allowed before intent authorization. |
+| `intent_authorized` | `fresh_context_loaded`, `rejected`, `conflict`, `provider_failed` | Fresh context must be loaded before preparation. |
+| `fresh_context_loaded` | `prepared`, `rejected`, `conflict`, `provider_failed` | Preparation follows fresh context validation. |
+| `prepared` | `mutation_submitted`, `rejected`, `conflict`, `provider_failed` | `submission_fenced_at` is persisted and synced while the state remains `prepared`, before the provider call. |
+| `mutation_submitted` | `verifying`, `conflict`, `provider_failed`, `indeterminate` | A provider mutation may have occurred; `rejected` is not legal. |
+| `verifying` | `verified`, `conflict`, `provider_failed`, `indeterminate` | Fresh verification evidence selects the outcome; `rejected` is not a verification result. |
+| `verified`, `rejected`, `conflict`, `provider_failed`, `indeterminate` | None | Terminal states. |
 
-**Important durable boundary:** the coordinator persists/syncs `submission_fenced_at` while the attempt is prepared before the provider call. `submit_once` then advances `mutation_submitted` in memory and invokes the provider. The durable pre-submit fence—not provider acknowledgement—is the no-blind-resubmit boundary.
+Arming the submission fence is an in-state action: the attempt remains `prepared` while the coordinator persists and syncs `submission_fenced_at`. `submit_once` then advances `mutation_submitted` in memory and invokes the provider. The durable fence is the no-blind-resubmit boundary. If restart finds a fenced attempt, reconciliation treats it as a possible submission even without provider acknowledgement and does not retry it blindly.
+
+`rejected` is allowed only from `requested`, `intent_authorized`, `fresh_context_loaded`, or `prepared`. It is not allowed from `mutation_submitted` or `verifying`. Verification accepts only `verified`, `conflict`, `provider_failed`, or `indeterminate` based on fresh evidence. The post-submission path cannot turn uncertainty into a clean rejection.
 
 **Guards:** semantic transition intent, current route/authority, fresh provider context, current project contract, required guard evidence, exact transition/runtime/lineage identities, durable fence before submission, fresh verification after possible submission.<br>
 **Side effects:** exactly one provider submission per safely prepared attempt; verification reread; ledger writes.<br>
 **Durability:** `TransitionAttemptLedger`.<br>
-**Failure/terminal:** `verified`, `rejected`, `conflict`, `provider_failed`, `indeterminate` are terminal.<br>
+**Failure/terminal:** `rejected`, `conflict`, and `provider_failed` may exit before submission from their legal source states. After possible submission, outcomes are `verified`, `conflict`, `provider_failed`, or `indeterminate`; every terminal state has no outgoing transition.<br>
 **Restart:** fenced possible submissions become reconciliation candidates; no blind resubmit.<br>
 **Authority owner:** TransitionCoordinator sequences; policy authority remains WorkControl/Orchestrator.<br>
 **H-090 action:** no change.
@@ -460,14 +458,18 @@ completed        -> MechanicalGuard(:completion_proof_verified)
 
 Although not a separate domain authority, the current Orchestrator epoch state is structurally relevant:
 
-```text
-unavailable -> refreshing -> current
-                         \-> failed
-current -> refreshing     # refresh/follow-up
-refreshing/current -> failed on cancellation/fingerprint drift/task failure
-```
+| Current status | Possible next status | Trigger or meaning |
+|---|---|---|
+| `unavailable` | `refreshing` | Startup or a dispatch/reconciliation path requests an epoch acquisition. |
+| `refreshing` | `current` | A complete snapshot and graph pass the current-epoch checks. |
+| `refreshing` | `failed` | Acquisition, task start, cancellation, or fingerprint validation fails. |
+| `current` | `refreshing` | A refresh, dirty-generation follow-up, or reconciliation starts a new acquisition. |
+| `current` | `failed` | Cancellation or configuration/contract invalidation makes the accepted epoch unusable. |
+| `failed` | `refreshing` | A later dispatch, reconciliation, or refresh needs an epoch and Orchestrator starts a new acquisition when no task is active. |
 
-The accepted graph is current only when the epoch ID matches, the graph is complete, no acquisition task remains, and `plane_epoch_status == :current`.
+A follow-up acquisition may keep the status at `refreshing` while Orchestrator replaces a completed task with another acquisition.
+
+`plane_epoch_current?/1` requires a matching epoch ID, a complete graph, no acquisition task, and `plane_epoch_status == :current`. A failed epoch is unusable and dispatch remains fail-closed until a new acquisition succeeds. Orchestrator owns reacquisition and epoch acceptance; `Plane.ReadScheduler` owns bounded provider-read scheduling. Restart initializes Orchestrator with `unavailable` and acquires a fresh epoch; it does not restore an old epoch as current. No status is terminal during the live Orchestrator lifecycle.
 
 **State owner:** Orchestrator.<br>
 **Side effects:** supervised read task plus Plane `ReadScheduler`.<br>

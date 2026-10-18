@@ -99,9 +99,17 @@ The AttemptLedger writes and syncs fence changes. An unresolved fence keeps in_f
 
 ### TransitionAttempt
 
-State path: requested, intent_authorized, fresh_context_loaded, prepared, mutation_submitted, verifying, then one of verified, rejected, conflict, provider_failed, or indeterminate.
+| Current state | Legal next state(s) | Boundary or guard |
+|---|---|---|
+| `requested` | `intent_authorized`, `rejected` | Rejection is allowed before intent authorization. |
+| `intent_authorized` | `fresh_context_loaded`, `rejected`, `conflict`, `provider_failed` | Fresh provider context must be loaded before preparation. |
+| `fresh_context_loaded` | `prepared`, `rejected`, `conflict`, `provider_failed` | Preparation follows fresh context validation. |
+| `prepared` | `mutation_submitted`, `rejected`, `conflict`, `provider_failed` | The durable submit fence may be armed here while state remains `prepared`. |
+| `mutation_submitted` | `verifying`, `conflict`, `provider_failed`, `indeterminate` | A provider mutation may have occurred; `rejected` is not legal. |
+| `verifying` | `verified`, `conflict`, `provider_failed`, `indeterminate` | Fresh verification selects the outcome; `rejected` is not a verification result. |
+| `verified`, `rejected`, `conflict`, `provider_failed`, `indeterminate` | None | Terminal states. |
 
-Before the provider call, the coordinator persists and syncs submission_fenced_at. That durable pre-submit fence prevents blind resubmission after a crash or ambiguous provider response. Restart reconciliation verifies possible submissions; it does not retry them blindly.
+Before the provider call, the coordinator persists and syncs `submission_fenced_at` while the attempt remains `prepared`. `submit_once` then advances `mutation_submitted` in memory and invokes the provider. The durable fence is the no-blind-resubmit boundary. Restart reconciliation treats a fenced attempt as a possible submission even without provider acknowledgement and does not retry it blindly. `rejected` is legal only from `requested`, `intent_authorized`, `fresh_context_loaded`, or `prepared`; it is not legal from `mutation_submitted` or `verifying`. Evidence-backed verification accepts only `verified`, `conflict`, `provider_failed`, or `indeterminate`, so post-submission uncertainty cannot be converted into a clean rejection.
 
 ### RuntimeAttempt
 
@@ -147,9 +155,16 @@ Candidate movement, policy or check movement, review provenance mismatch, missin
 
 ### Plane epoch
 
-State path: unavailable to refreshing to current or failed. Current can return to refreshing for a new read. Cancellation, fingerprint drift, or task failure moves the active epoch to failed.
+| Current status | Possible next status | Trigger or meaning |
+|---|---|---|
+| `unavailable` | `refreshing` | Startup or a dispatch/reconciliation path requests an epoch acquisition. |
+| `refreshing` | `current` | A complete snapshot and graph pass the current-epoch checks. |
+| `refreshing` | `failed` | Acquisition, task start, cancellation, or fingerprint validation fails. |
+| `current` | `refreshing` | A refresh, dirty-generation follow-up, or reconciliation starts a new acquisition. |
+| `current` | `failed` | Cancellation or configuration/contract invalidation makes the accepted epoch unusable. |
+| `failed` | `refreshing` | A later dispatch, reconciliation, or refresh needs an epoch and Orchestrator starts a new acquisition when no task is active. |
 
-The epoch is current only when its ID matches, the graph is complete, acquisition has ended, and plane_epoch_status is current. Orchestrator owns acceptance. Plane.ReadScheduler owns bounded provider-read scheduling.
+`failed` is not terminal. A failed epoch remains unusable and dispatch remains fail-closed until a new acquisition succeeds. `plane_epoch_current?/1` requires a matching epoch ID, a complete graph, no active acquisition task, and `plane_epoch_status == :current`. Orchestrator owns reacquisition and epoch acceptance; `Plane.ReadScheduler` owns bounded provider-read scheduling. Restart initializes Orchestrator with `unavailable` and acquires a fresh epoch instead of restoring an old epoch as current. No status is terminal during the live Orchestrator lifecycle.
 
 ## Seam assessment
 
