@@ -25,8 +25,8 @@ The following GitHub evidence was re-resolved before implementation:
 | Merge parent 2 | `faff4d1e828c78d4c0474d64829c5107d0b1e7d5` |
 | Merge signature | GitHub verification reports `verified=true`, reason `valid` |
 | Protected main | `main` is protected and matches the merge SHA and tree at the decision baseline |
-| Required check: `make-all` | GitHub App ID `15368`, success on PR #50; check run `39134159342` |
-| Required check: `validate-pr-description` | GitHub App ID `15368`, success on PR #50; check run `39134589030` |
+| Required check: `make-all` | GitHub App ID `15368`; workflow run `39134159342`; check run `117696199589`; success on PR #50 |
+| Required check: `validate-pr-description` | GitHub App ID `15368`; workflow run `39134589030`; check run `117696411591`; success on PR #50 |
 | Post-merge workflow | [Run `39135965103`](https://github.com/JCSchoeman96/symphony/actions/runs/39135965103), event `push`, HEAD `a58fee3a18eb2822f63d2ed3e44655d900f914e0`, attempt `1`, completed with `success` |
 
 All 15 jobs in post-merge run `39135965103` reached terminal success: `linux-dialyzer`, `linux-coverage-partition-1` through `linux-coverage-partition-8`, `linux-static-quality`, `linux-h070a-scale`, `linux-transition-coverage`, `linux-isolation-proof`, `linux-aggregate-coverage`, and `make-all`.
