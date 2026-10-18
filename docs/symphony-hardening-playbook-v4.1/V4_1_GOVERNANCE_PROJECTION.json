@@ -26,8 +26,8 @@
   },
   "decision": {
     "authority": "Master Governance",
-    "reference": "MG-2026-10-18-POST-H090-PRE-H120A-GOV-MATERIALIZATION-AUTH-01",
-    "timestamp": "2026-10-18T09:58:50+02:00"
+    "reference": "MG-2026-10-18-H090-ACCEPT-H120A-AUTH-01",
+    "timestamp": "2026-10-18T12:16:30+02:00"
   },
   "known_unresolved_governance_conditions": [
     "H120A_NOT_ACCEPTED"

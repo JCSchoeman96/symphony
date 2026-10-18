@@ -45,11 +45,11 @@ H-090 structural production implementation is not authorized by this decision. H
 
 ## Current governance state, 2026-10-18
 
-On 2026-10-18, Master Governance recorded H-090 as ACCEPTED at PR #48 merge `d8ebad76e34ef13a98bd11e70f4bd657392ff33d` / tree `3c54c625571ac259fa7ecf42d65b22b8e290cf66` under `MG-2026-10-18-POST-H090-PRE-H120A-GOV-MATERIALIZATION-AUTH-01` at `2026-10-18T09:58:50+02:00`. H-120A is the sole authorized active phase and is not accepted. Its scope is the Governance Pre-Gate only. H-100, H-110, and H-120B remain NOT_AUTHORIZED. H-100 is the next governance step, with no next authorized phase. Merge authority remains human-only.
+On 2026-10-18, Master Governance recorded H-090 as ACCEPTED at PR #48 merge `d8ebad76e34ef13a98bd11e70f4bd657392ff33d` / tree `3c54c625571ac259fa7ecf42d65b22b8e290cf66` under `MG-2026-10-18-H090-ACCEPT-H120A-AUTH-01` at `2026-10-18T12:16:30+02:00`. H-120A is the sole authorized active phase and is not accepted. Its scope is the Governance Pre-Gate only. H-100, H-110, and H-120B remain NOT_AUTHORIZED. H-100 is the next governance step, with no next authorized phase. Merge authority remains human-only.
 
 | Governance item | Status | PR | Accepted merge commit | Tree | Evidence / decision |
 |---|---|---:|---|---|---|
-| H-090 | ACCEPTED | [#48](https://github.com/JCSchoeman96/symphony/pull/48) | `d8ebad76e34ef13a98bd11e70f4bd657392ff33d` | `3c54c625571ac259fa7ecf42d65b22b8e290cf66` | [POST-H090 / PRE-H120A governance materialization](POST-H090_PRE-H120A_GOVERNANCE_MATERIALIZATION.md); `MG-2026-10-18-POST-H090-PRE-H120A-GOV-MATERIALIZATION-AUTH-01` |
+| H-090 | ACCEPTED | [#48](https://github.com/JCSchoeman96/symphony/pull/48) | `d8ebad76e34ef13a98bd11e70f4bd657392ff33d` | `3c54c625571ac259fa7ecf42d65b22b8e290cf66` | [POST-H090 / PRE-H120A governance materialization](POST-H090_PRE-H120A_GOVERNANCE_MATERIALIZATION.md); `MG-2026-10-18-H090-ACCEPT-H120A-AUTH-01` |
 
 Reviewed HEAD was `8d5c4ccf31ff20b110a0d12750e81896716f9319`. Protected-main `make-all` run `39107581172` completed with `SUCCESS`, attempt 1.
 
@@ -113,7 +113,7 @@ The accepted baseline above is PR #48's protected-main merge. The [POST-H090 / P
 | PRE-H080C | ACCEPTED effective 2026-10-12; governance gate, not a roadmap phase | [#40](https://github.com/JCSchoeman96/symphony/pull/40) | `81be62410f5ab6c5ac9c7f6aad13e15cd4b8363b` | `272ac528e83db332060c1b17cc89753021c7cee9` | [Reconciliation gate](PRE-H080C_RECONCILIATION_GATE.md); Master Governance decision `MG-2026-10-12-H080C-AUTH-01` | H-080C authorized |
 | H-080C | ACCEPTED | [#46](https://github.com/JCSchoeman96/symphony/pull/46) | `e8d945b70c4bfc2be1db154a22d23f3c5a5f1a27` | `3a325b8dc8cfd515e14a4f1c6016719d980f64b2` | [H-090 governance materialization](H-090_GOVERNANCE_MATERIALIZATION.md); `MG-2026-10-17-POST-H080C-PRE-H090-GOV-MATERIALIZATION-AUTH-01` | H-090 planning and seam assessment authorized |
 | H-090 | ACCEPTED | [#48](https://github.com/JCSchoeman96/symphony/pull/48) | `d8ebad76e34ef13a98bd11e70f4bd657392ff33d` | `3c54c625571ac259fa7ecf42d65b22b8e290cf66` | [POST-H090 / PRE-H120A governance materialization](POST-H090_PRE-H120A_GOVERNANCE_MATERIALIZATION.md); protected-main `make-all` run `39107581172`, SUCCESS, attempt 1 | H-120A Governance Pre-Gate authorized |
-| H-120A | AUTHORIZED / ACTIVE / NOT ACCEPTED; Governance Pre-Gate only | — | No accepted merge | — | [POST-H090 / PRE-H120A governance materialization](POST-H090_PRE-H120A_GOVERNANCE_MATERIALIZATION.md); `MG-2026-10-18-POST-H090-PRE-H120A-GOV-MATERIALIZATION-AUTH-01` | H-100 is the next governance step; H-100, H-110, and H-120B remain NOT_AUTHORIZED |
+| H-120A | AUTHORIZED / ACTIVE / NOT ACCEPTED; Governance Pre-Gate only | — | No accepted merge | — | [POST-H090 / PRE-H120A governance materialization](POST-H090_PRE-H120A_GOVERNANCE_MATERIALIZATION.md); `MG-2026-10-18-H090-ACCEPT-H120A-AUTH-01` | H-100 is the next governance step; H-100, H-110, and H-120B remain NOT_AUTHORIZED |
 
 ## Historical H-080A artifacts
 
@@ -131,7 +131,7 @@ PR #35 corrected AgentRunner lifecycle test isolation. It is accepted as a non-p
 
 Effective 2026-10-07, H-070B is accepted at `b621d6b1663703253da72b3f822c60f509180e5d`. REM-HI21 is accepted at `7ba76fccaacc5789443c685ed6f1d2bee7f04f9c`. The H-I20 CompletionProof remediation is accepted at `e226b14f409c806ff2bc6841b1f6be34746dd128`. H-080A is accepted at `56798754c8f6fd80d7ec53b604800873e339e030`. H-080B is accepted at `0bdd3960947bb2bafd34a7eb92e970eaae07a82a`. PRE-080C-01 is accepted effective 2026-10-09 at merge `09b72591d33fbe88243bceb584f85fca1f6fc819`. PR #35 is an accepted non-phase baseline remediation at `84a2fbfdaece47d5dd87ca37c2e25e85afe39880` / tree `799ef67d3c4124e76f37b4e31251b9c974695455`, verified by protected-main `make-all` run `37931419995`. The accepted protected-main baseline for PRE-080C-02 is PR #37 at `0640bf1135f8b5000ea29518c2c456272379e9c6` / tree `5c6f10cc88c41f395837a930fb7ea20e0bdae0cc`.
 
-PRE-080C-02 is **ACCEPTED** with outcome **LIMIT_FOUND**. PRE-080C-03 is **ACCEPTED** effective 2026-10-11. PRE-H080C is **ACCEPTED** effective 2026-10-12. On 2026-10-17, Master Governance accepted H-080C at PR #46 merge `e8d945b70c4bfc2be1db154a22d23f3c5a5f1a27` / tree `3a325b8dc8cfd515e14a4f1c6016719d980f64b2` and authorized H-090 planning and seam assessment only. On 2026-10-18, Master Governance recorded H-090 as ACCEPTED at PR #48 merge `d8ebad76e34ef13a98bd11e70f4bd657392ff33d` / tree `3c54c625571ac259fa7ecf42d65b22b8e290cf66` under `MG-2026-10-18-POST-H090-PRE-H120A-GOV-MATERIALIZATION-AUTH-01` at `2026-10-18T09:58:50+02:00`. H-120A is the sole authorized active phase and is not accepted. Its scope is the Governance Pre-Gate only. H-100, H-110, and H-120B remain NOT_AUTHORIZED. H-100 is the next governance step, with no next authorized phase. Merge authority remains human-only.
+PRE-080C-02 is **ACCEPTED** with outcome **LIMIT_FOUND**. PRE-080C-03 is **ACCEPTED** effective 2026-10-11. PRE-H080C is **ACCEPTED** effective 2026-10-12. On 2026-10-17, Master Governance accepted H-080C at PR #46 merge `e8d945b70c4bfc2be1db154a22d23f3c5a5f1a27` / tree `3a325b8dc8cfd515e14a4f1c6016719d980f64b2` and authorized H-090 planning and seam assessment only. On 2026-10-18, Master Governance recorded H-090 as ACCEPTED at PR #48 merge `d8ebad76e34ef13a98bd11e70f4bd657392ff33d` / tree `3c54c625571ac259fa7ecf42d65b22b8e290cf66` under `MG-2026-10-18-H090-ACCEPT-H120A-AUTH-01` at `2026-10-18T12:16:30+02:00`. H-120A is the sole authorized active phase and is not accepted. Its scope is the Governance Pre-Gate only. H-100, H-110, and H-120B remain NOT_AUTHORIZED. H-100 is the next governance step, with no next authorized phase. Merge authority remains human-only.
 
 <!-- BEGIN SYMPHONY_GOVERNANCE_STATUS_V1 -->
 GOVERNANCE_PROJECTION_PATH=docs/symphony-hardening-playbook-v4.1/V4_1_GOVERNANCE_PROJECTION.json
@@ -150,7 +150,7 @@ H_080C=ACCEPTED
 NEXT_GOVERNANCE_STEP=H-100
 NEXT_AUTHORIZED_PHASE=NONE
 DECISION_AUTHORITY=Master Governance
-DECISION_REFERENCE=MG-2026-10-18-POST-H090-PRE-H120A-GOV-MATERIALIZATION-AUTH-01
-DECISION_TIMESTAMP=2026-10-18T09:58:50+02:00
+DECISION_REFERENCE=MG-2026-10-18-H090-ACCEPT-H120A-AUTH-01
+DECISION_TIMESTAMP=2026-10-18T12:16:30+02:00
 KNOWN_UNRESOLVED_GOVERNANCE_CONDITIONS=H120A_NOT_ACCEPTED
 <!-- END SYMPHONY_GOVERNANCE_STATUS_V1 -->

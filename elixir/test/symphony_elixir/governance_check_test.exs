@@ -10,8 +10,8 @@ defmodule SymphonyElixir.GovernanceCheckTest do
   @roadmap_blob "4b0528bdc0647d889b42ebc478081d5b873898fe"
   @accepted_sha "d8ebad76e34ef13a98bd11e70f4bd657392ff33d"
   @accepted_tree "3c54c625571ac259fa7ecf42d65b22b8e290cf66"
-  @decision_reference "MG-2026-10-18-POST-H090-PRE-H120A-GOV-MATERIALIZATION-AUTH-01"
-  @decision_timestamp "2026-10-18T09:58:50+02:00"
+  @decision_reference "MG-2026-10-18-H090-ACCEPT-H120A-AUTH-01"
+  @decision_timestamp "2026-10-18T12:16:30+02:00"
 
   @conditions [
     "H120A_NOT_ACCEPTED"

@@ -39,7 +39,7 @@ NEXT_AUTHORIZED_PHASE = NONE
 MERGE_AUTHORITY = HUMAN_ONLY
 ```
 
-PR #46 merged H-080C at `e8d945b70c4bfc2be1db154a22d23f3c5a5f1a27` / tree `3a325b8dc8cfd515e14a4f1c6016719d980f64b2`. Master Governance accepted H-080C and authorized H-090 planning and seam assessment under `MG-2026-10-17-POST-H080C-PRE-H090-GOV-MATERIALIZATION-AUTH-01` at `2026-10-17T13:53+02:00`. On 2026-10-18, Master Governance recorded H-090 as ACCEPTED at PR #48 merge `d8ebad76e34ef13a98bd11e70f4bd657392ff33d` / tree `3c54c625571ac259fa7ecf42d65b22b8e290cf66` under `MG-2026-10-18-POST-H090-PRE-H120A-GOV-MATERIALIZATION-AUTH-01` at `2026-10-18T09:58:50+02:00`. H-120A is the sole authorized active phase and is not accepted. Its scope is the Governance Pre-Gate only. H-100, H-110, and H-120B remain NOT_AUTHORIZED. H-100 is the next governance step, with no next authorized phase. Merge authority remains human-only. The governance projection is derivative; merge alone does not establish acceptance. See the [POST-H090 / PRE-H120A materialization record](POST-H090_PRE-H120A_GOVERNANCE_MATERIALIZATION.md) for the current authority boundary.
+PR #46 merged H-080C at `e8d945b70c4bfc2be1db154a22d23f3c5a5f1a27` / tree `3a325b8dc8cfd515e14a4f1c6016719d980f64b2`. Master Governance accepted H-080C and authorized H-090 planning and seam assessment under `MG-2026-10-17-POST-H080C-PRE-H090-GOV-MATERIALIZATION-AUTH-01` at `2026-10-17T13:53+02:00`. On 2026-10-18, Master Governance recorded H-090 as ACCEPTED at PR #48 merge `d8ebad76e34ef13a98bd11e70f4bd657392ff33d` / tree `3c54c625571ac259fa7ecf42d65b22b8e290cf66` under `MG-2026-10-18-H090-ACCEPT-H120A-AUTH-01` at `2026-10-18T12:16:30+02:00`. H-120A is the sole authorized active phase and is not accepted. Its scope is the Governance Pre-Gate only. H-100, H-110, and H-120B remain NOT_AUTHORIZED. H-100 is the next governance step, with no next authorized phase. Merge authority remains human-only. The governance projection is derivative; merge alone does not establish acceptance. See the [POST-H090 / PRE-H120A materialization record](POST-H090_PRE-H120A_GOVERNANCE_MATERIALIZATION.md) for the current authority boundary.
 
 The H-070B, REM-HI21, H-I20 remediation, H-080A, and H-080B acceptance states above are current decisions effective 2026-10-07. They are not backdated to the historical merge events. PRE-080C-01 was accepted effective 2026-10-09 after Master Governance adjudication, merge `09b72591d33fbe88243bceb584f85fca1f6fc819`, and successful protected-main `make-all` run `37904661908`.
 
@@ -77,7 +77,7 @@ H_080C=ACCEPTED
 NEXT_GOVERNANCE_STEP=H-100
 NEXT_AUTHORIZED_PHASE=NONE
 DECISION_AUTHORITY=Master Governance
-DECISION_REFERENCE=MG-2026-10-18-POST-H090-PRE-H120A-GOV-MATERIALIZATION-AUTH-01
-DECISION_TIMESTAMP=2026-10-18T09:58:50+02:00
+DECISION_REFERENCE=MG-2026-10-18-H090-ACCEPT-H120A-AUTH-01
+DECISION_TIMESTAMP=2026-10-18T12:16:30+02:00
 KNOWN_UNRESOLVED_GOVERNANCE_CONDITIONS=H120A_NOT_ACCEPTED
 <!-- END SYMPHONY_GOVERNANCE_STATUS_V1 -->

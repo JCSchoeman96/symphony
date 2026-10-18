@@ -26,8 +26,8 @@ defmodule SymphonyElixir.Governance.Check do
   @next_governance_step "H-100"
   @next_authorized_phase nil
   @decision_authority "Master Governance"
-  @decision_reference "MG-2026-10-18-POST-H090-PRE-H120A-GOV-MATERIALIZATION-AUTH-01"
-  @decision_timestamp "2026-10-18T09:58:50+02:00"
+  @decision_reference "MG-2026-10-18-H090-ACCEPT-H120A-AUTH-01"
+  @decision_timestamp "2026-10-18T12:16:30+02:00"
   @unresolved_conditions ["H120A_NOT_ACCEPTED"]
   @status_begin "<!-- BEGIN SYMPHONY_GOVERNANCE_STATUS_V1 -->"
   @status_end "<!-- END SYMPHONY_GOVERNANCE_STATUS_V1 -->"

@@ -2,7 +2,11 @@
 
 ## Purpose
 
-This record materializes the Master Governance decision to accept H-090 and authorize H-120A. H-120A is the sole active candidate and is not accepted. The acceptance evidence below is the supplied H-090 evidence.
+This record materializes the externally supplied Master Governance decision MG-2026-10-18-H090-ACCEPT-H120A-AUTH-01 issued at 2026-10-18T12:16:30+02:00.
+
+The repository projection and checker record and enforce that authority; they do not create it.
+
+H-120A is the sole active candidate and is not accepted. The acceptance evidence below is the supplied H-090 evidence.
 
 ## H-090 acceptance evidence
 
@@ -27,8 +31,8 @@ REQUIRED_JOB_CLOSURE=SUCCESS
 
 ```text
 DECISION_AUTHORITY=Master Governance
-DECISION_REFERENCE=MG-2026-10-18-POST-H090-PRE-H120A-GOV-MATERIALIZATION-AUTH-01
-DECISION_TIMESTAMP=2026-10-18T09:58:50+02:00
+DECISION_REFERENCE=MG-2026-10-18-H090-ACCEPT-H120A-AUTH-01
+DECISION_TIMESTAMP=2026-10-18T12:16:30+02:00
 H090=ACCEPTED
 H120A=AUTHORIZED_ACTIVE_NOT_ACCEPTED
 H100=NOT_AUTHORIZED
@@ -56,7 +60,7 @@ This selector validates the projected active phase. It does not freeze an H-120A
 Decision-materialization selection is intentionally rejected while active work exists:
 
 ```bash
-mix governance.check --freeze --materialize-decision MG-2026-10-18-POST-H090-PRE-H120A-GOV-MATERIALIZATION-AUTH-01
+mix governance.check --freeze --materialize-decision MG-2026-10-18-H090-ACCEPT-H120A-AUTH-01
 ```
 
 The expected diagnostic is `:materialization_requires_no_authorized_work`. This selection requires no authorized work and must remain negative while H-120A is active.
