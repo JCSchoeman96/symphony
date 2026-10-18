@@ -426,7 +426,7 @@ defmodule SymphonyElixir.GovernanceCheckTest do
       assert :ok = Check.validate(root)
     end
 
-    test "rejects future authorization after H-120A", %{root: root} do
+    test "rejects a next authorized phase while H-120A is active", %{root: root} do
       projection = put_in(projection_map(), ["authority_snapshot", "next_authorized_phase"], "H-120A")
 
       write_projection(root, Jason.encode!(projection))
