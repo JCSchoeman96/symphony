@@ -8,13 +8,13 @@ defmodule SymphonyElixir.GovernanceCheckTest do
   @pre_080c_02_path "docs/symphony-hardening-playbook-v4.1/PRE-080C-02_PRODUCTION_RATE_EPOCH_CHARACTERIZATION.md"
   @projection_path "docs/symphony-hardening-playbook-v4.1/V4_1_GOVERNANCE_PROJECTION.json"
   @roadmap_blob "4b0528bdc0647d889b42ebc478081d5b873898fe"
-  @accepted_sha "e8d945b70c4bfc2be1db154a22d23f3c5a5f1a27"
-  @accepted_tree "3a325b8dc8cfd515e14a4f1c6016719d980f64b2"
-  @decision_reference "MG-2026-10-17-POST-H080C-PRE-H090-GOV-MATERIALIZATION-AUTH-01"
-  @decision_timestamp "2026-10-17T13:53+02:00"
+  @accepted_sha "d8ebad76e34ef13a98bd11e70f4bd657392ff33d"
+  @accepted_tree "3c54c625571ac259fa7ecf42d65b22b8e290cf66"
+  @decision_reference "MG-2026-10-18-H090-ACCEPT-H120A-AUTH-01"
+  @decision_timestamp "2026-10-18T12:16:30+02:00"
 
   @conditions [
-    "H090_NOT_ACCEPTED"
+    "H120A_NOT_ACCEPTED"
   ]
 
   setup do
@@ -292,7 +292,7 @@ defmodule SymphonyElixir.GovernanceCheckTest do
       assert_has_code(Check.validate(root), :invalid_decision_timestamp)
     end
 
-    test "rejects authority values outside the accepted H-080C and active H-090 snapshot", %{root: root} do
+    test "rejects authority values outside the accepted H-090 and active H-120A snapshot", %{root: root} do
       mutations = [
         {[
            "authority_snapshot",
@@ -323,7 +323,7 @@ defmodule SymphonyElixir.GovernanceCheckTest do
       end)
     end
 
-    test "rejects an invalid H-090 authorized-work tuple", %{root: root} do
+    test "rejects H-120A becoming ACCEPTED", %{root: root} do
       projection =
         put_in(
           projection_map(),
@@ -353,7 +353,7 @@ defmodule SymphonyElixir.GovernanceCheckTest do
       assert_has_code(Check.validate(root), :authority_snapshot_mismatch)
     end
 
-    test "rejects H090_NOT_ACCEPTED being removed from unresolved conditions", %{root: root} do
+    test "rejects H120A_NOT_ACCEPTED being replaced in unresolved conditions", %{root: root} do
       projection =
         put_in(
           projection_map(),
@@ -364,6 +364,22 @@ defmodule SymphonyElixir.GovernanceCheckTest do
       write_projection(root, Jason.encode!(projection))
 
       assert_has_code(Check.validate(root), :authority_snapshot_mismatch)
+    end
+
+    test "rejects H120A_NOT_ACCEPTED being missing from unresolved conditions", %{root: root} do
+      projection = put_in(projection_map(), ["known_unresolved_governance_conditions"], [])
+      write_projection(root, Jason.encode!(projection))
+
+      assert_has_code(Check.validate(root), :authority_snapshot_mismatch)
+    end
+
+    test "rejects H-100, H-110, and H-120B as active authorized work", %{root: root} do
+      for phase <- ["H-100", "H-110", "H-120B"] do
+        projection = put_in(projection_map(), ["authority_snapshot", "currently_authorized_work", "id"], phase)
+        write_projection(root, Jason.encode!(projection))
+
+        assert_has_code(Check.validate(root), :authority_snapshot_mismatch)
+      end
     end
 
     test "rejects the superseded H-080C authorization decision snapshot", %{root: root} do
@@ -406,11 +422,11 @@ defmodule SymphonyElixir.GovernanceCheckTest do
   end
 
   describe "logical governance consistency" do
-    test "accepts H-080C and authorized active H-090 planning", %{root: root} do
+    test "accepts H-090 and authorized active H-120A governance pre-gate", %{root: root} do
       assert :ok = Check.validate(root)
     end
 
-    test "rejects future authorization after H-090", %{root: root} do
+    test "rejects a next authorized phase while H-120A is active", %{root: root} do
       projection = put_in(projection_map(), ["authority_snapshot", "next_authorized_phase"], "H-120A")
 
       write_projection(root, Jason.encode!(projection))
@@ -474,7 +490,7 @@ defmodule SymphonyElixir.GovernanceCheckTest do
 
     test "rejects a Unified Roadmap phase mismatch", %{root: root} do
       path = Path.join(root, "docs/SYMPHONY_V4_1_UNIFIED_EXECUTION_ROADMAP_v1.3.2.md")
-      File.write!(path, String.replace(File.read!(path), "CURRENT_ACCEPTED_PHASE=H-080C", "CURRENT_ACCEPTED_PHASE=WRONG", global: false))
+      File.write!(path, String.replace(File.read!(path), "CURRENT_ACCEPTED_PHASE=H-090", "CURRENT_ACCEPTED_PHASE=WRONG", global: false))
 
       assert_has_code(Check.validate(root), :status_mismatch)
     end
@@ -492,11 +508,11 @@ defmodule SymphonyElixir.GovernanceCheckTest do
       mismatches = [
         {"ACCEPTED_PROTECTED_MAIN_AT_DECISION_TREE=#{@accepted_tree}", "ACCEPTED_PROTECTED_MAIN_AT_DECISION_TREE=WRONG"},
         {"CURRENT_ACCEPTED_PREREQUISITE=PRE-H080C", "CURRENT_ACCEPTED_PREREQUISITE=WRONG"},
-        {"CURRENTLY_AUTHORIZED_WORK=H-090", "CURRENTLY_AUTHORIZED_WORK=WRONG"},
+        {"CURRENTLY_AUTHORIZED_WORK=H-120A", "CURRENTLY_AUTHORIZED_WORK=WRONG"},
         {"H_080C=ACCEPTED", "H_080C=WRONG"},
         {"DECISION_REFERENCE=#{@decision_reference}", "DECISION_REFERENCE=WRONG"},
         {"DECISION_TIMESTAMP=#{@decision_timestamp}", "DECISION_TIMESTAMP=WRONG"},
-        {"KNOWN_UNRESOLVED_GOVERNANCE_CONDITIONS=H090_NOT_ACCEPTED", "KNOWN_UNRESOLVED_GOVERNANCE_CONDITIONS=WRONG"}
+        {"KNOWN_UNRESOLVED_GOVERNANCE_CONDITIONS=H120A_NOT_ACCEPTED", "KNOWN_UNRESOLVED_GOVERNANCE_CONDITIONS=WRONG"}
       ]
 
       Enum.each(mismatches, fn {expected, replacement} ->
@@ -598,7 +614,7 @@ defmodule SymphonyElixir.GovernanceCheckTest do
   end
 
   describe "freeze mode" do
-    test "accepts the H-090 candidate freeze on a clean descendant", %{root: root} do
+    test "accepts the H-120A candidate freeze on a clean descendant", %{root: root} do
       init_git!(root)
 
       assert :ok = Check.validate(root, candidate_phase_options())
@@ -617,7 +633,7 @@ defmodule SymphonyElixir.GovernanceCheckTest do
 
     test "rejects both freeze selectors together", %{root: root} do
       assert_has_code(
-        Check.validate(root, freeze: true, candidate_phase: "H-090", materialize_decision: @decision_reference),
+        Check.validate(root, freeze: true, candidate_phase: "H-120A", materialize_decision: @decision_reference),
         :freeze_selector_conflict
       )
     end
@@ -640,16 +656,16 @@ defmodule SymphonyElixir.GovernanceCheckTest do
       )
     end
 
-    test "rejects decision materialization with active H-090 authority", %{root: root} do
+    test "rejects decision materialization with active H-120A authority", %{root: root} do
       init_git!(root)
 
       assert_has_code(Check.validate(root, materialization_options()), :materialization_requires_no_authorized_work)
     end
 
-    test "rejects candidate freezes for phases other than H-090", %{root: root} do
+    test "rejects candidate freezes for phases other than H-120A", %{root: root} do
       init_git!(root)
 
-      for phase <- ["H-080C", "H-120A", "NONE", ""] do
+      for phase <- ["H-080C", "H-090", "H-100", "H-110", "H-120B", "NONE", ""] do
         assert_has_code(Check.validate(root, freeze: true, candidate_phase: phase), :candidate_phase_mismatch)
       end
     end
@@ -661,7 +677,7 @@ defmodule SymphonyElixir.GovernanceCheckTest do
     end
 
     test "rejects a candidate phase supplied without freeze mode", %{root: root} do
-      assert_has_code(Check.validate(root, candidate_phase: "H-090"), :candidate_phase_requires_freeze)
+      assert_has_code(Check.validate(root, candidate_phase: "H-120A"), :candidate_phase_requires_freeze)
     end
 
     test "rejects a missing accepted commit", %{root: root} do
@@ -1469,7 +1485,7 @@ defmodule SymphonyElixir.GovernanceCheckTest do
 
     test "requires freeze mode with a candidate phase", %{root: root} do
       assert_raise Mix.Error, ~r/candidate-phase requires --freeze/, fn ->
-        File.cd!(root, fn -> Mix.Tasks.Governance.Check.run(["--candidate-phase", "H-090"]) end)
+        File.cd!(root, fn -> Mix.Tasks.Governance.Check.run(["--candidate-phase", "H-120A"]) end)
       end
     end
 
@@ -1485,7 +1501,7 @@ defmodule SymphonyElixir.GovernanceCheckTest do
           Mix.Tasks.Governance.Check.run([
             "--freeze",
             "--candidate-phase",
-            "H-090",
+            "H-120A",
             "--materialize-decision",
             @decision_reference
           ])
@@ -1520,7 +1536,7 @@ defmodule SymphonyElixir.GovernanceCheckTest do
   end
 
   defp candidate_phase_options do
-    [freeze: true, candidate_phase: "H-090"]
+    [freeze: true, candidate_phase: "H-120A"]
   end
 
   defp projection_map do
@@ -1537,18 +1553,18 @@ defmodule SymphonyElixir.GovernanceCheckTest do
           "sha" => @accepted_sha,
           "tree" => @accepted_tree
         },
-        "current_accepted_phase" => "H-080C",
+        "current_accepted_phase" => "H-090",
         "current_accepted_prerequisite" => "PRE-H080C",
         "pre_080c_02_outcome" => "LIMIT_FOUND",
         "currently_authorized_work" => %{
-          "id" => "H-090",
+          "id" => "H-120A",
           "status" => "AUTHORIZED_ACTIVE_NOT_ACCEPTED",
           "scope" =>
-            "H-090 Structural Hardening planning and seam assessment only; no structural production implementation until a fresh H-090 plan is accepted and separately authorized by Master Governance."
+            "H-120A Governance Pre-Gate only: establish the pre-live-proof governance gate, exact candidate freeze and human-merge proof procedure; produce the governance checklist, exact required checks, evidence locations, CandidateRef freeze procedure, disposable Plane/GitHub proof plan, and human merge procedure. H-100, H-110, and H-120B remain unauthorized."
         },
         "pre_h080c" => "ACCEPTED",
         "h_080c" => "ACCEPTED",
-        "next_governance_step" => "H-120A",
+        "next_governance_step" => "H-100",
         "next_authorized_phase" => nil
       },
       "decision" => %{
@@ -1575,14 +1591,14 @@ defmodule SymphonyElixir.GovernanceCheckTest do
     GOVERNING_ROADMAP_BLOB_SHA=#{@roadmap_blob}
     ACCEPTED_PROTECTED_MAIN_AT_DECISION_SHA=#{accepted_sha}
     ACCEPTED_PROTECTED_MAIN_AT_DECISION_TREE=#{accepted_tree}
-    CURRENT_ACCEPTED_PHASE=H-080C
+    CURRENT_ACCEPTED_PHASE=H-090
     CURRENT_ACCEPTED_PREREQUISITE=PRE-H080C
     PRE_080C_02_OUTCOME=LIMIT_FOUND
-    CURRENTLY_AUTHORIZED_WORK=H-090
+    CURRENTLY_AUTHORIZED_WORK=H-120A
     CURRENTLY_AUTHORIZED_STATUS=AUTHORIZED_ACTIVE_NOT_ACCEPTED
     PRE_H080C=ACCEPTED
     H_080C=ACCEPTED
-    NEXT_GOVERNANCE_STEP=H-120A
+    NEXT_GOVERNANCE_STEP=H-100
     NEXT_AUTHORIZED_PHASE=NONE
     DECISION_AUTHORITY=Master Governance
     DECISION_REFERENCE=#{@decision_reference}

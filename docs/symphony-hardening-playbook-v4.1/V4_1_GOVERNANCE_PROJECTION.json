@@ -8,28 +8,28 @@
   },
   "authority_snapshot": {
     "accepted_protected_main_at_decision": {
-      "sha": "e8d945b70c4bfc2be1db154a22d23f3c5a5f1a27",
-      "tree": "3a325b8dc8cfd515e14a4f1c6016719d980f64b2"
+      "sha": "d8ebad76e34ef13a98bd11e70f4bd657392ff33d",
+      "tree": "3c54c625571ac259fa7ecf42d65b22b8e290cf66"
     },
-    "current_accepted_phase": "H-080C",
+    "current_accepted_phase": "H-090",
     "current_accepted_prerequisite": "PRE-H080C",
     "pre_080c_02_outcome": "LIMIT_FOUND",
     "currently_authorized_work": {
-      "id": "H-090",
+      "id": "H-120A",
       "status": "AUTHORIZED_ACTIVE_NOT_ACCEPTED",
-      "scope": "H-090 Structural Hardening planning and seam assessment only; no structural production implementation until a fresh H-090 plan is accepted and separately authorized by Master Governance."
+      "scope": "H-120A Governance Pre-Gate only: establish the pre-live-proof governance gate, exact candidate freeze and human-merge proof procedure; produce the governance checklist, exact required checks, evidence locations, CandidateRef freeze procedure, disposable Plane/GitHub proof plan, and human merge procedure. H-100, H-110, and H-120B remain unauthorized."
     },
     "pre_h080c": "ACCEPTED",
     "h_080c": "ACCEPTED",
-    "next_governance_step": "H-120A",
+    "next_governance_step": "H-100",
     "next_authorized_phase": null
   },
   "decision": {
     "authority": "Master Governance",
-    "reference": "MG-2026-10-17-POST-H080C-PRE-H090-GOV-MATERIALIZATION-AUTH-01",
-    "timestamp": "2026-10-17T13:53+02:00"
+    "reference": "MG-2026-10-18-H090-ACCEPT-H120A-AUTH-01",
+    "timestamp": "2026-10-18T12:16:30+02:00"
   },
   "known_unresolved_governance_conditions": [
-    "H090_NOT_ACCEPTED"
+    "H120A_NOT_ACCEPTED"
   ]
 }

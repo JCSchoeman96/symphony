@@ -10,6 +10,7 @@ This directory contains the accepted V4.1 future-roadmap authority, the current 
 - [PRE-080C-03 reconciliation](PRE-080C-03_GOVERNANCE_RECONCILIATION.md) preserves its candidate-era record and the post-acceptance reconciliation.
 - [H-080C governance materialization](H-080C_GOVERNANCE_MATERIALIZATION.md) records the PRE-H080C acceptance, the separate H-080C authorization, and their distinct authority references.
 - [H-090 governance materialization](H-090_GOVERNANCE_MATERIALIZATION.md) records H-080C acceptance and the planning-only H-090 authorization.
+- [POST-H090 / PRE-H120A governance materialization](POST-H090_PRE-H120A_GOVERNANCE_MATERIALIZATION.md) records H-090 acceptance and the sole active H-120A Governance Pre-Gate authorization.
 - [Historical governance reconciliation](GOVERNANCE_RECONCILIATION.md) records the reconstructed V4.1-000 through H-060A history, its evidence sources, and provenance gaps.
 - [2026-10-05 governance reconciliation](GOVERNANCE_RECONCILIATION_2026-10-05.md) reconciles H-070B through H-080B against exact Git/CI facts and preserves the 2026-10-07 Master Governance adjudication that establishes their current formal acceptance states.
 - [V3 accepted authority index](V3_ACCEPTED_AUTHORITY.md) links the immutable accepted H-010, H-020, and H-030 authority.
@@ -19,21 +20,26 @@ This directory contains the accepted V4.1 future-roadmap authority, the current 
 ## Current programme state and accepted baseline
 
 ```text
-LATEST_ACCEPTED_V4.1_PHASE = H-080C
+LATEST_ACCEPTED_V4.1_PHASE = H-090
 LATEST_ACCEPTED_PREREQUISITE = PRE-H080C
-ACCEPTED_PROTECTED_MAIN_AT_DECISION_SHA = e8d945b70c4bfc2be1db154a22d23f3c5a5f1a27
-ACCEPTED_PROTECTED_MAIN_AT_DECISION_TREE = 3a325b8dc8cfd515e14a4f1c6016719d980f64b2
+ACCEPTED_PROTECTED_MAIN_AT_DECISION_SHA = d8ebad76e34ef13a98bd11e70f4bd657392ff33d
+ACCEPTED_PROTECTED_MAIN_AT_DECISION_TREE = 3c54c625571ac259fa7ecf42d65b22b8e290cf66
 PRE-080C-01 = ACCEPTED effective 2026-10-09
 PRE-080C-02 = ACCEPTED; outcome LIMIT_FOUND
 PRE-080C-03 = ACCEPTED effective 2026-10-11
 PRE-H080C = ACCEPTED
 H-080C = ACCEPTED at PR #46
-H-090 = AUTHORIZED / ACTIVE / NOT ACCEPTED for planning and seam assessment only
-H-090 structural implementation = NOT AUTHORIZED by this decision
-NEXT_GOVERNANCE_STEP = H-120A; NOT AUTHORIZED
+H-090 = ACCEPTED at PR #48
+H-120A = AUTHORIZED / ACTIVE / NOT ACCEPTED; Governance Pre-Gate only
+H-100 = NOT_AUTHORIZED
+H-110 = NOT_AUTHORIZED
+H-120B = NOT_AUTHORIZED
+NEXT_GOVERNANCE_STEP = H-100
+NEXT_AUTHORIZED_PHASE = NONE
+MERGE_AUTHORITY = HUMAN_ONLY
 ```
 
-PR #46 merged H-080C at `e8d945b70c4bfc2be1db154a22d23f3c5a5f1a27` / tree `3a325b8dc8cfd515e14a4f1c6016719d980f64b2`. Master Governance accepted H-080C and authorized H-090 planning and seam assessment under `MG-2026-10-17-POST-H080C-PRE-H090-GOV-MATERIALIZATION-AUTH-01` at `2026-10-17T13:53+02:00`. This does not authorize H-090 structural production implementation. H-120A is the next governance step and is not authorized. The governance projection is derivative; merge alone does not establish acceptance. See the [H-090 materialization record](H-090_GOVERNANCE_MATERIALIZATION.md) for the authority boundary.
+PR #46 merged H-080C at `e8d945b70c4bfc2be1db154a22d23f3c5a5f1a27` / tree `3a325b8dc8cfd515e14a4f1c6016719d980f64b2`. Master Governance accepted H-080C and authorized H-090 planning and seam assessment under `MG-2026-10-17-POST-H080C-PRE-H090-GOV-MATERIALIZATION-AUTH-01` at `2026-10-17T13:53+02:00`. On 2026-10-18, Master Governance recorded H-090 as ACCEPTED at PR #48 merge `d8ebad76e34ef13a98bd11e70f4bd657392ff33d` / tree `3c54c625571ac259fa7ecf42d65b22b8e290cf66` under `MG-2026-10-18-H090-ACCEPT-H120A-AUTH-01` at `2026-10-18T12:16:30+02:00`. H-120A is the sole authorized active phase and is not accepted. Its scope is the Governance Pre-Gate only. H-100, H-110, and H-120B remain NOT_AUTHORIZED. H-100 is the next governance step, with no next authorized phase. Merge authority remains human-only. The governance projection is derivative; merge alone does not establish acceptance. See the [POST-H090 / PRE-H120A materialization record](POST-H090_PRE-H120A_GOVERNANCE_MATERIALIZATION.md) for the current authority boundary.
 
 The H-070B, REM-HI21, H-I20 remediation, H-080A, and H-080B acceptance states above are current decisions effective 2026-10-07. They are not backdated to the historical merge events. PRE-080C-01 was accepted effective 2026-10-09 after Master Governance adjudication, merge `09b72591d33fbe88243bceb584f85fca1f6fc819`, and successful protected-main `make-all` run `37904661908`.
 
@@ -59,19 +65,19 @@ GOVERNANCE_PROJECTION_PATH=docs/symphony-hardening-playbook-v4.1/V4_1_GOVERNANCE
 GOVERNING_ROADMAP_ID=docs/symphony-hardening-playbook-v4.1/V4_1_MASTER_ROADMAP.md
 GOVERNING_ROADMAP_VERSION=V4.1
 GOVERNING_ROADMAP_BLOB_SHA=4b0528bdc0647d889b42ebc478081d5b873898fe
-ACCEPTED_PROTECTED_MAIN_AT_DECISION_SHA=e8d945b70c4bfc2be1db154a22d23f3c5a5f1a27
-ACCEPTED_PROTECTED_MAIN_AT_DECISION_TREE=3a325b8dc8cfd515e14a4f1c6016719d980f64b2
-CURRENT_ACCEPTED_PHASE=H-080C
+ACCEPTED_PROTECTED_MAIN_AT_DECISION_SHA=d8ebad76e34ef13a98bd11e70f4bd657392ff33d
+ACCEPTED_PROTECTED_MAIN_AT_DECISION_TREE=3c54c625571ac259fa7ecf42d65b22b8e290cf66
+CURRENT_ACCEPTED_PHASE=H-090
 CURRENT_ACCEPTED_PREREQUISITE=PRE-H080C
 PRE_080C_02_OUTCOME=LIMIT_FOUND
-CURRENTLY_AUTHORIZED_WORK=H-090
+CURRENTLY_AUTHORIZED_WORK=H-120A
 CURRENTLY_AUTHORIZED_STATUS=AUTHORIZED_ACTIVE_NOT_ACCEPTED
 PRE_H080C=ACCEPTED
 H_080C=ACCEPTED
-NEXT_GOVERNANCE_STEP=H-120A
+NEXT_GOVERNANCE_STEP=H-100
 NEXT_AUTHORIZED_PHASE=NONE
 DECISION_AUTHORITY=Master Governance
-DECISION_REFERENCE=MG-2026-10-17-POST-H080C-PRE-H090-GOV-MATERIALIZATION-AUTH-01
-DECISION_TIMESTAMP=2026-10-17T13:53+02:00
-KNOWN_UNRESOLVED_GOVERNANCE_CONDITIONS=H090_NOT_ACCEPTED
+DECISION_REFERENCE=MG-2026-10-18-H090-ACCEPT-H120A-AUTH-01
+DECISION_TIMESTAMP=2026-10-18T12:16:30+02:00
+KNOWN_UNRESOLVED_GOVERNANCE_CONDITIONS=H120A_NOT_ACCEPTED
 <!-- END SYMPHONY_GOVERNANCE_STATUS_V1 -->
