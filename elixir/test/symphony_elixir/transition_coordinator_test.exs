@@ -5,6 +5,7 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
   alias SymphonyElixir.AgentRuntime.RuntimeAttempt.Identity
   alias SymphonyElixir.Dependency.Graph
   alias SymphonyElixir.Orchestrator
+  alias SymphonyElixir.Plane.Client
   alias SymphonyElixir.Tracker.Issue
   alias SymphonyElixir.TransitionCoordinator
 
@@ -1373,6 +1374,25 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
 
     sink = fn _witness -> {:ok, "preq_00000000-0000-4000-8000-000000000001"} end
 
+    for timeout_ms <- [0, -1, 5_001, "25"] do
+      result =
+        TransitionCoordinator.start_link(
+          name: nil,
+          ledger: nil,
+          require_durable?: false,
+          dispatch_witness_required?: true,
+          dispatch_witness_sink: sink,
+          dispatch_witness_timeout_ms: timeout_ms
+        )
+
+      case result do
+        {:ok, coordinator} -> GenServer.stop(coordinator)
+        {:error, _reason} -> :ok
+      end
+
+      assert result == {:error, {:invalid_dispatch_witness_timeout, timeout_ms}}
+    end
+
     assert {:error, :dispatch_witness_requires_durable_ledger} =
              TransitionCoordinator.start_link(
                name: nil,
@@ -1407,9 +1427,11 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
                name: nil,
                ledger: ledger,
                dispatch_witness_required?: true,
-               dispatch_witness_sink: sink
+               dispatch_witness_sink: sink,
+               dispatch_witness_timeout_ms: 25
              )
 
+    assert :sys.get_state(coordinator).dispatch_witness_timeout_ms == 25
     assert :ok = GenServer.stop(coordinator)
 
     assert {:error, :dispatch_witness_ledger_callbacks_must_be_durable} =
@@ -1427,6 +1449,112 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
              )
 
     Process.flag(:trap_exit, previous_trap_exit)
+  end
+
+  test "dispatch witness timeout leaves the durable attempt fenced and coordinator responsive" do
+    timeout_ms = 25
+    parent = self()
+    root = Path.join(System.tmp_dir!(), "symphony-witness-timeout-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(root)
+    on_exit(fn -> File.rm_rf(root) end)
+
+    ledger_path = Path.join(root, "attempts.dets")
+    ledger_identity = %{tracker_kind: "plane", provider_scope: %{project_id: "project-a"}}
+    {:ok, ledger} = TransitionAttemptLedger.open("project-a", ledger_identity, path: ledger_path)
+    on_exit(fn -> TransitionAttemptLedger.close(ledger) end)
+
+    {:ok, listener} = :gen_tcp.listen(0, [:binary, active: false, reuseaddr: true])
+    {:ok, {_address, port}} = :inet.sockname(listener)
+    on_exit(fn -> :gen_tcp.close(listener) end)
+
+    finch_observer =
+      Task.async(fn ->
+        case :gen_tcp.accept(listener, 200) do
+          {:ok, socket} ->
+            send(parent, :finch_invoked)
+            :gen_tcp.send(socket, "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            :gen_tcp.close(socket)
+            :finch_invoked
+
+          {:error, :timeout} ->
+            :no_finch_invocation
+        end
+      end)
+
+    sink = fn witness ->
+      send(parent, {:sink_worker, self(), witness.provider_request_id})
+
+      receive do
+        :release -> {:ok, witness.provider_request_id}
+      after
+        75 -> {:ok, witness.provider_request_id}
+      end
+    end
+
+    {:ok, coordinator} =
+      TransitionCoordinator.start_link(
+        name: nil,
+        ledger: ledger,
+        load_context: fn _intent -> {:ok, context()} end,
+        submit: fn _attempt, submission_context ->
+          send(parent, :submit_called)
+          envelope = submission_context.provider_mutation_envelope
+
+          result =
+            Client.update_work_item_state(
+              %{
+                base_url: "http://127.0.0.1:#{port}",
+                workspace_slug: "workspace-1",
+                workspace_id: envelope.workspace_id,
+                project_id: envelope.project_id,
+                api_key: "test-only"
+              },
+              envelope.work_item_id,
+              envelope.target_provider_state_id,
+              provider_mutation_envelope: envelope,
+              dispatch_witness_sink: sink,
+              dispatch_witness_required?: true,
+              dispatch_witness_timeout_ms: timeout_ms,
+              request_fun: nil
+            )
+
+          send(parent, {:submit_result, result})
+          result
+        end,
+        verify: fn _attempt, verification_context ->
+          send(parent, {:verify_result, verification_context.provider_result})
+          {:error, :verification_unavailable}
+        end,
+        suspend: fn _work_item_id, _reason, _attempt -> :ok end,
+        dispatch_witness_sink: sink,
+        dispatch_witness_timeout_ms: timeout_ms
+      )
+
+    on_exit(fn ->
+      if Process.alive?(coordinator), do: GenServer.stop(coordinator)
+    end)
+
+    request = Task.async(fn -> request_transition(coordinator, intent_attrs()) end)
+
+    assert_receive {:sink_worker, worker_pid, request_id}
+    assert_received :submit_called
+    assert {:ok, submitted} = TransitionAttemptLedger.latest_for_work_item(ledger, "work-1")
+    assert submitted.state == :mutation_submitted
+    assert submitted.provider_request_id == request_id
+    refute TransitionAttemptLedger.resubmit_allowed?(submitted)
+
+    assert {:ok, %{state: :indeterminate}} = Task.await(request, 1_000)
+    assert_received {:submit_result, {:error, {:dispatch_witness_failed, :sink_timeout}}}
+    assert_received {:verify_result, {:error, {:dispatch_witness_failed, :sink_timeout}}}
+    refute Process.alive?(worker_pid)
+
+    assert :no_finch_invocation = Task.await(finch_observer, 300)
+    assert :ok = TransitionCoordinator.sync_reconciliation_ledger(coordinator)
+    assert {:ok, reconciled} = TransitionAttemptLedger.latest_for_work_item(ledger, "work-1")
+    assert reconciled.provider_request_id == request_id
+    refute TransitionAttemptLedger.resubmit_allowed?(reconciled)
+    assert {:error, :transition_fenced} = request_transition(coordinator, intent_attrs())
+    refute_received :submit_called
   end
 
   test "treats a missing suspension callback as an explicit no-op only after fencing" do

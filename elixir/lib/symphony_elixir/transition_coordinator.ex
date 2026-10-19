@@ -58,6 +58,7 @@ defmodule SymphonyElixir.TransitionCoordinator do
       :clock,
       :orchestrator,
       :dispatch_witness_sink,
+      :dispatch_witness_timeout_ms,
       require_durable?: true,
       dispatch_witness_required?: false,
       transition_disabled?: false,
@@ -76,6 +77,7 @@ defmodule SymphonyElixir.TransitionCoordinator do
             clock: (-> DateTime.t()),
             orchestrator: GenServer.server(),
             dispatch_witness_sink: (ProviderDispatchWitness.t() -> term()) | nil,
+            dispatch_witness_timeout_ms: pos_integer(),
             require_durable?: boolean(),
             dispatch_witness_required?: boolean(),
             transition_disabled?: boolean(),
@@ -195,11 +197,20 @@ defmodule SymphonyElixir.TransitionCoordinator do
     dispatch_witness_sink = Keyword.get(opts, :dispatch_witness_sink)
     dispatch_witness_required? = Keyword.get(opts, :dispatch_witness_required?, false)
 
+    dispatch_witness_timeout_ms =
+      Keyword.get(opts, :dispatch_witness_timeout_ms, ProviderDispatchWitness.default_timeout_ms())
+
     default_suspend = fn work_item_id, reason, _attempt ->
       Orchestrator.suspend_work_item(orchestrator, work_item_id, reason)
     end
 
-    with :ok <- validate_dispatch_witness_options(opts, dispatch_witness_sink, dispatch_witness_required?),
+    with :ok <-
+           validate_dispatch_witness_options(
+             opts,
+             dispatch_witness_sink,
+             dispatch_witness_required?,
+             dispatch_witness_timeout_ms
+           ),
          {:ok, ledger} <- open_dispatch_witness_ledger(opts, dispatch_witness_required?),
          {:ok, refresh_contract} <- callback(opts, :refresh_contract, &default_refresh_contract/1),
          {:ok, load_context} <-
@@ -208,7 +219,13 @@ defmodule SymphonyElixir.TransitionCoordinator do
            end),
          {:ok, submit} <-
            callback(opts, :submit, fn attempt, context ->
-             default_submit(attempt, context, dispatch_witness_sink, dispatch_witness_required?)
+             default_submit(
+               attempt,
+               context,
+               dispatch_witness_sink,
+               dispatch_witness_required?,
+               dispatch_witness_timeout_ms
+             )
            end),
          {:ok, verify} <-
            callback(opts, :verify, fn attempt, context ->
@@ -229,6 +246,7 @@ defmodule SymphonyElixir.TransitionCoordinator do
         orchestrator: orchestrator,
         require_durable?: Keyword.get(opts, :require_durable?, true),
         dispatch_witness_sink: dispatch_witness_sink,
+        dispatch_witness_timeout_ms: dispatch_witness_timeout_ms,
         dispatch_witness_required?: dispatch_witness_required?
       }
 
@@ -1375,14 +1393,18 @@ defmodule SymphonyElixir.TransitionCoordinator do
   defp close_ledger(nil), do: :ok
   defp close_ledger(%TransitionAttemptLedger{} = ledger), do: TransitionAttemptLedger.close(ledger)
 
-  defp validate_dispatch_witness_options(opts, sink, required?) when is_boolean(required?) do
-    case validate_dispatch_witness_sink(sink, required?) do
-      :ok -> validate_required_dispatch_callbacks(opts, required?)
-      {:error, _reason} = error -> error
+  defp validate_dispatch_witness_options(opts, sink, required?, timeout_ms) when is_boolean(required?) do
+    if ProviderDispatchWitness.valid_timeout?(timeout_ms) do
+      case validate_dispatch_witness_sink(sink, required?) do
+        :ok -> validate_required_dispatch_callbacks(opts, required?)
+        {:error, _reason} = error -> error
+      end
+    else
+      {:error, {:invalid_dispatch_witness_timeout, timeout_ms}}
     end
   end
 
-  defp validate_dispatch_witness_options(_opts, _sink, _required?),
+  defp validate_dispatch_witness_options(_opts, _sink, _required?, _timeout_ms),
     do: {:error, :invalid_dispatch_witness_configuration}
 
   defp validate_dispatch_witness_sink(nil, true), do: {:error, :dispatch_witness_sink_required}
@@ -1703,7 +1725,13 @@ defmodule SymphonyElixir.TransitionCoordinator do
   defp validate_observation_scope(_observation, _contract),
     do: {:error, :provider_project_contract_required}
 
-  defp default_submit(%TransitionAttempt{} = attempt, context, dispatch_witness_sink, dispatch_witness_required?) do
+  defp default_submit(
+         %TransitionAttempt{} = attempt,
+         context,
+         dispatch_witness_sink,
+         dispatch_witness_required?,
+         dispatch_witness_timeout_ms
+       ) do
     opts =
       []
       |> maybe_put_option(:tracker_settings, Map.get(context, :tracker_settings))
@@ -1711,6 +1739,7 @@ defmodule SymphonyElixir.TransitionCoordinator do
       |> maybe_put_option(:pre_observation, Map.get(context, :provider_observation))
       |> maybe_put_option(:provider_mutation_envelope, Map.get(context, :provider_mutation_envelope))
       |> maybe_put_option(:dispatch_witness_sink, dispatch_witness_sink)
+      |> Keyword.put(:dispatch_witness_timeout_ms, dispatch_witness_timeout_ms)
       |> Keyword.put(:dispatch_witness_required?, dispatch_witness_required?)
 
     Tracker.submit_controlled_transition(attempt.work_item_id, attempt.requested_to, opts)

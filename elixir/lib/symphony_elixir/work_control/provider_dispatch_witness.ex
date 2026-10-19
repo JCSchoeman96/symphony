@@ -1,13 +1,16 @@
 defmodule SymphonyElixir.WorkControl.ProviderDispatchWitness do
   @moduledoc """
-  Safe, synchronous evidence that one correlated provider request is entering
-  its transport handoff.
+  Bounded evidence that one correlated provider request is entering its
+  transport handoff.
 
   The witness acknowledges an application request object. It does not prove
   that network bytes were sent or that the provider received the mutation.
   """
 
   alias SymphonyElixir.WorkControl.{ProviderMutationEnvelope, TransitionAttempt}
+
+  @default_sink_timeout_ms 1_000
+  @max_sink_timeout_ms 5_000
 
   defmodule DispatchError do
     @moduledoc false
@@ -115,21 +118,57 @@ defmodule SymphonyElixir.WorkControl.ProviderDispatchWitness do
 
   defp valid_target?(witness), do: non_empty?(witness.target_provider_state_id)
 
-  @spec dispatch(ProviderMutationEnvelope.t(), Finch.Request.t(), term(), boolean(), (Finch.Request.t() -> term())) ::
-          term()
+  @spec dispatch(
+          ProviderMutationEnvelope.t(),
+          Finch.Request.t(),
+          term(),
+          boolean(),
+          (Finch.Request.t() -> term())
+        ) :: term()
   def dispatch(%ProviderMutationEnvelope{} = envelope, %Finch.Request{} = request, sink, required?, transport_fun)
       when is_boolean(required?) and is_function(transport_fun, 1) do
+    dispatch(envelope, request, sink, required?, transport_fun, default_timeout_ms())
+  end
+
+  def dispatch(_envelope, _request, _sink, _required?, _transport_fun),
+    do: {:error, {:dispatch_witness_failed, :invalid_dispatch_request}}
+
+  @spec dispatch(
+          ProviderMutationEnvelope.t(),
+          Finch.Request.t(),
+          term(),
+          boolean(),
+          (Finch.Request.t() -> term()),
+          term()
+        ) :: term()
+  def dispatch(%ProviderMutationEnvelope{} = envelope, %Finch.Request{} = request, sink, required?, transport_fun, timeout_ms)
+      when is_boolean(required?) and is_function(transport_fun, 1) do
+    if valid_timeout?(timeout_ms) do
+      do_dispatch(envelope, request, sink, required?, transport_fun, timeout_ms)
+    else
+      {:error, {:dispatch_witness_failed, :invalid_sink_timeout}}
+    end
+  end
+
+  def dispatch(_envelope, _request, _sink, _required?, _transport_fun, _timeout_ms),
+    do: {:error, {:dispatch_witness_failed, :invalid_dispatch_request}}
+
+  defp do_dispatch(envelope, request, sink, required?, transport_fun, timeout_ms) do
     with :ok <- request_identity_matches(envelope, request),
          {:ok, witness} <- new(envelope, DateTime.utc_now()),
-         :ok <- acknowledge(sink, witness, required?) do
+         :ok <- acknowledge(sink, witness, required?, timeout_ms) do
       invoke_transport(transport_fun, request)
     else
       {:error, reason} -> {:error, {:dispatch_witness_failed, reason}}
     end
   end
 
-  def dispatch(_envelope, _request, _sink, _required?, _transport_fun),
-    do: {:error, {:dispatch_witness_failed, :invalid_dispatch_request}}
+  @spec default_timeout_ms() :: pos_integer()
+  def default_timeout_ms, do: @default_sink_timeout_ms
+
+  @spec valid_timeout?(term()) :: boolean()
+  def valid_timeout?(timeout_ms),
+    do: is_integer(timeout_ms) and timeout_ms > 0 and timeout_ms <= @max_sink_timeout_ms
 
   @spec private_request_id_key() :: atom()
   def private_request_id_key, do: @private_request_id_key
@@ -143,27 +182,89 @@ defmodule SymphonyElixir.WorkControl.ProviderDispatchWitness do
     end
   end
 
-  defp acknowledge(nil, _witness, false), do: :ok
-  defp acknowledge(nil, _witness, true), do: {:error, :sink_unavailable}
+  defp acknowledge(nil, _witness, false, _timeout_ms), do: :ok
+  defp acknowledge(nil, _witness, true, _timeout_ms), do: {:error, :sink_unavailable}
 
-  defp acknowledge(sink, witness, _required?) when is_function(sink, 1) do
-    case invoke_sink(sink, witness) do
-      {:ok, request_id} when request_id == witness.provider_request_id -> :ok
-      {:ok, _request_id} -> {:error, :acknowledgment_mismatch}
+  defp acknowledge(sink, witness, _required?, timeout_ms) when is_function(sink, 1) do
+    case invoke_sink(sink, witness, timeout_ms) do
+      {:ok, {:ok, request_id}} when request_id == witness.provider_request_id -> :ok
+      {:ok, {:ok, _request_id}} -> {:error, :acknowledgment_mismatch}
+      {:ok, {:error, _reason}} -> {:error, :sink_rejected}
+      {:ok, _other} -> {:error, :invalid_acknowledgment}
+      {:error, :sink_timeout} -> {:error, :sink_timeout}
       {:error, _reason} -> {:error, :sink_rejected}
-      _other -> {:error, :invalid_acknowledgment}
     end
   end
 
-  defp acknowledge(_sink, _witness, true), do: {:error, :sink_invalid}
-  defp acknowledge(_sink, _witness, false), do: {:error, :sink_invalid}
+  defp acknowledge(_sink, _witness, true, _timeout_ms), do: {:error, :sink_invalid}
+  defp acknowledge(_sink, _witness, false, _timeout_ms), do: {:error, :sink_invalid}
 
-  defp invoke_sink(sink, witness) do
+  defp invoke_sink(sink, witness, timeout_ms) do
+    caller = self()
+    reply_ref = make_ref()
+
+    {controller, monitor_ref} =
+      spawn_monitor(fn -> run_sink_controller(caller, reply_ref, sink, witness, timeout_ms) end)
+
+    receive do
+      {^reply_ref, result} ->
+        Process.demonitor(monitor_ref, [:flush])
+        result
+
+      {:DOWN, ^monitor_ref, :process, ^controller, _reason} ->
+        {:error, :sink_rejected}
+    end
+  end
+
+  defp run_sink_controller(caller, reply_ref, sink, witness, timeout_ms) do
+    controller = self()
+    caller_monitor = Process.monitor(caller)
+
+    {worker, worker_monitor} =
+      :erlang.spawn_opt(
+        fn -> send(controller, {:sink_result, invoke_sink_callback(sink, witness)}) end,
+        [:link, :monitor]
+      )
+
+    receive do
+      {:sink_result, result} ->
+        Process.unlink(worker)
+        await_worker_exit(worker, worker_monitor)
+        Process.demonitor(caller_monitor, [:flush])
+        send(caller, {reply_ref, {:ok, result}})
+
+      {:DOWN, ^worker_monitor, :process, ^worker, _reason} ->
+        Process.demonitor(caller_monitor, [:flush])
+        send(caller, {reply_ref, {:error, :sink_rejected}})
+
+      {:DOWN, ^caller_monitor, :process, ^caller, _reason} ->
+        stop_sink_worker(worker, worker_monitor)
+    after
+      timeout_ms ->
+        stop_sink_worker(worker, worker_monitor)
+        Process.demonitor(caller_monitor, [:flush])
+        send(caller, {reply_ref, {:error, :sink_timeout}})
+    end
+  end
+
+  defp invoke_sink_callback(sink, witness) do
     sink.(witness)
   rescue
     _error -> {:error, :sink_exception}
   catch
     _kind, _reason -> {:error, :sink_exception}
+  end
+
+  defp stop_sink_worker(worker, worker_monitor) do
+    Process.unlink(worker)
+    Process.exit(worker, :kill)
+    await_worker_exit(worker, worker_monitor)
+  end
+
+  defp await_worker_exit(worker, worker_monitor) do
+    receive do
+      {:DOWN, ^worker_monitor, :process, ^worker, _reason} -> :ok
+    end
   end
 
   defp invoke_transport(transport_fun, request) do

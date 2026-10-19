@@ -73,6 +73,35 @@ defmodule SymphonyElixir.ProviderDispatchWitnessTest do
     end
   end
 
+  test "times out and terminates a blocking sink before transport" do
+    parent = self()
+
+    sink = fn _witness ->
+      send(parent, {:sink_worker, self()})
+
+      receive do
+        :release -> {:ok, @request_id}
+      end
+    end
+
+    assert {:error, {:dispatch_witness_failed, :sink_timeout}} =
+             ProviderDispatchWitness.dispatch(
+               envelope(),
+               finch_request(@request_id),
+               sink,
+               true,
+               fn _request ->
+                 send(parent, :transport_called)
+                 {:ok, :response}
+               end,
+               25
+             )
+
+    assert_receive {:sink_worker, worker_pid}
+    refute Process.alive?(worker_pid)
+    refute_received :transport_called
+  end
+
   test "rejects a Finch request carrying a different correlation identity before witness or transport" do
     parent = self()
 

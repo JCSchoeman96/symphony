@@ -7,6 +7,7 @@ defmodule SymphonyElixir.Plane.Client do
   """
 
   alias SymphonyElixir.Plane.ReadScheduler
+  alias SymphonyElixir.Plane.ReqFinchErrorNormalizer
   alias SymphonyElixir.WorkControl.{ProviderDispatchWitness, ProviderMutationEnvelope}
 
   @default_base_url "https://api.plane.so"
@@ -413,10 +414,14 @@ defmodule SymphonyElixir.Plane.Client do
 
   defp validate_witness_configuration(opts) do
     witness_required? = Keyword.get(opts, :dispatch_witness_required?, false)
+    timeout_ms = Keyword.get(opts, :dispatch_witness_timeout_ms, ProviderDispatchWitness.default_timeout_ms())
 
     cond do
       not is_boolean(witness_required?) ->
         {:error, {:dispatch_witness_failed, :invalid_dispatch_witness_configuration}}
+
+      not ProviderDispatchWitness.valid_timeout?(timeout_ms) ->
+        {:error, {:dispatch_witness_failed, :invalid_sink_timeout}}
 
       witness_required? and not provider_mutation_envelope?(Keyword.get(opts, :provider_mutation_envelope)) ->
         {:error, {:dispatch_witness_failed, :provider_mutation_envelope_required}}
@@ -505,6 +510,7 @@ defmodule SymphonyElixir.Plane.Client do
     envelope = Keyword.get(opts, :provider_mutation_envelope)
     witness_sink = Keyword.get(opts, :dispatch_witness_sink)
     witness_required? = Keyword.get(opts, :dispatch_witness_required?, false)
+    witness_timeout_ms = Keyword.get(opts, :dispatch_witness_timeout_ms, ProviderDispatchWitness.default_timeout_ms())
 
     req_options = [
       method: :patch,
@@ -521,7 +527,10 @@ defmodule SymphonyElixir.Plane.Client do
     ]
 
     req_options = attach_request_correlation(req_options, envelope)
-    req_options = attach_witness_hook(req_options, request, envelope, witness_sink, witness_required?)
+
+    req_options =
+      attach_witness_hook(req_options, request, envelope, witness_sink, witness_required?, witness_timeout_ms)
+
     req_options = attach_witness_transport(req_options, witness_required?)
 
     case Req.request(req_options) do
@@ -546,15 +555,15 @@ defmodule SymphonyElixir.Plane.Client do
 
   defp attach_request_correlation(req_options, _envelope), do: req_options
 
-  defp attach_witness_hook(req_options, request, %ProviderMutationEnvelope{} = envelope, witness_sink, required?) do
+  defp attach_witness_hook(req_options, request, %ProviderMutationEnvelope{} = envelope, witness_sink, required?, timeout_ms) do
     Keyword.put(
       req_options,
       :finch_request,
-      witnessed_finch_request(request, envelope, witness_sink, required?)
+      witnessed_finch_request(request, envelope, witness_sink, required?, timeout_ms)
     )
   end
 
-  defp attach_witness_hook(req_options, _request, _envelope, _witness_sink, _required?), do: req_options
+  defp attach_witness_hook(req_options, _request, _envelope, _witness_sink, _required?, _timeout_ms), do: req_options
 
   defp attach_witness_transport(req_options, true) do
     req_options
@@ -566,7 +575,7 @@ defmodule SymphonyElixir.Plane.Client do
 
   defp attach_witness_transport(req_options, false), do: req_options
 
-  defp witnessed_finch_request(request, envelope, witness_sink, witness_required?) do
+  defp witnessed_finch_request(request, envelope, witness_sink, witness_required?, witness_timeout_ms) do
     fn req, finch_request, finch_name, finch_options ->
       transport_fun = fn final_request ->
         stream_bounded_response(req, final_request, finch_name, finch_options)
@@ -580,7 +589,8 @@ defmodule SymphonyElixir.Plane.Client do
               finch_request,
               witness_sink,
               witness_required?,
-              transport_fun
+              transport_fun,
+              witness_timeout_ms
             )
 
           {:error, _reason} = error ->
@@ -594,11 +604,14 @@ defmodule SymphonyElixir.Plane.Client do
         {req, %Req.TransportError{} = error} ->
           {req, error}
 
+        {req, %Req.HTTPError{} = error} ->
+          {req, error}
+
         {:error, {:dispatch_witness_failed, reason}} ->
           {req, %ProviderDispatchWitness.DispatchError{reason: reason}}
 
         {:error, exception} when is_exception(exception) ->
-          {req, normalize_finch_error(exception)}
+          {req, ReqFinchErrorNormalizer.normalize(exception)}
 
         _other ->
           {req, Req.TransportError.exception(reason: :provider_unavailable)}
@@ -646,14 +659,11 @@ defmodule SymphonyElixir.Plane.Client do
         {:cont, {current_req, %{current_response | trailers: Map.merge(current_response.trailers, trailers)}}}
     end
 
-    case Finch.stream_while(finch_request, finch_name, {req, response}, stream_fun, finch_options) do
-      {:ok, acc} -> acc
-      {:error, exception, _acc} -> {req, normalize_finch_error(exception)}
-    end
+    ReqFinchErrorNormalizer.normalize_stream_result(
+      req,
+      Finch.stream_while(finch_request, finch_name, {req, response}, stream_fun, finch_options)
+    )
   end
-
-  defp normalize_finch_error(%Mint.TransportError{reason: reason}), do: %Req.TransportError{reason: reason}
-  defp normalize_finch_error(exception), do: exception
 
   defp normalize_mutation_response(response) do
     status = Map.get(response, :status, Map.get(response, "status"))

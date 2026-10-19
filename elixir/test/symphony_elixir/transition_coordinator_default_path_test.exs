@@ -2,6 +2,7 @@ defmodule SymphonyElixir.TransitionCoordinatorDefaultPathTest do
   use SymphonyElixir.TestSupport
 
   alias SymphonyElixir.AgentRuntime.{Profile, Route}
+  alias SymphonyElixir.Plane.Client
   alias SymphonyElixir.SourceControl
   alias SymphonyElixir.SourceControl.CandidateRef
   alias SymphonyElixir.SourceControl.CandidateVerification
@@ -364,6 +365,57 @@ defmodule SymphonyElixir.TransitionCoordinatorDefaultPathTest do
       )
 
     assert {:ok, %{state: :provider_failed}} = request_transition(coordinator, intent())
+  end
+
+  test "a real Finch connection refusal reaches the coordinator as a proven non-commit" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory", symphony_project_id: "project-1")
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue("Ready", "state-ready")])
+
+    {:ok, listener} = :gen_tcp.listen(0, [:binary, active: false, reuseaddr: true])
+    {:ok, {_address, port}} = :inet.sockname(listener)
+    :ok = :gen_tcp.close(listener)
+    parent = self()
+
+    {:ok, orchestrator} =
+      SymphonyElixir.TransitionCoordinatorDefaultPathOrchestrator.start_link(transition_context: {:ok, ready_context()})
+
+    {:ok, coordinator} =
+      TransitionCoordinator.start_link(
+        name: nil,
+        ledger: nil,
+        orchestrator: orchestrator,
+        refresh_contract: fn _context -> {:ok, contract()} end,
+        submit: fn _attempt, context ->
+          envelope = context.provider_mutation_envelope
+
+          result =
+            Client.update_work_item_state(
+              %{
+                base_url: "http://127.0.0.1:#{port}",
+                workspace_slug: "workspace-1",
+                workspace_id: envelope.workspace_id,
+                project_id: envelope.project_id,
+                api_key: "test-only"
+              },
+              envelope.work_item_id,
+              envelope.target_provider_state_id,
+              provider_mutation_envelope: envelope,
+              request_fun: nil
+            )
+
+          send(parent, {:actual_finch_result, result})
+          result
+        end,
+        require_durable?: false
+      )
+
+    assert {:ok, attempt} = request_transition(coordinator, intent())
+    assert_received {:actual_finch_result, {:error, :econnrefused}}
+    assert attempt.state == :provider_failed
+    assert attempt.provider_ack_status == :not_submitted
+
+    GenServer.stop(coordinator)
+    GenServer.stop(orchestrator)
   end
 
   test "default verification classifies a proven non-submission after third-state movement as conflict" do

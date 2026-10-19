@@ -2,6 +2,7 @@ defmodule SymphonyElixir.PlaneClientTest do
   use ExUnit.Case, async: true
 
   alias SymphonyElixir.Plane.Client
+  alias SymphonyElixir.Plane.ReqFinchErrorNormalizer
   alias SymphonyElixir.WorkControl.ProviderMutationEnvelope
 
   @config %{
@@ -726,6 +727,39 @@ defmodule SymphonyElixir.PlaneClientTest do
       assert {:error, ^reason} =
                Client.update_work_item_state(@config, "item-1", "state-uuid", request_fun: fn _request -> {:error, reason} end)
     end
+  end
+
+  test "normalizes Mint and Finch errors using Req's Finch adapter semantics" do
+    assert %Req.TransportError{reason: :econnrefused} =
+             ReqFinchErrorNormalizer.normalize(%Mint.TransportError{reason: :econnrefused})
+
+    assert %Req.HTTPError{protocol: :http1, reason: :invalid_status} =
+             ReqFinchErrorNormalizer.normalize(%Mint.HTTPError{module: Mint.HTTP1, reason: :invalid_status})
+
+    assert %Req.HTTPError{protocol: :http2, reason: :stream_closed} =
+             ReqFinchErrorNormalizer.normalize(%Mint.HTTPError{module: Mint.HTTP2, reason: :stream_closed})
+
+    assert %Req.HTTPError{protocol: :http2, reason: :pool_not_available} =
+             ReqFinchErrorNormalizer.normalize(%Finch.Error{reason: :pool_not_available})
+
+    assert %Req.TransportError{reason: :econnrefused} =
+             ReqFinchErrorNormalizer.normalize(%Finch.TransportError{reason: :econnrefused})
+
+    assert %Req.HTTPError{protocol: :http1, reason: :closed} =
+             ReqFinchErrorNormalizer.normalize(%Finch.HTTPError{module: Mint.HTTP1, reason: :closed})
+
+    assert %Req.HTTPError{protocol: :http2, reason: :closed} =
+             ReqFinchErrorNormalizer.normalize(%Finch.HTTPError{module: Mint.HTTP2, reason: :closed})
+  end
+
+  test "normalizes both Finch stream error tuple shapes supported by Req" do
+    exception = %Finch.TransportError{reason: :econnrefused}
+
+    assert {:req, %Req.TransportError{reason: :econnrefused}} =
+             ReqFinchErrorNormalizer.normalize_stream_result(:req, {:error, exception})
+
+    assert {:req, %Req.TransportError{reason: :econnrefused}} =
+             ReqFinchErrorNormalizer.normalize_stream_result(:req, {:error, exception, {:acc, :state}})
   end
 
   test "passes mutation bodies through the supported positional request function arities" do

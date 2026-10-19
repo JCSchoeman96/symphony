@@ -460,7 +460,8 @@ defmodule SymphonyElixir.Plane.Adapter do
         :epoch_id,
         :provider_mutation_envelope,
         :dispatch_witness_sink,
-        :dispatch_witness_required?
+        :dispatch_witness_required?,
+        :dispatch_witness_timeout_ms
       ])
 
     Keyword.merge(propagated, request_opts(request_fun))
