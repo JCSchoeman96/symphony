@@ -14,7 +14,13 @@ defmodule SymphonyElixir.Tracker do
   alias SymphonyElixir.Tracker.Capabilities
   alias SymphonyElixir.Tracker.Issue
   alias SymphonyElixir.TransitionCoordinator
-  alias SymphonyElixir.WorkControl.{ProviderObservation, SemanticTransitionIntent, WorkflowLifecycle}
+
+  alias SymphonyElixir.WorkControl.{
+    ProviderMutationEnvelope,
+    ProviderObservation,
+    SemanticTransitionIntent,
+    WorkflowLifecycle
+  }
 
   @adapters %{
     "asana" => SymphonyElixir.Asana.Adapter,
@@ -170,7 +176,8 @@ defmodule SymphonyElixir.Tracker do
       when is_binary(work_item_id) and is_list(opts) do
     adapter = Keyword.get_lazy(opts, :adapter, &adapter/0)
 
-    with {:ok, declared} <- Capabilities.validate_adapter(adapter),
+    with :ok <- validate_mutation_correlation(work_item_id, target_state, opts),
+         {:ok, declared} <- Capabilities.validate_adapter(adapter),
          true <- :controlled_transition in declared,
          true <- Code.ensure_loaded?(adapter),
          true <- function_exported?(adapter, :submit_controlled_transition, 3) do
@@ -178,6 +185,26 @@ defmodule SymphonyElixir.Tracker do
     else
       false -> {:error, :controlled_transition_unsupported}
       {:error, _reason} = error -> error
+    end
+  end
+
+  defp validate_mutation_correlation(work_item_id, target_state, opts) do
+    envelope = Keyword.get(opts, :provider_mutation_envelope)
+    required? = Keyword.get(opts, :dispatch_witness_required?, false)
+
+    cond do
+      is_nil(envelope) and required? ->
+        {:error, :provider_mutation_envelope_required}
+
+      is_nil(envelope) ->
+        :ok
+
+      match?(%ProviderMutationEnvelope{}, envelope) and ProviderMutationEnvelope.valid?(envelope) and
+        envelope.work_item_id == work_item_id and envelope.requested_to == target_state ->
+        :ok
+
+      true ->
+        {:error, :provider_mutation_envelope_mismatch}
     end
   end
 

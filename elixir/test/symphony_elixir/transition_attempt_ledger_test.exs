@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.TransitionAttemptLedgerTest do
   use ExUnit.Case
 
-  alias SymphonyElixir.WorkControl.{TransitionAttempt, TransitionAttemptLedger}
+  alias SymphonyElixir.WorkControl.{SemanticTransitionIntent, TransitionAttempt, TransitionAttemptLedger}
 
   @identity %{tracker_kind: "plane", provider_scope: %{project_id: "project-a"}}
 
@@ -29,6 +29,77 @@ defmodule SymphonyElixir.TransitionAttemptLedgerTest do
     assert {:ok, ^attempt} = TransitionAttemptLedger.get(reopened, "attempt-a")
     assert {:ok, ^attempt} = TransitionAttemptLedger.latest_for_work_item(reopened, "work-a")
     assert :ok = TransitionAttemptLedger.close(reopened)
+  end
+
+  test "persists provider request correlation and rejects reuse across attempts", %{path: path} do
+    {:ok, ledger} = TransitionAttemptLedger.open("project-a", @identity, path: path)
+    request_id = "preq_00000000-0000-4000-8000-000000000001"
+    submitted = attempt("attempt-a", "work-a", :submitted) |> Map.put(:provider_request_id, request_id)
+
+    assert :ok = TransitionAttemptLedger.put_sync(ledger, submitted)
+    assert {:ok, ^submitted} = TransitionAttemptLedger.get(ledger, "attempt-a")
+
+    duplicate = attempt("attempt-b", "work-b", :submitted) |> Map.put(:provider_request_id, request_id)
+
+    assert {:error, {:duplicate_provider_request_id, ^request_id}} =
+             TransitionAttemptLedger.put_sync(ledger, duplicate)
+
+    assert :ok = TransitionAttemptLedger.close(ledger)
+
+    {:ok, reopened} = TransitionAttemptLedger.open("project-a", @identity, path: path)
+    assert {:ok, ^submitted} = TransitionAttemptLedger.get(reopened, "attempt-a")
+    assert :ok = TransitionAttemptLedger.close(reopened)
+  end
+
+  test "provider request correlation cannot be changed or removed after binding", %{path: path} do
+    {:ok, ledger} = TransitionAttemptLedger.open("project-a", @identity, path: path)
+    request_id = "preq_00000000-0000-4000-8000-000000000001"
+    submitted = attempt("attempt-a", "work-a", :submitted) |> Map.put(:provider_request_id, request_id)
+
+    assert :ok = TransitionAttemptLedger.put_sync(ledger, submitted)
+
+    changed = Map.put(submitted, :provider_request_id, "preq_00000000-0000-4000-8000-000000000002")
+    unbound = Map.delete(submitted, :provider_request_id)
+
+    assert {:error, {:provider_request_id_immutable, ^request_id}} =
+             TransitionAttemptLedger.put_sync(ledger, changed)
+
+    assert {:error, {:provider_request_id_immutable, ^request_id}} =
+             TransitionAttemptLedger.put_sync(ledger, unbound)
+
+    assert {:ok, ^submitted} = TransitionAttemptLedger.get(ledger, "attempt-a")
+    assert :ok = TransitionAttemptLedger.close(ledger)
+  end
+
+  test "keeps legacy submitted records without a provider request id readable", %{path: path} do
+    {:ok, ledger} = TransitionAttemptLedger.open("project-a", @identity, path: path)
+    legacy = attempt("legacy-attempt", "legacy-work", :submitted)
+
+    assert :ok = TransitionAttemptLedger.put_sync(ledger, legacy)
+    assert :ok = TransitionAttemptLedger.close(ledger)
+
+    {:ok, reopened} = TransitionAttemptLedger.open("project-a", @identity, path: path)
+    assert {:ok, ^legacy} = TransitionAttemptLedger.get(reopened, "legacy-attempt")
+    refute TransitionAttemptLedger.resubmit_allowed?(legacy)
+    assert :ok = TransitionAttemptLedger.close(reopened)
+  end
+
+  test "normalizes older struct-shaped records with the new request id field", %{path: path} do
+    {:ok, ledger} = TransitionAttemptLedger.open("project-a", @identity, path: path)
+
+    legacy_struct =
+      legacy_prepared_attempt()
+      |> Map.from_struct()
+      |> Map.delete(:provider_request_id)
+      |> Map.put(:__struct__, TransitionAttempt)
+
+    assert :ok = TransitionAttemptLedger.put_sync(ledger, legacy_struct)
+    assert {:ok, loaded} = TransitionAttemptLedger.get(ledger, "legacy-struct")
+    assert is_struct(loaded, TransitionAttempt)
+    assert Map.has_key?(loaded, :provider_request_id)
+    assert is_nil(Map.get(loaded, :provider_request_id))
+    refute TransitionAttemptLedger.resubmit_allowed?(loaded)
+    assert :ok = TransitionAttemptLedger.close(ledger)
   end
 
   test "rejects invalid ledger identities and malformed lookups", %{path: path} do
@@ -711,5 +782,46 @@ defmodule SymphonyElixir.TransitionAttemptLedgerTest do
       created_at: 1_700_000_000_000,
       updated_at: 1_700_000_000_000
     }
+  end
+
+  defp legacy_prepared_attempt do
+    requested_at = ~U[2026-10-19 09:00:00Z]
+
+    attrs = %{
+      transition_attempt_id: "legacy-struct",
+      work_item_id: "legacy-work",
+      requested_from: :ready,
+      requested_to: :in_progress,
+      responsibility: "implementation",
+      guard_evidence: [],
+      requested_at: requested_at
+    }
+
+    {:ok, intent} = SemanticTransitionIntent.new(Map.delete(attrs, :transition_attempt_id))
+    {:ok, attempt} = TransitionAttempt.new(attrs)
+    {:ok, authorized} = TransitionAttempt.authorize_intent(attempt, intent)
+
+    fresh_context = %{
+      provider: :plane,
+      workspace_id: "workspace-a",
+      project_id: "project-a",
+      provider_state_id: "ready-state",
+      provider_state_group: :unstarted,
+      provider_contract_fingerprint: "sha256:contract",
+      dependency_epoch_evidence: %{complete?: true}
+    }
+
+    {:ok, loaded} = TransitionAttempt.fresh_context_loaded(authorized, fresh_context)
+
+    prepared_context = %{
+      target_provider_state_id: "in-progress-state",
+      target_provider_state_group: :started,
+      provider_contract_fingerprint: "sha256:contract",
+      dependency_epoch_evidence: %{complete?: true}
+    }
+
+    {:ok, prepared} = TransitionAttempt.prepare(loaded, prepared_context)
+    {:ok, fenced} = TransitionAttempt.arm_submission_fence(prepared, %{at: requested_at})
+    fenced
   end
 end

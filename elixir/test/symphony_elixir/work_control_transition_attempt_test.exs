@@ -140,6 +140,28 @@ defmodule SymphonyElixir.WorkControlTransitionAttemptTest do
     refute TransitionAttempt.automatic_mutation_allowed?(verified)
   end
 
+  test "binds one opaque provider request id when mutation is submitted" do
+    assert {:ok, attempt} = TransitionAttempt.new(attempt_attrs())
+    assert {:ok, authorized} = TransitionAttempt.authorize_intent(attempt, intent())
+    assert {:ok, loaded} = TransitionAttempt.fresh_context_loaded(authorized, fresh_context())
+    assert {:ok, prepared} = TransitionAttempt.prepare(loaded, prepare_context())
+    assert {:ok, fenced} = TransitionAttempt.arm_submission_fence(prepared, %{at: @now})
+
+    request_id = "preq_00000000-0000-4000-8000-000000000001"
+
+    assert {:ok, submitted} =
+             TransitionAttempt.mark_mutation_submitted(fenced, %{at: @now, provider_request_id: request_id})
+
+    assert Map.get(submitted, :provider_request_id) == request_id
+
+    assert {:error, :invalid_provider_request_id} =
+             TransitionAttempt.mark_mutation_submitted(fenced, %{at: @now, provider_request_id: "ghp_secret"})
+
+    assert {:ok, generated} = TransitionAttempt.mark_mutation_submitted(fenced, %{at: @now})
+    assert is_binary(Map.get(generated, :provider_request_id))
+    assert String.starts_with?(Map.get(generated, :provider_request_id), "preq_")
+  end
+
   test "rejects mismatched intents and out-of-order forward transitions" do
     assert {:ok, attempt} = TransitionAttempt.new(attempt_attrs())
 

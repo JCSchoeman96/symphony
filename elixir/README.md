@@ -337,6 +337,14 @@ codex:
   after the closing node set remains stable. A provider mutation acknowledgement is not transition
   proof. Symphony rereads the provider and reassesses lifecycle authority. Plane capability does
   not establish Symphony authority or completion proof.
+- The transition coordinator durably records `mutation_submitted` with an opaque
+  `provider_request_id` before provider dispatch. In explicit witness-required mode, Req's
+  request-specific Finch hook makes that ID available in private request metadata and requires a
+  matching synchronous acknowledgment before invoking the exact Finch request. The witness proves
+  an application handoff only; it does not prove network transmission, provider receipt, or
+  provider commit. Fresh provider reread remains mandatory. See
+  [H-100 P0 submission correlation](../docs/symphony-hardening-playbook-v4.1/H100_P0_SUBMISSION_CORRELATION_IMPLEMENTATION.md)
+  for the current proof contract and limits.
 - Webhook wake-ups are optional. Set the host environment variable `PLANE_WEBHOOK_SECRET` to the
   secret from the Plane v2 webhook; it is not a `WORKFLOW.md` setting. The endpoint verifies the
   HMAC-SHA256 signature over the exact raw request bytes before decoding JSON and rejects bodies

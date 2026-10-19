@@ -73,7 +73,13 @@ defmodule SymphonyElixir.WorkControl.TransitionAttemptLedger do
   @spec put_sync(t(), TransitionAttempt.t() | map()) :: :ok | {:error, term()}
   def put_sync(%__MODULE__{} = ledger, attempt) do
     with {:ok, record, attempt_id, work_item_id} <- validate_attempt(ledger, attempt),
-         :ok <- persist(ledger, [{{:attempt, attempt_id}, record}, {{:latest, work_item_id}, attempt_id}]) do
+         :ok <- ensure_provider_request_id_binding(ledger, record, attempt_id),
+         :ok <-
+           persist(
+             ledger,
+             [{{:attempt, attempt_id}, record}, {{:latest, work_item_id}, attempt_id}] ++
+               provider_request_id_record(record, attempt_id)
+           ) do
       sync(ledger)
     end
   end
@@ -254,6 +260,9 @@ defmodule SymphonyElixir.WorkControl.TransitionAttemptLedger do
           {{:latest, _work_item_id}, _attempt_id}, _result ->
             {:error, {:corrupt_transition_attempt, :invalid_record}}
 
+          {{:provider_request_id, request_id}, attempt_id}, result ->
+            collect_provider_request_id(request_id, attempt_id, result)
+
           {{:reconciliation, marker_id}, marker}, {:ok, %{markers: markers} = result}
           when is_binary(marker_id) ->
             if Map.has_key?(markers, marker_id) do
@@ -277,12 +286,20 @@ defmodule SymphonyElixir.WorkControl.TransitionAttemptLedger do
           _other, _result ->
             {:error, {:corrupt_transition_attempt, :invalid_record}}
         end,
-        {:ok, %{attempts: [], pointers: [], markers: %{}, metadata_seen: false}},
+        {:ok, %{attempts: [], pointers: [], request_ids: %{}, markers: %{}, metadata_seen: false}},
         ledger.table
       )
 
-    with {:ok, %{attempts: attempts, pointers: pointers, markers: markers, metadata_seen: true}} <- result,
+    with {:ok,
+          %{
+            attempts: attempts,
+            pointers: pointers,
+            request_ids: request_ids,
+            markers: markers,
+            metadata_seen: true
+          }} <- result,
          :ok <- validate_latest_pointers(attempts, pointers),
+         :ok <- validate_provider_request_id_indexes(attempts, request_ids),
          :ok <- validate_markers(ledger, attempts, markers) do
       candidates =
         Enum.filter(attempts, fn attempt ->
@@ -431,8 +448,9 @@ defmodule SymphonyElixir.WorkControl.TransitionAttemptLedger do
   defp validate_metadata(_metadata, _ledger), do: {:error, {:corrupt_transition_attempt, :metadata}}
 
   defp validate_attempt(ledger, %TransitionAttempt{} = attempt) do
-    record = Map.from_struct(attempt)
-    validate_attempt_map(ledger, record, attempt)
+    normalized = Map.put_new(attempt, :provider_request_id, nil)
+    record = Map.from_struct(normalized)
+    validate_attempt_map(ledger, record, normalized)
   end
 
   defp validate_attempt(ledger, record) when is_map(record), do: validate_attempt_map(ledger, record, record)
@@ -449,6 +467,7 @@ defmodule SymphonyElixir.WorkControl.TransitionAttemptLedger do
          :ok <- validate_state_pair(record),
          :ok <- validate_status(status),
          :ok <- validate_attempt_timestamps(record),
+         :ok <- validate_provider_request_id(record),
          :ok <- validate_record_keys(record, original) do
       {:ok, original, attempt_id, work_item_id}
     end
@@ -493,6 +512,126 @@ defmodule SymphonyElixir.WorkControl.TransitionAttemptLedger do
       :ok
     else
       {:error, {:corrupt_transition_attempt, :invalid_record}}
+    end
+  end
+
+  defp validate_provider_request_id(record) do
+    case Map.get(record, :provider_request_id) do
+      nil ->
+        :ok
+
+      request_id when is_binary(request_id) ->
+        if TransitionAttempt.valid_provider_request_id?(request_id),
+          do: :ok,
+          else: {:error, {:corrupt_transition_attempt, :invalid_record}}
+
+      _request_id ->
+        {:error, {:corrupt_transition_attempt, :invalid_record}}
+    end
+  end
+
+  defp validate_provider_request_id_indexes(attempts, request_ids) do
+    attempts_by_id = Map.new(attempts, &{attempt_identifier(&1), &1})
+
+    attempts_valid? =
+      Enum.all?(attempts, fn attempt ->
+        case Map.get(attempt, :provider_request_id) do
+          nil -> true
+          request_id -> Map.get(request_ids, request_id) == attempt_identifier(attempt)
+        end
+      end)
+
+    indexes_valid? =
+      Enum.all?(request_ids, fn {request_id, attempt_id} ->
+        TransitionAttempt.valid_provider_request_id?(request_id) and
+          case Map.get(attempts_by_id, attempt_id) do
+            nil -> false
+            attempt -> Map.get(attempt, :provider_request_id) == request_id
+          end
+      end)
+
+    if attempts_valid? and indexes_valid?, do: :ok, else: {:error, {:corrupt_transition_attempt, :invalid_record}}
+  end
+
+  defp collect_provider_request_id(request_id, attempt_id, {:ok, %{request_ids: request_ids} = result})
+       when is_binary(request_id) and is_binary(attempt_id) do
+    if Map.has_key?(request_ids, request_id) do
+      {:error, {:corrupt_transition_attempt, :invalid_record}}
+    else
+      {:ok, Map.put(result, :request_ids, Map.put(request_ids, request_id, attempt_id))}
+    end
+  end
+
+  defp collect_provider_request_id(_request_id, _attempt_id, {:ok, _result}),
+    do: {:error, {:corrupt_transition_attempt, :invalid_record}}
+
+  defp collect_provider_request_id(_request_id, _attempt_id, {:error, _reason} = error), do: error
+
+  defp ensure_provider_request_id_binding(ledger, record, attempt_id) do
+    case ensure_request_id_immutable(ledger, record, attempt_id) do
+      :ok -> ensure_request_id_unique(ledger, Map.get(record, :provider_request_id), attempt_id)
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp ensure_request_id_immutable(ledger, record, attempt_id) do
+    case :dets.lookup(ledger.table, {:attempt, attempt_id}) do
+      [] ->
+        :ok
+
+      [{{:attempt, ^attempt_id}, previous}] ->
+        ledger
+        |> validate_attempt(previous)
+        |> validate_previous_request_id(record, attempt_id)
+
+      _other ->
+        {:error, {:corrupt_transition_attempt, :invalid_record}}
+    end
+  end
+
+  defp validate_previous_request_id(
+         {:ok, previous_record, stored_attempt_id, _work_item_id},
+         record,
+         attempt_id
+       )
+       when stored_attempt_id == attempt_id do
+    previous_request_id = Map.get(previous_record, :provider_request_id)
+    next_request_id = Map.get(record, :provider_request_id)
+
+    if is_nil(previous_request_id) or previous_request_id == next_request_id do
+      :ok
+    else
+      {:error, {:provider_request_id_immutable, previous_request_id}}
+    end
+  end
+
+  defp validate_previous_request_id({:error, _reason} = error, _record, _attempt_id), do: error
+
+  defp validate_previous_request_id(_result, _record, _attempt_id),
+    do: {:error, {:corrupt_transition_attempt, :invalid_record}}
+
+  defp ensure_request_id_unique(_ledger, nil, _attempt_id), do: :ok
+
+  defp ensure_request_id_unique(ledger, request_id, attempt_id) do
+    case :dets.lookup(ledger.table, {:provider_request_id, request_id}) do
+      [] ->
+        :ok
+
+      [{{:provider_request_id, ^request_id}, ^attempt_id}] ->
+        :ok
+
+      [{{:provider_request_id, ^request_id}, _other_attempt_id}] ->
+        {:error, {:duplicate_provider_request_id, request_id}}
+
+      _other ->
+        {:error, {:corrupt_transition_attempt, :invalid_record}}
+    end
+  end
+
+  defp provider_request_id_record(record, attempt_id) do
+    case Map.get(record, :provider_request_id) do
+      nil -> []
+      request_id -> [{{:provider_request_id, request_id}, attempt_id}]
     end
   end
 

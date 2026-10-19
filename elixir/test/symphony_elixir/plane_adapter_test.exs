@@ -13,6 +13,7 @@ defmodule SymphonyElixir.PlaneAdapterTest do
   alias SymphonyElixir.WorkControl.{
     CompletionProof,
     LifecycleAssessment,
+    ProviderMutationEnvelope,
     ProviderObservation,
     ProviderProjectContract,
     WorkflowLifecycle,
@@ -479,6 +480,49 @@ defmodule SymphonyElixir.PlaneAdapterTest do
              )
 
     assert_receive {:request, %{method: :patch, body: %{"state" => "state-in_progress"}}}
+  end
+
+  test "validates the correlated envelope against the Plane contract before mutation" do
+    contract = contract()
+    parent = self()
+
+    envelope = %ProviderMutationEnvelope{
+      provider_request_id: "preq_00000000-0000-4000-8000-000000000001",
+      transition_attempt_id: "transition-1",
+      work_item_id: "item-1",
+      provider: :plane,
+      workspace_id: contract.workspace_id,
+      project_id: contract.project_id,
+      requested_from: :ready,
+      requested_to: :in_progress,
+      target_provider_state_id: "state-in_progress",
+      target_provider_state_group: :started,
+      provider_contract_fingerprint: ProviderProjectContract.fingerprint(contract),
+      submitted_at: DateTime.utc_now()
+    }
+
+    assert :ok =
+             Adapter.submit_controlled_transition("item-1", :in_progress,
+               tracker_settings: @settings,
+               provider_project_contract: contract,
+               provider_mutation_envelope: envelope,
+               request_fun: fn request ->
+                 send(parent, {:request, request})
+                 {:ok, %{status: 204}}
+               end
+             )
+
+    assert_received {:request, %{method: :patch, body: %{"state" => "state-in_progress"}}}
+
+    mismatched = %{envelope | target_provider_state_id: "state-done"}
+
+    assert {:error, :provider_mutation_envelope_mismatch} =
+             Adapter.submit_controlled_transition("item-1", :in_progress,
+               tracker_settings: @settings,
+               provider_project_contract: contract,
+               provider_mutation_envelope: mismatched,
+               request_fun: fn _request -> flunk("mismatched envelope must be rejected before transport") end
+             )
   end
 
   test "does not resolve provider targets by display name or cross-scope observation" do

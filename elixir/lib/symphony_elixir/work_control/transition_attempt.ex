@@ -2,9 +2,10 @@ defmodule SymphonyElixir.WorkControl.TransitionAttempt do
   @moduledoc """
   Durable state law for one provider lifecycle mutation attempt.
 
-  `:prepared` is the last state in which a mutation may be emitted. The
-  `:mutation_submitted` state is a write-ahead no-resubmit fence and must be
-  synced before the provider request starts.
+  A `:prepared` attempt with `submission_fenced_at` is the conservative
+  restart/no-resubmit fence. `:mutation_submitted` is a separate durable
+  dispatch boundary and must be synced, with its immutable provider request
+  identity, before a provider request starts.
   """
 
   alias SymphonyElixir.WorkControl.{CompletionProof, GuardClass, SemanticTransitionIntent, WorkflowLifecycle}
@@ -40,6 +41,7 @@ defmodule SymphonyElixir.WorkControl.TransitionAttempt do
     :schema_version,
     :attempt_id,
     :transition_attempt_id,
+    :provider_request_id,
     :work_item_id,
     :provider,
     :workspace_id,
@@ -92,6 +94,7 @@ defmodule SymphonyElixir.WorkControl.TransitionAttempt do
     with :ok <- validate_keys(attrs),
          :ok <- validate_id(attempt_id, :attempt_id),
          :ok <- validate_id(transition_attempt_id, :transition_attempt_id),
+         :ok <- validate_unsubmitted_request_id(Map.get(attrs, :provider_request_id)),
          :ok <- validate_id(Map.get(attrs, :work_item_id), :work_item_id),
          {:ok, source} <- canonical_atom(Map.get(attrs, :requested_from)),
          {:ok, target} <- canonical_atom(Map.get(attrs, :requested_to)),
@@ -175,14 +178,17 @@ defmodule SymphonyElixir.WorkControl.TransitionAttempt do
   def mark_mutation_submitted(%__MODULE__{} = attempt, opts \\ %{}) when is_map(opts) do
     with :ok <- available?(attempt),
          :ok <- require_state(attempt, :prepared),
-         true <- submission_fenced?(attempt) do
+         true <- submission_fenced?(attempt),
+         :ok <- request_id_unbound?(attempt),
+         {:ok, provider_request_id} <- provider_request_id(opts) do
       at = Map.get(opts, :at, DateTime.utc_now())
 
       with {:ok, at} <- timestamp(at) do
         {:ok,
          advance(attempt, :mutation_submitted, %{
            status: :submitted,
-           submitted_at: at
+           submitted_at: at,
+           provider_request_id: provider_request_id
          })}
       end
     else
@@ -190,6 +196,13 @@ defmodule SymphonyElixir.WorkControl.TransitionAttempt do
       {:error, _reason} = error -> error
     end
   end
+
+  @spec valid_provider_request_id?(term()) :: boolean()
+  def valid_provider_request_id?(value) when is_binary(value) do
+    Regex.match?(~r/\Apreq_[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\z/, value)
+  end
+
+  def valid_provider_request_id?(_value), do: false
 
   @spec begin_verification(t(), map()) :: {:ok, t()} | {:error, atom()}
   def begin_verification(%__MODULE__{} = attempt, opts \\ %{}) when is_map(opts) do
@@ -519,6 +532,27 @@ defmodule SymphonyElixir.WorkControl.TransitionAttempt do
 
   defp validate_id(value, _field) when is_binary(value) and byte_size(value) > 0, do: :ok
   defp validate_id(_value, field), do: {:error, {:missing, field}}
+
+  defp validate_unsubmitted_request_id(nil), do: :ok
+  defp validate_unsubmitted_request_id(_value), do: {:error, :invalid_provider_request_id}
+
+  defp request_id_unbound?(attempt) do
+    if is_nil(Map.get(attempt, :provider_request_id)) do
+      :ok
+    else
+      {:error, :provider_request_id_already_bound}
+    end
+  end
+
+  defp provider_request_id(opts) do
+    value = Map.get(opts, :provider_request_id) || "preq_" <> Ecto.UUID.generate()
+
+    if valid_provider_request_id?(value) do
+      {:ok, value}
+    else
+      {:error, :invalid_provider_request_id}
+    end
+  end
 
   defp validate_keys(attrs) do
     allowed = Map.keys(%__MODULE__{}) -- [:__struct__]
