@@ -4,9 +4,9 @@ defmodule SymphonyElixir.TransitionCoordinator do
 
   The coordinator is deliberately a small sequencing boundary. It does not
   decide lifecycle policy or turn provider observations into authority. It
-  serializes requests, writes the durable no-resubmit fence before calling a
-  provider, and sends every possibly-submitted request through one fresh
-  verification callback.
+  serializes requests, writes the durable submission record before dispatch,
+  and sends every possibly-submitted request through one fresh verification
+  callback.
   """
 
   use GenServer
@@ -21,6 +21,8 @@ defmodule SymphonyElixir.TransitionCoordinator do
   alias SymphonyElixir.WorkControl.{
     GuardClass,
     LifecycleAssessment,
+    ProviderDispatchWitness,
+    ProviderMutationEnvelope,
     ProviderObservation,
     ProviderProjectContract,
     SemanticTransitionIntent,
@@ -55,7 +57,9 @@ defmodule SymphonyElixir.TransitionCoordinator do
       :suspend,
       :clock,
       :orchestrator,
+      :dispatch_witness_sink,
       require_durable?: true,
+      dispatch_witness_required?: false,
       transition_disabled?: false,
       active_work_items: MapSet.new(),
       fenced_work_items: MapSet.new()
@@ -71,7 +75,9 @@ defmodule SymphonyElixir.TransitionCoordinator do
             suspend: (String.t(), atom(), TransitionAttempt.t() -> term()) | nil,
             clock: (-> DateTime.t()),
             orchestrator: GenServer.server(),
+            dispatch_witness_sink: (ProviderDispatchWitness.t() -> term()) | nil,
             require_durable?: boolean(),
+            dispatch_witness_required?: boolean(),
             transition_disabled?: boolean(),
             active_work_items: MapSet.t(),
             fenced_work_items: MapSet.t()
@@ -186,18 +192,24 @@ defmodule SymphonyElixir.TransitionCoordinator do
   @impl true
   def init(opts) do
     orchestrator = Keyword.get(opts, :orchestrator, Orchestrator)
+    dispatch_witness_sink = Keyword.get(opts, :dispatch_witness_sink)
+    dispatch_witness_required? = Keyword.get(opts, :dispatch_witness_required?, false)
 
     default_suspend = fn work_item_id, reason, _attempt ->
       Orchestrator.suspend_work_item(orchestrator, work_item_id, reason)
     end
 
-    with {:ok, ledger} <- open_ledger(opts),
+    with :ok <- validate_dispatch_witness_options(opts, dispatch_witness_sink, dispatch_witness_required?),
+         {:ok, ledger} <- open_dispatch_witness_ledger(opts, dispatch_witness_required?),
          {:ok, refresh_contract} <- callback(opts, :refresh_contract, &default_refresh_contract/1),
          {:ok, load_context} <-
            callback(opts, :load_context, fn intent ->
              default_load_context(orchestrator, intent, refresh_contract)
            end),
-         {:ok, submit} <- callback(opts, :submit, &default_submit/2),
+         {:ok, submit} <-
+           callback(opts, :submit, fn attempt, context ->
+             default_submit(attempt, context, dispatch_witness_sink, dispatch_witness_required?)
+           end),
          {:ok, verify} <-
            callback(opts, :verify, fn attempt, context ->
              default_verify(attempt, context, refresh_contract)
@@ -215,7 +227,9 @@ defmodule SymphonyElixir.TransitionCoordinator do
         suspend: suspend,
         clock: Keyword.get(opts, :clock, &DateTime.utc_now/0),
         orchestrator: orchestrator,
-        require_durable?: Keyword.get(opts, :require_durable?, true)
+        require_durable?: Keyword.get(opts, :require_durable?, true),
+        dispatch_witness_sink: dispatch_witness_sink,
+        dispatch_witness_required?: dispatch_witness_required?
       }
 
       fenced_result =
@@ -396,10 +410,8 @@ defmodule SymphonyElixir.TransitionCoordinator do
          {:ok, attempt} <- persist_attempt(state, attempt),
          {:ok, attempt} <- transition_attempt(attempt, :arm_submission_fence, []),
          {:ok, attempt} <- persist_attempt(state, attempt),
-         {:ok, context} <- final_dispatch_context_with_attempt(state, intent, route, attempt, context),
-         {submit_result, attempt} <- submit_once(state, attempt, context),
-         {reply, state} <- reconcile_submission(state, attempt, context, submit_result) do
-      {reply, state}
+         {:ok, context} <- final_dispatch_context_with_attempt(state, intent, route, attempt, context) do
+      submit_prepared_attempt(state, attempt, context)
     else
       {:error, {:pre_submit, reason}, attempt} ->
         finish_pre_submit(state, attempt, reason)
@@ -410,6 +422,39 @@ defmodule SymphonyElixir.TransitionCoordinator do
       {:error, reason} ->
         finish_without_submission(state, intent, reason)
     end
+  end
+
+  defp submit_prepared_attempt(%State{} = state, %TransitionAttempt{} = attempt, context) do
+    with {:ok, envelope} <-
+           ProviderMutationEnvelope.new(attempt, context, submitted_at: state.clock.()),
+         {:ok, submitted} <-
+           transition_attempt(attempt, :mark_mutation_submitted, [
+             %{at: envelope.submitted_at, provider_request_id: envelope.provider_request_id}
+           ]),
+         {:ok, submitted} <- persist_attempt(state, submitted) do
+      context = Map.put(context, :provider_mutation_envelope, envelope)
+      {submit_result, submitted} = submit_once(state, submitted, context)
+      reconcile_submission(state, submitted, context, submit_result)
+    else
+      {:error, {:pre_submit, reason, %TransitionAttempt{state: :mutation_submitted} = submitted}} ->
+        fail_submitted_persistence(state, submitted, reason)
+
+      {:error, {:pre_submit, reason, %TransitionAttempt{} = fenced_attempt}} ->
+        fail_before_dispatch(state, fenced_attempt, reason)
+
+      {:error, reason} ->
+        fail_before_dispatch(state, attempt, reason)
+    end
+  end
+
+  defp fail_submitted_persistence(%State{} = state, %TransitionAttempt{} = attempt, reason) do
+    state = fence_work_item(state, attempt, :durability_failed)
+    {{:error, reason}, state}
+  end
+
+  defp fail_before_dispatch(%State{} = state, %TransitionAttempt{} = attempt, reason) do
+    state = fence_work_item(state, attempt, :submission_start_failed)
+    {{:error, {:submission_start_failed, reason}}, state}
   end
 
   defp final_dispatch_context_with_attempt(
@@ -902,16 +947,8 @@ defmodule SymphonyElixir.TransitionCoordinator do
     end
   end
 
-  defp submit_once(%State{submit: submit}, attempt, context) do
-    case transition_attempt(attempt, :mark_mutation_submitted, []) do
-      {:ok, submitted} ->
-        result = invoke(submit, [submitted, context])
-        {result, submitted}
-
-      {:error, reason} ->
-        {{:error, {:submission_start_failed, reason}}, attempt}
-    end
-  end
+  defp submit_once(%State{submit: submit}, attempt, context),
+    do: {invoke(submit, [attempt, context]), attempt}
 
   defp reconcile_submission(%State{} = state, attempt, context, result) do
     ack_status = provider_ack_status(result)
@@ -919,7 +956,10 @@ defmodule SymphonyElixir.TransitionCoordinator do
     verification_context =
       context
       |> Map.put(:provider_result, result)
-      |> Map.put(:provider_non_commit?, result == {:error, :econnrefused})
+      |> Map.put(
+        :provider_non_commit?,
+        result == {:error, :econnrefused} or match?({:error, {:dispatch_witness_failed, _reason}}, result)
+      )
 
     verify_submission(state, %{attempt | provider_ack_status: ack_status}, verification_context, ack_status)
   end
@@ -1335,6 +1375,68 @@ defmodule SymphonyElixir.TransitionCoordinator do
   defp close_ledger(nil), do: :ok
   defp close_ledger(%TransitionAttemptLedger{} = ledger), do: TransitionAttemptLedger.close(ledger)
 
+  defp validate_dispatch_witness_options(opts, sink, required?) when is_boolean(required?) do
+    case validate_dispatch_witness_sink(sink, required?) do
+      :ok -> validate_required_dispatch_callbacks(opts, required?)
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp validate_dispatch_witness_options(_opts, _sink, _required?),
+    do: {:error, :invalid_dispatch_witness_configuration}
+
+  defp validate_dispatch_witness_sink(nil, true), do: {:error, :dispatch_witness_sink_required}
+
+  defp validate_dispatch_witness_sink(sink, _required?) when not is_nil(sink) and not is_function(sink, 1),
+    do: {:error, :invalid_dispatch_witness_sink}
+
+  defp validate_dispatch_witness_sink(_sink, _required?), do: :ok
+
+  defp validate_required_dispatch_callbacks(opts, true) do
+    cond do
+      Keyword.has_key?(opts, :submit) ->
+        {:error, :custom_submit_disallowed_with_required_dispatch_witness}
+
+      Keyword.has_key?(opts, :verify) ->
+        {:error, :custom_verify_disallowed_with_required_dispatch_witness}
+
+      not Keyword.get(opts, :require_durable?, true) ->
+        {:error, :dispatch_witness_requires_durable_ledger}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_required_dispatch_callbacks(_opts, false), do: :ok
+
+  defp open_dispatch_witness_ledger(opts, false), do: open_ledger(opts)
+
+  defp open_dispatch_witness_ledger(opts, true) do
+    case open_ledger(opts) do
+      {:ok, nil} ->
+        {:error, :dispatch_witness_durable_ledger_required}
+
+      {:ok, %TransitionAttemptLedger{} = ledger} ->
+        if durable_ledger_callbacks?(ledger) do
+          {:ok, ledger}
+        else
+          _ = close_ledger(ledger)
+          {:error, :dispatch_witness_ledger_callbacks_must_be_durable}
+        end
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp durable_ledger_callbacks?(%TransitionAttemptLedger{write_fun: write_fun, sync_fun: sync_fun}) do
+    default_write_fun = &:dets.insert/2
+    default_sync_fun = &:dets.sync/1
+
+    write_fun === default_write_fun and sync_fun === default_sync_fun
+  end
+
   defp callback(opts, key, default) do
     callback = Keyword.get(opts, key, default)
 
@@ -1601,12 +1703,15 @@ defmodule SymphonyElixir.TransitionCoordinator do
   defp validate_observation_scope(_observation, _contract),
     do: {:error, :provider_project_contract_required}
 
-  defp default_submit(%TransitionAttempt{} = attempt, context) do
+  defp default_submit(%TransitionAttempt{} = attempt, context, dispatch_witness_sink, dispatch_witness_required?) do
     opts =
       []
       |> maybe_put_option(:tracker_settings, Map.get(context, :tracker_settings))
       |> maybe_put_option(:provider_project_contract, Map.get(context, :provider_project_contract))
       |> maybe_put_option(:pre_observation, Map.get(context, :provider_observation))
+      |> maybe_put_option(:provider_mutation_envelope, Map.get(context, :provider_mutation_envelope))
+      |> maybe_put_option(:dispatch_witness_sink, dispatch_witness_sink)
+      |> Keyword.put(:dispatch_witness_required?, dispatch_witness_required?)
 
     Tracker.submit_controlled_transition(attempt.work_item_id, attempt.requested_to, opts)
   end

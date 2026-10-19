@@ -7,6 +7,7 @@ defmodule SymphonyElixir.Plane.Client do
   """
 
   alias SymphonyElixir.Plane.ReadScheduler
+  alias SymphonyElixir.WorkControl.{ProviderDispatchWitness, ProviderMutationEnvelope}
 
   @default_base_url "https://api.plane.so"
   @default_read_scheduler SymphonyElixir.Plane.ReadScheduler
@@ -70,6 +71,8 @@ defmodule SymphonyElixir.Plane.Client do
     with {:ok, config} <- normalize_config(config, opts),
          {:ok, id} <- identifier(work_item_id),
          {:ok, state_id} <- identifier(target_state_id),
+         :ok <- validate_witness_configuration(opts),
+         :ok <- validate_mutation_envelope(opts, config, id, state_id),
          {:ok, response} <- mutation_request(config, work_item_path(config, id), %{"state" => state_id}, opts) do
       mutation_acknowledgement(response)
     end
@@ -403,16 +406,75 @@ defmodule SymphonyElixir.Plane.Client do
       ]
     }
 
+    with :ok <- validate_request_transport(opts) do
+      dispatch_mutation_request(config, request, opts)
+    end
+  end
+
+  defp validate_witness_configuration(opts) do
+    witness_required? = Keyword.get(opts, :dispatch_witness_required?, false)
+
+    cond do
+      not is_boolean(witness_required?) ->
+        {:error, {:dispatch_witness_failed, :invalid_dispatch_witness_configuration}}
+
+      witness_required? and not provider_mutation_envelope?(Keyword.get(opts, :provider_mutation_envelope)) ->
+        {:error, {:dispatch_witness_failed, :provider_mutation_envelope_required}}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_mutation_envelope(opts, config, work_item_id, target_state_id) do
+    case Keyword.get(opts, :provider_mutation_envelope) do
+      nil ->
+        :ok
+
+      %ProviderMutationEnvelope{} = envelope ->
+        if valid_mutation_binding?(envelope, config, work_item_id, target_state_id) do
+          :ok
+        else
+          {:error, {:dispatch_witness_failed, :provider_mutation_binding_mismatch}}
+        end
+
+      _invalid ->
+        {:error, {:dispatch_witness_failed, :invalid_provider_mutation_envelope}}
+    end
+  end
+
+  defp valid_mutation_binding?(envelope, config, work_item_id, target_state_id) do
+    ProviderMutationEnvelope.valid?(envelope) and
+      envelope.provider == :plane and
+      envelope.work_item_id == work_item_id and
+      envelope.workspace_id == config.workspace_id and
+      envelope.project_id == config.project_id and
+      envelope.target_provider_state_id == target_state_id
+  end
+
+  @spec provider_mutation_envelope?(term()) :: boolean()
+  defp provider_mutation_envelope?(%ProviderMutationEnvelope{}), do: true
+  defp provider_mutation_envelope?(_envelope), do: false
+
+  defp validate_request_transport(opts) do
+    if Keyword.get(opts, :dispatch_witness_required?, false) and is_function(Keyword.get(opts, :request_fun)) do
+      {:error, {:dispatch_witness_failed, :request_fun_transport_not_supported}}
+    else
+      :ok
+    end
+  end
+
+  defp dispatch_mutation_request(config, request, opts) do
     case Keyword.get(opts, :request_fun) do
-      fun when is_function(fun) ->
-        case invoke_mutation_request_fun(fun, request, config) do
+      request_fun when is_function(request_fun) ->
+        case invoke_mutation_request_fun(request_fun, request, config) do
           {:ok, response} when is_map(response) -> normalize_mutation_response(response)
           {:error, reason} -> {:error, mutation_transport_error(reason)}
           _invalid -> {:error, :provider_unavailable}
         end
 
       nil ->
-        perform_mutation_request(config, request)
+        perform_mutation_request(config, request, opts)
 
       _invalid ->
         {:error, :provider_unavailable}
@@ -420,19 +482,30 @@ defmodule SymphonyElixir.Plane.Client do
   end
 
   defp invoke_mutation_request_fun(fun, request, config) do
-    cond do
-      is_function(fun, 1) -> invoke_request_fun(fun, request, config)
-      is_function(fun, 5) -> fun.(request.method, request.path, request.params, request.body, config)
-      is_function(fun, 4) -> fun.(request.method, request.path, request.params, request.body)
-      true -> {:error, :invalid_request_fun}
-    end
+    invoke_mutation_request_fun_by_arity(:erlang.fun_info(fun, :arity), fun, request, config)
   rescue
     _error -> {:error, :request_fun_failed}
   catch
     _kind, _reason -> {:error, :request_fun_failed}
   end
 
-  defp perform_mutation_request(config, %{path: path, body: body, headers: headers}) do
+  defp invoke_mutation_request_fun_by_arity({:arity, 1}, fun, request, config),
+    do: invoke_request_fun(fun, request, config)
+
+  defp invoke_mutation_request_fun_by_arity({:arity, 5}, fun, request, config),
+    do: fun.(request.method, request.path, request.params, request.body, config)
+
+  defp invoke_mutation_request_fun_by_arity({:arity, 4}, fun, request, _config),
+    do: fun.(request.method, request.path, request.params, request.body)
+
+  defp invoke_mutation_request_fun_by_arity(_arity, _fun, _request, _config),
+    do: {:error, :invalid_request_fun}
+
+  defp perform_mutation_request(config, %{path: path, body: body, headers: headers} = request, opts) do
+    envelope = Keyword.get(opts, :provider_mutation_envelope)
+    witness_sink = Keyword.get(opts, :dispatch_witness_sink)
+    witness_required? = Keyword.get(opts, :dispatch_witness_required?, false)
+
     req_options = [
       method: :patch,
       url: config.base_url <> path,
@@ -447,14 +520,140 @@ defmodule SymphonyElixir.Plane.Client do
       into: &bounded_response_body/2
     ]
 
+    req_options = attach_request_correlation(req_options, envelope)
+    req_options = attach_witness_hook(req_options, request, envelope, witness_sink, witness_required?)
+    req_options = attach_witness_transport(req_options, witness_required?)
+
     case Req.request(req_options) do
       {:ok, %{status: status, headers: response_headers, body: response_body}} ->
         normalize_mutation_response(%{status: status, headers: response_headers, body: response_body})
+
+      {:error, %ProviderDispatchWitness.DispatchError{reason: reason}} ->
+        {:error, {:dispatch_witness_failed, reason}}
 
       {:error, reason} ->
         {:error, mutation_transport_error(reason)}
     end
   end
+
+  defp attach_request_correlation(req_options, %ProviderMutationEnvelope{} = envelope) do
+    Keyword.put(
+      req_options,
+      :finch_private,
+      %{ProviderDispatchWitness.private_request_id_key() => envelope.provider_request_id}
+    )
+  end
+
+  defp attach_request_correlation(req_options, _envelope), do: req_options
+
+  defp attach_witness_hook(req_options, request, %ProviderMutationEnvelope{} = envelope, witness_sink, required?) do
+    Keyword.put(
+      req_options,
+      :finch_request,
+      witnessed_finch_request(request, envelope, witness_sink, required?)
+    )
+  end
+
+  defp attach_witness_hook(req_options, _request, _envelope, _witness_sink, _required?), do: req_options
+
+  defp attach_witness_transport(req_options, true) do
+    req_options
+    |> Keyword.put(:adapter, &Req.Steps.run_finch/1)
+    |> Keyword.put(:plug, nil)
+    |> Keyword.put(:params, [])
+    |> Keyword.put(:plugins, [])
+  end
+
+  defp attach_witness_transport(req_options, false), do: req_options
+
+  defp witnessed_finch_request(request, envelope, witness_sink, witness_required?) do
+    fn req, finch_request, finch_name, finch_options ->
+      transport_fun = fn final_request ->
+        stream_bounded_response(req, final_request, finch_name, finch_options)
+      end
+
+      result =
+        case validate_final_finch_request(request, envelope, finch_request) do
+          :ok ->
+            ProviderDispatchWitness.dispatch(
+              envelope,
+              finch_request,
+              witness_sink,
+              witness_required?,
+              transport_fun
+            )
+
+          {:error, _reason} = error ->
+            error
+        end
+
+      case result do
+        {req, %Req.Response{} = response} ->
+          {req, response}
+
+        {req, %Req.TransportError{} = error} ->
+          {req, error}
+
+        {:error, {:dispatch_witness_failed, reason}} ->
+          {req, %ProviderDispatchWitness.DispatchError{reason: reason}}
+
+        {:error, exception} when is_exception(exception) ->
+          {req, normalize_finch_error(exception)}
+
+        _other ->
+          {req, Req.TransportError.exception(reason: :provider_unavailable)}
+      end
+    end
+  end
+
+  @spec validate_final_finch_request(map(), ProviderMutationEnvelope.t(), Finch.Request.t()) ::
+          :ok | {:error, {:dispatch_witness_failed, :request_identity_mismatch}}
+  defp validate_final_finch_request(request, envelope, finch_request) do
+    with true <- request.method == :patch,
+         true <- finch_request.method in ["PATCH", :patch],
+         true <- finch_request.path == request.path,
+         true <- finch_request.query in [nil, ""],
+         true <- finch_request.body == Jason.encode!(request.body),
+         true <-
+           Map.get(finch_request.private, ProviderDispatchWitness.private_request_id_key()) ==
+             envelope.provider_request_id do
+      :ok
+    else
+      _mismatch -> {:error, {:dispatch_witness_failed, :request_identity_mismatch}}
+    end
+  end
+
+  defp stream_bounded_response(req, finch_request, finch_name, finch_options) do
+    response = Req.Response.new()
+
+    stream_fun = fn
+      {:status, status}, {current_req, current_response} ->
+        {:cont, {current_req, %{current_response | status: status}}}
+
+      {:headers, fields}, {current_req, current_response} ->
+        updated_response =
+          Enum.reduce(fields, current_response, fn {name, value}, acc ->
+            Req.Response.put_header(acc, name, value)
+          end)
+
+        {:cont, {current_req, updated_response}}
+
+      {:data, data}, acc ->
+        bounded_response_body({:data, data}, acc)
+
+      {:trailers, fields}, {current_req, current_response} ->
+        trailers = Enum.reduce(fields, %{}, fn {name, value}, acc -> Map.update(acc, name, [value], &(&1 ++ [value])) end)
+        {:cont, {current_req, %{current_response | trailers: Map.merge(current_response.trailers, trailers)}}}
+    end
+
+    case Finch.stream_while(finch_request, finch_name, {req, response}, stream_fun, finch_options) do
+      {:ok, acc} -> acc
+      {:error, exception, _acc} -> {req, normalize_finch_error(exception)}
+    end
+  end
+
+  defp normalize_finch_error(%Mint.TransportError{reason: reason}), do: %Req.TransportError{reason: reason}
+  defp normalize_finch_error(exception), do: exception
 
   defp normalize_mutation_response(response) do
     status = Map.get(response, :status, Map.get(response, "status"))

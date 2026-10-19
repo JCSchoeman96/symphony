@@ -929,7 +929,7 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
       initialized
       | write_fun: fn _table, _records ->
           count = Agent.get_and_update(counter, fn count -> {count + 1, count + 1} end)
-          if count == 4, do: {:error, :disk_full}, else: :ok
+          if count == 5, do: {:error, :disk_full}, else: :ok
         end,
         sync_fun: fn _table -> :ok end
     }
@@ -1263,6 +1263,170 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
       Agent.stop(counter)
       File.rm_rf(root)
     end
+  end
+
+  test "durably records the submitted request identity before the provider callback" do
+    parent = self()
+    {ledger, root, _counter} = observed_submission_ledger(parent, nil)
+
+    {:ok, coordinator} =
+      TransitionCoordinator.start_link(
+        name: nil,
+        ledger: ledger,
+        load_context: fn _intent -> {:ok, context()} end,
+        submit: fn attempt, context ->
+          send(parent, {:provider_callback, attempt, Map.get(context, :provider_mutation_envelope)})
+          :ok
+        end,
+        verify: fn _attempt, _context -> {:verified, verified_context()} end
+      )
+
+    assert {:ok, %{state: :verified}} = request_transition(coordinator, intent_attrs())
+
+    assert_receive {:ledger_write, %{state: :prepared, submission_fenced_at: nil}}
+    assert_receive :ledger_sync
+    assert_receive {:ledger_write, %{state: :prepared, submission_fenced_at: %DateTime{}}}
+    assert_receive :ledger_sync
+
+    assert_receive {:ledger_write, %{state: :mutation_submitted, status: :submitted, provider_request_id: request_id}}
+
+    assert TransitionAttempt.valid_provider_request_id?(request_id)
+    assert_receive :ledger_sync
+
+    assert_receive {:provider_callback, %{state: :mutation_submitted, provider_request_id: ^request_id},
+                    %{
+                      provider_request_id: ^request_id,
+                      transition_attempt_id: attempt_id,
+                      work_item_id: "work-1"
+                    }}
+
+    assert attempt_id != ""
+
+    GenServer.stop(coordinator)
+    File.rm_rf(root)
+  end
+
+  test "blocks provider dispatch when submitted attempt write or sync fails" do
+    for failure <- [:write, :sync] do
+      parent = self()
+      {ledger, root, _counter} = observed_submission_ledger(parent, failure)
+
+      {:ok, coordinator} =
+        TransitionCoordinator.start_link(
+          name: nil,
+          ledger: ledger,
+          load_context: fn _intent -> {:ok, context()} end,
+          submit: fn _attempt, _context ->
+            send(parent, :provider_callback)
+            :ok
+          end,
+          verify: fn _attempt, _context ->
+            send(parent, :verify_callback)
+            {:verified, verified_context()}
+          end,
+          suspend: fn _work_item_id, _reason, _attempt -> :ok end
+        )
+
+      assert {:error, {:durability_failed, _reason}} = request_transition(coordinator, intent_attrs())
+      refute_received :provider_callback
+      refute_received :verify_callback
+
+      assert {:ok, attempt} = TransitionAttemptLedger.latest_for_work_item(ledger, "work-1")
+      assert TransitionAttempt.submission_fenced?(attempt)
+      refute TransitionAttemptLedger.resubmit_allowed?(attempt)
+
+      GenServer.stop(coordinator)
+      File.rm_rf(root)
+    end
+  end
+
+  test "validates required dispatch witness configuration at startup" do
+    previous_trap_exit = Process.flag(:trap_exit, true)
+
+    assert {:error, :dispatch_witness_sink_required} =
+             TransitionCoordinator.start_link(
+               name: nil,
+               ledger: nil,
+               require_durable?: false,
+               dispatch_witness_required?: true
+             )
+
+    assert {:error, :custom_submit_disallowed_with_required_dispatch_witness} =
+             TransitionCoordinator.start_link(
+               name: nil,
+               ledger: nil,
+               require_durable?: false,
+               dispatch_witness_required?: true,
+               dispatch_witness_sink: fn _witness -> {:ok, "preq_00000000-0000-4000-8000-000000000001"} end,
+               submit: fn _attempt, _context -> :ok end
+             )
+
+    assert {:error, :custom_verify_disallowed_with_required_dispatch_witness} =
+             TransitionCoordinator.start_link(
+               name: nil,
+               ledger: nil,
+               require_durable?: false,
+               dispatch_witness_required?: true,
+               dispatch_witness_sink: fn _witness -> {:ok, "preq_00000000-0000-4000-8000-000000000001"} end,
+               verify: fn _attempt, _context -> {:verified, %{}} end
+             )
+
+    sink = fn _witness -> {:ok, "preq_00000000-0000-4000-8000-000000000001"} end
+
+    assert {:error, :dispatch_witness_requires_durable_ledger} =
+             TransitionCoordinator.start_link(
+               name: nil,
+               ledger: nil,
+               require_durable?: false,
+               dispatch_witness_required?: true,
+               dispatch_witness_sink: sink
+             )
+
+    assert {:error, :dispatch_witness_durable_ledger_required} =
+             TransitionCoordinator.start_link(
+               name: nil,
+               ledger: nil,
+               require_durable?: true,
+               dispatch_witness_required?: true,
+               dispatch_witness_sink: sink
+             )
+
+    root = Path.join(System.tmp_dir!(), "symphony-required-witness-ledger-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(root)
+    on_exit(fn -> File.rm_rf(root) end)
+
+    {:ok, ledger} =
+      TransitionAttemptLedger.open(
+        "project-a",
+        %{tracker_kind: "plane", provider_scope: %{project_id: "project-a"}},
+        path: Path.join(root, "attempts.dets")
+      )
+
+    assert {:ok, coordinator} =
+             TransitionCoordinator.start_link(
+               name: nil,
+               ledger: ledger,
+               dispatch_witness_required?: true,
+               dispatch_witness_sink: sink
+             )
+
+    assert :ok = GenServer.stop(coordinator)
+
+    assert {:error, :dispatch_witness_ledger_callbacks_must_be_durable} =
+             TransitionCoordinator.start_link(
+               name: nil,
+               project_id: "project-a",
+               tracker_identity: %{tracker_kind: "plane", provider_scope: %{project_id: "project-a"}},
+               ledger_opts: [
+                 path: Path.join(root, "custom-callbacks.dets"),
+                 write_fun: fn table, records -> :dets.insert(table, records) end,
+                 sync_fun: fn table -> :dets.sync(table) end
+               ],
+               dispatch_witness_required?: true,
+               dispatch_witness_sink: sink
+             )
+
+    Process.flag(:trap_exit, previous_trap_exit)
   end
 
   test "treats a missing suspension callback as an explicit no-op only after fencing" do
@@ -1798,6 +1962,49 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
         sync_fun: fn _table ->
           count = Agent.get_and_update(counter, fn value -> {value + 1, value + 1} end)
           if count <= 2, do: :ok, else: {:error, :sync_failed}
+        end
+      )
+
+    {ledger, root, counter}
+  end
+
+  defp observed_submission_ledger(observer, failure) do
+    root = Path.join(System.tmp_dir!(), "symphony-transition-observed-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(root)
+    path = Path.join(root, "attempts.dets")
+    identity = %{tracker_kind: "plane", provider_scope: %{project_id: "project-a"}}
+    {:ok, initialized} = TransitionAttemptLedger.open("project-a", identity, path: path)
+    :ok = TransitionAttemptLedger.close(initialized)
+    {:ok, counter} = Agent.start_link(fn -> %{write: 0, sync: 0} end)
+
+    {:ok, ledger} =
+      TransitionAttemptLedger.open("project-a", identity,
+        path: path,
+        write_fun: fn table, records ->
+          attempt =
+            Enum.find_value(records, fn
+              {{:attempt, _attempt_id}, value} -> value
+              _record -> nil
+            end)
+
+          count = Agent.get_and_update(counter, fn counts -> {counts.write + 1, %{counts | write: counts.write + 1}} end)
+          send(observer, {:ledger_write, attempt})
+
+          if failure == :write and count == 3 do
+            {:error, :write_failed}
+          else
+            :dets.insert(table, records)
+          end
+        end,
+        sync_fun: fn table ->
+          count = Agent.get_and_update(counter, fn counts -> {counts.sync + 1, %{counts | sync: counts.sync + 1}} end)
+          send(observer, :ledger_sync)
+
+          if failure == :sync and count == 3 do
+            {:error, :sync_failed}
+          else
+            :dets.sync(table)
+          end
         end
       )
 

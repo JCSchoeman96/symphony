@@ -22,6 +22,15 @@ defmodule SymphonyElixir.TrackerCapabilitiesThrowingAdapter do
   def capabilities, do: throw(:capability_declaration_failed)
 end
 
+defmodule SymphonyElixir.TrackerCapabilitiesMutationEnvelopeAdapter do
+  def capabilities, do: [:controlled_transition]
+
+  def submit_controlled_transition(work_item_id, target_state, opts) do
+    send(self(), {:mutation_envelope, work_item_id, target_state, Keyword.get(opts, :provider_mutation_envelope)})
+    :ok
+  end
+end
+
 defmodule SymphonyElixir.TrackerContextualSpecsProbeAdapter do
   def agent_tool_specs(context) do
     send(self(), {:contextual_agent_tool_specs, context})
@@ -58,7 +67,13 @@ defmodule SymphonyElixir.TrackerCapabilitiesTest do
   alias SymphonyElixir.Tracker.Capabilities
   alias SymphonyElixir.Tracker.Issue
   alias SymphonyElixir.TransitionCoordinator
-  alias SymphonyElixir.WorkControl.{ProviderProjectContract, SemanticTransitionIntent, WorkflowLifecycle}
+
+  alias SymphonyElixir.WorkControl.{
+    ProviderMutationEnvelope,
+    ProviderProjectContract,
+    SemanticTransitionIntent,
+    WorkflowLifecycle
+  }
 
   defp dispatch_guard_evidence(route, runtime_identity) do
     %{
@@ -413,6 +428,38 @@ defmodule SymphonyElixir.TrackerCapabilitiesTest do
                "work-1",
                :in_progress,
                adapter: SymphonyElixir.TrackerCapabilitiesUnknownAdapter
+             )
+  end
+
+  test "passes the typed mutation envelope through the provider-neutral tracker seam" do
+    envelope = %ProviderMutationEnvelope{
+      provider_request_id: "preq_00000000-0000-4000-8000-000000000001",
+      transition_attempt_id: "transition-1",
+      work_item_id: "work-1",
+      provider: :plane,
+      workspace_id: "workspace-1",
+      project_id: "project-1",
+      requested_from: :merging,
+      requested_to: :done,
+      target_provider_state_id: "state-done",
+      target_provider_state_group: :completed,
+      provider_contract_fingerprint: "sha256:contract",
+      submitted_at: DateTime.utc_now()
+    }
+
+    assert :ok =
+             Tracker.submit_controlled_transition("work-1", :done,
+               adapter: SymphonyElixir.TrackerCapabilitiesMutationEnvelopeAdapter,
+               provider_mutation_envelope: envelope,
+               dispatch_witness_required?: true
+             )
+
+    assert_received {:mutation_envelope, "work-1", :done, ^envelope}
+
+    assert {:error, :provider_mutation_envelope_mismatch} =
+             Tracker.submit_controlled_transition("other-work", :done,
+               adapter: SymphonyElixir.TrackerCapabilitiesMutationEnvelopeAdapter,
+               provider_mutation_envelope: envelope
              )
   end
 

@@ -451,15 +451,21 @@ requested
 
 **Outputs:** verified transition or a fail-closed terminal/indeterminate outcome.
 
-**Guards:** durable pre-submit fence; no blind resubmission after possibly committed mutation.
+**Guards:** durable Prepared restart fence; durable correlated Submitted boundary before dispatch; no blind resubmission after possibly committed mutation.
 
 **Side effects:** provider mutation only in designated authorized execution phases.
 
-**Durability:** transition-attempt/fence evidence is durable.
+**Durability:** the `prepared` record with `submission_fenced_at` is synced first. The coordinator then records and syncs `mutation_submitted` with an immutable `provider_request_id` before dispatch.
 
 **Authority granted:** none from a mutation response; only reconciled truth may advance canonical state.
 
 **Authority explicitly NOT granted:** no retry merely because a response was missing/ambiguous.
+
+The Prepared fence and Submitted boundary serve distinct purposes. A fenced Prepared record remains reconciliation-only after restart. The Submitted record binds the attempt to one opaque request identity; it does not make the provider mutation idempotent. The typed envelope passes that identity and the bound transition scope through Tracker and the Plane adapter.
+
+When explicit witness-required mode is enabled, Req's request-specific `:finch_request` hook places the ID in Finch private metadata, validates the final PATCH request, and requires the synchronous sink to acknowledge the same ID before invoking Finch. This witness proves an acknowledged application handoff of that request object. It does not prove network transmission, provider receipt, or provider commit. Fresh provider reread remains mandatory.
+
+Legacy records without `provider_request_id` remain readable and reconciliation-only. A host environment that suppresses responses must still independently prove how it binds the witness to the exact encrypted response path; application correlation alone does not authorize or complete H-100 P0 execution.
 
 ## 4.14 SuspensionContext
 

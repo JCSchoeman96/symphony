@@ -2,6 +2,7 @@ defmodule SymphonyElixir.PlaneClientTest do
   use ExUnit.Case, async: true
 
   alias SymphonyElixir.Plane.Client
+  alias SymphonyElixir.WorkControl.ProviderMutationEnvelope
 
   @config %{
     base_url: "https://api.plane.so",
@@ -743,5 +744,186 @@ defmodule SymphonyElixir.PlaneClientTest do
                  {:ok, %{status: 204, body: nil}}
                end
              )
+  end
+
+  test "required witness mode fails before Req transport when the sink is absent" do
+    assert {:error, {:dispatch_witness_failed, :sink_unavailable}} =
+             Client.update_work_item_state(@config, "item-1", "state-done",
+               provider_mutation_envelope: mutation_envelope(),
+               dispatch_witness_required?: true
+             )
+  end
+
+  test "required witness mode rejects an alternate request callback before invocation" do
+    parent = self()
+
+    assert {:error, {:dispatch_witness_failed, :request_fun_transport_not_supported}} =
+             Client.update_work_item_state(@config, "item-1", "state-done",
+               provider_mutation_envelope: mutation_envelope(),
+               dispatch_witness_required?: true,
+               dispatch_witness_sink: fn witness -> {:ok, witness.provider_request_id} end,
+               request_fun: fn _request ->
+                 send(parent, :transport_called)
+                 {:ok, %{status: 204}}
+               end
+             )
+
+    refute_received :transport_called
+  end
+
+  test "required witness mode rejects a missing envelope before request callback invocation" do
+    parent = self()
+
+    assert {:error, {:dispatch_witness_failed, :provider_mutation_envelope_required}} =
+             Client.update_work_item_state(@config, "item-1", "state-done",
+               dispatch_witness_required?: true,
+               request_fun: fn _request ->
+                 send(parent, :transport_called)
+                 {:ok, %{status: 204}}
+               end
+             )
+
+    refute_received :transport_called
+  end
+
+  test "required witness mode rejects an envelope for a different work item before transport" do
+    parent = self()
+
+    assert {:error, {:dispatch_witness_failed, :provider_mutation_binding_mismatch}} =
+             Client.update_work_item_state(@config, "item-1", "state-done",
+               provider_mutation_envelope: %{mutation_envelope() | work_item_id: "item-2"},
+               dispatch_witness_required?: true,
+               dispatch_witness_sink: fn witness -> {:ok, witness.provider_request_id} end,
+               request_fun: fn _request ->
+                 send(parent, :transport_called)
+                 {:ok, %{status: 204}}
+               end
+             )
+
+    refute_received :transport_called
+  end
+
+  test "required witness mode rejects an envelope for a different target state before transport" do
+    parent = self()
+
+    assert {:error, {:dispatch_witness_failed, :provider_mutation_binding_mismatch}} =
+             Client.update_work_item_state(@config, "item-1", "state-different",
+               provider_mutation_envelope: mutation_envelope(),
+               dispatch_witness_required?: true,
+               dispatch_witness_sink: fn witness -> {:ok, witness.provider_request_id} end,
+               request_fun: fn _request ->
+                 send(parent, :transport_called)
+                 {:ok, %{status: 204}}
+               end
+             )
+
+    refute_received :transport_called
+  end
+
+  test "witness acknowledgment precedes the exact bounded Finch request" do
+    parent = self()
+    ack_table = :ets.new(:dispatch_witness_test, [:set, :public])
+    {:ok, listener} = :gen_tcp.listen(0, [:binary, active: false, reuseaddr: true])
+    {:ok, {_address, port}} = :inet.sockname(listener)
+
+    on_exit(fn ->
+      :gen_tcp.close(listener)
+    end)
+
+    spawn_link(fn ->
+      case :gen_tcp.accept(listener) do
+        {:ok, socket} ->
+          request = receive_http_request(socket, <<>>)
+          {request_line, headers, body} = request
+          acknowledged? = :ets.lookup(ack_table, :acknowledged) == [{:acknowledged, true}]
+          send(parent, {:local_finch_request, request_line, headers, body, acknowledged?})
+          :gen_tcp.send(socket, "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+          :gen_tcp.close(socket)
+
+        {:error, reason} ->
+          send(parent, {:local_server_error, reason})
+      end
+    end)
+
+    request_id = "preq_00000000-0000-4000-8000-000000000001"
+
+    sink = fn witness ->
+      send(parent, {:witness_acknowledged, witness.provider_request_id})
+      :ets.insert(ack_table, {:acknowledged, true})
+      {:ok, witness.provider_request_id}
+    end
+
+    assert :ok =
+             Client.update_work_item_state(%{@config | base_url: "http://127.0.0.1:#{port}"}, "item-1", "state-done",
+               request_fun: nil,
+               provider_mutation_envelope: mutation_envelope(request_id),
+               dispatch_witness_required?: true,
+               dispatch_witness_sink: sink
+             )
+
+    assert_receive {:witness_acknowledged, ^request_id}
+    assert_receive {:local_finch_request, "PATCH /api/v1/workspaces/workspace-1/projects/project-1/work-items/item-1/ HTTP/1.1", headers, body, true}
+    assert String.contains?(String.downcase(headers), "x-api-key: secret")
+    assert body == "{\"state\":\"state-done\"}"
+    refute String.contains?(headers, request_id)
+    refute String.contains?(body, request_id)
+  end
+
+  defp mutation_envelope(request_id \\ "preq_00000000-0000-4000-8000-000000000001") do
+    %ProviderMutationEnvelope{
+      provider_request_id: request_id,
+      transition_attempt_id: "transition-1",
+      work_item_id: "item-1",
+      provider: :plane,
+      workspace_id: "workspace-id-1",
+      project_id: "project-1",
+      requested_from: :merging,
+      requested_to: :done,
+      target_provider_state_id: "state-done",
+      target_provider_state_group: :completed,
+      provider_contract_fingerprint: "sha256:contract",
+      submitted_at: ~U[2026-10-19 09:00:00Z]
+    }
+  end
+
+  defp receive_http_request(socket, buffered) do
+    case :binary.match(buffered, "\r\n\r\n") do
+      {header_end, 4} ->
+        headers = binary_part(buffered, 0, header_end)
+        body_start = header_end + 4
+        body = binary_part(buffered, body_start, byte_size(buffered) - body_start)
+        content_length = request_content_length(headers)
+
+        if byte_size(body) >= content_length do
+          {request_line, _other_headers} = String.split(headers, "\r\n", parts: 2) |> List.to_tuple()
+          {request_line, headers, binary_part(body, 0, content_length)}
+        else
+          {:ok, next_chunk} = :gen_tcp.recv(socket, 0, 5_000)
+          receive_http_request(socket, buffered <> next_chunk)
+        end
+
+      :nomatch ->
+        {:ok, next_chunk} = :gen_tcp.recv(socket, 0, 5_000)
+        receive_http_request(socket, buffered <> next_chunk)
+    end
+  end
+
+  defp request_content_length(headers) do
+    headers
+    |> String.split("\r\n")
+    |> Enum.find_value(0, &content_length_header/1)
+  end
+
+  defp content_length_header(header) do
+    case String.split(header, ":", parts: 2) do
+      [name, value] -> parse_content_length(name, value)
+      _other -> nil
+    end
+  end
+
+  defp parse_content_length(name, value) do
+    if String.downcase(name) == "content-length" do
+      String.trim(value) |> String.to_integer()
+    end
   end
 end

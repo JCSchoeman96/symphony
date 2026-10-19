@@ -7,7 +7,7 @@ defmodule SymphonyElixir.Plane.Adapter do
   alias SymphonyElixir.Plane.{AgentTool, Client, DependencyReader, StateProjection}
   alias SymphonyElixir.Tracker.Capabilities
   alias SymphonyElixir.Tracker.Issue
-  alias SymphonyElixir.WorkControl.ProviderProjectContract
+  alias SymphonyElixir.WorkControl.{ProviderMutationEnvelope, ProviderProjectContract}
 
   @plane_api_key_env "PLANE_API_KEY"
   @plane_webhook_secret_env "PLANE_WEBHOOK_SECRET"
@@ -100,13 +100,14 @@ defmodule SymphonyElixir.Plane.Adapter do
          {:ok, config} <- client_config(tracker_settings),
          :ok <- validate_contract_scope(config, contract),
          :ok <- validate_work_item_scope(Keyword.get(opts, :pre_observation), config, work_item_id),
+         :ok <- validate_mutation_envelope(opts, contract, work_item_id, requested_to),
          {:ok, mapping} <- ProviderProjectContract.provider_mapping_for(contract, requested_to),
          :ok <- validate_target_mapping(mapping, contract, requested_to) do
       Client.update_work_item_state(
         config,
         work_item_id,
         mapping.state_id,
-        request_opts(Keyword.get(opts, :request_fun))
+        request_opts(Keyword.get(opts, :request_fun), opts)
       )
     end
   end
@@ -451,8 +452,38 @@ defmodule SymphonyElixir.Plane.Adapter do
   defp request_opts(request_fun), do: [request_fun: request_fun]
 
   defp request_opts(request_fun, opts) do
-    propagated = Keyword.take(opts, [:request_metrics, :scheduler, :class, :epoch_id])
+    propagated =
+      Keyword.take(opts, [
+        :request_metrics,
+        :scheduler,
+        :class,
+        :epoch_id,
+        :provider_mutation_envelope,
+        :dispatch_witness_sink,
+        :dispatch_witness_required?
+      ])
+
     Keyword.merge(propagated, request_opts(request_fun))
+  end
+
+  defp validate_mutation_envelope(opts, contract, work_item_id, requested_to) do
+    envelope = Keyword.get(opts, :provider_mutation_envelope)
+    required? = Keyword.get(opts, :dispatch_witness_required?, false)
+
+    cond do
+      is_nil(envelope) and required? ->
+        {:error, :provider_mutation_envelope_required}
+
+      is_nil(envelope) ->
+        :ok
+
+      match?(%ProviderMutationEnvelope{}, envelope) and
+          ProviderMutationEnvelope.matches?(envelope, work_item_id, requested_to, contract) ->
+        :ok
+
+      true ->
+        {:error, :provider_mutation_envelope_mismatch}
+    end
   end
 
   defp normalize_contract(%ProviderProjectContract{} = contract), do: {:ok, contract}
