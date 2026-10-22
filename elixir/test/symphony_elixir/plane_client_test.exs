@@ -72,6 +72,45 @@ defmodule SymphonyElixir.PlaneClientTest do
     assert state_params["fields"] == "id,name,group,project,workspace"
   end
 
+  test "accepts a complete work-item snapshot with a terminal provider cursor" do
+    parent = self()
+    page1_item = %{"id" => "one"}
+    page2_item = %{"id" => "two"}
+
+    request_fun = fn request ->
+      send(parent, {:terminal_cursor_request, request.params["cursor"]})
+
+      body =
+        case request.params["cursor"] do
+          nil ->
+            %{
+              "results" => [page1_item],
+              "count" => 1,
+              "total_results" => 2,
+              "next_page_results" => true,
+              "next_cursor" => "c1"
+            }
+
+          "c1" ->
+            %{
+              "results" => [page2_item],
+              "count" => 1,
+              "total_results" => 2,
+              "next_page_results" => false,
+              "next_cursor" => "provider-terminal-cursor"
+            }
+        end
+
+      {:ok, %{status: 200, body: body}}
+    end
+
+    assert {:ok, [^page1_item, ^page2_item]} =
+             Client.list_work_items(@config, request_fun: request_fun)
+
+    assert_received {:terminal_cursor_request, nil}
+    assert_received {:terminal_cursor_request, "c1"}
+  end
+
   test "combines every work-item page and rejects incomplete cursor pagination" do
     parent = self()
 
@@ -294,10 +333,20 @@ defmodule SymphonyElixir.PlaneClientTest do
 
     assert {:ok, [%{"id" => "s1"}, %{"id" => "s2"}]} = Client.list_states(@config, request_fun: request_fun)
 
-    assert {:error, :snapshot_incomplete} =
+    assert {:ok, []} =
              Client.list_states(@config,
                request_fun: fn _request ->
-                 {:ok, %{status: 200, body: %{"results" => [], "next_page_results" => false, "next_cursor" => "stale"}}}
+                 {:ok,
+                  %{
+                    status: 200,
+                    body: %{
+                      "results" => [],
+                      "count" => 0,
+                      "total_results" => 0,
+                      "next_page_results" => false,
+                      "next_cursor" => "stale"
+                    }
+                  }}
                end
              )
 

@@ -244,11 +244,8 @@ defmodule SymphonyElixir.Plane.Client do
       next? ->
         {:error, :snapshot_incomplete}
 
-      is_nil(next_cursor) or next_cursor == "" ->
-        {:ok, false}
-
       true ->
-        {:error, :snapshot_incomplete}
+        {:ok, false}
     end
   end
 
