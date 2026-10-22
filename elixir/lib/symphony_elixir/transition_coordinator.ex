@@ -13,12 +13,14 @@ defmodule SymphonyElixir.TransitionCoordinator do
 
   alias SymphonyElixir.AgentRuntime.{Authority, Route}
   alias SymphonyElixir.{Config, Orchestrator, SourceControl}
+  alias SymphonyElixir.Plane.Adapter, as: PlaneAdapter
   alias SymphonyElixir.Plane.ProjectContract, as: PlaneProjectContract
   alias SymphonyElixir.Tracker
   alias SymphonyElixir.Tracker.Issue
   alias SymphonyElixir.Tracker.TransitionPolicy
 
   alias SymphonyElixir.WorkControl.{
+    A4Proof,
     GuardClass,
     LifecycleAssessment,
     ProviderDispatchWitness,
@@ -48,6 +50,7 @@ defmodule SymphonyElixir.TransitionCoordinator do
     @moduledoc false
 
     defstruct [
+      :a4_controller,
       :ledger,
       :load_context,
       :refresh_contract,
@@ -67,6 +70,7 @@ defmodule SymphonyElixir.TransitionCoordinator do
     ]
 
     @type t :: %__MODULE__{
+            a4_controller: map() | nil,
             ledger: TransitionAttemptLedger.t() | nil,
             load_context: (SemanticTransitionIntent.t() -> term()),
             refresh_contract: (map() -> term()),
@@ -235,6 +239,7 @@ defmodule SymphonyElixir.TransitionCoordinator do
          {:ok, apply_verified} <- callback(opts, :apply_verified, default_apply),
          {:ok, suspend} <- callback(opts, :suspend, default_suspend) do
       base_state = %State{
+        a4_controller: Keyword.get(opts, :a4_controller),
         ledger: ledger,
         load_context: load_context,
         refresh_contract: refresh_contract,
@@ -451,8 +456,19 @@ defmodule SymphonyElixir.TransitionCoordinator do
            ]),
          {:ok, submitted} <- persist_attempt(state, submitted) do
       context = Map.put(context, :provider_mutation_envelope, envelope)
-      {submit_result, submitted} = submit_once(state, submitted, context)
-      reconcile_submission(state, submitted, context, submit_result)
+
+      case a4_preflight(state, submitted, envelope, context) do
+        {:ok, proof_context} ->
+          try do
+            {submit_result, submitted} = submit_once(state, submitted, proof_context)
+            reconcile_submission(state, submitted, context, submit_result)
+          after
+            A4Proof.release(Map.get(proof_context, :a4_session))
+          end
+
+        {:error, {:dispatch_witness_failed, _}} = failure ->
+          reconcile_submission(state, submitted, context, failure)
+      end
     else
       {:error, {:pre_submit, reason, %TransitionAttempt{state: :mutation_submitted} = submitted}} ->
         fail_submitted_persistence(state, submitted, reason)
@@ -462,6 +478,23 @@ defmodule SymphonyElixir.TransitionCoordinator do
 
       {:error, reason} ->
         fail_before_dispatch(state, attempt, reason)
+    end
+  end
+
+  defp a4_preflight(%State{a4_controller: nil}, _attempt, _envelope, context), do: {:ok, context}
+
+  defp a4_preflight(%State{} = state, attempt, envelope, context) do
+    with %TransitionAttemptLedger{} <- state.ledger,
+         {:ok, persisted} <- TransitionAttemptLedger.get(state.ledger, attempt.attempt_id),
+         true <- persisted == attempt,
+         settings when is_map(settings) <- Map.get(context, :tracker_settings),
+         {:ok, binding} <- PlaneAdapter.a4_binding(settings, envelope),
+         binding <- Map.merge(binding, %{witness_required?: state.dispatch_witness_required?, durable?: true}),
+         {:ok, token} <- A4Proof.acquire(state.a4_controller, persisted, envelope, binding) do
+      {:ok, Map.put(context, :a4_session, token)}
+    else
+      {:error, {:dispatch_witness_failed, _}} = failure -> failure
+      _ -> {:error, {:dispatch_witness_failed, :invalid_a4_preflight_boundary}}
     end
   end
 
@@ -1738,6 +1771,7 @@ defmodule SymphonyElixir.TransitionCoordinator do
       |> maybe_put_option(:provider_project_contract, Map.get(context, :provider_project_contract))
       |> maybe_put_option(:pre_observation, Map.get(context, :provider_observation))
       |> maybe_put_option(:provider_mutation_envelope, Map.get(context, :provider_mutation_envelope))
+      |> maybe_put_option(:a4_session, Map.get(context, :a4_session))
       |> maybe_put_option(:dispatch_witness_sink, dispatch_witness_sink)
       |> Keyword.put(:dispatch_witness_timeout_ms, dispatch_witness_timeout_ms)
       |> Keyword.put(:dispatch_witness_required?, dispatch_witness_required?)

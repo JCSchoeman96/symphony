@@ -831,7 +831,8 @@ defmodule SymphonyElixir.PlaneClientTest do
 
   test "required witness mode fails before Req transport when the sink is absent" do
     assert {:error, {:dispatch_witness_failed, :sink_unavailable}} =
-             Client.update_work_item_state(@config, "item-1", "state-done",
+             Client.update_work_item_state(%{@config | base_url: "http://127.0.0.1:1"}, "item-1", "state-done",
+               request_fun: nil,
                provider_mutation_envelope: mutation_envelope(),
                dispatch_witness_required?: true
              )
