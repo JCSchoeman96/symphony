@@ -292,6 +292,13 @@ defmodule SymphonyElixir.A4DormantCapture do
 
   defp validate_capture!(cases) do
     by_name = Map.new(cases, &{&1.name, &1})
+    validate_capture_results!(by_name)
+    expected_request = validate_request_equivalence!(by_name)
+    validate_expected_request!(expected_request)
+    :ok
+  end
+
+  defp validate_capture_results!(by_name) do
     accepted = Map.fetch!(by_name, "accepted")
     provider_error = Map.fetch!(by_name, "provider_error")
     timeout = Map.fetch!(by_name, "timeout")
@@ -305,6 +312,12 @@ defmodule SymphonyElixir.A4DormantCapture do
              witness_rejection.transport_count == 0 do
       raise "witness rejection reached transport"
     end
+
+    :ok
+  end
+
+  defp validate_request_equivalence!(by_name) do
+    accepted = Map.fetch!(by_name, "accepted")
 
     request_fields = [
       :method,
@@ -326,6 +339,10 @@ defmodule SymphonyElixir.A4DormantCapture do
       unless observed_request == expected_request, do: raise("#{case_name} request differed from accepted request")
     end
 
+    expected_request
+  end
+
+  defp validate_expected_request!(expected_request) do
     unless expected_request.method == "PATCH" and expected_request.witness_ack_before_transport and
              expected_request.transport_count == 1 and expected_request.request_id_in_origin == false and
              expected_request.proof_finch_started == false and expected_request.proof_helper_started == false do

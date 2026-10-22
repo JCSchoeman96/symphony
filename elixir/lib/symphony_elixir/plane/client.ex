@@ -304,30 +304,34 @@ defmodule SymphonyElixir.Plane.Client do
     }
 
     with :ok <- qualification_transport_guard(config, opts) do
-      increment_request_metric(Keyword.get(opts, :request_metrics), 1)
-
-      request_fun = Keyword.get(opts, :request_fun)
-      scheduler = scheduler_option(opts, request_fun)
-
-      result =
-        if scheduler do
-          ReadScheduler.execute(
-            scheduler,
-            request_class,
-            fn ->
-              increment_request_metric(Keyword.get(opts, :request_metrics), 2)
-              raw_get_request(config, request, request_fun)
-            end,
-            wait_timeout: @read_wait_timeout_ms,
-            epoch_id: Keyword.get(opts, :epoch_id),
-            request_metrics: Keyword.get(opts, :request_metrics)
-          )
-        else
-          raw_get_request(config, request, request_fun)
-        end
-
-      sanitize_get_result(result)
+      execute_request(config, request, opts, request_class)
     end
+  end
+
+  defp execute_request(config, request, opts, request_class) do
+    increment_request_metric(Keyword.get(opts, :request_metrics), 1)
+
+    request_fun = Keyword.get(opts, :request_fun)
+    scheduler = scheduler_option(opts, request_fun)
+
+    result =
+      if scheduler do
+        ReadScheduler.execute(
+          scheduler,
+          request_class,
+          fn ->
+            increment_request_metric(Keyword.get(opts, :request_metrics), 2)
+            raw_get_request(config, request, request_fun)
+          end,
+          wait_timeout: @read_wait_timeout_ms,
+          epoch_id: Keyword.get(opts, :epoch_id),
+          request_metrics: Keyword.get(opts, :request_metrics)
+        )
+      else
+        raw_get_request(config, request, request_fun)
+      end
+
+    sanitize_get_result(result)
   end
 
   defp scheduler_option(opts, request_fun) do
@@ -453,8 +457,18 @@ defmodule SymphonyElixir.Plane.Client do
   end
 
   defp local_req_test_transport?(opts) do
-    Keyword.get(opts, :qualification_local_transport?, false) and
-      Enum.any?(Keyword.take(Req.default_options(), [:adapter, :plug]), fn {_key, value} -> is_function(value) end)
+    defaults = Req.default_options()
+    req_test_plug? = match?({Req.Test, _stub}, Keyword.get(defaults, :plug))
+
+    explicit_local_transport? =
+      Keyword.get(opts, :qualification_local_transport?, false) or
+        Application.get_env(:symphony_elixir, :a4_qualification_local_transport, false)
+
+    explicit_adapter? =
+      explicit_local_transport? and
+        Enum.any?(Keyword.take(defaults, [:adapter, :plug]), fn {_key, value} -> is_function(value) end)
+
+    req_test_plug? or explicit_adapter?
   end
 
   defp validate_witness_configuration(opts) do

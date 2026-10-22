@@ -70,6 +70,30 @@ defmodule SymphonyElixir.A4QualificationTransportGuardTest do
     refute_received {:unexpected_req, _method}
   end
 
+  test "allows the explicit Req.Test plug without opening a provider connection" do
+    parent = self()
+    defaults = Req.default_options()
+    stub = {:a4_qualification_local, System.unique_integer([:positive])}
+
+    :ok = Req.Test.set_req_test_to_shared()
+
+    :ok =
+      Req.Test.stub(stub, fn conn ->
+        send(parent, {:local_req_test, conn.request_path})
+        Req.Test.json(conn, %{"id" => "project"})
+      end)
+
+    Req.default_options(Keyword.put(defaults, :plug, {Req.Test, stub}))
+
+    on_exit(fn ->
+      Req.default_options(defaults)
+      Req.Test.set_req_test_to_private()
+    end)
+
+    assert {:ok, %{"id" => "project"}} = Client.get_project(client_config("https://api.plane.so"))
+    assert_received {:local_req_test, "/api/v1/workspaces/workspace/projects/project/"}
+  end
+
   defp client_config(base_url) do
     %{
       base_url: base_url,

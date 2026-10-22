@@ -110,9 +110,6 @@ defmodule SymphonyElixir.Plane.Adapter do
         request_opts(Keyword.get(opts, :request_fun), opts)
       )
     else
-      {:error, {:dispatch_witness_failed, _reason}} = failure ->
-        failure
-
       {:error, reason} ->
         if is_nil(Keyword.get(opts, :a4_session)) do
           {:error, reason}

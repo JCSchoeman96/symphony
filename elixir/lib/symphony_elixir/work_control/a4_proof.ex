@@ -181,21 +181,24 @@ defmodule SymphonyElixir.WorkControl.A4Proof do
        })
        when is_pid(pid) and is_reference(ref) and is_integer(timeout) and timeout in 1..@max_timeout_ms and
               is_binary(sha) and is_binary(tree) do
-    cond do
-      node(pid) != node() ->
-        {:error, :remote_proof_controller}
-
-      :atomics.info(gate)[:size] == 1 and Process.alive?(pid) ->
-        :ok
-
-      true ->
-        {:error, :proof_controller_unavailable}
-    end
+    validate_controller(pid, gate)
   rescue
     _ -> {:error, :invalid_proof_controller_capability}
   end
 
   defp validate_capability(_), do: {:error, :invalid_proof_controller_capability}
+
+  defp validate_controller(pid, gate) do
+    if node(pid) == node(),
+      do: validate_controller_gate(pid, gate),
+      else: {:error, :remote_proof_controller}
+  end
+
+  defp validate_controller_gate(pid, gate) do
+    if :atomics.info(gate)[:size] == 1 and Process.alive?(pid),
+      do: :ok,
+      else: {:error, :proof_controller_unavailable}
+  end
 
   defp claim_session(capability) do
     case :atomics.compare_exchange(capability.gate, 1, 0, 1) do

@@ -1,31 +1,39 @@
 defmodule SymphonyElixir.A4ClientTest do
   use ExUnit.Case, async: false
 
-  alias SymphonyElixir.Plane.Client
   alias SymphonyElixir.Plane.Adapter
+  alias SymphonyElixir.Plane.Client
   alias SymphonyElixir.WorkControl.A4Proof
-  alias SymphonyElixir.WorkControl.{ProviderMutationEnvelope, ProviderProjectContract, TransitionAttempt, WorkflowLifecycle}
+
+  alias SymphonyElixir.WorkControl.{
+    ProviderMutationEnvelope,
+    ProviderProjectContract,
+    TransitionAttempt,
+    WorkflowLifecycle
+  }
 
   test "rejects an invalid proof session before invoking an alternate transport" do
     parent = self()
 
-    assert {:error, {:dispatch_witness_failed, _reason}} =
-             Client.update_work_item_state(
-               %{
-                 base_url: "https://api.plane.so",
-                 workspace_slug: "workspace",
-                 workspace_id: "workspace-id",
-                 project_id: "project",
-                 api_key: "secret"
-               },
-               "item-1",
-               "state-done",
-               a4_session: :invalid,
-               request_fun: fn _request ->
-                 send(parent, :transport_called)
-                 {:ok, %{status: 204}}
-               end
-             )
+    result =
+      Client.update_work_item_state(
+        %{
+          base_url: "https://api.plane.so",
+          workspace_slug: "workspace",
+          workspace_id: "workspace-id",
+          project_id: "project",
+          api_key: "secret"
+        },
+        "item-1",
+        "state-done",
+        a4_session: :invalid,
+        request_fun: fn _request ->
+          send(parent, :transport_called)
+          {:ok, %{status: 204}}
+        end
+      )
+
+    assert {:error, {:dispatch_witness_failed, _reason}} = result
 
     refute_received :transport_called
   end
