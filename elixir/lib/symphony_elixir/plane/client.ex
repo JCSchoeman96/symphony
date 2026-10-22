@@ -303,29 +303,31 @@ defmodule SymphonyElixir.Plane.Client do
       headers: [{"X-API-Key", config.api_key}, {"Accept", "application/json"}]
     }
 
-    increment_request_metric(Keyword.get(opts, :request_metrics), 1)
+    with :ok <- qualification_transport_guard(config, opts) do
+      increment_request_metric(Keyword.get(opts, :request_metrics), 1)
 
-    request_fun = Keyword.get(opts, :request_fun)
-    scheduler = scheduler_option(opts, request_fun)
+      request_fun = Keyword.get(opts, :request_fun)
+      scheduler = scheduler_option(opts, request_fun)
 
-    result =
-      if scheduler do
-        ReadScheduler.execute(
-          scheduler,
-          request_class,
-          fn ->
-            increment_request_metric(Keyword.get(opts, :request_metrics), 2)
-            raw_get_request(config, request, request_fun)
-          end,
-          wait_timeout: @read_wait_timeout_ms,
-          epoch_id: Keyword.get(opts, :epoch_id),
-          request_metrics: Keyword.get(opts, :request_metrics)
-        )
-      else
-        raw_get_request(config, request, request_fun)
-      end
+      result =
+        if scheduler do
+          ReadScheduler.execute(
+            scheduler,
+            request_class,
+            fn ->
+              increment_request_metric(Keyword.get(opts, :request_metrics), 2)
+              raw_get_request(config, request, request_fun)
+            end,
+            wait_timeout: @read_wait_timeout_ms,
+            epoch_id: Keyword.get(opts, :epoch_id),
+            request_metrics: Keyword.get(opts, :request_metrics)
+          )
+        else
+          raw_get_request(config, request, request_fun)
+        end
 
-    sanitize_get_result(result)
+      sanitize_get_result(result)
+    end
   end
 
   defp scheduler_option(opts, request_fun) do
@@ -418,9 +420,41 @@ defmodule SymphonyElixir.Plane.Client do
       ]
     }
 
-    with :ok <- validate_request_transport(opts) do
+    with :ok <- qualification_transport_guard(config, opts),
+         :ok <- validate_request_transport(opts) do
       dispatch_mutation_request(config, request, opts)
     end
+  end
+
+  @doc false
+  @spec qualification_transport_guard(config(), keyword()) :: :ok | {:error, atom()}
+  def qualification_transport_guard(config, opts) do
+    if Application.get_env(:symphony_elixir, :a4_qualification_local_only, false) do
+      request_funs = Keyword.get_values(opts, :request_fun)
+      base_url = Map.get(config, :base_url)
+      uri = if is_binary(base_url), do: URI.parse(base_url), else: nil
+
+      cond do
+        length(request_funs) > 1 ->
+          {:error, :qualification_transport_ambiguous}
+
+        (uri && uri.host == "api.plane.so") and request_funs in [[], [nil]] and
+            not local_req_test_transport?(opts) ->
+          {:error, :qualification_live_plane_http_forbidden}
+
+        true ->
+          :ok
+      end
+    else
+      :ok
+    end
+  rescue
+    _error -> {:error, :qualification_transport_invalid}
+  end
+
+  defp local_req_test_transport?(opts) do
+    Keyword.get(opts, :qualification_local_transport?, false) and
+      Enum.any?(Keyword.take(Req.default_options(), [:adapter, :plug]), fn {_key, value} -> is_function(value) end)
   end
 
   defp validate_witness_configuration(opts) do

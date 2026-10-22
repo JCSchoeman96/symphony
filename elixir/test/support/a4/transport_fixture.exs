@@ -10,6 +10,8 @@ defmodule SymphonyElixir.A4TransportProofFixture do
   @timeout 10_000
 
   def run!(:suppressed_tls12) do
+    Application.put_env(:symphony_elixir, :a4_qualification_local_only, true)
+
     root = Path.join(System.tmp_dir!(), "a4-transport-#{System.unique_integer([:positive])}")
     File.mkdir_p!(root)
     on_exit = fn -> File.rm_rf(root) end
