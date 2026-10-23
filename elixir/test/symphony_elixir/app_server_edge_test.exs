@@ -3,6 +3,7 @@ defmodule SymphonyElixir.AppServerEdgeTest do
 
   alias SymphonyElixir.AgentRuntime.{Profile, Route}
   alias SymphonyElixir.Tracker.Memory
+  alias SymphonyElixir.WorkControl.WorkflowLifecycle
 
   test "remote startup rejects an empty workspace before launch" do
     assert {:error, {:invalid_workspace_cwd, :empty_remote_workspace, "worker-01"}} =
@@ -753,8 +754,8 @@ defmodule SymphonyElixir.AppServerEdgeTest do
     workspace = Path.join(workspace_root, "SYNTHETIC")
     binary = Path.join(test_root, "codex")
     trace = Path.join(test_root, "codex-trace.jsonl")
-    previous_plane_api_key = System.get_env("PLANE_API_KEY")
-    System.put_env("PLANE_API_KEY", "test-plane-secret")
+    previous_ferdi_api_key = System.get_env("PLANE_API_KEY_FERDI")
+    System.put_env("PLANE_API_KEY_FERDI", "test-ferdi-plane-key")
     File.mkdir_p!(workspace)
     write_plane_workflow!(Workflow.workflow_file_path(), workspace_root)
     write_tracing_fake_codex!(binary, trace, workspace)
@@ -825,7 +826,7 @@ defmodule SymphonyElixir.AppServerEdgeTest do
                ["In Review"]
              ]
     after
-      restore_env("PLANE_API_KEY", previous_plane_api_key)
+      restore_env("PLANE_API_KEY_FERDI", previous_ferdi_api_key)
       File.rm_rf(test_root)
     end
   end
@@ -862,6 +863,12 @@ defmodule SymphonyElixir.AppServerEdgeTest do
   end
 
   defp write_plane_workflow!(path, workspace_root) do
+    state_mappings =
+      WorkflowLifecycle.states()
+      |> Enum.map_join("\n", fn state ->
+        "    #{state}:\n      state_id: \"state-#{state}\""
+      end)
+
     File.write!(path, """
     ---
     tracker:
@@ -872,7 +879,20 @@ defmodule SymphonyElixir.AppServerEdgeTest do
         workspace_slug: "workspace-1"
         workspace_id: "workspace-stable-1"
         project_id: "project-1"
-        api_key: "$PLANE_API_KEY"
+        api_key: "$PLANE_API_KEY_FERDI"
+    provider_project_contract:
+      schema_version: 1
+      provider: "plane"
+      workspace_id: "workspace-stable-1"
+      project_id: "project-1"
+      runtime_principal:
+        api_key_env: "PLANE_API_KEY_FERDI"
+        user_id: "920272c2-862e-4592-b13e-b0ba11c91b12"
+        principal_kind: "api_key"
+        project_relation: "contributor"
+        required_permissions: ["workitem:view", "workitem:edit"]
+      state_mappings:
+    #{state_mappings}
     symphony:
       project_id: "symphony-plane"
     workspace:

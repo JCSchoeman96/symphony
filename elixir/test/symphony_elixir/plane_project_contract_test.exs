@@ -79,6 +79,38 @@ defmodule SymphonyElixir.PlaneProjectContractTest do
     end
   end
 
+  test "fails closed when the live runtime principal snapshot is missing" do
+    result = ProjectContract.validate(contract!(), Map.delete(snapshot(), :runtime_principal))
+
+    assert result.status == :snapshot_incomplete
+    assert has_class?(result, :snapshot_incomplete)
+  end
+
+  test "rejects the wrong runtime identity, principal kind, relation, or permission set" do
+    contract = contract!()
+    principal = snapshot().runtime_principal
+
+    invalid_principals = [
+      %{principal | user_id: "00000000-0000-4000-8000-000000000001"},
+      %{principal | principal_kind: "oauth"},
+      %{principal | project_relation: "admin"},
+      %{principal | required_permissions: ["workitem:view"]}
+    ]
+
+    for invalid_principal <- invalid_principals do
+      result = ProjectContract.validate(contract, Map.put(snapshot(), :runtime_principal, invalid_principal))
+      assert result.status == :drift_detected
+    end
+  end
+
+  test "classifies malformed runtime principal evidence as provider malformed" do
+    malformed = Map.put(snapshot(), :runtime_principal, %{snapshot().runtime_principal | user_id: 42})
+
+    result = ProjectContract.validate(contract!(), malformed)
+    assert result.status == :provider_malformed
+    assert has_class?(result, :provider_malformed)
+  end
+
   test "normalizes string-keyed provider snapshots and descriptive groups" do
     contract = contract!()
     result = ProjectContract.validate(contract, string_snapshot())
@@ -338,6 +370,7 @@ defmodule SymphonyElixir.PlaneProjectContractTest do
       provider: :plane,
       workspace_id: "workspace-1",
       project_id: "project-1",
+      runtime_principal: runtime_principal_policy(),
       state_mappings:
         Map.new(@states, fn state ->
           {state, %{state_id: "state-#{state}", name: WorkflowLifecycle.display(state)}}
@@ -355,6 +388,7 @@ defmodule SymphonyElixir.PlaneProjectContractTest do
       workspace_name: "Workspace",
       project_id: "project-1",
       project_name: "Project",
+      runtime_principal: runtime_principal_observation(),
       states:
         Enum.map(@states, fn state ->
           %{id: "state-#{state}", group: Map.fetch!(@plane_groups, state), name: WorkflowLifecycle.display(state)}
@@ -384,6 +418,12 @@ defmodule SymphonyElixir.PlaneProjectContractTest do
       "provider" => "plane",
       "workspace_id" => "workspace-1",
       "project_id" => "project-1",
+      "runtime_principal" => %{
+        "user_id" => "920272c2-862e-4592-b13e-b0ba11c91b12",
+        "principal_kind" => "api_key",
+        "project_relation" => "contributor",
+        "required_permissions" => ["workitem:view", "workitem:edit"]
+      },
       "states" =>
         Enum.map(@states, fn state ->
           %{
@@ -399,6 +439,20 @@ defmodule SymphonyElixir.PlaneProjectContractTest do
       "capability_statuses" => Map.new(Capabilities.vocabulary(), &{Atom.to_string(&1), :supported}),
       "completeness" => :complete
     }
+  end
+
+  defp runtime_principal_policy do
+    %{
+      api_key_env: "PLANE_API_KEY_FERDI",
+      user_id: "920272c2-862e-4592-b13e-b0ba11c91b12",
+      principal_kind: "api_key",
+      project_relation: "contributor",
+      required_permissions: ["workitem:view", "workitem:edit"]
+    }
+  end
+
+  defp runtime_principal_observation do
+    Map.delete(runtime_principal_policy(), :api_key_env)
   end
 
   defp has_class?(result, class) do

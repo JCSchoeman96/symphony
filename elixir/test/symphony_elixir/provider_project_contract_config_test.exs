@@ -69,12 +69,36 @@ defmodule SymphonyElixir.ProviderProjectContractConfigTest do
     assert settings.provider_project_contract.provider == :plane
   end
 
+  test "runtime principal policy is limited to the Ferdi user, contributor role, and required grants" do
+    for {field, value} <- [
+          {"api_key_env", "PLANE_API_KEY_JC"},
+          {"user_id", "00000000-0000-4000-8000-000000000001"},
+          {"project_relation", "admin"},
+          {"required_permissions", ["workitem:view"]}
+        ] do
+      malformed =
+        update_in(contract_config(), ["runtime_principal", field], fn _ -> value end)
+
+      assert {:error, {:invalid_workflow_config, message}} =
+               Schema.parse(%{"provider_project_contract" => malformed})
+
+      assert message =~ "provider_project_contract"
+    end
+  end
+
   defp contract_config do
     %{
       "schema_version" => 1,
       "provider" => "plane",
       "workspace_id" => "workspace-1",
       "project_id" => "project-1",
+      "runtime_principal" => %{
+        "api_key_env" => "PLANE_API_KEY_FERDI",
+        "user_id" => "920272c2-862e-4592-b13e-b0ba11c91b12",
+        "principal_kind" => "api_key",
+        "project_relation" => "contributor",
+        "required_permissions" => ["workitem:view", "workitem:edit"]
+      },
       "state_mappings" =>
         Map.new(@states, fn state ->
           {Atom.to_string(state),

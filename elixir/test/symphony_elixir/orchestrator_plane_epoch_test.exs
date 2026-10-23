@@ -238,6 +238,12 @@ defmodule SymphonyElixir.OrchestratorPlaneEpochFakeTracker do
       provider: :plane,
       workspace_id: "workspace-stable-1",
       project_id: "project-1",
+      runtime_principal: %{
+        user_id: "920272c2-862e-4592-b13e-b0ba11c91b12",
+        principal_kind: "api_key",
+        project_relation: "contributor",
+        required_permissions: ["workitem:view", "workitem:edit"]
+      },
       states:
         Enum.map(WorkflowLifecycle.states(), fn state ->
           %{id: "state-#{state}", group: Map.fetch!(groups, state), name: WorkflowLifecycle.display(state)}
@@ -403,7 +409,8 @@ defmodule SymphonyElixir.OrchestratorPlaneEpochTest do
   alias SymphonyElixir.Workspace.OwnershipLedger
 
   setup do
-    System.put_env("PLANE_API_KEY", "plane-epoch-test-secret")
+    previous_runtime_key = System.get_env("PLANE_API_KEY_FERDI")
+    System.put_env("PLANE_API_KEY_FERDI", "plane-epoch-test-secret")
     plane_workflow!("project-1")
     Application.put_env(:symphony_elixir, :plane_epoch_test_pid, self())
     Application.put_env(:symphony_elixir, :plane_epoch_test_mode, :normal)
@@ -419,7 +426,11 @@ defmodule SymphonyElixir.OrchestratorPlaneEpochTest do
       Application.delete_env(:symphony_elixir, :plane_epoch_graph_fetch_counter)
       Application.delete_env(:symphony_elixir, :plane_epoch_issue_read_counter)
       Application.delete_env(:symphony_elixir, :plane_epoch_test_graph_issues)
-      System.delete_env("PLANE_API_KEY")
+
+      case previous_runtime_key do
+        nil -> System.delete_env("PLANE_API_KEY_FERDI")
+        key -> System.put_env("PLANE_API_KEY_FERDI", key)
+      end
     end)
 
     :ok
@@ -4100,7 +4111,7 @@ defmodule SymphonyElixir.OrchestratorPlaneEpochTest do
       "workspace_slug" => workspace_slug,
       "workspace_id" => workspace_id,
       "project_id" => project_id,
-      "api_key" => "$PLANE_API_KEY"
+      "api_key" => "$PLANE_API_KEY_FERDI"
     }
 
     contract = %{
@@ -4108,6 +4119,13 @@ defmodule SymphonyElixir.OrchestratorPlaneEpochTest do
       "provider" => "plane",
       "workspace_id" => workspace_id,
       "project_id" => project_id,
+      "runtime_principal" => %{
+        "api_key_env" => "PLANE_API_KEY_FERDI",
+        "user_id" => "920272c2-862e-4592-b13e-b0ba11c91b12",
+        "principal_kind" => "api_key",
+        "project_relation" => "contributor",
+        "required_permissions" => ["workitem:view", "workitem:edit"]
+      },
       "state_mappings" =>
         Map.new(WorkflowLifecycle.states(), fn state ->
           {Atom.to_string(state), %{"state_id" => "state-#{state}#{contract_state_id_suffix}", "name" => WorkflowLifecycle.display(state)}}

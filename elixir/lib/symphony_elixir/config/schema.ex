@@ -14,6 +14,9 @@ defmodule SymphonyElixir.Config.Schema do
   @primary_key false
   @linear_endpoint "https://api.linear.app/graphql"
   @plane_endpoint "https://api.plane.so"
+  @plane_runtime_api_key_env "PLANE_API_KEY_FERDI"
+  @plane_operator_api_key_env "PLANE_API_KEY_JC"
+  @plane_legacy_api_key_env "PLANE_API_KEY"
   @linear_active_states ["Todo", "In Progress"]
   @linear_terminal_states ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
   @project_id_pattern ~r/\A[A-Za-z0-9][A-Za-z0-9._-]*\z/
@@ -99,6 +102,7 @@ defmodule SymphonyElixir.Config.Schema do
       field(:assignee, :string)
       field(:provider, :map, default: %{})
       field(:secret_environment_names, {:array, :string}, default: [])
+      field(:runtime_principal, :map)
       field(:required_labels, {:array, :string}, default: [])
       field(:active_states, {:array, :string})
       field(:terminal_states, {:array, :string})
@@ -806,7 +810,12 @@ defmodule SymphonyElixir.Config.Schema do
 
     with {:ok, provider_project_contract} <-
            resolve_provider_project_contract(settings.provider_project_contract) do
-      settings = %{settings | provider_project_contract: provider_project_contract}
+      tracker = %{
+        settings.tracker
+        | runtime_principal: provider_project_contract && provider_project_contract.runtime_principal
+      }
+
+      settings = %{settings | provider_project_contract: provider_project_contract, tracker: tracker}
 
       settings
       |> enrich_plane_scope(provider_project_contract)
@@ -884,13 +893,18 @@ defmodule SymphonyElixir.Config.Schema do
       |> Map.put_new("api_key", tracker.api_key)
 
     resolved_api_key =
-      resolve_secret_setting(plane_provider["api_key"], System.get_env("PLANE_API_KEY"))
+      resolve_secret_setting(plane_provider["api_key"], nil)
 
     {
       resolved_api_key,
       tracker.assignee,
       plane_provider,
-      ["PLANE_API_KEY" | env_reference_names([plane_provider["api_key"]])]
+      [
+        @plane_runtime_api_key_env,
+        @plane_operator_api_key_env,
+        @plane_legacy_api_key_env
+        | env_reference_names([plane_provider["api_key"]])
+      ]
     }
   end
 

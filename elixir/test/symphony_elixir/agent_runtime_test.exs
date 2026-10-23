@@ -73,7 +73,7 @@ defmodule SymphonyElixir.AgentRuntimeTest do
   alias SymphonyElixir.AgentRuntime
   alias SymphonyElixir.AgentRuntime.{Codex, Router, RuntimeAttempt}
   alias SymphonyElixir.Codex.AppServer
-  alias SymphonyElixir.WorkControl.WorkItem
+  alias SymphonyElixir.WorkControl.{WorkflowLifecycle, WorkItem}
 
   @work_control_now ~U[2026-09-16 00:00:00Z]
 
@@ -471,8 +471,8 @@ defmodule SymphonyElixir.AgentRuntimeTest do
 
   test "routed Plane continuation starts a fresh catalogue for the refreshed route" do
     test_pid = self()
-    previous_plane_api_key = System.get_env("PLANE_API_KEY")
-    System.put_env("PLANE_API_KEY", "test-plane-secret")
+    previous_plane_api_key = System.get_env("PLANE_API_KEY_FERDI")
+    System.put_env("PLANE_API_KEY_FERDI", "test-plane-secret")
 
     workspace_root = Path.join(System.tmp_dir!(), "symphony-plane-catalogue-#{System.unique_integer([:positive])}")
     File.mkdir_p!(workspace_root)
@@ -577,15 +577,15 @@ defmodule SymphonyElixir.AgentRuntimeTest do
       assert :atomics.get(snapshot_reads, 1) == 2
       assert :atomics.get(provider_reads, 1) == 0
     after
-      restore_env("PLANE_API_KEY", previous_plane_api_key)
+      restore_env("PLANE_API_KEY_FERDI", previous_plane_api_key)
       File.rm_rf(workspace_root)
     end
   end
 
   test "Plane continuation stops on complete epoch absence without a provider read" do
     test_pid = self()
-    previous_plane_api_key = System.get_env("PLANE_API_KEY")
-    System.put_env("PLANE_API_KEY", "test-plane-secret")
+    previous_plane_api_key = System.get_env("PLANE_API_KEY_FERDI")
+    System.put_env("PLANE_API_KEY_FERDI", "test-plane-secret")
     workspace_root = Path.join(System.tmp_dir!(), "symphony-plane-absence-#{System.unique_integer([:positive])}")
     File.mkdir_p!(workspace_root)
     write_plane_workflow_file!(Workflow.workflow_file_path(), workspace_root)
@@ -616,15 +616,15 @@ defmodule SymphonyElixir.AgentRuntimeTest do
       refute_receive {:runtime_turn, _session, _prompt, _issue}, 50
       assert :atomics.get(provider_reads, 1) == 0
     after
-      restore_env("PLANE_API_KEY", previous_plane_api_key)
+      restore_env("PLANE_API_KEY_FERDI", previous_plane_api_key)
       File.rm_rf(workspace_root)
     end
   end
 
   test "Plane continuation fails closed when the complete epoch is unavailable" do
     test_pid = self()
-    previous_plane_api_key = System.get_env("PLANE_API_KEY")
-    System.put_env("PLANE_API_KEY", "test-plane-secret")
+    previous_plane_api_key = System.get_env("PLANE_API_KEY_FERDI")
+    System.put_env("PLANE_API_KEY_FERDI", "test-plane-secret")
     workspace_root = Path.join(System.tmp_dir!(), "symphony-plane-unavailable-#{System.unique_integer([:positive])}")
     File.mkdir_p!(workspace_root)
     write_plane_workflow_file!(Workflow.workflow_file_path(), workspace_root)
@@ -655,15 +655,15 @@ defmodule SymphonyElixir.AgentRuntimeTest do
       assert_receive {:runtime_stopped, _session}
       assert :atomics.get(provider_reads, 1) == 0
     after
-      restore_env("PLANE_API_KEY", previous_plane_api_key)
+      restore_env("PLANE_API_KEY_FERDI", previous_plane_api_key)
       File.rm_rf(workspace_root)
     end
   end
 
   test "Plane continuation fails closed when the host snapshot reader is missing" do
     test_pid = self()
-    previous_plane_api_key = System.get_env("PLANE_API_KEY")
-    System.put_env("PLANE_API_KEY", "test-plane-secret")
+    previous_plane_api_key = System.get_env("PLANE_API_KEY_FERDI")
+    System.put_env("PLANE_API_KEY_FERDI", "test-plane-secret")
     workspace_root = Path.join(System.tmp_dir!(), "symphony-plane-missing-reader-#{System.unique_integer([:positive])}")
     File.mkdir_p!(workspace_root)
     write_plane_workflow_file!(Workflow.workflow_file_path(), workspace_root)
@@ -693,7 +693,7 @@ defmodule SymphonyElixir.AgentRuntimeTest do
       assert_receive {:runtime_stopped, _session}
       assert :atomics.get(provider_reads, 1) == 0
     after
-      restore_env("PLANE_API_KEY", previous_plane_api_key)
+      restore_env("PLANE_API_KEY_FERDI", previous_plane_api_key)
       File.rm_rf(workspace_root)
     end
   end
@@ -904,8 +904,27 @@ defmodule SymphonyElixir.AgentRuntimeTest do
   end
 
   defp write_plane_workflow_file!(path, workspace_root) do
+    project_contract = %{
+      "schema_version" => 1,
+      "provider" => "plane",
+      "workspace_id" => "workspace-stable-1",
+      "project_id" => "project-1",
+      "runtime_principal" => %{
+        "api_key_env" => "PLANE_API_KEY_FERDI",
+        "user_id" => "920272c2-862e-4592-b13e-b0ba11c91b12",
+        "principal_kind" => "api_key",
+        "project_relation" => "contributor",
+        "required_permissions" => ["workitem:view", "workitem:edit"]
+      },
+      "state_mappings" =>
+        Map.new(WorkflowLifecycle.states(), fn state ->
+          {Atom.to_string(state), %{"state_id" => "state-#{state}", "name" => WorkflowLifecycle.display(state)}}
+        end)
+    }
+
     File.write!(path, """
     ---
+    provider_project_contract: #{Jason.encode!(project_contract)}
     tracker:
       kind: "plane"
       active_states: ["Ready", "In Progress"]
@@ -914,7 +933,7 @@ defmodule SymphonyElixir.AgentRuntimeTest do
         workspace_slug: "workspace-1"
         workspace_id: "workspace-stable-1"
         project_id: "project-1"
-        api_key: "$PLANE_API_KEY"
+        api_key: "$PLANE_API_KEY_FERDI"
     symphony:
       project_id: "symphony-plane"
     workspace:

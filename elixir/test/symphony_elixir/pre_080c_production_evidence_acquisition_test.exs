@@ -553,7 +553,7 @@ defmodule SymphonyElixir.Pre080cProductionEvidenceAcquisitionTest do
     previous_memory_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
     previous_test_pid = Application.get_env(:symphony_elixir, :pre_080c_test_pid)
     previous_coordinator = Application.get_env(:symphony_elixir, :pre_080c_test_coordinator)
-    previous_plane_api_key = System.get_env("PLANE_API_KEY")
+    previous_plane_api_key = System.get_env("PLANE_API_KEY_FERDI")
     previous_req_options = Req.default_options()
     codex = Path.join(root, "codex")
     File.mkdir_p!(root)
@@ -565,7 +565,7 @@ defmodule SymphonyElixir.Pre080cProductionEvidenceAcquisitionTest do
       restore_application_env(:memory_tracker_issues, previous_memory_issues)
       restore_application_env(:pre_080c_test_pid, previous_test_pid)
       restore_application_env(:pre_080c_test_coordinator, previous_coordinator)
-      restore_env("PLANE_API_KEY", previous_plane_api_key)
+      restore_env("PLANE_API_KEY_FERDI", previous_plane_api_key)
       Req.default_options(previous_req_options)
       Req.Test.set_req_test_to_private()
       File.rm_rf(root)
@@ -593,11 +593,11 @@ defmodule SymphonyElixir.Pre080cProductionEvidenceAcquisitionTest do
       String.replace(
         workflow,
         "tracker:\n",
-        "tracker:\n  provider:\n    workspace_slug: workspace-1\n    workspace_id: workspace-1\n    project_id: project-1\n    api_key: $PLANE_API_KEY\n"
+        "tracker:\n  provider:\n    workspace_slug: workspace-1\n    workspace_id: workspace-1\n    project_id: project-1\n    api_key: $PLANE_API_KEY_FERDI\n"
       )
     )
 
-    System.put_env("PLANE_API_KEY", "pre-080c-plane-test-key")
+    System.put_env("PLANE_API_KEY_FERDI", "pre-080c-plane-test-key")
     :ok = SymphonyElixir.Workflow.set_workflow_file_path(workflow_path)
     :ok = SymphonyElixir.WorkflowStore.force_reload()
 
@@ -615,6 +615,18 @@ defmodule SymphonyElixir.Pre080cProductionEvidenceAcquisitionTest do
     :ok =
       Req.Test.stub(req_stub, fn conn ->
         case conn.request_path do
+          "/api/v2/users/me/" ->
+            Req.Test.json(conn, %{
+              "id" => "920272c2-862e-4592-b13e-b0ba11c91b12",
+              "principal_kind" => "api_key"
+            })
+
+          "/api/v2/workspaces/workspace-1/projects/project-1/permissions/me/" ->
+            Req.Test.json(conn, %{
+              "relation" => "contributor",
+              "permission_grants" => ["workitem:view", "workitem:edit"]
+            })
+
           "/api/v1/workspaces/workspace-1/projects/project-1/" ->
             Req.Test.json(conn, %{
               "id" => "project-1",
@@ -2033,6 +2045,7 @@ defmodule SymphonyElixir.Pre080cProductionEvidenceAcquisitionTest do
         provider: :plane,
         workspace_id: "workspace-1",
         project_id: "project-1",
+        runtime_principal: runtime_principal_policy(),
         state_mappings: mappings,
         dependency_relation_semantics: %{blocked_by: :blocked_by, blocking: :blocking}
       })
@@ -2046,11 +2059,22 @@ defmodule SymphonyElixir.Pre080cProductionEvidenceAcquisitionTest do
       provider: "plane",
       workspace_id: provider_contract.workspace_id,
       project_id: provider_contract.project_id,
+      runtime_principal: Map.new(provider_contract.runtime_principal, fn {key, value} -> {Atom.to_string(key), value} end),
       state_mappings:
         Map.new(provider_contract.state_mappings, fn {state, mapping} ->
           {state, Map.take(mapping, [:state_id, :name])}
         end),
       dependency_relation_semantics: provider_contract.dependency_relation_semantics
+    }
+  end
+
+  defp runtime_principal_policy do
+    %{
+      api_key_env: "PLANE_API_KEY_FERDI",
+      user_id: "920272c2-862e-4592-b13e-b0ba11c91b12",
+      principal_kind: "api_key",
+      project_relation: "contributor",
+      required_permissions: ["workitem:view", "workitem:edit"]
     }
   end
 

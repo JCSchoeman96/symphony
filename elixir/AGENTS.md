@@ -21,6 +21,13 @@ These documents and this file guide authorized work. They do not grant implement
 - Follow V4.1 repository law and accepted governance where they differ from upstream/generic
   [`../SPEC.md`](../SPEC.md). Update the spec only when doing so preserves that precedence.
 - Prefer adding config access through `SymphonyElixir.Config` instead of ad-hoc env reads.
+- Plane identity policy is fixed for autonomous V1 runtime: JC is the human/operator/admin Plane
+  identity, and Ferdi is Symphony's runtime identity at user ID
+  `920272c2-862e-4592-b13e-b0ba11c91b12`. Runtime config uses `$PLANE_API_KEY_FERDI` and the
+  configured `api_key` principal must resolve live as a Plane API key with the `contributor`
+  project relation and `workitem:view` plus `workitem:edit`. The login/display name
+  `bigbrainbusiness90` is descriptive only. Keep both credentials out of child processes and never
+  add a fallback to the JC/admin credential.
 - Workspace safety is critical:
   - Never run Codex turn cwd in source repo.
   - Workspaces must stay under configured workspace root.

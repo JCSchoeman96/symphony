@@ -1,4 +1,6 @@
 ---
+# This default remains legacy Linear. Routed Plane V1 uses the Ferdi runtime principal policy in
+# `elixir/README.md`; `PLANE_API_KEY_JC` is reserved for human/operator/admin use.
 tracker:
   kind: linear
   provider:

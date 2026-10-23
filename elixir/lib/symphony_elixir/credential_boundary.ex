@@ -9,6 +9,8 @@ defmodule SymphonyElixir.CredentialBoundary do
   alias SymphonyElixir.{Config, PathSafety}
 
   @plane_api_key_env "PLANE_API_KEY"
+  @plane_runtime_api_key_env "PLANE_API_KEY_FERDI"
+  @plane_operator_api_key_env "PLANE_API_KEY_JC"
   @plane_webhook_secret_env "PLANE_WEBHOOK_SECRET"
 
   @standard_github_token_envs ["GITHUB_TOKEN", "GH_TOKEN"]
@@ -67,7 +69,7 @@ defmodule SymphonyElixir.CredentialBoundary do
 
     Enum.uniq(
       @standard_github_token_envs ++
-        [@plane_api_key_env, @plane_webhook_secret_env] ++
+        [@plane_api_key_env, @plane_runtime_api_key_env, @plane_operator_api_key_env, @plane_webhook_secret_env] ++
         configured ++
         @scm_delegation_envs ++
         @routed_credential_channel_envs ++

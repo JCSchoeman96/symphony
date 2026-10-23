@@ -46,6 +46,42 @@ defmodule SymphonyElixir.PlaneClientTest do
     assert {"X-API-Key", "secret"} in headers
   end
 
+  test "reads the current principal and effective project permissions through Plane v2" do
+    parent = self()
+
+    request_fun = fn request ->
+      send(parent, {:principal_request, request})
+
+      body =
+        case request.path do
+          "/api/v2/users/me/" ->
+            %{"id" => "920272c2-862e-4592-b13e-b0ba11c91b12", "principal_kind" => "api_key"}
+
+          "/api/v2/workspaces/workspace-1/projects/project-1/permissions/me/" ->
+            %{"relation" => "contributor", "permission_grants" => ["workitem:view", "workitem:edit"]}
+        end
+
+      {:ok, %{status: 200, body: body}}
+    end
+
+    assert {:ok, %{"id" => user_id, "principal_kind" => "api_key"}} =
+             Client.get_current_user(@config, request_fun: request_fun)
+
+    assert user_id == "920272c2-862e-4592-b13e-b0ba11c91b12"
+    assert_receive {:principal_request, %{method: :get, path: "/api/v2/users/me/", params: %{}, headers: headers}}
+    assert {"X-API-Key", "secret"} in headers
+
+    assert {:ok, %{"relation" => "contributor", "permission_grants" => grants}} =
+             Client.get_project_permissions(@config, request_fun: request_fun)
+
+    assert "workitem:view" in grants
+    assert "workitem:edit" in grants
+
+    assert_receive {:principal_request, %{method: :get, path: "/api/v2/workspaces/workspace-1/projects/project-1/permissions/me/", params: %{}, headers: headers}}
+
+    assert {"X-API-Key", "secret"} in headers
+  end
+
   test "requests the factual fields required for project work items and states" do
     parent = self()
 

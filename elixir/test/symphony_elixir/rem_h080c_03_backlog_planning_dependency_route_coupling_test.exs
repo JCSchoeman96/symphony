@@ -504,7 +504,7 @@ defmodule SymphonyElixir.RemH080C03BacklogPlanningDependencyRouteCouplingTest do
     previous_provider = Application.get_env(:symphony_elixir, :rem_h080c_03_provider)
     previous_coordinator = Application.get_env(:symphony_elixir, :rem_h080c_03_coordinator)
     previous_options = Req.default_options()
-    previous_plane_key = System.get_env("PLANE_API_KEY")
+    previous_runtime_key = System.get_env("PLANE_API_KEY_FERDI")
 
     provider =
       start_supervised!(
@@ -530,7 +530,7 @@ defmodule SymphonyElixir.RemH080C03BacklogPlanningDependencyRouteCouplingTest do
       restore_test_env(:rem_h080c_03_test_pid, previous_test_pid)
       restore_test_env(:rem_h080c_03_provider, previous_provider)
       restore_test_env(:rem_h080c_03_coordinator, previous_coordinator)
-      restore_env("PLANE_API_KEY", previous_plane_key)
+      restore_env("PLANE_API_KEY_FERDI", previous_runtime_key)
       Req.default_options(previous_options)
       Req.Test.set_req_test_to_private()
       File.rm_rf(root)
@@ -555,11 +555,11 @@ defmodule SymphonyElixir.RemH080C03BacklogPlanningDependencyRouteCouplingTest do
       String.replace(
         File.read!(workflow_path),
         "tracker:\n",
-        "tracker:\n  provider:\n    workspace_slug: workspace-1\n    workspace_id: workspace-1\n    project_id: project-1\n    api_key: $PLANE_API_KEY\n"
+        "tracker:\n  provider:\n    workspace_slug: workspace-1\n    workspace_id: workspace-1\n    project_id: project-1\n    api_key: $PLANE_API_KEY_FERDI\n"
       )
     )
 
-    System.put_env("PLANE_API_KEY", "rem-h080c-03-plane-test-key")
+    System.put_env("PLANE_API_KEY_FERDI", "rem-h080c-03-plane-test-key")
     :ok = Workflow.set_workflow_file_path(workflow_path)
     :ok = WorkflowStore.force_reload()
     Application.put_env(:symphony_elixir, :rem_h080c_03_test_pid, self())
@@ -645,6 +645,34 @@ defmodule SymphonyElixir.RemH080C03BacklogPlanningDependencyRouteCouplingTest do
       {:rem_h080c_03_provider_request, path, conn.method}
     )
 
+    case runtime_principal_response(path) do
+      {:ok, body} ->
+        Req.Test.json(conn, body)
+
+      :not_runtime_principal ->
+        dispatch_provider_request(conn, provider, path)
+    end
+  end
+
+  defp runtime_principal_response("/api/v2/users/me/") do
+    {:ok,
+     %{
+       "id" => "920272c2-862e-4592-b13e-b0ba11c91b12",
+       "principal_kind" => "api_key"
+     }}
+  end
+
+  defp runtime_principal_response("/api/v2/workspaces/workspace-1/projects/project-1/permissions/me/") do
+    {:ok,
+     %{
+       "relation" => "contributor",
+       "permission_grants" => ["workitem:view", "workitem:edit"]
+     }}
+  end
+
+  defp runtime_principal_response(_path), do: :not_runtime_principal
+
+  defp dispatch_provider_request(conn, provider, path) do
     case plane_request_kind(path, conn.method) do
       :states ->
         states = Enum.map(WorkflowLifecycle.states(), &provider_state/1)
@@ -787,6 +815,7 @@ defmodule SymphonyElixir.RemH080C03BacklogPlanningDependencyRouteCouplingTest do
         provider: :plane,
         workspace_id: "workspace-1",
         project_id: "project-1",
+        runtime_principal: runtime_principal_policy(),
         state_mappings: mappings,
         dependency_relation_semantics: %{blocked_by: :blocked_by, blocking: :blocking}
       })
@@ -800,11 +829,22 @@ defmodule SymphonyElixir.RemH080C03BacklogPlanningDependencyRouteCouplingTest do
       provider: "plane",
       workspace_id: contract.workspace_id,
       project_id: contract.project_id,
+      runtime_principal: Map.new(contract.runtime_principal, fn {key, value} -> {Atom.to_string(key), value} end),
       state_mappings:
         Map.new(contract.state_mappings, fn {state, mapping} ->
           {state, Map.take(mapping, [:state_id, :name])}
         end),
       dependency_relation_semantics: contract.dependency_relation_semantics
+    }
+  end
+
+  defp runtime_principal_policy do
+    %{
+      api_key_env: "PLANE_API_KEY_FERDI",
+      user_id: "920272c2-862e-4592-b13e-b0ba11c91b12",
+      principal_kind: "api_key",
+      project_relation: "contributor",
+      required_permissions: ["workitem:view", "workitem:edit"]
     }
   end
 

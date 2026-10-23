@@ -29,6 +29,8 @@ defmodule SymphonyElixir.CredentialChannelEnforcementTest do
     names = CredentialBoundary.deny_environment_names(["CUSTOM_GITHUB_TOKEN"])
 
     assert "PLANE_API_KEY" in names
+    assert "PLANE_API_KEY_FERDI" in names
+    assert "PLANE_API_KEY_JC" in names
     assert "GITHUB_TOKEN" in names
     assert "GH_TOKEN" in names
     assert "CUSTOM_GITHUB_TOKEN" in names

@@ -26,6 +26,7 @@ defmodule SymphonyElixir.WorkControl.ProviderProjectContract do
     :dependency_relation_semantics,
     :required_capabilities,
     :optional_capabilities,
+    :runtime_principal,
     :configuration_fingerprint
   ]
 
@@ -40,8 +41,15 @@ defmodule SymphonyElixir.WorkControl.ProviderProjectContract do
     "dependency_relation_semantics" => :dependency_relation_semantics,
     "required_capabilities" => :required_capabilities,
     "optional_capabilities" => :optional_capabilities,
+    "runtime_principal" => :runtime_principal,
     "configuration_fingerprint" => :configuration_fingerprint
   }
+
+  @runtime_principal_keys [:api_key_env, :user_id, :principal_kind, :project_relation, :required_permissions]
+  @runtime_principal_key_names Map.new(@runtime_principal_keys, &{Atom.to_string(&1), &1})
+  @runtime_permissions ["workitem:view", "workitem:edit"]
+  @runtime_api_key_env "PLANE_API_KEY_FERDI"
+  @runtime_user_id "920272c2-862e-4592-b13e-b0ba11c91b12"
 
   @capability_names %{
     "current_issue_refresh" => :current_issue_refresh,
@@ -153,6 +161,7 @@ defmodule SymphonyElixir.WorkControl.ProviderProjectContract do
     :dependency_relation_semantics,
     :required_capabilities,
     :optional_capabilities,
+    :runtime_principal,
     :configuration_fingerprint
   ]
 
@@ -165,6 +174,7 @@ defmodule SymphonyElixir.WorkControl.ProviderProjectContract do
           dependency_relation_semantics: %{blocked_by: :blocked_by, blocking: :blocking},
           required_capabilities: [Capabilities.capability()],
           optional_capabilities: [Capabilities.capability()],
+          runtime_principal: map() | nil,
           configuration_fingerprint: String.t()
         }
 
@@ -192,7 +202,8 @@ defmodule SymphonyElixir.WorkControl.ProviderProjectContract do
              attribute(attrs, :optional_capabilities),
              optional_capabilities(),
              :optional_capabilities_redefinition
-           ) do
+           ),
+         {:ok, runtime_principal} <- validate_runtime_principal(attribute(attrs, :runtime_principal)) do
       contract = %__MODULE__{
         schema_version: @schema_version,
         provider: provider,
@@ -202,6 +213,7 @@ defmodule SymphonyElixir.WorkControl.ProviderProjectContract do
         dependency_relation_semantics: dependency_relation_semantics,
         required_capabilities: required,
         optional_capabilities: optional,
+        runtime_principal: runtime_principal,
         configuration_fingerprint: ""
       }
 
@@ -226,7 +238,8 @@ defmodule SymphonyElixir.WorkControl.ProviderProjectContract do
       Map.get(contract, :project_id),
       fingerprint_state_mappings(Map.get(contract, :state_mappings)),
       fingerprint_relations(Map.get(contract, :dependency_relation_semantics)),
-      fingerprint_capabilities(Map.get(contract, :required_capabilities))
+      fingerprint_capabilities(Map.get(contract, :required_capabilities)),
+      fingerprint_runtime_principal(Map.get(contract, :runtime_principal))
     }
 
     digest = :crypto.hash(:sha256, :erlang.term_to_binary(semantics))
@@ -520,6 +533,85 @@ defmodule SymphonyElixir.WorkControl.ProviderProjectContract do
 
   defp resolve_capability_set({:ok, _value}, _expected, code), do: {:error, config_error(code)}
 
+  defp validate_runtime_principal(:missing), do: {:ok, nil}
+
+  defp validate_runtime_principal({:ok, value}) when is_map(value) do
+    with {:ok, attrs} <-
+           normalize_keys(
+             value,
+             &canonical_runtime_principal_key/1,
+             :runtime_principal,
+             :unknown_runtime_principal_key,
+             :duplicate_runtime_principal_key
+           ),
+         {:ok, api_key_env} <- validate_runtime_api_key_env(attribute(attrs, :api_key_env)),
+         {:ok, user_id} <- validate_runtime_user_id(attribute(attrs, :user_id)),
+         {:ok, principal_kind} <- validate_runtime_principal_kind(attribute(attrs, :principal_kind)),
+         {:ok, project_relation} <- validate_runtime_project_relation(attribute(attrs, :project_relation)),
+         {:ok, required_permissions} <- validate_runtime_permissions(attribute(attrs, :required_permissions)) do
+      {:ok,
+       %{
+         api_key_env: api_key_env,
+         user_id: user_id,
+         principal_kind: principal_kind,
+         project_relation: project_relation,
+         required_permissions: required_permissions
+       }}
+    end
+  end
+
+  defp validate_runtime_principal(_value), do: {:error, config_error(:invalid_runtime_principal, :runtime_principal)}
+
+  defp validate_runtime_api_key_env({:ok, @runtime_api_key_env}), do: {:ok, @runtime_api_key_env}
+
+  defp validate_runtime_api_key_env(_value),
+    do: {:error, config_error(:invalid_runtime_credential_environment, :api_key_env)}
+
+  defp validate_runtime_user_id({:ok, value}) when is_binary(value) do
+    if String.match?(value, ~r/\A[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\z/) do
+      case String.downcase(value) do
+        @runtime_user_id -> {:ok, @runtime_user_id}
+        _other -> {:error, config_error(:unexpected_runtime_user_id, :user_id)}
+      end
+    else
+      {:error, config_error(:invalid_runtime_user_id, :user_id)}
+    end
+  end
+
+  defp validate_runtime_user_id(_value), do: {:error, config_error(:invalid_runtime_user_id, :user_id)}
+
+  defp validate_runtime_principal_kind({:ok, "api_key"}), do: {:ok, "api_key"}
+
+  defp validate_runtime_principal_kind(_value),
+    do: {:error, config_error(:unsupported_runtime_principal_kind, :principal_kind)}
+
+  defp validate_runtime_project_relation({:ok, "contributor"}), do: {:ok, "contributor"}
+
+  defp validate_runtime_project_relation(_value),
+    do: {:error, config_error(:unsupported_runtime_project_relation, :project_relation)}
+
+  defp validate_runtime_permissions({:ok, permissions}) when is_list(permissions) do
+    case permissions do
+      [first, second] when is_binary(first) and is_binary(second) and first != second ->
+        if Enum.sort([first, second]) == Enum.sort(@runtime_permissions),
+          do: {:ok, @runtime_permissions},
+          else: {:error, config_error(:unsupported_runtime_permissions, :required_permissions)}
+
+      _invalid ->
+        {:error, config_error(:unsupported_runtime_permissions, :required_permissions)}
+    end
+  end
+
+  defp validate_runtime_permissions(_value),
+    do: {:error, config_error(:unsupported_runtime_permissions, :required_permissions)}
+
+  defp canonical_runtime_principal_key(key) when key in @runtime_principal_keys, do: key
+
+  defp canonical_runtime_principal_key(key) when is_binary(key),
+    do: Map.get(@runtime_principal_key_names, key, :unknown)
+
+  defp canonical_runtime_principal_key(_key), do: :unknown
+
   defp relation_key(:blocked_by), do: :blocked_by
   defp relation_key(:blocking), do: :blocking
   defp relation_key("blocked_by"), do: :blocked_by
@@ -608,6 +700,20 @@ defmodule SymphonyElixir.WorkControl.ProviderProjectContract do
 
   defp fingerprint_capabilities(capabilities) when is_list(capabilities), do: Enum.sort(capabilities)
   defp fingerprint_capabilities(value), do: value
+
+  defp fingerprint_runtime_principal(nil), do: nil
+
+  defp fingerprint_runtime_principal(principal) when is_map(principal) do
+    {
+      Map.get(principal, :api_key_env),
+      Map.get(principal, :user_id),
+      Map.get(principal, :principal_kind),
+      Map.get(principal, :project_relation),
+      principal |> Map.get(:required_permissions, []) |> Enum.sort()
+    }
+  end
+
+  defp fingerprint_runtime_principal(value), do: value
 
   defp config_error(code, field \\ nil, value \\ nil, reason \\ nil) do
     %ConfigError{code: code, field: field, value: safe_config_value(value), reason: reason}

@@ -254,6 +254,7 @@ defmodule SymphonyElixir.ProjectContractEvidenceTest do
       provider: :plane,
       workspace_id: "workspace-1",
       project_id: "project-1",
+      runtime_principal: runtime_principal_policy(),
       state_mappings:
         Map.new(@states, fn state ->
           {state, %{state_id: "state-#{state}", name: WorkflowLifecycle.display(state)}}
@@ -294,6 +295,7 @@ defmodule SymphonyElixir.ProjectContractEvidenceTest do
       provider: :plane,
       workspace_id: "workspace-1",
       project_id: "project-1",
+      runtime_principal: runtime_principal_observation(),
       states:
         Enum.map(@states, fn state ->
           %{id: "state-#{state}", group: Map.fetch!(groups, state), name: WorkflowLifecycle.display(state)}
@@ -302,5 +304,19 @@ defmodule SymphonyElixir.ProjectContractEvidenceTest do
       capability_statuses: Map.new(Capabilities.vocabulary(), &{&1, :supported}),
       completeness: :complete
     }
+  end
+
+  defp runtime_principal_policy do
+    %{
+      api_key_env: "PLANE_API_KEY_FERDI",
+      user_id: "920272c2-862e-4592-b13e-b0ba11c91b12",
+      principal_kind: "api_key",
+      project_relation: "contributor",
+      required_permissions: ["workitem:view", "workitem:edit"]
+    }
+  end
+
+  defp runtime_principal_observation do
+    Map.delete(runtime_principal_policy(), :api_key_env)
   end
 end
