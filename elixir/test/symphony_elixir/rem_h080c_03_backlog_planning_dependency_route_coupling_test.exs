@@ -773,18 +773,36 @@ defmodule SymphonyElixir.RemH080C03BacklogPlanningDependencyRouteCouplingTest do
     %{relation_mode: mode, dependent_blocked_by: dependent_blocked_by, blocker_blocked_by: blocker_blocked_by} =
       Agent.get(provider, &Map.take(&1, [:relation_mode, :dependent_blocked_by, :blocker_blocked_by]))
 
-    blocked_by = if issue_id == @work_item_id, do: dependent_blocked_by, else: blocker_blocked_by
+    blocked_by_ids = if issue_id == @work_item_id, do: dependent_blocked_by, else: blocker_blocked_by
+
+    blocking_ids =
+      reciprocal_blocking_ids(issue_id, dependent_blocked_by, blocker_blocked_by)
 
     if mode == :malformed and issue_id == @work_item_id do
       %{"blocked_by" => %{}, "blocking" => []}
     else
       relation_project_id = if mode == :cross_project, do: "other-project", else: "project-1"
+      relation_entry = fn id -> %{"issue_id" => id, "project_id" => relation_project_id} end
 
       %{
-        "blocked_by" => Enum.map(blocked_by, &%{"issue_id" => &1, "project_id" => relation_project_id}),
-        "blocking" => []
+        "blocked_by" => Enum.map(blocked_by_ids, relation_entry),
+        "blocking" => Enum.map(blocking_ids, relation_entry)
       }
     end
+  end
+
+  defp reciprocal_blocking_ids(issue_id, dependent_blocked_by, blocker_blocked_by) do
+    blocker_blocks_work_item =
+      if issue_id == @blocker_id and Enum.member?(dependent_blocked_by, @blocker_id),
+        do: [@work_item_id],
+        else: []
+
+    work_item_blocks_blocker =
+      if issue_id == @work_item_id and Enum.member?(blocker_blocked_by, @work_item_id),
+        do: [@blocker_id],
+        else: []
+
+    blocker_blocks_work_item ++ work_item_blocks_blocker
   end
 
   defp provider_state(state) do

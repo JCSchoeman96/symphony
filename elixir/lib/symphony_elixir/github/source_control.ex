@@ -19,6 +19,12 @@ defmodule SymphonyElixir.GitHub.SourceControl do
   @user_agent "symphony"
   @max_check_runs_per_subject 300
   @max_associated_prs 100
+  @max_workflow_runs_per_head 100
+  @synthetic_execution_evidence_job_name "linux-static-quality"
+  @synthetic_execution_evidence_step_name "Record exact candidate checkout"
+  @job_log_timestamp_prefix ~r/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z /
+  @checkout_sha_line ~r/^CI checkout SHA: ([0-9a-f]{40})$/i
+  @checkout_tree_line ~r/^CI checkout tree: ([0-9a-f]{40})$/i
 
   @type config :: %{
           kind: :github,
@@ -87,6 +93,24 @@ defmodule SymphonyElixir.GitHub.SourceControl do
   def fetch_check_runs(config, head_sha, opts \\ []) when is_binary(head_sha) do
     {owner, repo} = split_repository(config.repository)
     fetch_check_runs_page(config, owner, repo, head_sha, 1, [], opts)
+  end
+
+  @spec fetch_workflow_runs(config(), String.t(), keyword()) :: {:ok, [map()]} | {:error, term()}
+  def fetch_workflow_runs(config, head_sha, opts \\ []) when is_binary(head_sha) do
+    {owner, repo} = split_repository(config.repository)
+    fetch_workflow_runs_page(config, owner, repo, head_sha, 1, [], opts)
+  end
+
+  @spec fetch_workflow_run(config(), integer(), keyword()) :: {:ok, map()} | {:error, term()}
+  def fetch_workflow_run(config, workflow_run_id, opts \\ []) when is_integer(workflow_run_id) do
+    {owner, repo} = split_repository(config.repository)
+    get(config, "/repos/#{owner}/#{repo}/actions/runs/#{workflow_run_id}", %{}, opts)
+  end
+
+  @spec fetch_workflow_run_jobs(config(), integer(), keyword()) :: {:ok, map()} | {:error, term()}
+  def fetch_workflow_run_jobs(config, workflow_run_id, opts \\ []) when is_integer(workflow_run_id) do
+    {owner, repo} = split_repository(config.repository)
+    get(config, "/repos/#{owner}/#{repo}/actions/runs/#{workflow_run_id}/jobs", %{}, opts)
   end
 
   @spec fetch_merge_ref_commit(config(), String.t() | integer(), keyword()) ::
@@ -198,43 +222,59 @@ defmodule SymphonyElixir.GitHub.SourceControl do
   end
 
   defp verify_required_checks_list(config, candidate_ref, candidate_tree_sha, checks, opts) do
-    with :ok <- validate_synthetic_merge_subjects(config, candidate_ref, candidate_tree_sha, checks, opts),
+    opts = Keyword.put(opts, :github_source_control_config, config)
+
+    with {:ok, opts} <- enrich_synthetic_merge_evidence(config, candidate_ref, candidate_tree_sha, checks, opts),
          {:ok, runs_by_lookup_sha} <- fetch_grouped_check_runs(config, candidate_ref, checks, opts) do
-      evaluate_configured_checks(checks, runs_by_lookup_sha, candidate_ref)
+      evaluate_configured_checks(checks, runs_by_lookup_sha, candidate_ref, opts)
     end
   end
 
-  defp evaluate_configured_checks(checks, runs_by_lookup_sha, candidate_ref) do
+  defp evaluate_configured_checks(checks, runs_by_lookup_sha, candidate_ref, opts) do
     Enum.reduce_while(checks, :ok, fn check, _acc ->
-      case evaluate_required_check(check, runs_by_lookup_sha, candidate_ref) do
+      case evaluate_required_check(check, runs_by_lookup_sha, candidate_ref, opts) do
         :ok -> {:cont, :ok}
         {:error, reason} -> {:halt, {:error, reason}}
       end
     end)
   end
 
-  defp validate_synthetic_merge_subjects(config, candidate_ref, candidate_tree_sha, checks, opts) do
+  defp enrich_synthetic_merge_evidence(config, candidate_ref, candidate_tree_sha, checks, opts) do
     cond do
       skip_synthetic_merge_validation?(opts) ->
-        :ok
+        {:ok, opts}
 
       Enum.any?(checks, &synthetic_merge_check?/1) ->
-        do_validate_synthetic_merge_subject(config, candidate_ref, candidate_tree_sha, opts)
+        with {:ok, merge_commit} <- fetch_merge_ref_commit(config, candidate_ref.pr_identity, opts),
+             :ok <- validate_synthetic_merge(merge_commit, candidate_ref, candidate_tree_sha),
+             synthetic_sha <- normalize_sha(merge_commit["sha"]),
+             candidate_sha <- candidate_ref.candidate_sha,
+             {:ok, workflow_runs} <- fetch_workflow_runs(config, candidate_sha, opts),
+             workflow_runs = hydrate_workflow_runs_for_candidate_binding(config, workflow_runs, opts),
+             true <- synthetic_execution_evidence_present?(workflow_runs) do
+          {:ok,
+           Keyword.merge(opts,
+             synthetic_execution_sha: synthetic_sha,
+             synthetic_execution_candidate_sha: candidate_sha,
+             synthetic_execution_candidate_ref: candidate_ref,
+             synthetic_execution_candidate_tree_sha: candidate_tree_sha,
+             synthetic_workflow_runs: workflow_runs
+           )}
+        else
+          false -> {:error, :synthetic_execution_evidence_missing}
+          {:error, reason} -> {:error, reason}
+        end
 
       true ->
-        :ok
+        {:ok, opts}
     end
   end
 
-  defp skip_synthetic_merge_validation?(opts) when is_list(opts),
+  defp skip_synthetic_merge_validation?(opts),
     do: Keyword.get(opts, :merge_verified?, false)
 
-  defp skip_synthetic_merge_validation?(_opts), do: false
-
-  defp do_validate_synthetic_merge_subject(config, candidate_ref, candidate_tree_sha, opts) do
-    with {:ok, merge_commit} <- fetch_merge_ref_commit(config, candidate_ref.pr_identity, opts) do
-      validate_synthetic_merge(merge_commit, candidate_ref, candidate_tree_sha)
-    end
+  defp synthetic_execution_evidence_present?(workflow_runs) when is_list(workflow_runs) do
+    Enum.any?(workflow_runs, &workflow_run_successful?/1)
   end
 
   defp fetch_grouped_check_runs(config, candidate_ref, checks, opts) do
@@ -256,7 +296,7 @@ defmodule SymphonyElixir.GitHub.SourceControl do
     end
   end
 
-  defp evaluate_required_check(check, runs_by_lookup_sha, candidate_ref) do
+  defp evaluate_required_check(check, runs_by_lookup_sha, candidate_ref, opts) do
     subject = normalize_subject(Map.get(check, :subject) || Map.get(check, "subject"))
     context = Map.get(check, :context) || Map.get(check, "context")
     app_id = Map.get(check, :app_id) || Map.get(check, "app_id")
@@ -267,7 +307,7 @@ defmodule SymphonyElixir.GitHub.SourceControl do
 
       lookup_sha ->
         runs = Map.get(runs_by_lookup_sha, lookup_sha, [])
-        evaluate_check_runs(runs, context, app_id, lookup_sha, subject)
+        evaluate_check_runs(runs, context, app_id, lookup_sha, subject, opts)
     end
   end
 
@@ -278,6 +318,7 @@ defmodule SymphonyElixir.GitHub.SourceControl do
   defp check_run_lookup_sha(check, candidate_ref) do
     case normalize_subject(Map.get(check, :subject) || Map.get(check, "subject")) do
       :head -> candidate_ref.candidate_sha
+      # Check-run records attach to the PR head; synthetic-merge execution is proven separately.
       :synthetic_merge -> candidate_ref.candidate_sha
       _ -> nil
     end
@@ -331,7 +372,7 @@ defmodule SymphonyElixir.GitHub.SourceControl do
     end
   end
 
-  defp evaluate_check_runs(runs, context, app_id, lookup_sha, subject) do
+  defp evaluate_check_runs(runs, context, app_id, lookup_sha, subject, opts) do
     matching =
       Enum.filter(runs, fn run ->
         is_map(run) and
@@ -350,8 +391,378 @@ defmodule SymphonyElixir.GitHub.SourceControl do
         {:error, :missing_required_check}
 
       observations ->
-        evaluate_terminal_observations(observations)
+        case verify_synthetic_execution_binding(observations, subject, opts) do
+          :ok -> evaluate_terminal_observations(observations)
+          {:error, reason} -> {:error, reason}
+        end
     end
+  end
+
+  defp verify_synthetic_execution_binding(_observations, :head, _opts), do: :ok
+
+  defp verify_synthetic_execution_binding(observations, :synthetic_merge, opts) do
+    if skip_synthetic_merge_validation?(opts) do
+      :ok
+    else
+      do_verify_synthetic_execution_binding(observations, opts)
+    end
+  end
+
+  defp verify_synthetic_execution_binding(_observations, _subject, _opts), do: :ok
+
+  defp do_verify_synthetic_execution_binding(observations, opts) do
+    with {:ok, binding} <- synthetic_binding_context(opts) do
+      first_successful_synthetic_binding(observations, binding, opts)
+    end
+  end
+
+  defp synthetic_binding_context(opts) do
+    config = Keyword.get(opts, :github_source_control_config)
+    synthetic_sha = Keyword.get(opts, :synthetic_execution_sha)
+    candidate_ref = Keyword.get(opts, :synthetic_execution_candidate_ref)
+    candidate_tree_sha = Keyword.get(opts, :synthetic_execution_candidate_tree_sha)
+    workflow_runs = Keyword.get(opts, :synthetic_workflow_runs, [])
+
+    if is_binary(synthetic_sha) and is_binary(candidate_tree_sha) and match?(%CandidateRef{}, candidate_ref) and
+         is_map(config) do
+      {:ok,
+       %{
+         config: config,
+         synthetic_sha: synthetic_sha,
+         candidate_ref: candidate_ref,
+         candidate_tree_sha: candidate_tree_sha,
+         workflow_runs: workflow_runs
+       }}
+    else
+      {:error, :synthetic_execution_evidence_missing}
+    end
+  end
+
+  defp first_successful_synthetic_binding(observations, binding, opts) do
+    observations
+    |> Enum.reduce_while({:error, :synthetic_execution_evidence_missing}, fn run, _last_error ->
+      case verify_synthetic_observation_binding(run, binding, opts) do
+        :ok -> {:halt, :ok}
+        {:error, reason} -> {:cont, {:error, reason}}
+      end
+    end)
+    |> case do
+      :ok -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp verify_synthetic_observation_binding(run, binding, opts) do
+    suite_id = suite_check_suite_id(run)
+    check_run_head_sha = check_run_field(run, "head_sha") |> normalize_sha()
+    candidate_sha = binding.candidate_ref.candidate_sha
+
+    if check_run_head_sha != candidate_sha or not is_integer(suite_id) do
+      {:error, :synthetic_execution_evidence_missing}
+    else
+      verify_bound_workflow_runs(suite_id, binding, opts)
+    end
+  end
+
+  defp verify_bound_workflow_runs(suite_id, binding, opts) do
+    binding.workflow_runs
+    |> Enum.reduce_while({:error, :synthetic_execution_evidence_missing}, fn workflow_run, _acc ->
+      verify_bound_workflow_run(workflow_run, suite_id, binding, opts)
+    end)
+    |> case do
+      :ok -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp verify_bound_workflow_run(workflow_run, suite_id, binding, opts) do
+    candidate_ref = binding.candidate_ref
+
+    if workflow_run_binds_synthetic_merge_execution?(workflow_run, suite_id, candidate_ref) do
+      case verify_workflow_run_checkout_evidence(
+             binding.config,
+             workflow_run,
+             binding.synthetic_sha,
+             binding.candidate_tree_sha,
+             opts
+           ) do
+        :ok -> {:halt, :ok}
+        {:error, reason} -> {:cont, {:error, reason}}
+      end
+    else
+      {:cont, {:error, :synthetic_execution_evidence_missing}}
+    end
+  end
+
+  defp workflow_run_binds_synthetic_merge_execution?(workflow_run, suite_id, candidate_ref) do
+    workflow_run_successful?(workflow_run) and
+      Map.get(workflow_run, "check_suite_id") == suite_id and
+      workflow_run_event(workflow_run) in ["pull_request", "pull_request_target"] and
+      workflow_run_matches_candidate_pull?(workflow_run, candidate_ref)
+  end
+
+  defp workflow_run_matches_candidate_pull?(workflow_run, candidate_ref) do
+    candidate_sha = candidate_ref.candidate_sha
+    base_sha = candidate_ref.base_sha
+    pr_identity = candidate_ref.pr_identity
+
+    normalize_sha(Map.get(workflow_run, "head_sha")) == candidate_sha and
+      workflow_run_pull_requests_match_candidate?(workflow_run, pr_identity, candidate_sha, base_sha)
+  end
+
+  defp workflow_run_pull_requests_match_candidate?(workflow_run, pr_identity, candidate_sha, base_sha) do
+    case Map.get(workflow_run, "pull_requests") do
+      pulls when is_list(pulls) ->
+        Enum.any?(pulls, &pull_request_matches_candidate?(&1, pr_identity, candidate_sha, base_sha))
+
+      _ ->
+        false
+    end
+  end
+
+  defp pull_request_matches_candidate?(pull, pr_identity, candidate_sha, base_sha) do
+    to_string(Map.get(pull, "number")) == pr_identity and
+      normalize_sha(get_in(pull, ["head", "sha"])) == candidate_sha and
+      normalize_sha(get_in(pull, ["base", "sha"])) == base_sha
+  end
+
+  defp hydrate_workflow_runs_for_candidate_binding(config, workflow_runs, opts) when is_list(workflow_runs) do
+    Enum.map(workflow_runs, &hydrate_workflow_run_pull_requests(config, &1, opts))
+  end
+
+  defp hydrate_workflow_run_pull_requests(config, workflow_run, opts) do
+    if workflow_run_pull_requests_populated?(workflow_run),
+      do: workflow_run,
+      else: maybe_fetch_workflow_run_details(config, workflow_run, opts)
+  end
+
+  defp maybe_fetch_workflow_run_details(config, workflow_run, opts) do
+    case Map.get(workflow_run, "id") do
+      id when is_integer(id) ->
+        case fetch_workflow_run(config, id, opts) do
+          {:ok, detailed} -> Map.merge(workflow_run, detailed)
+          {:error, _} -> workflow_run
+        end
+
+      _ ->
+        workflow_run
+    end
+  end
+
+  defp workflow_run_pull_requests_populated?(workflow_run) do
+    case Map.get(workflow_run, "pull_requests") do
+      [%{"number" => _} | _] -> true
+      _ -> false
+    end
+  end
+
+  defp verify_workflow_run_checkout_evidence(config, workflow_run, synthetic_sha, candidate_tree_sha, opts) do
+    workflow_run_id = Map.get(workflow_run, "id")
+
+    with id when is_integer(id) <- workflow_run_id,
+         {:ok, %{"jobs" => jobs}} <- fetch_workflow_run_jobs(config, id, opts),
+         {:ok, job} <- find_successful_evidence_job(jobs),
+         :ok <- checkout_evidence_step_succeeded?(job),
+         {:ok, logs} <- fetch_workflow_job_logs(config, Map.get(job, "id"), opts),
+         {:ok, checkout} <- parse_checkout_evidence_lines(logs),
+         :ok <- validate_checkout_evidence(checkout, synthetic_sha, candidate_tree_sha) do
+      :ok
+    else
+      {:error, reason} -> {:error, reason}
+      _ -> {:error, :synthetic_checkout_evidence_missing}
+    end
+  end
+
+  defp find_successful_evidence_job(jobs) when is_list(jobs) do
+    case Enum.find(jobs, &evidence_job_successful?/1) do
+      %{} = job -> {:ok, job}
+      _ -> {:error, :synthetic_checkout_evidence_missing}
+    end
+  end
+
+  defp find_successful_evidence_job(_jobs), do: {:error, :synthetic_checkout_evidence_missing}
+
+  defp evidence_job_successful?(job) do
+    is_map(job) and
+      Map.get(job, "name") == @synthetic_execution_evidence_job_name and
+      Map.get(job, "status") == "completed" and
+      Map.get(job, "conclusion") == "success"
+  end
+
+  defp checkout_evidence_step_succeeded?(job) do
+    steps = Map.get(job, "steps", [])
+
+    case Enum.find(steps, &(&1["name"] == @synthetic_execution_evidence_step_name)) do
+      %{"status" => "completed", "conclusion" => "success"} ->
+        :ok
+
+      _ ->
+        {:error, :synthetic_checkout_evidence_missing}
+    end
+  end
+
+  defp fetch_workflow_job_logs(config, job_id, opts) when is_integer(job_id) do
+    {owner, repo} = split_repository(config.repository)
+    path = "/repos/#{owner}/#{repo}/actions/jobs/#{job_id}/logs"
+
+    if Keyword.has_key?(opts, :request_fun) do
+      case get(config, path, %{}, opts) do
+        {:ok, body} when is_binary(body) -> {:ok, body}
+        _ -> {:error, :synthetic_checkout_evidence_missing}
+      end
+    else
+      fetch_workflow_job_logs_http(path, config, opts)
+    end
+  end
+
+  defp fetch_workflow_job_logs(_config, _job_id, _opts), do: {:error, :synthetic_checkout_evidence_missing}
+
+  defp fetch_workflow_job_logs_http(path, config, opts) do
+    token = resolve_token(config, opts)
+    url = @default_api_url <> path
+
+    headers = [
+      {"accept", "application/vnd.github+json"},
+      {"authorization", "Bearer " <> token},
+      {"user-agent", @user_agent},
+      {"x-github-api-version", @api_version}
+    ]
+
+    request_impl = Keyword.get(opts, :http_request, &default_log_http_request/2)
+
+    case request_impl.(url, headers) do
+      {:ok, %{status: status, body: body}} when status in 200..299 and is_binary(body) ->
+        {:ok, decode_job_log_archive(body)}
+
+      {:ok, %{status: status}} ->
+        {:error, {:github_status, status}}
+
+      {:error, reason} ->
+        {:error, normalize_transport_error(reason, token)}
+    end
+  end
+
+  defp default_log_http_request(url, headers) do
+    case Req.request(
+           method: :get,
+           url: url,
+           headers: headers,
+           receive_timeout: 60_000,
+           redirect: true,
+           retry: false
+         ) do
+      {:ok, %{status: status, body: body}} when status in 200..299 ->
+        {:ok, %{status: status, body: body}}
+
+      {:ok, %{status: status}} ->
+        {:ok, %{status: status, body: nil}}
+
+      {:error, reason} ->
+        {:error, %Error{kind: :transport_failed, detail: safe_transport_detail(reason)}}
+    end
+  end
+
+  defp decode_job_log_archive(body) when is_binary(body) do
+    if zip_archive?(body), do: unzip_job_log_text(body), else: body
+  end
+
+  defp unzip_job_log_text(body) do
+    case :zip.unzip(body, [:memory]) do
+      {:ok, entries} -> join_job_log_entries(entries)
+      {:error, _} -> body
+    end
+  end
+
+  defp join_job_log_entries(entries) do
+    entries
+    |> Enum.filter(&job_log_entry?/1)
+    |> Enum.sort()
+    |> Enum.map_join("\n", fn {_name, content} -> content end)
+  end
+
+  defp job_log_entry?({name, _content}), do: String.ends_with?(List.to_string(name), ".txt")
+
+  defp zip_archive?(<<0x50, 0x4B, 0x03, 0x04, _::binary>>), do: true
+  defp zip_archive?(_body), do: false
+
+  defp parse_checkout_evidence_lines(logs) when is_binary(logs) do
+    lines = String.split(logs, "\n", trim: true)
+    shas = unique_checkout_field_values(lines, @checkout_sha_line)
+    trees = unique_checkout_field_values(lines, @checkout_tree_line)
+    classify_checkout_evidence_values(shas, trees)
+  end
+
+  defp unique_checkout_field_values(lines, pattern) do
+    lines
+    |> Enum.flat_map(&checkout_field_matches(&1, pattern))
+    |> Enum.uniq()
+  end
+
+  defp checkout_field_matches(line, pattern) do
+    payload = normalize_job_log_line(line)
+
+    case Regex.run(pattern, payload) do
+      [_, value] -> [normalize_sha(value)]
+      _ -> []
+    end
+  end
+
+  defp normalize_job_log_line(line) do
+    line
+    |> String.trim()
+    |> then(&Regex.replace(@job_log_timestamp_prefix, &1, ""))
+  end
+
+  defp classify_checkout_evidence_values(shas, trees) do
+    cond do
+      shas == [] or trees == [] -> {:error, :synthetic_checkout_evidence_missing}
+      length(shas) > 1 or length(trees) > 1 -> {:error, :ambiguous_synthetic_checkout_evidence}
+      true -> {:ok, %{sha: hd(shas), tree: hd(trees)}}
+    end
+  end
+
+  defp validate_checkout_evidence(%{sha: sha, tree: tree}, synthetic_sha, candidate_tree_sha) do
+    with {:ok, expected_sha} <- validate_tree_sha(synthetic_sha),
+         {:ok, expected_tree} <- validate_tree_sha(candidate_tree_sha),
+         {:ok, checkout_sha} <- validate_tree_sha(sha),
+         {:ok, checkout_tree} <- validate_tree_sha(tree) do
+      cond do
+        checkout_sha != expected_sha ->
+          {:error, :synthetic_checkout_sha_mismatch}
+
+        checkout_tree != expected_tree ->
+          {:error, :synthetic_checkout_tree_mismatch}
+
+        true ->
+          :ok
+      end
+    else
+      _ -> {:error, :synthetic_checkout_evidence_missing}
+    end
+  end
+
+  defp workflow_run_event(%{"event" => event}) when is_binary(event), do: event
+  defp workflow_run_event(_workflow_run), do: nil
+
+  defp suite_check_suite_id(run) do
+    case check_run_field(run, "check_suite") do
+      %{"id" => id} when is_integer(id) -> id
+      _ -> nil
+    end
+  end
+
+  defp workflow_run_successful?(run) when is_map(run) do
+    run["status"] == "completed" and run["conclusion"] == "success"
+  end
+
+  defp workflow_run_successful?(_run), do: false
+
+  defp check_run_matches_subject?(run, lookup_sha, :head) do
+    check_run_field(run, "head_sha") |> normalize_sha() == lookup_sha
+  end
+
+  defp check_run_matches_subject?(run, lookup_sha, :synthetic_merge) do
+    check_run_field(run, "head_sha") |> normalize_sha() == lookup_sha
   end
 
   defp check_run_matches_subject?(run, lookup_sha, _subject) do
@@ -562,6 +973,52 @@ defmodule SymphonyElixir.GitHub.SourceControl do
         total: total,
         opts: opts
       })
+    end
+  end
+
+  defp fetch_workflow_runs_page(config, owner, repo, head_sha, page, acc, opts) do
+    with {:ok, %{"workflow_runs" => runs, "total_count" => total}} <-
+           get(
+             config,
+             "/repos/#{owner}/#{repo}/actions/runs",
+             %{"head_sha" => head_sha, "per_page" => 100, "page" => page},
+             opts
+           ) do
+      continue_workflow_runs_page(%{
+        config: config,
+        owner: owner,
+        repo: repo,
+        head_sha: head_sha,
+        page: page,
+        acc: acc,
+        runs: runs,
+        total: total,
+        opts: opts
+      })
+    end
+  end
+
+  defp continue_workflow_runs_page(%{page: page, acc: acc, runs: runs, total: total} = state) do
+    runs = if is_list(runs), do: runs, else: []
+    acc = acc ++ runs
+
+    cond do
+      length(acc) > @max_workflow_runs_per_head or (acc == [] and page > 1) ->
+        {:error, :too_many_workflow_runs}
+
+      length(acc) >= total or runs == [] ->
+        {:ok, acc}
+
+      true ->
+        fetch_workflow_runs_page(
+          state.config,
+          state.owner,
+          state.repo,
+          state.head_sha,
+          page + 1,
+          acc,
+          state.opts
+        )
     end
   end
 

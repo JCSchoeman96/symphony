@@ -42,7 +42,7 @@ defmodule SymphonyElixir.PlaneDependencyReaderTest do
     assert graph.nodes["a"].blocked_by == [%{id: "b", identifier: "B", state: "Ready"}]
     assert graph.nodes["b"].blocked_by == []
     assert Graph.complete?(graph)
-    assert request_count(requests, "/relations/") == 2
+    assert request_count(requests, "/relations/") == 4
   end
 
   @tag :plane_relation_endpoint_bare_target_ids
@@ -80,7 +80,7 @@ defmodule SymphonyElixir.PlaneDependencyReaderTest do
     assert Enum.map(graph.nodes[dependent_id].blocked_by, & &1.id) == [primary_id]
     assert graph.nodes[primary_id].blocked_by == []
     assert Graph.complete?(graph)
-    assert request_count(requests, "/relations/") == 2
+    assert request_count(requests, "/relations/") == 4
   end
 
   test "rejects invalid acquisition inputs before transport" do
@@ -169,7 +169,7 @@ defmodule SymphonyElixir.PlaneDependencyReaderTest do
 
     assert {:ok, graph} = Adapter.fetch_dependency_graph_for_test(@settings, request_fun)
     assert Map.keys(graph.nodes) == ["a", "b"]
-    assert request_count(requests, "/relations/") == 2
+    assert request_count(requests, "/relations/") == 4
   end
 
   test "rejects an enumerated item outside the configured project scope" do
@@ -186,7 +186,19 @@ defmodule SymphonyElixir.PlaneDependencyReaderTest do
   test "retains more than one hundred prerequisites without truncation" do
     ids = Enum.map(1..106, &"b-#{&1}")
     items = [item("dependent") | Enum.map(ids, &item/1)]
-    relations = %{"dependent" => %{"blocked_by" => Enum.map(ids, &%{"issue_id" => &1, "project_id" => "project-1"}), "blocking" => []}}
+    blocked_by = Enum.map(ids, &%{"issue_id" => &1, "project_id" => "project-1"})
+
+    blocking =
+      Map.new(ids, fn blocker_id ->
+        {blocker_id, [%{"issue_id" => "dependent", "project_id" => "project-1"}]}
+      end)
+
+    relations =
+      Map.merge(
+        %{"dependent" => %{"blocked_by" => blocked_by, "blocking" => []}},
+        Map.new(ids, fn id -> {id, %{"blocked_by" => [], "blocking" => Map.get(blocking, id, [])}} end)
+      )
+
     requests = start_request_log()
 
     assert {:ok, graph} =
@@ -252,15 +264,15 @@ defmodule SymphonyElixir.PlaneDependencyReaderTest do
 
       assert Graph.complete?(graph)
       assert Graph.cycles(graph) == []
-      assert :atomics.get(request_metrics, 1) == 4
-      assert :atomics.get(request_metrics, 2) == 5
+      assert :atomics.get(request_metrics, 1) == 6
+      assert :atomics.get(request_metrics, 2) == 7
       assert :atomics.get(request_metrics, 2) <= 2 * :atomics.get(request_metrics, 1)
       assert :atomics.get(request_metrics, 4) <= 4
       assert :atomics.get(request_metrics, 5) == 1
       assert :atomics.get(request_metrics, 6) == 1
       assert :atomics.get(request_metrics, 7) == 1
       assert :atomics.get(request_metrics, 8) >= 1
-      assert Agent.get(attempts_by_id, &Map.get(&1, "a")) == 2
+      assert Agent.get(attempts_by_id, &Map.get(&1, "a")) == 3
       assert ReadScheduler.stats(scheduler).peak_concurrency <= 4
     after
       if Process.alive?(scheduler), do: GenServer.stop(scheduler)
@@ -405,7 +417,12 @@ defmodule SymphonyElixir.PlaneDependencyReaderTest do
                  dependency_request_fun(requests, %{"a" => relation_body})
                )
 
-      assert reason in [:relation_malformed, :cross_project_dependency, :missing_dependency_target]
+      assert reason in [
+               :relation_malformed,
+               :cross_project_dependency,
+               :missing_dependency_target,
+               :inverse_relation_inconsistent
+             ]
     end
   end
 
@@ -430,6 +447,71 @@ defmodule SymphonyElixir.PlaneDependencyReaderTest do
     assert Graph.complete?(graph)
     assert Graph.cycles(graph) == [["a", "b"]]
     assert graph.edges == %{"a" => ["b"], "b" => ["a"]}
+  end
+
+  test "fails closed when relations change between opening and closing snapshots" do
+    requests = start_request_log()
+    stable = %{"a" => empty_relations(), "b" => empty_relations()}
+
+    changed = %{
+      "a" => %{
+        "blocked_by" => [%{"issue_id" => "b", "project_id" => "project-1"}],
+        "blocking" => []
+      },
+      "b" => %{
+        "blocked_by" => [],
+        "blocking" => [%{"issue_id" => "a", "project_id" => "project-1"}]
+      }
+    }
+
+    assert {:error, :relation_epoch_changed} =
+             Adapter.fetch_dependency_graph_for_test(
+               @settings,
+               relation_epoch_request_fun(requests, stable, changed)
+             )
+  end
+
+  test "fails closed for inverse-inconsistent blocked_by and blocking groups" do
+    requests = start_request_log()
+
+    assert {:error, :inverse_relation_inconsistent} =
+             Adapter.fetch_dependency_graph_for_test(
+               @settings,
+               dependency_request_fun(
+                 requests,
+                 %{
+                   "a" => %{
+                     "blocked_by" => [%{"issue_id" => "b", "project_id" => "project-1"}],
+                     "blocking" => []
+                   },
+                   "b" => %{"blocked_by" => [], "blocking" => []}
+                 }
+               )
+             )
+  end
+
+  test "accepts reciprocal blocked_by and blocking relation groups" do
+    requests = start_request_log()
+
+    assert {:ok, graph} =
+             Adapter.fetch_dependency_graph_for_test(
+               @settings,
+               dependency_request_fun(
+                 requests,
+                 %{
+                   "a" => %{
+                     "blocked_by" => [%{"issue_id" => "b", "project_id" => "project-1"}],
+                     "blocking" => []
+                   },
+                   "b" => %{
+                     "blocked_by" => [],
+                     "blocking" => [%{"issue_id" => "a", "project_id" => "project-1"}]
+                   }
+                 }
+               )
+             )
+
+    assert graph.edges == %{"a" => [], "b" => ["a"]}
   end
 
   test "fails closed when the closing node set changes" do
@@ -658,16 +740,22 @@ defmodule SymphonyElixir.PlaneDependencyReaderTest do
              )
 
     assert graph.epoch == epoch_id
-    assert :atomics.get(request_metrics, 1) == 4
+    assert :atomics.get(request_metrics, 1) == 6
     assert :atomics.get(request_metrics, 2) == 0
   end
 
   @tag timeout: 240_000
   @tag :h070a_scale
-  test "characterizes bounded 1,000, 5,000, and 10,000 item epochs" do
-    for item_count <- [1_000, 5_000, 10_000] do
+  test "characterizes bounded 1,000 and 5,000 item epochs" do
+    for item_count <- [1_000, 5_000] do
       run_scale_fixture(item_count)
     end
+  end
+
+  @tag timeout: 900_000
+  @tag :h070a_scale
+  test "characterizes bounded 10,000 item epoch" do
+    run_scale_fixture(10_000)
   end
 
   test "raw provider Done does not satisfy a dependency while trusted completion does" do
@@ -679,6 +767,8 @@ defmodule SymphonyElixir.PlaneDependencyReaderTest do
     closing_items = Keyword.get(opts, :closing_items, opening_items)
     relation_error = Keyword.get(opts, :relation_error)
     relation_sleep_ms = Keyword.get(opts, :relation_sleep_ms, 0)
+    opening_relations = Keyword.get(opts, :opening_relations, relation_map)
+    closing_relations = Keyword.get(opts, :closing_relations, relation_map)
 
     fn request ->
       enumeration_count = Agent.get(log, & &1.enumeration_count)
@@ -692,14 +782,26 @@ defmodule SymphonyElixir.PlaneDependencyReaderTest do
           relation_error
 
         String.ends_with?(request.path, "/relations/") ->
-          maybe_sleep(relation_sleep_ms)
-          id = request.path |> String.split("/") |> Enum.at(-3)
-          {:ok, %{status: 200, body: Map.get(relation_map, id, empty_relations())}}
+          relation_response(request, enumeration_count, opening_relations, closing_relations, relation_sleep_ms)
 
         true ->
           {:error, :unexpected_path}
       end
     end
+  end
+
+  defp relation_response(request, enumeration_count, opening_relations, closing_relations, relation_sleep_ms) do
+    maybe_sleep(relation_sleep_ms)
+    id = request.path |> String.split("/") |> Enum.at(-3)
+    relation_map_for_pass = if enumeration_count < 2, do: opening_relations, else: closing_relations
+    {:ok, %{status: 200, body: Map.get(relation_map_for_pass, id, empty_relations())}}
+  end
+
+  defp relation_epoch_request_fun(log, opening_relations, closing_relations) do
+    dependency_request_fun(log, opening_relations,
+      opening_relations: opening_relations,
+      closing_relations: closing_relations
+    )
   end
 
   defp maybe_sleep(milliseconds) when milliseconds > 0, do: Process.sleep(milliseconds)
@@ -721,7 +823,7 @@ defmodule SymphonyElixir.PlaneDependencyReaderTest do
   defp run_scale_fixture(item_count) do
     page_size = 100
     page_count = div(item_count + page_size - 1, page_size)
-    expected_requests = item_count + 2 * page_count
+    expected_requests = item_count + 2 * page_count + item_count
     items = Enum.map(0..(item_count - 1), &item("item-#{&1}"))
 
     relations = dag_relations(item_count)
@@ -826,20 +928,38 @@ defmodule SymphonyElixir.PlaneDependencyReaderTest do
   end
 
   defp dag_relations(item_count) do
-    Map.new(0..(item_count - 1), fn index ->
-      blocker_indexes =
-        cond do
-          index < 5 -> []
-          index in 10..14 -> Enum.to_list(0..9)
-          true -> Enum.to_list(0..4)
-        end
+    blocked_by_by_item =
+      Map.new(0..(item_count - 1), fn index ->
+        blocker_indexes =
+          cond do
+            index < 5 -> []
+            index in 10..14 -> Enum.to_list(0..9)
+            true -> Enum.to_list(0..4)
+          end
 
-      blocked_by =
-        Enum.map(blocker_indexes, fn blocker_index ->
-          %{"issue_id" => "item-#{blocker_index}", "project_id" => "project-1"}
+        {index,
+         Enum.map(blocker_indexes, fn blocker_index ->
+           %{"issue_id" => "item-#{blocker_index}", "project_id" => "project-1"}
+         end)}
+      end)
+
+    blocking_by_item =
+      Enum.reduce(blocked_by_by_item, %{}, fn {index, blocked_by}, acc ->
+        Enum.reduce(blocked_by, acc, fn %{"issue_id" => blocker_id}, inner ->
+          Map.update(inner, blocker_id, [%{"issue_id" => "item-#{index}", "project_id" => "project-1"}], fn entries ->
+            [%{"issue_id" => "item-#{index}", "project_id" => "project-1"} | entries]
+          end)
         end)
+      end)
 
-      {"item-#{index}", %{"blocked_by" => blocked_by, "blocking" => []}}
+    Map.new(0..(item_count - 1), fn index ->
+      id = "item-#{index}"
+
+      {"item-#{index}",
+       %{
+         "blocked_by" => Map.get(blocked_by_by_item, index, []),
+         "blocking" => Map.get(blocking_by_item, id, [])
+       }}
     end)
   end
 

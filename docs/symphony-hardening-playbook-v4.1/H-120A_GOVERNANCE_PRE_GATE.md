@@ -788,6 +788,16 @@ For every required CI result retained in H-100 evidence, capture:
 
 For `make-all`, retain the workflow's existing exact `HEAD`/tree/subject logging and `HEAD == GITHUB_SHA` assertion. If `GITHUB_SHA` is a GitHub synthetic merge, do not relabel it as head evidence. The configured source-control check subject must correspond to what was actually checked.
 
+Symphony's GitHub adapter treats these as separate facts for `synthetic_merge` required checks:
+
+- check-run records may attach to the PR head SHA and expose only `check_suite.id` (not a nested `workflow_run.id`);
+- Actions workflow-run listings for pull-request CI are keyed by PR head SHA (`workflow_run.head_sha`), not the synthetic merge ref SHA;
+- the synthetic merge ref commit must still be re-resolved and validated (exact base/candidate parents and candidate tree) before binding;
+- the required check must bind `check_run.check_suite.id` to `workflow_run.check_suite_id` on a successful `pull_request` / `pull_request_target` run whose `pull_requests[]` entry matches the exact PR number, candidate head, and frozen base;
+- the checked-out commit for that execution is proven mechanically from the **same bound workflow run** by reading the designated `linux-static-quality` job, requiring a successful `Record exact candidate checkout` step, and parsing the stable `CI checkout SHA` / `CI checkout tree` log lines to match the validated synthetic merge ref SHA and candidate tree;
+- H-100 evidence must still retain those checkout log lines in the evidence bundle for human audit even though SourceControl now enforces them mechanically;
+- a green check on the head alone, without merge-ref validation, workflow-run binding, and checkout-log execution proof, is insufficient when the configured subject is `synthetic_merge`.
+
 For `validate-pr-description`, retain its exact check identity and candidate binding required by the frozen policy.
 
 ## 7.4 Terminal classification
@@ -975,7 +985,7 @@ H-100 disposable lifecycle proof - <candidate-short-sha>
 ## 9.2 Credentials/capabilities
 
 - Plane REST credential: scoped to the named disposable proof target.
-- Symphony runtime GitHub credential: read/check/PR observation capability only as required by current SourceControl.
+- Symphony runtime GitHub credential: read/check/PR observation capability as required by current SourceControl, plus bounded **`Actions: read`** on the frozen H-100 GitHub App installation so `GET /actions/runs` (and single-run hydration when `pull_requests[]` is absent) can bind synthetic-merge checks on private repositories.
 - Codex/agent runtime: no GitHub merge/admin credential.
 - Human merge identity: separate interactive/human credential that is **not** available to Symphony or child agents.
 - Setup/cleanup administrator credential, if required: held outside runtime and used only for disposable-resource setup/cleanup.

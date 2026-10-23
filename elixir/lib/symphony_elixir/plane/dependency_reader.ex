@@ -18,7 +18,8 @@ defmodule SymphonyElixir.Plane.DependencyReader do
     enumerating_items: [:reading_relations, :failed],
     reading_relations: [:normalizing, :failed],
     normalizing: [:validating, :failed],
-    validating: [:analyzing_cycles, :failed],
+    validating: [:verifying_relation_epoch, :failed],
+    verifying_relation_epoch: [:analyzing_cycles, :failed],
     analyzing_cycles: [:complete, :failed],
     complete: [],
     failed: []
@@ -30,6 +31,7 @@ defmodule SymphonyElixir.Plane.DependencyReader do
           | :reading_relations
           | :normalizing
           | :validating
+          | :verifying_relation_epoch
           | :analyzing_cycles
           | :complete
           | :failed
@@ -55,16 +57,23 @@ defmodule SymphonyElixir.Plane.DependencyReader do
          {:ok, opening_issues} <- project_items(opening_items, scope(config)),
          :ok <- ensure_unique_ids(opening_issues),
          {:ok, acquisition} <- advance(acquisition, :reading_relations),
-         {:ok, observations} <- read_relations(config, opening_issues, opts),
+         {:ok, opening_observations} <- read_relations(config, opening_issues, opts),
          {:ok, acquisition} <- advance(acquisition, :normalizing),
-         {:ok, edges} <- normalize_observations(observations),
+         {:ok, opening_edges} <- normalize_observations(opening_observations),
          {:ok, acquisition} <- advance(acquisition, :validating),
-         :ok <- validate_edges(edges, opening_issues),
+         :ok <- validate_edges(opening_edges, opening_issues),
+         :ok <- validate_inverse_relation_consistency(opening_observations),
+         {:ok, acquisition} <- advance(acquisition, :verifying_relation_epoch),
          {:ok, closing_items} <- enumerate_items(config, opts),
          {:ok, closing_issues} <- project_items(closing_items, scope(config)),
          :ok <- ensure_unique_ids(closing_issues),
          :ok <- ensure_node_set_unchanged(opening_issues, closing_issues),
-         {:ok, final_issues} <- apply_edges(closing_issues, edges),
+         {:ok, closing_observations} <- read_relations(config, closing_issues, opts),
+         {:ok, closing_edges} <- normalize_observations(closing_observations),
+         :ok <- validate_edges(closing_edges, closing_issues),
+         :ok <- validate_inverse_relation_consistency(closing_observations),
+         :ok <- ensure_relation_epoch_unchanged(opening_edges, closing_edges),
+         {:ok, final_issues} <- apply_edges(closing_issues, closing_edges),
          {:ok, acquisition} <- advance(acquisition, :analyzing_cycles),
          {:ok, graph} <- build_graph(final_issues, config, opts),
          true <- Graph.complete?(graph),
@@ -290,10 +299,10 @@ defmodule SymphonyElixir.Plane.DependencyReader do
   defp relation_target(_entry, _project_id), do: {:error, :relation_malformed}
 
   defp canonical_observation(:blocked_by, owner_id, target_id),
-    do: %{prerequisite_id: target_id, dependent_id: owner_id}
+    do: %{group: :blocked_by, prerequisite_id: target_id, dependent_id: owner_id}
 
   defp canonical_observation(:blocking, owner_id, target_id),
-    do: %{prerequisite_id: owner_id, dependent_id: target_id}
+    do: %{group: :blocking, prerequisite_id: owner_id, dependent_id: target_id}
 
   defp required_relation_string(map, key) do
     case fetch_key(map, key) do
@@ -304,6 +313,26 @@ defmodule SymphonyElixir.Plane.DependencyReader do
       _ ->
         {:error, :missing}
     end
+  end
+
+  defp validate_inverse_relation_consistency(observations) when is_list(observations) do
+    blocked_by_edges =
+      observations
+      |> Enum.filter(&(&1.group == :blocked_by))
+      |> Enum.map(&{&1.prerequisite_id, &1.dependent_id})
+      |> MapSet.new()
+
+    blocking_edges =
+      observations
+      |> Enum.filter(&(&1.group == :blocking))
+      |> Enum.map(&{&1.prerequisite_id, &1.dependent_id})
+      |> MapSet.new()
+
+    if blocked_by_edges == blocking_edges, do: :ok, else: {:error, :inverse_relation_inconsistent}
+  end
+
+  defp ensure_relation_epoch_unchanged(opening_edges, closing_edges) do
+    if opening_edges == closing_edges, do: :ok, else: {:error, :relation_epoch_changed}
   end
 
   defp normalize_observations(observations) when is_list(observations) do
@@ -375,6 +404,8 @@ defmodule SymphonyElixir.Plane.DependencyReader do
   defp relation_failure(:relation_shape_unsupported), do: :relation_shape_unsupported
   defp relation_failure(:cross_project_dependency), do: :cross_project_dependency
   defp relation_failure(:missing_dependency_target), do: :missing_dependency_target
+  defp relation_failure(:inverse_relation_inconsistent), do: :inverse_relation_inconsistent
+  defp relation_failure(:relation_epoch_changed), do: :relation_epoch_changed
   defp relation_failure(_reason), do: :relation_malformed
 
   defp normalize_failure({:duplicate_work_item, _id}), do: :duplicate_work_item
@@ -390,6 +421,8 @@ defmodule SymphonyElixir.Plane.DependencyReader do
               :cross_project_dependency,
               :missing_dependency_target,
               :node_set_changed,
+              :relation_epoch_changed,
+              :inverse_relation_inconsistent,
               :provider_unavailable,
               :rate_limited,
               :graph_incomplete
