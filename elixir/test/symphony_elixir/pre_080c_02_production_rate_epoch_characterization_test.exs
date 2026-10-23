@@ -1730,7 +1730,18 @@ defmodule SymphonyElixir.Pre080C02ProductionRateEpochCharacterizationTest do
     blocker_indexes = relation_blockers(index)
     blocker_indexes = add_relation_revision_edge(blocker_indexes, index, state)
     blocked_by = Enum.map(blocker_indexes, &%{"issue_id" => "item-#{&1}", "project_id" => @scope.project_id})
-    {:ok, %{status: 200, body: %{"blocked_by" => blocked_by, "blocking" => []}}}
+
+    blocking_indexes =
+      Enum.flat_map(0..(state.item_count - 1), fn dependent_index ->
+        dependents_blockers =
+          relation_blockers(dependent_index)
+          |> add_relation_revision_edge(dependent_index, state)
+
+        if index in dependents_blockers, do: [dependent_index], else: []
+      end)
+
+    blocking = Enum.map(blocking_indexes, &%{"issue_id" => "item-#{&1}", "project_id" => @scope.project_id})
+    {:ok, %{status: 200, body: %{"blocked_by" => blocked_by, "blocking" => blocking}}}
   end
 
   defp relation_blockers(index) when index < 5, do: []
