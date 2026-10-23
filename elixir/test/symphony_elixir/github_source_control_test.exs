@@ -506,7 +506,7 @@ defmodule SymphonyElixir.GitHub.SourceControlTest do
                      }
 
                    String.contains?(path, "/actions/runs") ->
-                     workflow_runs_payload(sha_merge, 42_001)
+                     workflow_runs_payload(@sha_b, 42_001)
 
                    true ->
                      base_github_payload().(path)
@@ -515,7 +515,52 @@ defmodule SymphonyElixir.GitHub.SourceControlTest do
              )
   end
 
-  test "synthetic merge checks require workflow execution evidence on the merge ref" do
+  test "synthetic merge checks list workflow runs at PR head, not merge ref SHA" do
+    config =
+      Map.put(@config, :required_checks, [
+        %{context: "make-all", app_id: 15_368, subject: "synthetic_merge"}
+      ])
+
+    candidate_ref = candidate_ref()
+    sha_merge = String.duplicate("9", 40)
+
+    assert :ok =
+             SourceControl.verify_required_checks(
+               config,
+               candidate_ref,
+               @tree,
+               [
+                 token: "token",
+                 request_fun: fn _token, path, params, _opts ->
+                   cond do
+                     String.contains?(path, "/actions/runs") ->
+                       queried_sha = normalize_query_sha(params)
+
+                       cond do
+                         queried_sha == sha_merge ->
+                           {:ok, %{"total_count" => 0, "workflow_runs" => []}}
+
+                         queried_sha == @sha_b ->
+                           {:ok, workflow_runs_payload(@sha_b, 42_001)}
+
+                         true ->
+                           {:ok, %{"total_count" => 0, "workflow_runs" => []}}
+                       end
+
+                     true ->
+                       {:ok,
+                        synthetic_merge_github_payload(path, sha_merge)
+                        |> then(fn
+                          nil -> base_github_payload().(path)
+                          payload -> payload
+                        end)}
+                   end
+                 end
+               ]
+             )
+  end
+
+  test "synthetic merge checks require workflow execution evidence at PR head" do
     config =
       Map.put(@config, :required_checks, [
         %{context: "make-all", app_id: 15_368, subject: "synthetic_merge"}
@@ -790,6 +835,38 @@ defmodule SymphonyElixir.GitHub.SourceControlTest do
         }
       ]
     }
+  end
+
+  defp synthetic_merge_github_payload(path, sha_merge) do
+    cond do
+      String.contains?(path, "/pulls/15") ->
+        open_pull(15, %{"merge_commit_sha" => sha_merge})
+
+      String.contains?(path, "/git/commits/" <> sha_merge) ->
+        %{
+          "sha" => sha_merge,
+          "tree" => %{"sha" => @tree},
+          "parents" => [%{"sha" => @sha_a}, %{"sha" => @sha_b}]
+        }
+
+      String.contains?(path, "/check-runs") ->
+        %{
+          "total_count" => 1,
+          "check_runs" => [check_run("make-all", "success", workflow_run_id: 42_001)]
+        }
+
+      true ->
+        nil
+    end
+  end
+
+  defp normalize_query_sha(params) when is_map(params) do
+    params
+    |> Map.get("head_sha", Map.get(params, :head_sha))
+    |> case do
+      sha when is_binary(sha) -> String.downcase(sha)
+      _ -> nil
+    end
   end
 
   defp base_github_payload do

@@ -791,8 +791,10 @@ For `make-all`, retain the workflow's existing exact `HEAD`/tree/subject logging
 Symphony's GitHub adapter treats these as separate facts for `synthetic_merge` required checks:
 
 - check-run records may attach to the PR head SHA;
-- workflow execution must be proven on the validated synthetic merge SHA via Actions workflow-run evidence;
-- a green check on the head alone is insufficient when the configured subject is `synthetic_merge`.
+- Actions workflow-run listings for pull-request CI are keyed by PR head SHA (`workflow_run.head_sha`), not the synthetic merge ref SHA;
+- the synthetic merge ref commit must still be re-resolved and validated (exact base/candidate parents and candidate tree) before binding;
+- the required check must link to a successful pull-request workflow run at that PR head, which is the execution surface GitHub uses while checking out the validated test-merge commit;
+- a green check on the head alone, without merge-ref validation and workflow-run binding, is insufficient when the configured subject is `synthetic_merge`.
 
 For `validate-pr-description`, retain its exact check identity and candidate binding required by the frozen policy.
 

@@ -229,11 +229,13 @@ defmodule SymphonyElixir.GitHub.SourceControl do
         with {:ok, merge_commit} <- fetch_merge_ref_commit(config, candidate_ref.pr_identity, opts),
              :ok <- validate_synthetic_merge(merge_commit, candidate_ref, candidate_tree_sha),
              synthetic_sha <- normalize_sha(merge_commit["sha"]),
-             {:ok, workflow_runs} <- fetch_workflow_runs(config, synthetic_sha, opts),
+             candidate_sha <- candidate_ref.candidate_sha,
+             {:ok, workflow_runs} <- fetch_workflow_runs(config, candidate_sha, opts),
              true <- synthetic_execution_evidence_present?(workflow_runs) do
           {:ok,
            Keyword.merge(opts,
              synthetic_execution_sha: synthetic_sha,
+             synthetic_execution_candidate_sha: candidate_sha,
              synthetic_workflow_runs: workflow_runs
            )}
         else
@@ -390,27 +392,48 @@ defmodule SymphonyElixir.GitHub.SourceControl do
 
   defp do_verify_synthetic_execution_binding(observations, opts) do
     synthetic_sha = Keyword.get(opts, :synthetic_execution_sha)
+    candidate_sha = Keyword.get(opts, :synthetic_execution_candidate_sha)
     workflow_runs = Keyword.get(opts, :synthetic_workflow_runs, [])
 
-    if is_binary(synthetic_sha) and
-         Enum.any?(observations, &check_run_binds_synthetic_execution?(&1, synthetic_sha, workflow_runs)) do
+    if is_binary(synthetic_sha) and is_binary(candidate_sha) and
+         Enum.any?(observations, &check_run_binds_synthetic_execution?(&1, synthetic_sha, candidate_sha, workflow_runs)) do
       :ok
     else
       {:error, :synthetic_execution_evidence_missing}
     end
   end
 
-  defp check_run_binds_synthetic_execution?(run, synthetic_sha, workflow_runs) do
+  defp check_run_binds_synthetic_execution?(run, synthetic_sha, candidate_sha, workflow_runs) do
     suite_head_sha = check_run_field(run, "check_suite") |> suite_head_sha()
+    check_run_head_sha = check_run_field(run, "head_sha") |> normalize_sha()
     workflow_run_id = suite_workflow_run_id(run)
 
     suite_head_sha == synthetic_sha or
-      Enum.any?(workflow_runs, fn workflow_run ->
-        workflow_run_successful?(workflow_run) and
-          normalize_sha(Map.get(workflow_run, "head_sha")) == synthetic_sha and
-          workflow_run_id != nil and Map.get(workflow_run, "id") == workflow_run_id
-      end)
+      (check_run_head_sha == candidate_sha and
+         Enum.any?(workflow_runs, fn workflow_run ->
+           workflow_run_binds_synthetic_merge_execution?(
+             workflow_run,
+             workflow_run_id,
+             candidate_sha,
+             synthetic_sha
+           )
+         end))
   end
+
+  # GitHub indexes pull_request workflow runs by PR head SHA, while GITHUB_SHA in the
+  # job is the validated test-merge commit (synthetic merge ref). Merge-ref parents/tree
+  # are proven separately in validate_synthetic_merge/3.
+  defp workflow_run_binds_synthetic_merge_execution?(workflow_run, workflow_run_id, candidate_sha, synthetic_sha) do
+    workflow_run_successful?(workflow_run) and
+      workflow_run_id != nil and
+      Map.get(workflow_run, "id") == workflow_run_id and
+      normalize_sha(Map.get(workflow_run, "head_sha")) == candidate_sha and
+      synthetic_sha != candidate_sha and
+      workflow_run_event(workflow_run) in ["pull_request", "pull_request_target"]
+  end
+
+  defp workflow_run_event(%{"event" => event}) when is_binary(event), do: event
+  defp workflow_run_event(_workflow_run), do: nil
 
   defp suite_head_sha(%{"head_sha" => head_sha}), do: normalize_sha(head_sha)
   defp suite_head_sha(_suite), do: nil
