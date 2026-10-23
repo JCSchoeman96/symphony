@@ -101,6 +101,7 @@ defmodule SymphonyElixir.OrchestratorStartupReconciliationTest do
     GenServer.stop(pid)
   catch
     :exit, {:noproc, _reason} -> :ok
+    :exit, {{:shutdown, {:sys, :terminate, _args}}, {GenServer, :stop, _stop_args}} -> :ok
   end
 
   test "cleanup tolerates a process that exited before teardown" do
@@ -108,6 +109,34 @@ defmodule SymphonyElixir.OrchestratorStartupReconciliationTest do
 
     assert :ok = Agent.stop(pid)
     assert :ok = stop_process_safely(pid)
+  end
+
+  test "cleanup tolerates shutdown while stop is in progress" do
+    pid =
+      spawn(fn ->
+        receive do
+          :hold -> :hold
+        end
+      end)
+
+    stop_task = Task.async(fn -> stop_process_safely(pid) end)
+
+    assert eventually(fn ->
+             case Process.info(pid, :messages) do
+               {:messages, messages} ->
+                 Enum.any?(messages, fn
+                   {:system, _from, {:terminate, :normal}} -> true
+                   _message -> false
+                 end)
+
+               nil ->
+                 false
+             end
+           end)
+
+    Process.exit(pid, :shutdown)
+
+    assert :ok = Task.await(stop_task)
   end
 
   test "startup stays pending and preserves terminal workspaces until reconciliation" do
@@ -1473,8 +1502,8 @@ defmodule SymphonyElixir.OrchestratorStartupReconciliationTest do
       )
 
     on_exit(fn ->
-      if Process.alive?(pid), do: GenServer.stop(pid)
-      if Process.alive?(coordinator), do: GenServer.stop(coordinator)
+      stop_process_safely(pid)
+      stop_process_safely(coordinator)
       File.rm_rf(root)
     end)
 
