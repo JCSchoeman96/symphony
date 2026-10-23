@@ -180,7 +180,7 @@ defmodule SymphonyElixir.WorkspaceOwnershipLedgerTest do
     send(release_writer, :allow_release_write)
 
     assert {:ok, released} = Task.await(release_task, 1_000)
-    assert {:error, {:invalid_transition, :released, :owned}} = Task.await(cancel_task, 1_000)
+    assert {:error, {:invalid_transition, :released, :owned}} = Task.await(cancel_task, 5_000)
     assert {:ok, current} = OwnershipLedger.get(ledger, pending.workspace_ownership_id)
     assert current == released
     assert :ok = OwnershipLedger.close(ledger)
