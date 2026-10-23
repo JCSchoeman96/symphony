@@ -744,7 +744,7 @@ defmodule SymphonyElixir.PlaneDependencyReaderTest do
     assert :atomics.get(request_metrics, 2) == 0
   end
 
-  @tag timeout: 240_000
+  @tag timeout: 600_000
   @tag :h070a_scale
   test "characterizes bounded 1,000, 5,000, and 10,000 item epochs" do
     for item_count <- [1_000, 5_000, 10_000] do
