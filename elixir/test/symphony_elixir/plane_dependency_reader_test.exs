@@ -744,12 +744,18 @@ defmodule SymphonyElixir.PlaneDependencyReaderTest do
     assert :atomics.get(request_metrics, 2) == 0
   end
 
-  @tag timeout: 600_000
+  @tag timeout: 240_000
   @tag :h070a_scale
-  test "characterizes bounded 1,000, 5,000, and 10,000 item epochs" do
-    for item_count <- [1_000, 5_000, 10_000] do
+  test "characterizes bounded 1,000 and 5,000 item epochs" do
+    for item_count <- [1_000, 5_000] do
       run_scale_fixture(item_count)
     end
+  end
+
+  @tag timeout: 900_000
+  @tag :h070a_scale
+  test "characterizes bounded 10,000 item epoch" do
+    run_scale_fixture(10_000)
   end
 
   test "raw provider Done does not satisfy a dependency while trusted completion does" do
