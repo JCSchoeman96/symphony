@@ -19,6 +19,7 @@ defmodule SymphonyElixir.GitHub.SourceControl do
   @user_agent "symphony"
   @max_check_runs_per_subject 300
   @max_associated_prs 100
+  @max_workflow_runs_per_head 100
 
   @type config :: %{
           kind: :github,
@@ -87,6 +88,12 @@ defmodule SymphonyElixir.GitHub.SourceControl do
   def fetch_check_runs(config, head_sha, opts \\ []) when is_binary(head_sha) do
     {owner, repo} = split_repository(config.repository)
     fetch_check_runs_page(config, owner, repo, head_sha, 1, [], opts)
+  end
+
+  @spec fetch_workflow_runs(config(), String.t(), keyword()) :: {:ok, [map()]} | {:error, term()}
+  def fetch_workflow_runs(config, head_sha, opts \\ []) when is_binary(head_sha) do
+    {owner, repo} = split_repository(config.repository)
+    fetch_workflow_runs_page(config, owner, repo, head_sha, 1, [], opts)
   end
 
   @spec fetch_merge_ref_commit(config(), String.t() | integer(), keyword()) ::
@@ -198,31 +205,44 @@ defmodule SymphonyElixir.GitHub.SourceControl do
   end
 
   defp verify_required_checks_list(config, candidate_ref, candidate_tree_sha, checks, opts) do
-    with :ok <- validate_synthetic_merge_subjects(config, candidate_ref, candidate_tree_sha, checks, opts),
+    with {:ok, opts} <- enrich_synthetic_merge_evidence(config, candidate_ref, candidate_tree_sha, checks, opts),
          {:ok, runs_by_lookup_sha} <- fetch_grouped_check_runs(config, candidate_ref, checks, opts) do
-      evaluate_configured_checks(checks, runs_by_lookup_sha, candidate_ref)
+      evaluate_configured_checks(checks, runs_by_lookup_sha, candidate_ref, opts)
     end
   end
 
-  defp evaluate_configured_checks(checks, runs_by_lookup_sha, candidate_ref) do
+  defp evaluate_configured_checks(checks, runs_by_lookup_sha, candidate_ref, opts) do
     Enum.reduce_while(checks, :ok, fn check, _acc ->
-      case evaluate_required_check(check, runs_by_lookup_sha, candidate_ref) do
+      case evaluate_required_check(check, runs_by_lookup_sha, candidate_ref, opts) do
         :ok -> {:cont, :ok}
         {:error, reason} -> {:halt, {:error, reason}}
       end
     end)
   end
 
-  defp validate_synthetic_merge_subjects(config, candidate_ref, candidate_tree_sha, checks, opts) do
+  defp enrich_synthetic_merge_evidence(config, candidate_ref, candidate_tree_sha, checks, opts) do
     cond do
       skip_synthetic_merge_validation?(opts) ->
-        :ok
+        {:ok, opts}
 
       Enum.any?(checks, &synthetic_merge_check?/1) ->
-        do_validate_synthetic_merge_subject(config, candidate_ref, candidate_tree_sha, opts)
+        with {:ok, merge_commit} <- fetch_merge_ref_commit(config, candidate_ref.pr_identity, opts),
+             :ok <- validate_synthetic_merge(merge_commit, candidate_ref, candidate_tree_sha),
+             synthetic_sha <- normalize_sha(merge_commit["sha"]),
+             {:ok, workflow_runs} <- fetch_workflow_runs(config, synthetic_sha, opts),
+             true <- synthetic_execution_evidence_present?(workflow_runs) do
+          {:ok,
+           Keyword.merge(opts,
+             synthetic_execution_sha: synthetic_sha,
+             synthetic_workflow_runs: workflow_runs
+           )}
+        else
+          false -> {:error, :synthetic_execution_evidence_missing}
+          {:error, reason} -> {:error, reason}
+        end
 
       true ->
-        :ok
+        {:ok, opts}
     end
   end
 
@@ -231,10 +251,8 @@ defmodule SymphonyElixir.GitHub.SourceControl do
 
   defp skip_synthetic_merge_validation?(_opts), do: false
 
-  defp do_validate_synthetic_merge_subject(config, candidate_ref, candidate_tree_sha, opts) do
-    with {:ok, merge_commit} <- fetch_merge_ref_commit(config, candidate_ref.pr_identity, opts) do
-      validate_synthetic_merge(merge_commit, candidate_ref, candidate_tree_sha)
-    end
+  defp synthetic_execution_evidence_present?(workflow_runs) when is_list(workflow_runs) do
+    Enum.any?(workflow_runs, &workflow_run_successful?/1)
   end
 
   defp fetch_grouped_check_runs(config, candidate_ref, checks, opts) do
@@ -256,7 +274,7 @@ defmodule SymphonyElixir.GitHub.SourceControl do
     end
   end
 
-  defp evaluate_required_check(check, runs_by_lookup_sha, candidate_ref) do
+  defp evaluate_required_check(check, runs_by_lookup_sha, candidate_ref, opts) do
     subject = normalize_subject(Map.get(check, :subject) || Map.get(check, "subject"))
     context = Map.get(check, :context) || Map.get(check, "context")
     app_id = Map.get(check, :app_id) || Map.get(check, "app_id")
@@ -267,7 +285,7 @@ defmodule SymphonyElixir.GitHub.SourceControl do
 
       lookup_sha ->
         runs = Map.get(runs_by_lookup_sha, lookup_sha, [])
-        evaluate_check_runs(runs, context, app_id, lookup_sha, subject)
+        evaluate_check_runs(runs, context, app_id, lookup_sha, subject, opts)
     end
   end
 
@@ -278,6 +296,7 @@ defmodule SymphonyElixir.GitHub.SourceControl do
   defp check_run_lookup_sha(check, candidate_ref) do
     case normalize_subject(Map.get(check, :subject) || Map.get(check, "subject")) do
       :head -> candidate_ref.candidate_sha
+      # Check-run records attach to the PR head; synthetic-merge execution is proven separately.
       :synthetic_merge -> candidate_ref.candidate_sha
       _ -> nil
     end
@@ -331,7 +350,7 @@ defmodule SymphonyElixir.GitHub.SourceControl do
     end
   end
 
-  defp evaluate_check_runs(runs, context, app_id, lookup_sha, subject) do
+  defp evaluate_check_runs(runs, context, app_id, lookup_sha, subject, opts) do
     matching =
       Enum.filter(runs, fn run ->
         is_map(run) and
@@ -350,8 +369,72 @@ defmodule SymphonyElixir.GitHub.SourceControl do
         {:error, :missing_required_check}
 
       observations ->
-        evaluate_terminal_observations(observations)
+        case verify_synthetic_execution_binding(observations, subject, opts) do
+          :ok -> evaluate_terminal_observations(observations)
+          {:error, reason} -> {:error, reason}
+        end
     end
+  end
+
+  defp verify_synthetic_execution_binding(_observations, :head, _opts), do: :ok
+
+  defp verify_synthetic_execution_binding(observations, :synthetic_merge, opts) do
+    if skip_synthetic_merge_validation?(opts) do
+      :ok
+    else
+      do_verify_synthetic_execution_binding(observations, opts)
+    end
+  end
+
+  defp verify_synthetic_execution_binding(_observations, _subject, _opts), do: :ok
+
+  defp do_verify_synthetic_execution_binding(observations, opts) do
+    synthetic_sha = Keyword.get(opts, :synthetic_execution_sha)
+    workflow_runs = Keyword.get(opts, :synthetic_workflow_runs, [])
+
+    if is_binary(synthetic_sha) and
+         Enum.any?(observations, &check_run_binds_synthetic_execution?(&1, synthetic_sha, workflow_runs)) do
+      :ok
+    else
+      {:error, :synthetic_execution_evidence_missing}
+    end
+  end
+
+  defp check_run_binds_synthetic_execution?(run, synthetic_sha, workflow_runs) do
+    suite_head_sha = check_run_field(run, "check_suite") |> suite_head_sha()
+    workflow_run_id = suite_workflow_run_id(run)
+
+    suite_head_sha == synthetic_sha or
+      Enum.any?(workflow_runs, fn workflow_run ->
+        workflow_run_successful?(workflow_run) and
+          normalize_sha(Map.get(workflow_run, "head_sha")) == synthetic_sha and
+          workflow_run_id != nil and Map.get(workflow_run, "id") == workflow_run_id
+      end)
+  end
+
+  defp suite_head_sha(%{"head_sha" => head_sha}), do: normalize_sha(head_sha)
+  defp suite_head_sha(_suite), do: nil
+
+  defp suite_workflow_run_id(run) do
+    case check_run_field(run, "check_suite") do
+      %{"workflow_run" => %{"id" => id}} when is_integer(id) -> id
+      %{"workflow_run_id" => id} when is_integer(id) -> id
+      _ -> nil
+    end
+  end
+
+  defp workflow_run_successful?(run) when is_map(run) do
+    run["status"] == "completed" and run["conclusion"] == "success"
+  end
+
+  defp workflow_run_successful?(_run), do: false
+
+  defp check_run_matches_subject?(run, lookup_sha, :head) do
+    check_run_field(run, "head_sha") |> normalize_sha() == lookup_sha
+  end
+
+  defp check_run_matches_subject?(run, lookup_sha, :synthetic_merge) do
+    check_run_field(run, "head_sha") |> normalize_sha() == lookup_sha
   end
 
   defp check_run_matches_subject?(run, lookup_sha, _subject) do
@@ -562,6 +645,52 @@ defmodule SymphonyElixir.GitHub.SourceControl do
         total: total,
         opts: opts
       })
+    end
+  end
+
+  defp fetch_workflow_runs_page(config, owner, repo, head_sha, page, acc, opts) do
+    with {:ok, %{"workflow_runs" => runs, "total_count" => total}} <-
+           get(
+             config,
+             "/repos/#{owner}/#{repo}/actions/runs",
+             %{"head_sha" => head_sha, "per_page" => 100, "page" => page},
+             opts
+           ) do
+      continue_workflow_runs_page(%{
+        config: config,
+        owner: owner,
+        repo: repo,
+        head_sha: head_sha,
+        page: page,
+        acc: acc,
+        runs: runs,
+        total: total,
+        opts: opts
+      })
+    end
+  end
+
+  defp continue_workflow_runs_page(%{page: page, acc: acc, runs: runs, total: total} = state) do
+    runs = if is_list(runs), do: runs, else: []
+    acc = acc ++ runs
+
+    cond do
+      length(acc) > @max_workflow_runs_per_head or (acc == [] and page > 1) ->
+        {:error, :too_many_workflow_runs}
+
+      length(acc) >= total or runs == [] ->
+        {:ok, acc}
+
+      true ->
+        fetch_workflow_runs_page(
+          state.config,
+          state.owner,
+          state.repo,
+          state.head_sha,
+          page + 1,
+          acc,
+          state.opts
+        )
     end
   end
 
