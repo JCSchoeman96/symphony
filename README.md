@@ -58,6 +58,12 @@ Manual DETS deletion is unsupported because it can destroy safety history.
 
 Plane observations and supported transition tools operate within Symphony's authority boundaries. `conditional_transition` remains unsupported. A Plane capability does not grant Symphony authority by itself.
 
+Autonomous Plane runtime uses the dedicated Ferdi API-key principal at user ID
+`920272c2-862e-4592-b13e-b0ba11c91b12`, with the project `contributor` relation and required
+`workitem:view` and `workitem:edit` grants. The JC Plane credential remains for human/operator/admin
+use. Symphony checks the live identity and grants before startup authority and controlled lifecycle
+mutations; see [the Elixir Plane configuration](elixir/README.md#plane-adapter-profile).
+
 Before accepting a transition, Symphony rereads Plane and reassesses lifecycle authority. A provider mutation acknowledgement is not proof of an authoritative transition. Dispatch and retry paths use the immutable dependency epoch built during reconciliation, and incomplete or unavailable dependency data fails routed dispatch closed.
 
 Explicit routed work still requires authoritative graph support for implementation and correction.

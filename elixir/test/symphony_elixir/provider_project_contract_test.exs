@@ -47,6 +47,32 @@ defmodule SymphonyElixir.ProviderProjectContractTest do
     assert String.starts_with?(contract.configuration_fingerprint, "sha256:")
   end
 
+  test "binds runtime authority to the configured Ferdi principal and bounded Plane permissions" do
+    attrs = Map.put(valid_attrs(), :runtime_principal, runtime_principal())
+
+    assert {:ok, contract} = ProviderProjectContract.new(attrs)
+    assert contract.runtime_principal == runtime_principal()
+
+    changed_user = put_in(contract.runtime_principal.user_id, "00000000-0000-4000-8000-000000000001")
+    assert ProviderProjectContract.fingerprint(changed_user) != ProviderProjectContract.fingerprint(contract)
+
+    changed_credential = put_in(contract.runtime_principal.api_key_env, "PLANE_API_KEY_JC")
+    assert ProviderProjectContract.fingerprint(changed_credential) != ProviderProjectContract.fingerprint(contract)
+  end
+
+  test "rejects an admin runtime role and unbounded Plane permission declarations" do
+    assert {:error, %ProviderProjectContract.ConfigError{code: :unsupported_runtime_project_relation}} =
+             ProviderProjectContract.new(Map.put(valid_attrs(), :runtime_principal, %{runtime_principal() | project_relation: "admin"}))
+
+    assert {:error, %ProviderProjectContract.ConfigError{code: :unsupported_runtime_permissions}} =
+             ProviderProjectContract.new(
+               Map.put(valid_attrs(), :runtime_principal, %{
+                 runtime_principal()
+                 | required_permissions: ["workitem:view", "workitem:edit", "project:manage"]
+               })
+             )
+  end
+
   test "accepts normalized workflow maps with string keys and canonicalizes them" do
     assert {:ok, contract} = ProviderProjectContract.new(string_keyed_attrs())
 
@@ -327,6 +353,16 @@ defmodule SymphonyElixir.ProviderProjectContractTest do
              name: WorkflowLifecycle.display(state)
            }}
         end)
+    }
+  end
+
+  defp runtime_principal do
+    %{
+      api_key_env: "PLANE_API_KEY_FERDI",
+      user_id: "920272c2-862e-4592-b13e-b0ba11c91b12",
+      principal_kind: "api_key",
+      project_relation: "contributor",
+      required_permissions: ["workitem:view", "workitem:edit"]
     }
   end
 

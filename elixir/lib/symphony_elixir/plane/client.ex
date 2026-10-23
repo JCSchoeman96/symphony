@@ -46,6 +46,22 @@ defmodule SymphonyElixir.Plane.Client do
     end
   end
 
+  @spec get_current_user(config(), keyword()) :: {:ok, map()} | {:error, term()}
+  def get_current_user(config, opts \\ []) when is_map(config) and is_list(opts) do
+    with {:ok, config} <- normalize_config(config, opts),
+         {:ok, response} <- request(config, "/api/v2/users/me/", %{}, opts, :control) do
+      successful_body(response, :object)
+    end
+  end
+
+  @spec get_project_permissions(config(), keyword()) :: {:ok, map()} | {:error, term()}
+  def get_project_permissions(config, opts \\ []) when is_map(config) and is_list(opts) do
+    with {:ok, config} <- normalize_config(config, opts),
+         {:ok, response} <- request(config, project_permissions_path(config), %{}, opts, :control) do
+      successful_body(response, :object)
+    end
+  end
+
   @spec get_work_item(config(), String.t(), keyword()) :: {:ok, map()} | {:error, term()}
   def get_work_item(config, work_item_id, opts \\ [])
       when is_map(config) and is_binary(work_item_id) and is_list(opts) do
@@ -1107,6 +1123,10 @@ defmodule SymphonyElixir.Plane.Client do
   end
 
   defp project_path(config), do: "/api/v1/workspaces/#{encoded(config.workspace_slug)}/projects/#{encoded(config.project_id)}/"
+
+  defp project_permissions_path(config),
+    do: "/api/v2/workspaces/#{encoded(config.workspace_slug)}/projects/#{encoded(config.project_id)}/permissions/me/"
+
   defp work_item_path(config, id), do: work_items_path(config) <> encoded(id) <> "/"
   defp relation_path(config, id), do: work_items_path(config) <> encoded(id) <> "/relations/"
   defp work_items_path(config), do: project_path(config) <> "work-items/"

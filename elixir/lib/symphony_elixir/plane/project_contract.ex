@@ -35,6 +35,7 @@ defmodule SymphonyElixir.Plane.ProjectContract do
     :provider,
     :workspace_id,
     :project_id,
+    :runtime_principal,
     :states,
     :dependency_relation_semantics,
     :capability_statuses,
@@ -72,6 +73,7 @@ defmodule SymphonyElixir.Plane.ProjectContract do
   defp validate_complete_snapshot(contract, snapshot, expected_fingerprint) do
     diagnostics =
       identity_diagnostics(contract, snapshot) ++
+        runtime_principal_diagnostics(contract, snapshot.runtime_principal) ++
         state_diagnostics(contract, snapshot.states) ++
         relation_diagnostics(contract, snapshot.dependency_relation_semantics) ++
         capability_diagnostics(contract, snapshot.capability_statuses)
@@ -94,6 +96,56 @@ defmodule SymphonyElixir.Plane.ProjectContract do
     |> add_mismatch(:provider, contract.provider, snapshot.provider, :provider_identity_mismatch)
     |> add_mismatch(:workspace_id, contract.workspace_id, snapshot.workspace_id, :workspace_identity_mismatch)
     |> add_mismatch(:project_id, contract.project_id, snapshot.project_id, :project_identity_mismatch)
+  end
+
+  defp runtime_principal_diagnostics(%ProviderProjectContract{runtime_principal: expected}, _observed)
+       when not is_map(expected) do
+    [
+      diagnostic(
+        :runtime_principal_policy_missing,
+        field: :runtime_principal,
+        reason: :required_runtime_principal_policy_missing
+      )
+    ]
+  end
+
+  defp runtime_principal_diagnostics(%ProviderProjectContract{runtime_principal: expected}, observed) do
+    missing_permissions = expected.required_permissions -- observed.required_permissions
+
+    []
+    |> add_mismatch(:runtime_user_id, expected.user_id, observed.user_id, :runtime_principal_identity_mismatch)
+    |> add_mismatch(
+      :runtime_principal_kind,
+      expected.principal_kind,
+      observed.principal_kind,
+      :runtime_principal_kind_mismatch
+    )
+    |> add_mismatch(
+      :runtime_project_relation,
+      expected.project_relation,
+      observed.project_relation,
+      :runtime_project_relation_mismatch
+    )
+    |> add_missing_runtime_permissions(
+      missing_permissions,
+      expected.required_permissions,
+      observed.required_permissions
+    )
+  end
+
+  defp add_missing_runtime_permissions(diagnostics, [], _expected, _observed), do: diagnostics
+
+  defp add_missing_runtime_permissions(diagnostics, _missing, expected, observed) do
+    diagnostics ++
+      [
+        diagnostic(
+          :runtime_permission_missing,
+          field: :required_permissions,
+          expected: expected,
+          observed: observed,
+          reason: :required_runtime_permission_missing
+        )
+      ]
   end
 
   defp state_diagnostics(contract, states) do
@@ -236,10 +288,23 @@ defmodule SymphonyElixir.Plane.ProjectContract do
         project_id: snapshot.project_id,
         state_mappings: observed_mappings,
         dependency_relation_semantics: snapshot.dependency_relation_semantics,
-        required_capabilities: supported_required_capabilities
+        required_capabilities: supported_required_capabilities,
+        runtime_principal: observed_runtime_principal(contract.runtime_principal, snapshot.runtime_principal)
     }
 
     ProviderProjectContract.fingerprint(observed_contract)
+  end
+
+  defp observed_runtime_principal(nil, _observed), do: nil
+
+  defp observed_runtime_principal(expected, observed) do
+    %{
+      expected
+      | user_id: observed.user_id,
+        principal_kind: observed.principal_kind,
+        project_relation: observed.project_relation,
+        required_permissions: Enum.filter(expected.required_permissions, &(&1 in observed.required_permissions))
+    }
   end
 
   defp add_fingerprint_diagnostic(diagnostics, expected, observed) when expected == observed, do: diagnostics
@@ -322,6 +387,7 @@ defmodule SymphonyElixir.Plane.ProjectContract do
          {:ok, workspace_name} <- parse_optional_name(snapshot_value(snapshot, :workspace_name), :workspace_name),
          {:ok, project_id} <- parse_identifier(snapshot_value(snapshot, :project_id), :project_id),
          {:ok, project_name} <- parse_optional_name(snapshot_value(snapshot, :project_name), :project_name),
+         {:ok, runtime_principal} <- parse_runtime_principal(snapshot_value(snapshot, :runtime_principal)),
          {:ok, states} <- parse_states(snapshot_value(snapshot, :states)),
          {:ok, relations} <- parse_relations(snapshot_value(snapshot, :dependency_relation_semantics)),
          {:ok, capabilities} <- parse_capabilities(snapshot_value(snapshot, :capability_statuses)) do
@@ -332,6 +398,7 @@ defmodule SymphonyElixir.Plane.ProjectContract do
          workspace_name: workspace_name,
          project_id: project_id,
          project_name: project_name,
+         runtime_principal: runtime_principal,
          states: states,
          dependency_relation_semantics: relations,
          capability_statuses: capabilities,
@@ -386,6 +453,89 @@ defmodule SymphonyElixir.Plane.ProjectContract do
   defp parse_optional_name(:missing, _field), do: {:ok, nil}
   defp parse_optional_name({:ok, nil}, _field), do: {:ok, nil}
   defp parse_optional_name(value, field), do: parse_name(value, field)
+
+  defp parse_runtime_principal({:ok, principal}) when is_map(principal) do
+    with {:ok, user_id} <- parse_runtime_user_id(nested_value(principal, :user_id)),
+         {:ok, principal_kind} <- parse_runtime_text(nested_value(principal, :principal_kind), :principal_kind),
+         {:ok, project_relation} <- parse_runtime_relation(nested_value(principal, :project_relation)),
+         {:ok, required_permissions} <- parse_runtime_permissions(nested_value(principal, :required_permissions)) do
+      {:ok,
+       %{
+         user_id: user_id,
+         principal_kind: principal_kind,
+         project_relation: project_relation,
+         required_permissions: required_permissions
+       }}
+    end
+  end
+
+  defp parse_runtime_principal({:ok, value}), do: malformed(:runtime_principal, value, :invalid_runtime_principal)
+  defp parse_runtime_principal(:missing), do: incomplete(:runtime_principal, :required_field_missing)
+  defp parse_runtime_principal({:ambiguous, field}), do: malformed(field, field, :duplicate_field_key)
+
+  defp parse_runtime_user_id({:ok, value}) when is_binary(value) do
+    if String.match?(value, ~r/\A[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\z/) do
+      {:ok, String.downcase(value)}
+    else
+      malformed(:runtime_user_id, value, :invalid_runtime_user_id)
+    end
+  end
+
+  defp parse_runtime_user_id({:ok, value}), do: malformed(:runtime_user_id, value, :invalid_runtime_user_id)
+  defp parse_runtime_user_id(:missing), do: incomplete(:runtime_user_id, :required_field_missing)
+  defp parse_runtime_user_id({:ambiguous, _field}), do: malformed(:runtime_user_id, :duplicate, :duplicate_field_key)
+
+  defp parse_runtime_text({:ok, value}, _field) when is_binary(value) do
+    if valid_bounded_text?(value, @max_identifier_bytes) do
+      {:ok, value}
+    else
+      malformed(:runtime_principal_kind, value, :invalid_runtime_principal_kind)
+    end
+  end
+
+  defp parse_runtime_text({:ok, value}, field), do: malformed(field, value, :invalid_runtime_principal_kind)
+  defp parse_runtime_text(:missing, field), do: incomplete(field, :required_field_missing)
+  defp parse_runtime_text({:ambiguous, field}, _target), do: malformed(field, field, :duplicate_field_key)
+
+  defp parse_runtime_relation({:ok, nil}), do: {:ok, nil}
+
+  defp parse_runtime_relation({:ok, value}) when is_binary(value) do
+    if valid_bounded_text?(value, @max_identifier_bytes) do
+      {:ok, value}
+    else
+      malformed(:runtime_project_relation, value, :invalid_runtime_project_relation)
+    end
+  end
+
+  defp parse_runtime_relation({:ok, value}), do: malformed(:runtime_project_relation, value, :invalid_runtime_project_relation)
+  defp parse_runtime_relation(:missing), do: incomplete(:runtime_project_relation, :required_field_missing)
+  defp parse_runtime_relation({:ambiguous, field}), do: malformed(field, field, :duplicate_field_key)
+
+  defp parse_runtime_permissions({:ok, permissions}) when is_list(permissions) do
+    case bounded_list_length(permissions, 2) do
+      {:ok, _length} ->
+        cond do
+          not Enum.all?(permissions, &(is_binary(&1) and &1 in ["workitem:view", "workitem:edit"])) ->
+            malformed(:runtime_permissions, permissions, :unsupported_runtime_permissions)
+
+          length(Enum.uniq(permissions)) != length(permissions) ->
+            malformed(:runtime_permissions, permissions, :duplicate_runtime_permission)
+
+          true ->
+            {:ok, permissions}
+        end
+
+      {:too_many, length} ->
+        malformed(:runtime_permissions, length, :unsupported_runtime_permissions)
+
+      :improper ->
+        malformed(:runtime_permissions, :improper_list, :invalid_runtime_permissions)
+    end
+  end
+
+  defp parse_runtime_permissions({:ok, value}), do: malformed(:runtime_permissions, value, :invalid_runtime_permissions)
+  defp parse_runtime_permissions(:missing), do: incomplete(:runtime_permissions, :required_field_missing)
+  defp parse_runtime_permissions({:ambiguous, field}), do: malformed(field, field, :duplicate_field_key)
 
   defp parse_states({:ok, states}) when is_list(states) do
     case bounded_list_length(states, @max_snapshot_states) do

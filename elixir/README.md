@@ -327,8 +327,41 @@ codex:
 
 - Config: use `tracker.kind: plane` with `tracker.provider.workspace_slug` for the Plane REST
   path, an explicit stable `tracker.provider.workspace_id`, and `tracker.provider.project_id`.
-  `tracker.provider.api_key` must be `$PLANE_API_KEY` (or be supplied host-side); literal tokens
-  are rejected. The endpoint is the host-controlled `https://api.plane.so` default.
+  Routed V1 config sets `tracker.provider.api_key: $PLANE_API_KEY_FERDI` and declares the runtime
+  principal in `provider_project_contract.runtime_principal`. Its stable Plane user ID is
+  `920272c2-862e-4592-b13e-b0ba11c91b12`, its principal kind is `api_key`, its project relation
+  is `contributor`, and its required grants are `workitem:view` and `workitem:edit`. The human
+  operator/admin credential uses `PLANE_API_KEY_JC`; Symphony rejects it as a runtime credential.
+  Its current login/display name is `bigbrainbusiness90`, which is descriptive only. Symphony
+  identifies the runtime principal by the stable user ID.
+  The API key stays in the host environment. Literal tokens are rejected in workflow config, and
+  the endpoint is the host-controlled `https://api.plane.so` default.
+- `runtime_principal` belongs in the YAML front matter parsed by `SymphonyElixir.Config`, alongside
+  the complete project contract and state mappings. Symphony resolves the configured key, checks
+  Plane's live user identity and project permissions before startup reconciliation can make
+  autonomous dispatch ready, and repeats that check before a controlled lifecycle mutation.
+  Missing or malformed provider evidence keeps autonomous authority closed. Neither login/display
+  names nor `providers.env` select the runtime identity.
+- Required front-matter fields:
+
+  ```yaml
+  tracker:
+    provider:
+      api_key: $PLANE_API_KEY_FERDI
+  provider_project_contract:
+    runtime_principal:
+      api_key_env: PLANE_API_KEY_FERDI
+      user_id: 920272c2-862e-4592-b13e-b0ba11c91b12
+      principal_kind: api_key
+      project_relation: contributor
+      required_permissions:
+        - workitem:view
+        - workitem:edit
+  ```
+
+  These fields supplement the full Plane project contract, including its stable scope and state
+  mappings. Set `PLANE_API_KEY_FERDI` only in the host environment. Both Plane API keys are kept
+  out of Codex child processes.
 - The current routed Plane capability set includes `current_issue_refresh`, `dependency_graph`,
   `dependency_completeness`, `controlled_transition`, `transition_verification`,
   `agent_read_tools`, and `agent_transition_tools`. `conditional_transition` remains unsupported.

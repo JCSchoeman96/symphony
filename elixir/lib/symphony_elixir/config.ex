@@ -10,6 +10,10 @@ defmodule SymphonyElixir.Config do
   alias SymphonyElixir.Workflow
   alias SymphonyElixir.WorkflowStore
 
+  @plane_runtime_api_key_env "PLANE_API_KEY_FERDI"
+  @plane_runtime_user_id "920272c2-862e-4592-b13e-b0ba11c91b12"
+  @plane_runtime_permissions ["workitem:view", "workitem:edit"]
+
   @default_prompt_template """
   You are working on an issue from the configured tracker.
 
@@ -221,6 +225,7 @@ defmodule SymphonyElixir.Config do
     else
       with :ok <- Tracker.validate_config(settings.tracker),
            :ok <- validate_plane_runtime_mode(settings),
+           :ok <- validate_plane_runtime_principal(settings),
            :ok <- Tracker.validate_routed_capabilities(settings),
            :ok <- Schema.validate_source_control(settings),
            :ok <- Schema.validate_routed_turn_sandbox_policy(settings),
@@ -234,6 +239,36 @@ defmodule SymphonyElixir.Config do
     do: {:error, :plane_legacy_routing_unsupported}
 
   defp validate_plane_runtime_mode(_settings), do: :ok
+
+  defp validate_plane_runtime_principal(%{
+         tracker: %{
+           kind: "plane",
+           runtime_principal:
+             %{
+               api_key_env: @plane_runtime_api_key_env,
+               user_id: @plane_runtime_user_id,
+               principal_kind: "api_key",
+               project_relation: "contributor",
+               required_permissions: @plane_runtime_permissions
+             } = policy,
+           provider: provider
+         },
+         agent: %{routing: "routed"}
+       }) do
+    if Map.get(provider, "api_key", Map.get(provider, :api_key)) == "$" <> policy.api_key_env do
+      :ok
+    else
+      {:error, :invalid_plane_runtime_credential_reference}
+    end
+  end
+
+  defp validate_plane_runtime_principal(%{
+         tracker: %{kind: "plane"},
+         agent: %{routing: "routed"}
+       }),
+       do: {:error, :plane_runtime_principal_policy_required}
+
+  defp validate_plane_runtime_principal(_settings), do: :ok
 
   defp format_config_error(reason) do
     case reason do

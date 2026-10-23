@@ -24,8 +24,15 @@ defmodule SymphonyElixir.PlaneAdapterTest do
     kind: "plane",
     api_key: "secret",
     endpoint: "https://api.plane.so",
-    provider: %{"workspace_slug" => "workspace-1", "workspace_id" => "workspace-stable-1", "project_id" => "project-1", "api_key" => "$PLANE_API_KEY"},
-    secret_environment_names: ["PLANE_API_KEY"]
+    provider: %{"workspace_slug" => "workspace-1", "workspace_id" => "workspace-stable-1", "project_id" => "project-1", "api_key" => "$PLANE_API_KEY_FERDI"},
+    secret_environment_names: ["PLANE_API_KEY_FERDI"],
+    runtime_principal: %{
+      api_key_env: "PLANE_API_KEY_FERDI",
+      user_id: "920272c2-862e-4592-b13e-b0ba11c91b12",
+      principal_kind: "api_key",
+      project_relation: "contributor",
+      required_permissions: ["workitem:view", "workitem:edit"]
+    }
   }
 
   test "declares the graduated host capabilities" do
@@ -40,7 +47,13 @@ defmodule SymphonyElixir.PlaneAdapterTest do
            ]
 
     assert {:ok, Adapter.capabilities()} == Capabilities.validate_adapter(Adapter)
-    assert Adapter.secret_environment_names(@settings) == ["PLANE_API_KEY", "PLANE_WEBHOOK_SECRET"]
+
+    assert Adapter.secret_environment_names(@settings) == [
+             "PLANE_API_KEY",
+             "PLANE_API_KEY_FERDI",
+             "PLANE_API_KEY_JC",
+             "PLANE_WEBHOOK_SECRET"
+           ]
   end
 
   test "forwards semantic Plane tool callbacks without exposing provider scope" do
@@ -425,7 +438,9 @@ defmodule SymphonyElixir.PlaneAdapterTest do
       end
     end
 
-    assert {:ok, snapshot} = Adapter.fetch_project_snapshot_for_test(@settings, request_fun)
+    assert {:ok, snapshot} =
+             Adapter.fetch_project_snapshot_for_test(@settings, authenticated_request_fun(request_fun))
+
     assert snapshot.provider == :plane
     assert snapshot.workspace_id == "workspace-stable-1"
     assert snapshot.project_id == "project-1"
@@ -473,10 +488,10 @@ defmodule SymphonyElixir.PlaneAdapterTest do
                :in_progress,
                @settings,
                contract,
-               fn request ->
+               authenticated_request_fun(fn request ->
                  send(parent, {:request, request})
                  {:ok, %{status: 204, body: nil}}
-               end
+               end)
              )
 
     assert_receive {:request, %{method: :patch, body: %{"state" => "state-in_progress"}}}
@@ -506,10 +521,11 @@ defmodule SymphonyElixir.PlaneAdapterTest do
                tracker_settings: @settings,
                provider_project_contract: contract,
                provider_mutation_envelope: envelope,
-               request_fun: fn request ->
-                 send(parent, {:request, request})
-                 {:ok, %{status: 204}}
-               end
+               request_fun:
+                 authenticated_request_fun(fn request ->
+                   send(parent, {:request, request})
+                   {:ok, %{status: 204}}
+                 end)
              )
 
     assert_received {:request, %{method: :patch, body: %{"state" => "state-in_progress"}}}
@@ -613,28 +629,31 @@ defmodule SymphonyElixir.PlaneAdapterTest do
 
   test "rejects a snapshot with states from multiple workspaces" do
     assert {:error, :wrong_project} =
-             Adapter.fetch_project_snapshot_for_test(@settings, fn request ->
-               case request.path do
-                 "/api/v1/workspaces/workspace-1/projects/project-1/" ->
-                   {:ok, %{status: 200, body: %{"id" => "project-1", "workspace" => "workspace-stable-1"}}}
+             Adapter.fetch_project_snapshot_for_test(
+               @settings,
+               authenticated_request_fun(fn request ->
+                 case request.path do
+                   "/api/v1/workspaces/workspace-1/projects/project-1/" ->
+                     {:ok, %{status: 200, body: %{"id" => "project-1", "workspace" => "workspace-stable-1"}}}
 
-                 _states_path ->
-                   {:ok,
-                    %{
-                      status: 200,
-                      body: %{
-                        "results" => [
-                          %{"id" => "state-1", "name" => "Ready", "group" => "unstarted", "project" => "project-1", "workspace" => "workspace-stable-1"},
-                          %{"id" => "state-2", "name" => "Done", "group" => "completed", "project" => "project-1", "workspace" => "workspace-other"}
-                        ],
-                        "count" => 2,
-                        "total_results" => 2,
-                        "next_page_results" => false,
-                        "next_cursor" => nil
-                      }
-                    }}
-               end
-             end)
+                   _states_path ->
+                     {:ok,
+                      %{
+                        status: 200,
+                        body: %{
+                          "results" => [
+                            %{"id" => "state-1", "name" => "Ready", "group" => "unstarted", "project" => "project-1", "workspace" => "workspace-stable-1"},
+                            %{"id" => "state-2", "name" => "Done", "group" => "completed", "project" => "project-1", "workspace" => "workspace-other"}
+                          ],
+                          "count" => 2,
+                          "total_results" => 2,
+                          "next_page_results" => false,
+                          "next_cursor" => nil
+                        }
+                      }}
+                 end
+               end)
+             )
   end
 
   defp contract do
@@ -653,11 +672,41 @@ defmodule SymphonyElixir.PlaneAdapterTest do
         provider: :plane,
         workspace_id: "workspace-stable-1",
         project_id: "project-1",
+        runtime_principal: @settings.runtime_principal,
         state_mappings: state_mappings,
         dependency_relation_semantics: %{blocked_by: :blocked_by, blocking: :blocking}
       })
 
     contract
+  end
+
+  defp authenticated_request_fun(request_fun) do
+    fn request ->
+      case request.path do
+        "/api/v2/users/me/" ->
+          {:ok,
+           %{
+             status: 200,
+             body: %{
+               "id" => @settings.runtime_principal.user_id,
+               "principal_kind" => "api_key"
+             }
+           }}
+
+        "/api/v2/workspaces/workspace-1/projects/project-1/permissions/me/" ->
+          {:ok,
+           %{
+             status: 200,
+             body: %{
+               "relation" => "contributor",
+               "permission_grants" => ["workitem:view", "workitem:edit"]
+             }
+           }}
+
+        _other_path ->
+          request_fun.(request)
+      end
+    end
   end
 
   defp merge_route do
@@ -672,15 +721,18 @@ defmodule SymphonyElixir.PlaneAdapterTest do
           %{"id" => "other-project", "name" => "Project"}
         ] do
       assert {:error, :wrong_project} =
-               Adapter.fetch_project_snapshot_for_test(@settings, fn request ->
-                 case request.path do
-                   "/api/v1/workspaces/workspace-1/projects/project-1/" ->
-                     {:ok, %{status: 200, body: project}}
+               Adapter.fetch_project_snapshot_for_test(
+                 @settings,
+                 authenticated_request_fun(fn request ->
+                   case request.path do
+                     "/api/v1/workspaces/workspace-1/projects/project-1/" ->
+                       {:ok, %{status: 200, body: project}}
 
-                   _states_path ->
-                     {:ok, %{status: 200, body: %{"results" => [], "count" => 0, "total_results" => 0, "next_page_results" => false}}}
-                 end
-               end)
+                     _states_path ->
+                       {:ok, %{status: 200, body: %{"results" => [], "count" => 0, "total_results" => 0, "next_page_results" => false}}}
+                   end
+                 end)
+               )
     end
   end
 
@@ -691,7 +743,80 @@ defmodule SymphonyElixir.PlaneAdapterTest do
           %{"id" => "state-1", "name" => "Ready", "group" => "unstarted", "project" => "project-1"}
         ] do
       assert {:error, reason} =
-               Adapter.fetch_project_snapshot_for_test(@settings, fn request ->
+               Adapter.fetch_project_snapshot_for_test(
+                 @settings,
+                 authenticated_request_fun(fn request ->
+                   case request.path do
+                     "/api/v1/workspaces/workspace-1/projects/project-1/" ->
+                       {:ok, %{status: 200, body: %{"id" => "project-1", "name" => "Project"}}}
+
+                     _states_path ->
+                       {:ok,
+                        %{
+                          status: 200,
+                          body: %{
+                            "results" => [state],
+                            "count" => 1,
+                            "total_results" => 1,
+                            "next_page_results" => false,
+                            "next_cursor" => nil
+                          }
+                        }}
+                   end
+                 end)
+               )
+
+      assert reason in [:wrong_project, {:provider_malformed, {:missing_scope, :workspace_id}}]
+    end
+  end
+
+  test "does not accept same descriptive names or slugs with different stable IDs" do
+    assert {:error, :wrong_project} =
+             Adapter.fetch_project_snapshot_for_test(
+               @settings,
+               authenticated_request_fun(fn request ->
+                 case request.path do
+                   "/api/v1/workspaces/workspace-1/projects/project-1/" ->
+                     {:ok,
+                      %{
+                        status: 200,
+                        body: %{
+                          "id" => "project-1",
+                          "name" => "Project",
+                          "workspace_slug" => "workspace-1"
+                        }
+                      }}
+
+                   _states_path ->
+                     {:ok,
+                      %{
+                        status: 200,
+                        body: %{
+                          "results" => [
+                            %{
+                              "id" => "state-1",
+                              "name" => "Ready",
+                              "group" => "unstarted",
+                              "project" => %{"id" => "project-1", "name" => "Project"},
+                              "workspace" => %{"id" => "workspace-recreated", "slug" => "workspace-1", "name" => "Workspace"}
+                            }
+                          ],
+                          "count" => 1,
+                          "total_results" => 1,
+                          "next_page_results" => false,
+                          "next_cursor" => nil
+                        }
+                      }}
+                 end
+               end)
+             )
+  end
+
+  test "does not claim a complete snapshot without provider workspace evidence" do
+    assert {:error, :snapshot_incomplete} =
+             Adapter.fetch_project_snapshot_for_test(
+               @settings,
+               authenticated_request_fun(fn request ->
                  case request.path do
                    "/api/v1/workspaces/workspace-1/projects/project-1/" ->
                      {:ok, %{status: 200, body: %{"id" => "project-1", "name" => "Project"}}}
@@ -701,111 +826,50 @@ defmodule SymphonyElixir.PlaneAdapterTest do
                       %{
                         status: 200,
                         body: %{
-                          "results" => [state],
-                          "count" => 1,
-                          "total_results" => 1,
+                          "results" => [],
+                          "count" => 0,
+                          "total_results" => 0,
                           "next_page_results" => false,
                           "next_cursor" => nil
                         }
                       }}
                  end
                end)
-
-      assert reason in [:wrong_project, {:provider_malformed, {:missing_scope, :workspace_id}}]
-    end
-  end
-
-  test "does not accept same descriptive names or slugs with different stable IDs" do
-    assert {:error, :wrong_project} =
-             Adapter.fetch_project_snapshot_for_test(@settings, fn request ->
-               case request.path do
-                 "/api/v1/workspaces/workspace-1/projects/project-1/" ->
-                   {:ok,
-                    %{
-                      status: 200,
-                      body: %{
-                        "id" => "project-1",
-                        "name" => "Project",
-                        "workspace_slug" => "workspace-1"
-                      }
-                    }}
-
-                 _states_path ->
-                   {:ok,
-                    %{
-                      status: 200,
-                      body: %{
-                        "results" => [
-                          %{
-                            "id" => "state-1",
-                            "name" => "Ready",
-                            "group" => "unstarted",
-                            "project" => %{"id" => "project-1", "name" => "Project"},
-                            "workspace" => %{"id" => "workspace-recreated", "slug" => "workspace-1", "name" => "Workspace"}
-                          }
-                        ],
-                        "count" => 1,
-                        "total_results" => 1,
-                        "next_page_results" => false,
-                        "next_cursor" => nil
-                      }
-                    }}
-               end
-             end)
-  end
-
-  test "does not claim a complete snapshot without provider workspace evidence" do
-    assert {:error, :snapshot_incomplete} =
-             Adapter.fetch_project_snapshot_for_test(@settings, fn request ->
-               case request.path do
-                 "/api/v1/workspaces/workspace-1/projects/project-1/" ->
-                   {:ok, %{status: 200, body: %{"id" => "project-1", "name" => "Project"}}}
-
-                 _states_path ->
-                   {:ok,
-                    %{
-                      status: 200,
-                      body: %{
-                        "results" => [],
-                        "count" => 0,
-                        "total_results" => 0,
-                        "next_page_results" => false,
-                        "next_cursor" => nil
-                      }
-                    }}
-               end
-             end)
+             )
   end
 
   test "uses provider project workspace evidence when the project has no states" do
     assert {:ok, snapshot} =
-             Adapter.fetch_project_snapshot_for_test(@settings, fn request ->
-               case request.path do
-                 "/api/v1/workspaces/workspace-1/projects/project-1/" ->
-                   {:ok,
-                    %{
-                      status: 200,
-                      body: %{
-                        "id" => "project-1",
-                        "name" => "Project",
-                        "workspace" => "workspace-stable-1"
-                      }
-                    }}
+             Adapter.fetch_project_snapshot_for_test(
+               @settings,
+               authenticated_request_fun(fn request ->
+                 case request.path do
+                   "/api/v1/workspaces/workspace-1/projects/project-1/" ->
+                     {:ok,
+                      %{
+                        status: 200,
+                        body: %{
+                          "id" => "project-1",
+                          "name" => "Project",
+                          "workspace" => "workspace-stable-1"
+                        }
+                      }}
 
-                 _states_path ->
-                   {:ok,
-                    %{
-                      status: 200,
-                      body: %{
-                        "results" => [],
-                        "count" => 0,
-                        "total_results" => 0,
-                        "next_page_results" => false,
-                        "next_cursor" => nil
-                      }
-                    }}
-               end
-             end)
+                   _states_path ->
+                     {:ok,
+                      %{
+                        status: 200,
+                        body: %{
+                          "results" => [],
+                          "count" => 0,
+                          "total_results" => 0,
+                          "next_page_results" => false,
+                          "next_cursor" => nil
+                        }
+                      }}
+                 end
+               end)
+             )
 
     assert snapshot.workspace_id == "workspace-stable-1"
     assert snapshot.completeness == :complete
@@ -924,24 +988,27 @@ defmodule SymphonyElixir.PlaneAdapterTest do
              end)
 
     assert {:error, {:provider_malformed, :invalid_group}} =
-             Adapter.fetch_project_snapshot_for_test(@settings, fn request ->
-               case request.path do
-                 "/api/v1/workspaces/workspace-1/projects/project-1/" ->
-                   {:ok, %{status: 200, body: %{"id" => "project-1", "workspace" => %{"slug" => "workspace-1"}}}}
+             Adapter.fetch_project_snapshot_for_test(
+               @settings,
+               authenticated_request_fun(fn request ->
+                 case request.path do
+                   "/api/v1/workspaces/workspace-1/projects/project-1/" ->
+                     {:ok, %{status: 200, body: %{"id" => "project-1", "workspace" => %{"slug" => "workspace-1"}}}}
 
-                 _states_path ->
-                   {:ok,
-                    %{
-                      status: 200,
-                      body: %{
-                        "results" => [%{"id" => "state-1", "name" => "Ready", "group" => "unknown", "project" => "project-1", "workspace" => "workspace-stable-1"}],
-                        "count" => 1,
-                        "total_results" => 1,
-                        "next_page_results" => false
-                      }
-                    }}
-               end
-             end)
+                   _states_path ->
+                     {:ok,
+                      %{
+                        status: 200,
+                        body: %{
+                          "results" => [%{"id" => "state-1", "name" => "Ready", "group" => "unknown", "project" => "project-1", "workspace" => "workspace-stable-1"}],
+                          "count" => 1,
+                          "total_results" => 1,
+                          "next_page_results" => false
+                        }
+                      }}
+                 end
+               end)
+             )
   end
 
   test "supports contract scope fallback and string-keyed tracker settings" do

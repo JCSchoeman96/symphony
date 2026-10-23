@@ -4,12 +4,14 @@ defmodule SymphonyElixir.Plane.Adapter do
   @behaviour SymphonyElixir.Tracker
 
   alias SymphonyElixir.Config
-  alias SymphonyElixir.Plane.{AgentTool, Client, DependencyReader, StateProjection}
+  alias SymphonyElixir.Plane.{AgentTool, Client, DependencyReader, RuntimePrincipal, StateProjection}
   alias SymphonyElixir.Tracker.Capabilities
   alias SymphonyElixir.Tracker.Issue
   alias SymphonyElixir.WorkControl.{ProviderMutationEnvelope, ProviderProjectContract}
 
   @plane_api_key_env "PLANE_API_KEY"
+  @plane_runtime_api_key_env "PLANE_API_KEY_FERDI"
+  @plane_operator_api_key_env "PLANE_API_KEY_JC"
   @plane_webhook_secret_env "PLANE_WEBHOOK_SECRET"
 
   @spec capabilities() :: [Capabilities.capability()]
@@ -102,7 +104,13 @@ defmodule SymphonyElixir.Plane.Adapter do
          :ok <- validate_work_item_scope(Keyword.get(opts, :pre_observation), config, work_item_id),
          :ok <- validate_mutation_envelope(opts, contract, work_item_id, requested_to),
          {:ok, mapping} <- ProviderProjectContract.provider_mapping_for(contract, requested_to),
-         :ok <- validate_target_mapping(mapping, contract, requested_to) do
+         :ok <- validate_target_mapping(mapping, contract, requested_to),
+         {:ok, _runtime_principal} <-
+           verify_runtime_principal(
+             config,
+             contract.runtime_principal,
+             runtime_principal_request_opts(Keyword.get(opts, :request_fun), opts)
+           ) do
       Client.update_work_item_state(
         config,
         work_item_id,
@@ -149,6 +157,8 @@ defmodule SymphonyElixir.Plane.Adapter do
 
     [
       @plane_api_key_env,
+      @plane_runtime_api_key_env,
+      @plane_operator_api_key_env,
       @plane_webhook_secret_env
       | configured ++ env_reference_names([provider_value(provider, "api_key")])
     ]
@@ -255,6 +265,12 @@ defmodule SymphonyElixir.Plane.Adapter do
 
     with :ok <- validate_config(tracker_settings),
          {:ok, config} <- client_config(tracker_settings),
+         {:ok, runtime_principal} <-
+           verify_runtime_principal(
+             config,
+             setting(tracker_settings, :runtime_principal),
+             runtime_principal_request_opts(request_fun, opts)
+           ),
          {:ok, raw_project} <- Client.get_project(config, Keyword.put(client_opts, :class, :control)),
          {:ok, project} <- StateProjection.project_project(raw_project),
          :ok <- validate_project_scope(project, config),
@@ -271,6 +287,7 @@ defmodule SymphonyElixir.Plane.Adapter do
          project_identifier: project.identifier,
          project_description: project.description,
          states: states,
+         runtime_principal: runtime_principal,
          dependency_relation_semantics: %{blocked_by: :blocked_by, blocking: :blocking},
          capability_statuses: capability_statuses(),
          completeness: :complete
@@ -389,8 +406,7 @@ defmodule SymphonyElixir.Plane.Adapter do
 
   defp configured_api_key(tracker_settings) do
     Map.get(tracker_settings, :api_key) ||
-      Map.get(tracker_settings, "api_key") ||
-      System.get_env(@plane_api_key_env)
+      Map.get(tracker_settings, "api_key")
   end
 
   defp validate_client_config(base_url, workspace_slug, workspace_id, project_id, api_key) do
@@ -421,23 +437,66 @@ defmodule SymphonyElixir.Plane.Adapter do
 
   defp validate_credential_reference(tracker_settings) do
     provider = provider_settings(tracker_settings)
+    policy = setting(tracker_settings, :runtime_principal)
+    reference = provider_value(provider, "api_key")
 
-    case provider_value(provider, "api_key") do
-      nil ->
-        configured = Map.get(tracker_settings, :api_key, Map.get(tracker_settings, "api_key"))
-        names = Map.get(tracker_settings, :secret_environment_names, [])
-
-        if is_nil(configured) or @plane_api_key_env in names,
-          do: :ok,
-          else: {:error, :literal_plane_api_key_forbidden}
-
-      "$" <> env_name ->
-        if env_name == @plane_api_key_env, do: :ok, else: {:error, :invalid_plane_api_key_reference}
-
-      _literal ->
-        {:error, :literal_plane_api_key_forbidden}
+    case policy do
+      nil -> validate_legacy_credential_reference(tracker_settings, reference)
+      _ -> validate_policy_credential_reference(policy, reference)
     end
   end
+
+  defp validate_policy_credential_reference(%{api_key_env: expected_env}, "$" <> env_name)
+       when is_binary(expected_env) do
+    if env_name == expected_env, do: :ok, else: {:error, :invalid_plane_api_key_reference}
+  end
+
+  defp validate_policy_credential_reference(_policy, nil),
+    do: {:error, :missing_plane_api_key_reference}
+
+  defp validate_policy_credential_reference(_policy, "$" <> _env_name),
+    do: {:error, :invalid_plane_api_key_reference}
+
+  defp validate_policy_credential_reference(_policy, _literal),
+    do: {:error, :literal_plane_api_key_forbidden}
+
+  defp validate_legacy_credential_reference(_settings, "$" <> @plane_api_key_env), do: :ok
+  defp validate_legacy_credential_reference(_settings, "$" <> @plane_runtime_api_key_env), do: :ok
+
+  defp validate_legacy_credential_reference(settings, nil) do
+    configured = Map.get(settings, :api_key, Map.get(settings, "api_key"))
+    names = Map.get(settings, :secret_environment_names, [])
+
+    if is_nil(configured) or @plane_api_key_env in names,
+      do: :ok,
+      else: {:error, :literal_plane_api_key_forbidden}
+  end
+
+  defp validate_legacy_credential_reference(_settings, "$" <> _env_name),
+    do: {:error, :invalid_plane_api_key_reference}
+
+  defp validate_legacy_credential_reference(_settings, _literal),
+    do: {:error, :literal_plane_api_key_forbidden}
+
+  defp verify_runtime_principal(config, policy, opts) when is_map(policy) do
+    RuntimePrincipal.verify(config, policy, opts)
+  end
+
+  defp verify_runtime_principal(_config, _policy, _opts),
+    do: {:error, :runtime_principal_policy_required}
+
+  defp runtime_principal_request_opts(request_fun, opts) do
+    opts
+    |> Keyword.take([:request_metrics, :scheduler])
+    |> Keyword.put(:class, :control)
+    |> Keyword.merge(request_opts(request_fun))
+  end
+
+  defp setting(map, key) when is_map(map) do
+    Map.get(map, key, Map.get(map, Atom.to_string(key)))
+  end
+
+  defp setting(_map, _key), do: nil
 
   defp validate_endpoint_setting(tracker_settings) do
     provider = provider_settings(tracker_settings)
@@ -529,8 +588,14 @@ defmodule SymphonyElixir.Plane.Adapter do
   defp contract_from_settings(_settings), do: nil
 
   defp bind_contract_scope(settings, %ProviderProjectContract{} = contract) when is_map(settings) do
-    case Map.get(settings, :provider_project_contract, Map.get(settings, "provider_project_contract")) do
-      nil -> Map.put(settings, :provider_project_contract, contract)
+    settings =
+      case Map.get(settings, :provider_project_contract, Map.get(settings, "provider_project_contract")) do
+        nil -> Map.put(settings, :provider_project_contract, contract)
+        _existing -> settings
+      end
+
+    case setting(settings, :runtime_principal) do
+      nil when is_map(contract.runtime_principal) -> Map.put(settings, :runtime_principal, contract.runtime_principal)
       _existing -> settings
     end
   end
