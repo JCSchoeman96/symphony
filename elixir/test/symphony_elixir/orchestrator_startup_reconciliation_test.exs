@@ -97,6 +97,19 @@ defmodule SymphonyElixir.OrchestratorStartupReconciliationTest do
     Path.join(Path.dirname(workspace_root), "#{Path.basename(workspace_root)}-ownership-ledger")
   end
 
+  defp stop_process_safely(pid) do
+    GenServer.stop(pid)
+  catch
+    :exit, {:noproc, _reason} -> :ok
+  end
+
+  test "cleanup tolerates a process that exited before teardown" do
+    {:ok, pid} = Agent.start_link(fn -> :ready end)
+
+    assert :ok = Agent.stop(pid)
+    assert :ok = stop_process_safely(pid)
+  end
+
   test "startup stays pending and preserves terminal workspaces until reconciliation" do
     workspace_root =
       Path.join(System.tmp_dir!(), "symphony-h060b-startup-#{System.unique_integer([:positive])}")
@@ -897,7 +910,7 @@ defmodule SymphonyElixir.OrchestratorStartupReconciliationTest do
       )
 
     on_exit(fn ->
-      if Process.alive?(pid), do: GenServer.stop(pid)
+      stop_process_safely(pid)
       File.rm_rf(workspace_root)
       File.rm_rf(ledger_root)
     end)
