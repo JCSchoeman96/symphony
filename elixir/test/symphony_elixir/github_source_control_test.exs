@@ -520,6 +520,45 @@ defmodule SymphonyElixir.GitHub.SourceControlTest do
              )
   end
 
+  test "synthetic merge checks parse timestamped checkout lines from the HTTP job-log path" do
+    config =
+      Map.put(@config, :required_checks, [
+        %{context: "make-all", app_id: 15_368, subject: "synthetic_merge"}
+      ])
+
+    candidate_ref = candidate_ref()
+    sha_merge = String.duplicate("9", 40)
+
+    assert :ok =
+             SourceControl.verify_required_checks(
+               config,
+               candidate_ref,
+               @tree,
+               synthetic_merge_github_http_request_opts(
+                 sha_merge,
+                 checkout_log: timestamped_checkout_log(sha_merge, @tree)
+               )
+             )
+  end
+
+  test "synthetic merge checks fail closed when the HTTP job-log request fails" do
+    config =
+      Map.put(@config, :required_checks, [
+        %{context: "make-all", app_id: 15_368, subject: "synthetic_merge"}
+      ])
+
+    candidate_ref = candidate_ref()
+    sha_merge = String.duplicate("9", 40)
+
+    assert {:error, {:github_status, 503}} =
+             SourceControl.verify_required_checks(
+               config,
+               candidate_ref,
+               @tree,
+               synthetic_merge_github_http_request_opts(sha_merge, log_status: 503)
+             )
+  end
+
   test "synthetic merge checks list workflow runs at PR head, not merge ref SHA" do
     config =
       Map.put(@config, :required_checks, [
@@ -622,6 +661,72 @@ defmodule SymphonyElixir.GitHub.SourceControlTest do
                  ) || base_github_payload().(path)
                end)
              )
+  end
+
+  test "synthetic merge checks fail closed when evidence jobs are absent or malformed" do
+    config =
+      Map.put(@config, :required_checks, [
+        %{context: "make-all", app_id: 15_368, subject: "synthetic_merge"}
+      ])
+
+    candidate_ref = candidate_ref()
+    sha_merge = String.duplicate("9", 40)
+
+    for jobs_payload <- [%{"jobs" => []}, %{"jobs" => "malformed"}, %{"jobs" => [nil]}] do
+      assert {:error, :synthetic_checkout_evidence_missing} =
+               SourceControl.verify_required_checks(
+                 config,
+                 candidate_ref,
+                 @tree,
+                 synthetic_merge_github_request_opts(sha_merge, jobs_payload: jobs_payload)
+               )
+    end
+  end
+
+  test "synthetic merge checks fail closed when the bound workflow run has no ID" do
+    config =
+      Map.put(@config, :required_checks, [
+        %{context: "make-all", app_id: 15_368, subject: "synthetic_merge"}
+      ])
+
+    candidate_ref = candidate_ref()
+    sha_merge = String.duplicate("9", 40)
+    workflow_runs = update_in(workflow_runs_payload(@sha_b), ["workflow_runs", Access.at(0)], &Map.delete(&1, "id"))
+
+    assert {:error, :synthetic_checkout_evidence_missing} =
+             SourceControl.verify_required_checks(
+               config,
+               candidate_ref,
+               @tree,
+               synthetic_merge_github_request_opts(sha_merge, workflow_runs_payload: workflow_runs)
+             )
+  end
+
+  test "synthetic merge checks fail closed when checkout steps or logs are malformed" do
+    config =
+      Map.put(@config, :required_checks, [
+        %{context: "make-all", app_id: 15_368, subject: "synthetic_merge"}
+      ])
+
+    candidate_ref = candidate_ref()
+    sha_merge = String.duplicate("9", 40)
+    jobs_payload = workflow_jobs_payload()
+    jobs_without_step = put_in(jobs_payload, ["jobs", Access.at(0), "steps"], [])
+    jobs_without_id = update_in(jobs_payload, ["jobs", Access.at(0)], &Map.delete(&1, "id"))
+
+    for opts <- [
+          [jobs_payload: jobs_without_step],
+          [jobs_payload: jobs_without_id],
+          [checkout_log: %{"unexpected" => "non-text response"}]
+        ] do
+      assert {:error, :synthetic_checkout_evidence_missing} =
+               SourceControl.verify_required_checks(
+                 config,
+                 candidate_ref,
+                 @tree,
+                 synthetic_merge_github_request_opts(sha_merge, opts)
+               )
+    end
   end
 
   test "synthetic merge checks require workflow execution evidence at PR head" do
@@ -926,6 +1031,46 @@ defmodule SymphonyElixir.GitHub.SourceControlTest do
     else
       synthetic_merge_github_json(path, sha_merge)
     end
+  end
+
+  defp synthetic_merge_github_request_opts(sha_merge, opts) do
+    request_opts(fn path ->
+      cond do
+        workflow_run_jobs_path?(path) ->
+          Keyword.get(opts, :jobs_payload, workflow_jobs_payload())
+
+        job_logs_path?(path) ->
+          Keyword.get(opts, :checkout_log, synthetic_checkout_log(sha_merge, @tree))
+
+        String.contains?(path, "/actions/runs") ->
+          Keyword.get(opts, :workflow_runs_payload, workflow_runs_payload(@sha_b))
+
+        true ->
+          synthetic_merge_github_response(path, sha_merge) || base_github_payload().(path)
+      end
+    end)
+  end
+
+  defp synthetic_merge_github_http_request_opts(sha_merge, opts) do
+    [
+      token: "token",
+      http_request: fn url, _headers ->
+        path = URI.parse(url).path
+
+        if job_logs_path?(path) do
+          case Keyword.get(opts, :log_status, 200) do
+            200 ->
+              {:ok, %{status: 200, body: Keyword.fetch!(opts, :checkout_log)}}
+
+            status ->
+              {:ok, %{status: status, body: nil}}
+          end
+        else
+          body = synthetic_merge_github_response(path, sha_merge) || base_github_payload().(path)
+          {:ok, %{status: 200, body: body}}
+        end
+      end
+    ]
   end
 
   defp synthetic_merge_github_json(path, sha_merge) do
