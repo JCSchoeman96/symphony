@@ -788,6 +788,12 @@ For every required CI result retained in H-100 evidence, capture:
 
 For `make-all`, retain the workflow's existing exact `HEAD`/tree/subject logging and `HEAD == GITHUB_SHA` assertion. If `GITHUB_SHA` is a GitHub synthetic merge, do not relabel it as head evidence. The configured source-control check subject must correspond to what was actually checked.
 
+Symphony's GitHub adapter treats these as separate facts for `synthetic_merge` required checks:
+
+- check-run records may attach to the PR head SHA;
+- workflow execution must be proven on the validated synthetic merge SHA via Actions workflow-run evidence;
+- a green check on the head alone is insufficient when the configured subject is `synthetic_merge`.
+
 For `validate-pr-description`, retain its exact check identity and candidate binding required by the frozen policy.
 
 ## 7.4 Terminal classification

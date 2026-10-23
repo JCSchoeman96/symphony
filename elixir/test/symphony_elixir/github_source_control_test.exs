@@ -502,8 +502,53 @@ defmodule SymphonyElixir.GitHub.SourceControlTest do
                    String.contains?(path, "/check-runs") ->
                      %{
                        "total_count" => 1,
+                       "check_runs" => [check_run("make-all", "success", workflow_run_id: 42_001)]
+                     }
+
+                   String.contains?(path, "/actions/runs") ->
+                     workflow_runs_payload(sha_merge, 42_001)
+
+                   true ->
+                     base_github_payload().(path)
+                 end
+               end)
+             )
+  end
+
+  test "synthetic merge checks require workflow execution evidence on the merge ref" do
+    config =
+      Map.put(@config, :required_checks, [
+        %{context: "make-all", app_id: 15_368, subject: "synthetic_merge"}
+      ])
+
+    candidate_ref = candidate_ref()
+    sha_merge = String.duplicate("9", 40)
+
+    assert {:error, :synthetic_execution_evidence_missing} =
+             SourceControl.verify_required_checks(
+               config,
+               candidate_ref,
+               @tree,
+               request_opts(fn path ->
+                 cond do
+                   String.contains?(path, "/pulls/15") ->
+                     open_pull(15, %{"merge_commit_sha" => sha_merge})
+
+                   String.contains?(path, "/git/commits/" <> sha_merge) ->
+                     %{
+                       "sha" => sha_merge,
+                       "tree" => %{"sha" => @tree},
+                       "parents" => [%{"sha" => @sha_a}, %{"sha" => @sha_b}]
+                     }
+
+                   String.contains?(path, "/check-runs") ->
+                     %{
+                       "total_count" => 1,
                        "check_runs" => [check_run("make-all", "success")]
                      }
+
+                   String.contains?(path, "/actions/runs") ->
+                     %{"total_count" => 0, "workflow_runs" => []}
 
                    true ->
                      base_github_payload().(path)
@@ -709,13 +754,41 @@ defmodule SymphonyElixir.GitHub.SourceControlTest do
     end
   end
 
-  defp check_run(name, conclusion) do
+  defp check_run(name, conclusion, opts \\ []) do
+    workflow_run_id = Keyword.get(opts, :workflow_run_id)
+    suite_head_sha = Keyword.get(opts, :suite_head_sha, @sha_b)
+
+    check_suite =
+      %{"head_sha" => suite_head_sha}
+      |> maybe_put_workflow_run(workflow_run_id)
+
     %{
       "name" => name,
       "head_sha" => @sha_b,
       "status" => "completed",
       "conclusion" => conclusion,
-      "app" => %{"id" => 15_368}
+      "app" => %{"id" => 15_368},
+      "check_suite" => check_suite
+    }
+  end
+
+  defp maybe_put_workflow_run(check_suite, nil), do: check_suite
+
+  defp maybe_put_workflow_run(check_suite, workflow_run_id),
+    do: Map.put(check_suite, "workflow_run", %{"id" => workflow_run_id})
+
+  defp workflow_runs_payload(head_sha, workflow_run_id) do
+    %{
+      "total_count" => 1,
+      "workflow_runs" => [
+        %{
+          "id" => workflow_run_id,
+          "head_sha" => head_sha,
+          "status" => "completed",
+          "conclusion" => "success",
+          "event" => "pull_request"
+        }
+      ]
     }
   end
 
