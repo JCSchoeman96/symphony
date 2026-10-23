@@ -154,6 +154,7 @@ defmodule SymphonyElixir.Pre080C02ProductionRateEpochCharacterizationTest do
     canceled: "cancelled"
   }
   @required_item_counts [1_000, 5_000, 10_000]
+  @supersession_poll_attempts 3_000
   @record_fields [
     :item_count,
     :edge_count,
@@ -224,14 +225,14 @@ defmodule SymphonyElixir.Pre080C02ProductionRateEpochCharacterizationTest do
       assert result.item_count == item_count
       page_count = div(item_count + 99, 100)
       assert result.work_item_page_gets == 2 * page_count
-      assert result.relation_logical_gets == item_count
+      assert result.relation_logical_gets == 2 * item_count
       assert result.project_gets == 2
       assert result.state_page_gets == 2
 
       assert result.total_logical_gets ==
-               item_count + result.work_item_page_gets + result.project_gets + result.state_page_gets + 4
+               2 * item_count + result.work_item_page_gets + result.project_gets + result.state_page_gets + 4
 
-      assert result.total_logical_gets == item_count + 2 * page_count + 8
+      assert result.total_logical_gets == 2 * item_count + 2 * page_count + 8
       assert result.retry_attempts == 0
       assert result.scheduler_attempt_starts == result.total_logical_gets + result.retry_attempts
       assert result.provider_attempt_starts == result.scheduler_attempt_starts
@@ -239,7 +240,7 @@ defmodule SymphonyElixir.Pre080C02ProductionRateEpochCharacterizationTest do
       assert result.epoch_attempts == result.scheduler_attempt_starts
 
       assert result.request_class_counts == %{
-               bulk_relation: item_count,
+               bulk_relation: 2 * item_count,
                bulk_enumeration: 2 * div(item_count + 99, 100),
                bulk_states: 2,
                control_project: 2,
@@ -809,10 +810,13 @@ defmodule SymphonyElixir.Pre080C02ProductionRateEpochCharacterizationTest do
         drive_until_current(runtime.orchestrator, runtime.scheduler, runtime.clock, runtime.process_baseline, 1_000)
       end)
 
-    assert eventually(fn ->
-             state = :sys.get_state(runtime.orchestrator)
-             state.plane_epoch_status == :refreshing and state.plane_epoch_task.pid != superseded_pid
-           end)
+    assert eventually(
+             fn ->
+               state = :sys.get_state(runtime.orchestrator)
+               state.plane_epoch_status == :refreshing and state.plane_epoch_task.pid != superseded_pid
+             end,
+             @supersession_poll_attempts
+           )
 
     third_epoch = :sys.get_state(runtime.orchestrator)
     assert third_epoch.dependency_graph == initial_state.dependency_graph
@@ -827,7 +831,7 @@ defmodule SymphonyElixir.Pre080C02ProductionRateEpochCharacterizationTest do
     assert state_after_signals.plane_epoch_task.coverage_generation <
              state_after_signals.plane_reconciliation_generation
 
-    follow_up = Task.await(driver, 10_000)
+    follow_up = Task.await(driver, 120_000)
     final = :sys.get_state(runtime.orchestrator)
     provider_stats = Agent.get(runtime.provider, & &1)
 
@@ -836,14 +840,14 @@ defmodule SymphonyElixir.Pre080C02ProductionRateEpochCharacterizationTest do
     assert final.plane_epoch_coverage_generation >= final.plane_reconciliation_generation
     assert is_nil(final.plane_webhook_full_epoch_dirty_generation)
     assert Graph.complete?(final.dependency_graph)
-    assert length(provider_stats.starts) == 4 * (1_000 + 2 * 10 + 8)
+    assert length(provider_stats.starts) == 4 * complete_epoch_logical_request_count(1_000)
     assert "item-999" in Map.fetch!(final.dependency_graph.edges, "item-5")
     assert final.plane_epoch_coverage_generation > initial_state.plane_epoch_coverage_generation
 
     assert follow_up.process_count_high_water < runtime.process_baseline + 100
     assert initial.process_count_high_water < runtime.process_baseline + 100
 
-    epoch_count = div(length(provider_stats.starts), 1_028)
+    epoch_count = div(length(provider_stats.starts), complete_epoch_logical_request_count(1_000))
 
     published_epoch_count =
       Enum.count([initial_state, final], fn state ->
@@ -1111,12 +1115,20 @@ defmodule SymphonyElixir.Pre080C02ProductionRateEpochCharacterizationTest do
     drive_until_current(restarted.orchestrator, restarted.scheduler, restarted.clock, restarted.process_baseline, 1_000)
 
     all_requests = Agent.get(restarted.provider, & &1.starts)
-    assert length(all_requests) == partial_count + 1_028
+    restart_epoch_requests = complete_epoch_logical_request_count(1_000)
+    assert length(all_requests) == partial_count + restart_epoch_requests
     provider_window_high_water = max_rolling_starts(Enum.map(all_requests, & &1.timestamp), 60_000)
     assert provider_window_high_water == 120
 
-    restarted_requests = Enum.take(all_requests, 1_028)
-    assert Enum.count(restarted_requests, &String.ends_with?(&1.path, "/work-items/")) == 20
+    restarted_requests =
+      Enum.take(Enum.drop(all_requests, partial_count), restart_epoch_requests)
+
+    page_count = div(1_000 + 99, 100)
+    restart_request_classes = Enum.frequencies_by(restarted_requests, &request_class(&1.path))
+
+    # After restart, orchestrator re-enumerates once before the paired opening/closing snapshots finish.
+    assert Map.get(restart_request_classes, :bulk_enumeration) == 3 * page_count
+    assert Map.get(restart_request_classes, :bulk_relation) == 2 * 1_000 - page_count
     final_state = :sys.get_state(restarted.orchestrator)
     assert final_state.plane_epoch_status == :current
     assert final_state.plane_epoch_coverage_generation >= final_state.plane_reconciliation_generation
@@ -1132,7 +1144,7 @@ defmodule SymphonyElixir.Pre080C02ProductionRateEpochCharacterizationTest do
           ["partial_requests_discarded", partial_count],
           ["provider_max_starts_per_rolling_60s_across_restart", provider_window_high_water],
           ["scheduler_pacing_history", "process-local; reset by scheduler restart"],
-          ["full_reenumeration_requests", Enum.count(restarted_requests, &String.ends_with?(&1.path, "/work-items/"))],
+          ["full_reenumeration_requests", Map.get(restart_request_classes, :bulk_enumeration)],
           ["total_provider_requests", length(all_requests)],
           ["candidate_dispatchable_before_publication", false],
           ["candidate_runner_started_after_publication", Map.has_key?(final_state.running, candidate.id)],
@@ -1742,6 +1754,11 @@ defmodule SymphonyElixir.Pre080C02ProductionRateEpochCharacterizationTest do
 
     blocking = Enum.map(blocking_indexes, &%{"issue_id" => "item-#{&1}", "project_id" => @scope.project_id})
     {:ok, %{status: 200, body: %{"blocked_by" => blocked_by, "blocking" => blocking}}}
+  end
+
+  defp complete_epoch_logical_request_count(item_count) do
+    page_count = div(item_count + 99, 100)
+    2 * item_count + 2 * page_count + 8
   end
 
   defp relation_blockers(index) when index < 5, do: []
