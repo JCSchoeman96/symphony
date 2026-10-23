@@ -52,8 +52,6 @@ defmodule SymphonyElixir.Plane.RuntimePrincipal do
     end
   end
 
-  defp validate_identity(_identity, _policy), do: {:error, :provider_malformed}
-
   defp expected_user(expected, expected), do: :ok
   defp expected_user(_observed, _expected), do: {:error, :runtime_principal_identity_mismatch}
 
@@ -74,8 +72,6 @@ defmodule SymphonyElixir.Plane.RuntimePrincipal do
        }}
     end
   end
-
-  defp validate_project_permissions(_permissions, _policy), do: {:error, :provider_malformed}
 
   defp required_relation(permissions) do
     case value(permissions, :relation) do

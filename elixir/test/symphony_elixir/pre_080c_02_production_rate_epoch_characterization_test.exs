@@ -229,9 +229,9 @@ defmodule SymphonyElixir.Pre080C02ProductionRateEpochCharacterizationTest do
       assert result.state_page_gets == 2
 
       assert result.total_logical_gets ==
-               item_count + result.work_item_page_gets + result.project_gets + result.state_page_gets
+               item_count + result.work_item_page_gets + result.project_gets + result.state_page_gets + 4
 
-      assert result.total_logical_gets == item_count + 2 * page_count + 4
+      assert result.total_logical_gets == item_count + 2 * page_count + 8
       assert result.retry_attempts == 0
       assert result.scheduler_attempt_starts == result.total_logical_gets + result.retry_attempts
       assert result.provider_attempt_starts == result.scheduler_attempt_starts
@@ -242,7 +242,9 @@ defmodule SymphonyElixir.Pre080C02ProductionRateEpochCharacterizationTest do
                bulk_relation: item_count,
                bulk_enumeration: 2 * div(item_count + 99, 100),
                bulk_states: 2,
-               control_project: 2
+               control_project: 2,
+               control_identity: 2,
+               control_permissions: 2
              }
 
       assert List.first(result.request_start_timestamp_counts) == [0, 60]
@@ -834,14 +836,14 @@ defmodule SymphonyElixir.Pre080C02ProductionRateEpochCharacterizationTest do
     assert final.plane_epoch_coverage_generation >= final.plane_reconciliation_generation
     assert is_nil(final.plane_webhook_full_epoch_dirty_generation)
     assert Graph.complete?(final.dependency_graph)
-    assert length(provider_stats.starts) == 4 * (1_000 + 2 * 10 + 4)
+    assert length(provider_stats.starts) == 4 * (1_000 + 2 * 10 + 8)
     assert "item-999" in Map.fetch!(final.dependency_graph.edges, "item-5")
     assert final.plane_epoch_coverage_generation > initial_state.plane_epoch_coverage_generation
 
     assert follow_up.process_count_high_water < runtime.process_baseline + 100
     assert initial.process_count_high_water < runtime.process_baseline + 100
 
-    epoch_count = div(length(provider_stats.starts), 1_024)
+    epoch_count = div(length(provider_stats.starts), 1_028)
 
     published_epoch_count =
       Enum.count([initial_state, final], fn state ->
@@ -1109,11 +1111,11 @@ defmodule SymphonyElixir.Pre080C02ProductionRateEpochCharacterizationTest do
     drive_until_current(restarted.orchestrator, restarted.scheduler, restarted.clock, restarted.process_baseline, 1_000)
 
     all_requests = Agent.get(restarted.provider, & &1.starts)
-    assert length(all_requests) == partial_count + 1_024
+    assert length(all_requests) == partial_count + 1_028
     provider_window_high_water = max_rolling_starts(Enum.map(all_requests, & &1.timestamp), 60_000)
     assert provider_window_high_water == 120
 
-    restarted_requests = Enum.take(all_requests, 1_024)
+    restarted_requests = Enum.take(all_requests, 1_028)
     assert Enum.count(restarted_requests, &String.ends_with?(&1.path, "/work-items/")) == 20
     final_state = :sys.get_state(restarted.orchestrator)
     assert final_state.plane_epoch_status == :current
@@ -1143,11 +1145,11 @@ defmodule SymphonyElixir.Pre080C02ProductionRateEpochCharacterizationTest do
   end
 
   setup do
-    previous_api_key = System.get_env("PLANE_API_KEY")
+    previous_api_key = System.get_env("PLANE_API_KEY_FERDI")
     previous_test_pid = Application.get_env(:symphony_elixir, :pre_080c_02_test_pid)
     previous_workflow_path = Application.get_env(:symphony_elixir, :workflow_file_path)
     previous_attempt_ledger_root = Application.get_env(:symphony_elixir, :attempt_ledger_root)
-    System.put_env("PLANE_API_KEY", "pre-080c-02-test-secret")
+    System.put_env("PLANE_API_KEY_FERDI", "pre-080c-02-test-secret")
     Application.put_env(:symphony_elixir, :pre_080c_02_test_pid, self())
 
     root = Path.join(System.tmp_dir!(), "pre-080c-02-#{System.unique_integer([:positive])}")
@@ -1178,8 +1180,8 @@ defmodule SymphonyElixir.Pre080C02ProductionRateEpochCharacterizationTest do
       end
 
       case previous_api_key do
-        nil -> System.delete_env("PLANE_API_KEY")
-        key -> System.put_env("PLANE_API_KEY", key)
+        nil -> System.delete_env("PLANE_API_KEY_FERDI")
+        key -> System.put_env("PLANE_API_KEY_FERDI", key)
       end
     end)
 
@@ -1643,17 +1645,50 @@ defmodule SymphonyElixir.Pre080C02ProductionRateEpochCharacterizationTest do
 
   defp response_for(state, %{path: path, params: params}) do
     case response_kind(path) do
-      :project -> project_response()
-      :states -> states_response(state.states)
-      :work_item_page -> work_item_page_response(state, params)
-      {:work_item, id} -> work_item_response(id)
-      {:relation, id} -> relation_response(state, id)
-      :unexpected -> {:error, {:unexpected_path, path}}
+      :runtime_identity ->
+        {:ok,
+         %{
+           status: 200,
+           body: %{
+             "id" => "920272c2-862e-4592-b13e-b0ba11c91b12",
+             "principal_kind" => "api_key"
+           }
+         }}
+
+      :runtime_permissions ->
+        {:ok,
+         %{
+           status: 200,
+           body: %{
+             "relation" => "contributor",
+             "permission_grants" => ["workitem:view", "workitem:edit"]
+           }
+         }}
+
+      :project ->
+        project_response()
+
+      :states ->
+        states_response(state.states)
+
+      :work_item_page ->
+        work_item_page_response(state, params)
+
+      {:work_item, id} ->
+        work_item_response(id)
+
+      {:relation, id} ->
+        relation_response(state, id)
+
+      :unexpected ->
+        {:error, {:unexpected_path, path}}
     end
   end
 
   defp response_kind(path) do
     cond do
+      String.ends_with?(path, "/api/v2/users/me/") -> :runtime_identity
+      String.ends_with?(path, "/permissions/me/") -> :runtime_permissions
       String.ends_with?(path, "/projects/#{@scope.project_id}/") -> :project
       String.ends_with?(path, "/states/") -> :states
       String.ends_with?(path, "/work-items/") -> :work_item_page
@@ -1777,6 +1812,8 @@ defmodule SymphonyElixir.Pre080C02ProductionRateEpochCharacterizationTest do
 
   defp request_class(path) do
     cond do
+      String.ends_with?(path, "/api/v2/users/me/") -> :control_identity
+      String.ends_with?(path, "/permissions/me/") -> :control_permissions
       String.ends_with?(path, "/relations/") -> :bulk_relation
       String.ends_with?(path, "/work-items/") -> :bulk_enumeration
       String.ends_with?(path, "/states/") -> :bulk_states
@@ -1847,6 +1884,13 @@ defmodule SymphonyElixir.Pre080C02ProductionRateEpochCharacterizationTest do
       "provider" => "plane",
       "workspace_id" => @scope.workspace_id,
       "project_id" => @scope.project_id,
+      "runtime_principal" => %{
+        "api_key_env" => "PLANE_API_KEY_FERDI",
+        "user_id" => "920272c2-862e-4592-b13e-b0ba11c91b12",
+        "principal_kind" => "api_key",
+        "project_relation" => "contributor",
+        "required_permissions" => ["workitem:view", "workitem:edit"]
+      },
       "state_mappings" =>
         Map.new(["backlog", "planning", "ready", "in_progress", "in_review", "changes_requested", "ready_to_merge", "merging", "blocked", "done", "canceled"], fn key ->
           state_name = state(String.to_atom(key))["name"]
@@ -1854,7 +1898,7 @@ defmodule SymphonyElixir.Pre080C02ProductionRateEpochCharacterizationTest do
         end)
     }
 
-    provider = %{"workspace_slug" => @scope.workspace_slug, "workspace_id" => @scope.workspace_id, "project_id" => @scope.project_id, "api_key" => "$PLANE_API_KEY"}
+    provider = %{"workspace_slug" => @scope.workspace_slug, "workspace_id" => @scope.workspace_id, "project_id" => @scope.project_id, "api_key" => "$PLANE_API_KEY_FERDI"}
 
     workflow = """
     ---

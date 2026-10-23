@@ -496,8 +496,6 @@ defmodule SymphonyElixir.Plane.Adapter do
     Map.get(map, key, Map.get(map, Atom.to_string(key)))
   end
 
-  defp setting(_map, _key), do: nil
-
   defp validate_endpoint_setting(tracker_settings) do
     provider = provider_settings(tracker_settings)
     configured = provider_value(provider, "endpoint") || Map.get(tracker_settings, :endpoint, Map.get(tracker_settings, "endpoint"))

@@ -50,6 +50,7 @@ These answers record the current candidate's reconciliation evidence. They do no
    - Restart-local pacing history: non-blocking operational debt.
    - Repeated dirty full epochs: non-blocking operational debt.
    - Baseline-reproduced epoch-test timeouts and CI nondeterminism: non-blocking reliability debt; the same timeout failures reproduced against the accepted base, while required `make-all` passed on the reviewed candidate checkpoint.
+   - CI advisory set before the final H100 candidate: Bandit `1.12.5`, Decimal `2.3.0`, and Plug.Crypto `2.2.0` (reported medium). Track these for separate security adjudication; this remediation does not change dependencies.
    - Decimal `2.3.0` advisories: unresolved, separately tracked dependency debt. Current repository review found no Symphony application `Decimal` or `:decimal` usage. Remediation crosses the existing Ecto Decimal 2.x constraint and requires broader, separately authorized dependency work. The advisories are not fixed by this candidate.
 
 These conclusions are bounded to the evidence identified in this document. They do not change any accepted programme status or authorize integrated H-080C testing.

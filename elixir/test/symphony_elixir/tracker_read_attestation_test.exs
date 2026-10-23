@@ -22,19 +22,19 @@ defmodule SymphonyElixir.TrackerReadAttestationTest do
       "workspace_slug" => "workspace-1",
       "workspace_id" => "workspace-stable-1",
       "project_id" => "project-1",
-      "api_key" => "$PLANE_API_KEY"
+      "api_key" => "$PLANE_API_KEY_FERDI"
     },
-    secret_environment_names: ["PLANE_API_KEY"]
+    secret_environment_names: ["PLANE_API_KEY_FERDI"]
   }
 
   setup do
     previous_signing_key = Application.get_env(:symphony_elixir, :completion_proof_signing_key)
-    previous_plane_key = System.get_env("PLANE_API_KEY")
+    previous_runtime_key = System.get_env("PLANE_API_KEY_FERDI")
     Application.delete_env(:symphony_elixir, :completion_proof_signing_key)
 
     on_exit(fn ->
       restore_application_env(:completion_proof_signing_key, previous_signing_key)
-      restore_env("PLANE_API_KEY", previous_plane_key)
+      restore_env("PLANE_API_KEY_FERDI", previous_runtime_key)
     end)
 
     :ok
@@ -126,13 +126,13 @@ defmodule SymphonyElixir.TrackerReadAttestationTest do
     previous_workflow_path = Application.get_env(:symphony_elixir, :workflow_file_path)
     previous_signing_key = Application.get_env(:symphony_elixir, :completion_proof_signing_key)
     previous_local_transport = Application.get_env(:symphony_elixir, :a4_qualification_local_transport)
-    previous_plane_key = System.get_env("PLANE_API_KEY")
+    previous_runtime_key = System.get_env("PLANE_API_KEY_FERDI")
     previous_req_options = Req.default_options()
     root = Path.join(System.tmp_dir!(), "tracker-attestation-#{System.unique_integer([:positive])}")
     workflow_path = Path.join(root, "WORKFLOW.md")
 
     File.mkdir_p!(root)
-    System.put_env("PLANE_API_KEY", @settings.api_key)
+    System.put_env("PLANE_API_KEY_FERDI", @settings.api_key)
     Application.delete_env(:symphony_elixir, :completion_proof_signing_key)
     File.write!(workflow_path, plane_workflow())
     Workflow.set_workflow_file_path(workflow_path)
@@ -144,7 +144,7 @@ defmodule SymphonyElixir.TrackerReadAttestationTest do
       restore_application_env(:workflow_file_path, previous_workflow_path)
       restore_application_env(:completion_proof_signing_key, previous_signing_key)
       restore_application_env(:a4_qualification_local_transport, previous_local_transport)
-      restore_env("PLANE_API_KEY", previous_plane_key)
+      restore_env("PLANE_API_KEY_FERDI", previous_runtime_key)
       Req.default_options(previous_req_options)
 
       if Process.whereis(WorkflowStore), do: WorkflowStore.force_reload()
@@ -153,8 +153,27 @@ defmodule SymphonyElixir.TrackerReadAttestationTest do
   end
 
   defp plane_workflow do
+    project_contract = %{
+      "schema_version" => 1,
+      "provider" => "plane",
+      "workspace_id" => "workspace-stable-1",
+      "project_id" => "project-1",
+      "runtime_principal" => %{
+        "api_key_env" => "PLANE_API_KEY_FERDI",
+        "user_id" => "920272c2-862e-4592-b13e-b0ba11c91b12",
+        "principal_kind" => "api_key",
+        "project_relation" => "contributor",
+        "required_permissions" => ["workitem:view", "workitem:edit"]
+      },
+      "state_mappings" =>
+        Map.new(WorkflowLifecycle.states(), fn state ->
+          {Atom.to_string(state), %{"state_id" => "state-#{state}", "name" => WorkflowLifecycle.display(state)}}
+        end)
+    }
+
     """
     ---
+    provider_project_contract: #{Jason.encode!(project_contract)}
     symphony:
       project_id: tracker-attestation-test
     tracker:
@@ -163,7 +182,7 @@ defmodule SymphonyElixir.TrackerReadAttestationTest do
         workspace_slug: workspace-1
         workspace_id: workspace-stable-1
         project_id: project-1
-      api_key: "$PLANE_API_KEY"
+        api_key: "$PLANE_API_KEY_FERDI"
     agent:
       routing: routed
     source_control:
@@ -200,30 +219,52 @@ defmodule SymphonyElixir.TrackerReadAttestationTest do
       adapter: fn request ->
         path = request.url.path
 
-        response =
-          cond do
-            is_binary(path) and String.ends_with?(path, "/work-items/item-1/") ->
-              plane_item()
-
-            is_binary(path) and String.ends_with?(path, "/work-items/") ->
-              %{
-                "results" => [plane_item()],
-                "count" => 1,
-                "total_results" => 1,
-                "next_page_results" => false,
-                "next_cursor" => nil
-              }
-
-            is_binary(path) and String.ends_with?(path, "/relations/") ->
-              %{"blocked_by" => [], "blocking" => []}
-
-            true ->
-              raise "unexpected Plane request path #{inspect(path)}"
-          end
+        response = runtime_principal_response(path) || plane_data_response(path)
 
         {request, Req.Response.new(status: 200, body: Jason.encode!(response))}
       end
     )
+  end
+
+  defp runtime_principal_response(path) do
+    cond do
+      is_binary(path) and String.ends_with?(path, "/api/v2/users/me/") ->
+        %{
+          "id" => "920272c2-862e-4592-b13e-b0ba11c91b12",
+          "principal_kind" => "api_key"
+        }
+
+      is_binary(path) and String.ends_with?(path, "/api/v2/workspaces/workspace-1/projects/project-1/permissions/me/") ->
+        %{
+          "relation" => "contributor",
+          "permission_grants" => ["workitem:view", "workitem:edit"]
+        }
+
+      true ->
+        nil
+    end
+  end
+
+  defp plane_data_response(path) do
+    cond do
+      is_binary(path) and String.ends_with?(path, "/work-items/item-1/") ->
+        plane_item()
+
+      is_binary(path) and String.ends_with?(path, "/work-items/") ->
+        %{
+          "results" => [plane_item()],
+          "count" => 1,
+          "total_results" => 1,
+          "next_page_results" => false,
+          "next_cursor" => nil
+        }
+
+      is_binary(path) and String.ends_with?(path, "/relations/") ->
+        %{"blocked_by" => [], "blocking" => []}
+
+      true ->
+        raise "unexpected Plane request path #{inspect(path)}"
+    end
   end
 
   defp plane_item do
@@ -249,11 +290,22 @@ defmodule SymphonyElixir.TrackerReadAttestationTest do
         provider: :plane,
         workspace_id: "workspace-stable-1",
         project_id: "project-1",
+        runtime_principal: runtime_principal_policy(),
         state_mappings: state_mappings,
         dependency_relation_semantics: %{blocked_by: :blocked_by, blocking: :blocking}
       })
 
     contract
+  end
+
+  defp runtime_principal_policy do
+    %{
+      api_key_env: "PLANE_API_KEY_FERDI",
+      user_id: "920272c2-862e-4592-b13e-b0ba11c91b12",
+      principal_kind: "api_key",
+      project_relation: "contributor",
+      required_permissions: ["workitem:view", "workitem:edit"]
+    }
   end
 
   defp restore_application_env(key, nil), do: Application.delete_env(:symphony_elixir, key)
