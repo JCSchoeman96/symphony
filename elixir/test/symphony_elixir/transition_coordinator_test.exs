@@ -1848,6 +1848,41 @@ defmodule SymphonyElixir.TransitionCoordinatorTest do
     end
   end
 
+  test "A4 preflight failure after durable submission reconciles without provider dispatch" do
+    parent = self()
+    root = Path.join(System.tmp_dir!(), "a4-coordinator-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(root)
+    on_exit(fn -> File.rm_rf(root) end)
+
+    {:ok, coordinator} =
+      TransitionCoordinator.start_link(
+        name: nil,
+        project_id: "project-a",
+        tracker_identity: %{tracker_kind: "plane", provider_scope: %{project_id: "project-a"}},
+        ledger_opts: [path: Path.join(root, "attempts.dets")],
+        a4_controller: %{controller: self(), ref: make_ref(), timeout_ms: 10},
+        load_context: fn _ -> {:ok, Map.put(context(), :tracker_settings, %{provider: %{workspace_slug: "workspace-a", project_id: "project-a"}})} end,
+        submit: fn _, _ ->
+          send(parent, :unexpected_a4_submit)
+          :ok
+        end,
+        verify: fn attempt, ctx ->
+          send(parent, {:a4_verified, attempt, ctx})
+          {:error, :verification_unavailable}
+        end,
+        suspend: fn _, _, _ -> :ok end
+      )
+
+    {:ok, intent} = SemanticTransitionIntent.new(intent_attrs())
+    assert {:ok, %{state: :indeterminate}} = request_transition(coordinator, intent)
+    assert_received {:a4_verified, %{state: :verifying, provider_request_id: request_id}, verification}
+    assert is_binary(request_id)
+    assert verification.provider_non_commit?
+    assert {:error, {:dispatch_witness_failed, :invalid_proof_controller_capability}} = verification.provider_result
+    refute_received :unexpected_a4_submit
+    GenServer.stop(coordinator)
+  end
+
   defp request_transition(server, intent, opts \\ [])
 
   defp request_transition(server, intent, opts) when is_map(intent) and is_list(opts) do
