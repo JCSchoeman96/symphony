@@ -496,6 +496,30 @@ defmodule SymphonyElixir.GitHub.SourceControlTest do
              )
   end
 
+  test "synthetic merge checks accept timestamped checkout log lines from GitHub" do
+    config =
+      Map.put(@config, :required_checks, [
+        %{context: "make-all", app_id: 15_368, subject: "synthetic_merge"}
+      ])
+
+    candidate_ref = candidate_ref()
+    sha_merge = String.duplicate("9", 40)
+
+    assert :ok =
+             SourceControl.verify_required_checks(
+               config,
+               candidate_ref,
+               @tree,
+               request_opts(fn path ->
+                 synthetic_merge_github_response(
+                   path,
+                   sha_merge,
+                   checkout_log: timestamped_checkout_log(sha_merge, @tree)
+                 ) || base_github_payload().(path)
+               end)
+             )
+  end
+
   test "synthetic merge checks list workflow runs at PR head, not merge ref SHA" do
     config =
       Map.put(@config, :required_checks, [
@@ -568,6 +592,33 @@ defmodule SymphonyElixir.GitHub.SourceControlTest do
                    path,
                    sha_merge,
                    checkout_log: synthetic_checkout_log(sha_merge, @tree) <> synthetic_checkout_log(other_sha, @tree)
+                 ) || base_github_payload().(path)
+               end)
+             )
+  end
+
+  test "synthetic merge checks reject ambiguous timestamped checkout evidence" do
+    config =
+      Map.put(@config, :required_checks, [
+        %{context: "make-all", app_id: 15_368, subject: "synthetic_merge"}
+      ])
+
+    candidate_ref = candidate_ref()
+    sha_merge = String.duplicate("9", 40)
+    other_sha = String.duplicate("8", 40)
+
+    assert {:error, :ambiguous_synthetic_checkout_evidence} =
+             SourceControl.verify_required_checks(
+               config,
+               candidate_ref,
+               @tree,
+               request_opts(fn path ->
+                 synthetic_merge_github_response(
+                   path,
+                   sha_merge,
+                   checkout_log:
+                     timestamped_checkout_log(sha_merge, @tree) <>
+                       timestamped_checkout_log(other_sha, @tree)
                  ) || base_github_payload().(path)
                end)
              )
@@ -918,6 +969,13 @@ defmodule SymphonyElixir.GitHub.SourceControlTest do
     """
     CI checkout SHA: #{sha}
     CI checkout tree: #{tree}
+    """
+  end
+
+  defp timestamped_checkout_log(sha, tree) do
+    """
+    2026-10-23T15:15:06.4280356Z CI checkout SHA: #{sha}
+    2026-10-23T15:15:06.4298595Z CI checkout tree: #{tree}
     """
   end
 

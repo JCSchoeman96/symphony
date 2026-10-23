@@ -22,6 +22,7 @@ defmodule SymphonyElixir.GitHub.SourceControl do
   @max_workflow_runs_per_head 100
   @synthetic_execution_evidence_job_name "linux-static-quality"
   @synthetic_execution_evidence_step_name "Record exact candidate checkout"
+  @job_log_timestamp_prefix ~r/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z /
   @checkout_sha_line ~r/^CI checkout SHA: ([0-9a-f]{40})$/i
   @checkout_tree_line ~r/^CI checkout tree: ([0-9a-f]{40})$/i
 
@@ -698,10 +699,18 @@ defmodule SymphonyElixir.GitHub.SourceControl do
   end
 
   defp checkout_field_matches(line, pattern) do
-    case Regex.run(pattern, String.trim(line)) do
+    payload = normalize_job_log_line(line)
+
+    case Regex.run(pattern, payload) do
       [_, value] -> [normalize_sha(value)]
       _ -> []
     end
+  end
+
+  defp normalize_job_log_line(line) do
+    line
+    |> String.trim()
+    |> then(&Regex.replace(@job_log_timestamp_prefix, &1, ""))
   end
 
   defp classify_checkout_evidence_values(shas, trees) do
