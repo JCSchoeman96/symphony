@@ -8,6 +8,8 @@ defmodule SymphonyElixir.GitHub.SourceControlTest do
   @sha_b String.duplicate("b", 40)
   @sha_m String.duplicate("d", 40)
   @tree String.duplicate("c", 40)
+  @workflow_run_id 42_001
+  @check_suite_id 42_002
 
   @config %{
     kind: :github,
@@ -499,17 +501,8 @@ defmodule SymphonyElixir.GitHub.SourceControlTest do
                        "parents" => [%{"sha" => @sha_a}, %{"sha" => @sha_b}]
                      }
 
-                   String.contains?(path, "/check-runs") ->
-                     %{
-                       "total_count" => 1,
-                       "check_runs" => [check_run("make-all", "success", workflow_run_id: 42_001)]
-                     }
-
-                   String.contains?(path, "/actions/runs") ->
-                     workflow_runs_payload(@sha_b, 42_001)
-
                    true ->
-                     base_github_payload().(path)
+                     synthetic_merge_github_payload(path, sha_merge) || base_github_payload().(path)
                  end
                end)
              )
@@ -529,34 +522,53 @@ defmodule SymphonyElixir.GitHub.SourceControlTest do
                config,
                candidate_ref,
                @tree,
-               [
-                 token: "token",
-                 request_fun: fn _token, path, params, _opts ->
-                   cond do
-                     String.contains?(path, "/actions/runs") ->
-                       queried_sha = normalize_query_sha(params)
+               token: "token",
+               request_fun: fn _token, path, params, _opts ->
+                 cond do
+                   String.contains?(path, "/actions/runs") ->
+                     queried_sha = normalize_query_sha(params)
 
-                       cond do
-                         queried_sha == sha_merge ->
-                           {:ok, %{"total_count" => 0, "workflow_runs" => []}}
+                     cond do
+                       queried_sha == sha_merge ->
+                         {:ok, %{"total_count" => 0, "workflow_runs" => []}}
 
-                         queried_sha == @sha_b ->
-                           {:ok, workflow_runs_payload(@sha_b, 42_001)}
+                       queried_sha == @sha_b ->
+                         {:ok, workflow_runs_payload(@sha_b)}
 
-                         true ->
-                           {:ok, %{"total_count" => 0, "workflow_runs" => []}}
-                       end
+                       true ->
+                         {:ok, %{"total_count" => 0, "workflow_runs" => []}}
+                     end
 
-                     true ->
-                       {:ok,
-                        synthetic_merge_github_payload(path, sha_merge)
-                        |> then(fn
-                          nil -> base_github_payload().(path)
-                          payload -> payload
-                        end)}
-                   end
+                   true ->
+                     {:ok, synthetic_merge_github_payload(path, sha_merge) || base_github_payload().(path)}
                  end
-               ]
+               end
+             )
+  end
+
+  test "synthetic merge checks require check suite execution sha to match merge ref" do
+    config =
+      Map.put(@config, :required_checks, [
+        %{context: "make-all", app_id: 15_368, subject: "synthetic_merge"}
+      ])
+
+    candidate_ref = candidate_ref()
+    sha_merge = String.duplicate("9", 40)
+
+    assert {:error, :synthetic_execution_evidence_missing} =
+             SourceControl.verify_required_checks(
+               config,
+               candidate_ref,
+               @tree,
+               request_opts(fn path ->
+                 cond do
+                   String.contains?(path, "/check-suites/") ->
+                     %{"id" => @check_suite_id, "head_sha" => @sha_b}
+
+                   true ->
+                     synthetic_merge_github_payload(path, sha_merge) || base_github_payload().(path)
+                 end
+               end)
              )
   end
 
@@ -800,12 +812,18 @@ defmodule SymphonyElixir.GitHub.SourceControlTest do
   end
 
   defp check_run(name, conclusion, opts \\ []) do
-    workflow_run_id = Keyword.get(opts, :workflow_run_id)
-    suite_head_sha = Keyword.get(opts, :suite_head_sha, @sha_b)
-
     check_suite =
-      %{"head_sha" => suite_head_sha}
-      |> maybe_put_workflow_run(workflow_run_id)
+      case Keyword.get(opts, :check_suite_id) do
+        id when is_integer(id) ->
+          %{"id" => id}
+
+        _ ->
+          suite_head_sha = Keyword.get(opts, :suite_head_sha, @sha_b)
+          workflow_run_id = Keyword.get(opts, :workflow_run_id)
+
+          %{"head_sha" => suite_head_sha}
+          |> maybe_put_workflow_run(workflow_run_id)
+      end
 
     %{
       "name" => name,
@@ -822,18 +840,28 @@ defmodule SymphonyElixir.GitHub.SourceControlTest do
   defp maybe_put_workflow_run(check_suite, workflow_run_id),
     do: Map.put(check_suite, "workflow_run", %{"id" => workflow_run_id})
 
-  defp workflow_runs_payload(head_sha, workflow_run_id) do
+  defp workflow_runs_payload(head_sha) do
     %{
       "total_count" => 1,
       "workflow_runs" => [
         %{
-          "id" => workflow_run_id,
+          "id" => @workflow_run_id,
           "head_sha" => head_sha,
+          "check_suite_id" => @check_suite_id,
           "status" => "completed",
           "conclusion" => "success",
-          "event" => "pull_request"
+          "event" => "pull_request",
+          "pull_requests" => [pull_request_summary(head_sha)]
         }
       ]
+    }
+  end
+
+  defp pull_request_summary(head_sha) do
+    %{
+      "number" => 15,
+      "head" => %{"sha" => head_sha},
+      "base" => %{"sha" => @sha_a}
     }
   end
 
@@ -849,11 +877,17 @@ defmodule SymphonyElixir.GitHub.SourceControlTest do
           "parents" => [%{"sha" => @sha_a}, %{"sha" => @sha_b}]
         }
 
+      String.contains?(path, "/check-suites/") ->
+        %{"id" => @check_suite_id, "head_sha" => sha_merge}
+
       String.contains?(path, "/check-runs") ->
         %{
           "total_count" => 1,
-          "check_runs" => [check_run("make-all", "success", workflow_run_id: 42_001)]
+          "check_runs" => [check_run("make-all", "success", check_suite_id: @check_suite_id)]
         }
+
+      String.contains?(path, "/actions/runs") ->
+        workflow_runs_payload(@sha_b)
 
       true ->
         nil
