@@ -794,9 +794,9 @@ Symphony's GitHub adapter treats these as separate facts for `synthetic_merge` r
 - Actions workflow-run listings for pull-request CI are keyed by PR head SHA (`workflow_run.head_sha`), not the synthetic merge ref SHA;
 - the synthetic merge ref commit must still be re-resolved and validated (exact base/candidate parents and candidate tree) before binding;
 - the required check must bind `check_run.check_suite.id` to `workflow_run.check_suite_id` on a successful `pull_request` / `pull_request_target` run whose `pull_requests[]` entry matches the exact PR number, candidate head, and frozen base;
-- the checked-out commit for that execution is proven mechanically by re-reading the Check Suite `head_sha` and requiring it to equal the validated synthetic merge ref SHA (GitHub's `GITHUB_SHA` for `pull_request` workflows);
-- H-100 evidence must still retain the workflow's existing `make-all` checkout log lines (`CI checkout SHA`, tree, parents, and `HEAD == GITHUB_SHA`) as independent human-auditable corroboration;
-- a green check on the head alone, without merge-ref validation, check-suite execution SHA proof, and workflow-run binding, is insufficient when the configured subject is `synthetic_merge`.
+- the checked-out commit for that execution is proven mechanically from the **same bound workflow run** by reading the designated `linux-static-quality` job, requiring a successful `Record exact candidate checkout` step, and parsing the stable `CI checkout SHA` / `CI checkout tree` log lines to match the validated synthetic merge ref SHA and candidate tree;
+- H-100 evidence must still retain those checkout log lines in the evidence bundle for human audit even though SourceControl now enforces them mechanically;
+- a green check on the head alone, without merge-ref validation, workflow-run binding, and checkout-log execution proof, is insufficient when the configured subject is `synthetic_merge`.
 
 For `validate-pr-description`, retain its exact check identity and candidate binding required by the frozen policy.
 
