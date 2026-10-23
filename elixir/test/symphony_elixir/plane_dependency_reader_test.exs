@@ -45,6 +45,44 @@ defmodule SymphonyElixir.PlaneDependencyReaderTest do
     assert request_count(requests, "/relations/") == 2
   end
 
+  @tag :plane_relation_endpoint_bare_target_ids
+  test "normalizes Plane relation endpoint arrays of target ID strings" do
+    primary_id = "8658ea09-51c3-4675-adb9-1d67e0b00839"
+    dependent_id = "b0fc71d2-8225-4f5f-aafc-2a77b2a3ee11"
+    requests = start_request_log()
+    items = [item(primary_id), item(dependent_id)]
+
+    relation_body = fn blocked_by, blocking ->
+      %{
+        "blocked_by" => blocked_by,
+        "blocking" => blocking,
+        "duplicate" => [],
+        "finish_after" => [],
+        "finish_before" => [],
+        "relates_to" => [],
+        "start_after" => [],
+        "start_before" => []
+      }
+    end
+
+    relation_map = %{
+      primary_id => relation_body.([], [dependent_id]),
+      dependent_id => relation_body.([primary_id], [])
+    }
+
+    assert {:ok, %Graph{} = graph} =
+             Adapter.fetch_dependency_graph_for_test(
+               @settings,
+               dependency_request_fun(requests, relation_map, items: items)
+             )
+
+    assert graph.edges == %{primary_id => [dependent_id], dependent_id => []}
+    assert Enum.map(graph.nodes[dependent_id].blocked_by, & &1.id) == [primary_id]
+    assert graph.nodes[primary_id].blocked_by == []
+    assert Graph.complete?(graph)
+    assert request_count(requests, "/relations/") == 2
+  end
+
   test "rejects invalid acquisition inputs before transport" do
     config = %{
       base_url: "https://api.plane.so",

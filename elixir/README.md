@@ -333,10 +333,12 @@ codex:
   `dependency_completeness`, `controlled_transition`, `transition_verification`,
   `agent_read_tools`, and `agent_transition_tools`. `conditional_transition` remains unsupported.
   Plane enumerates the configured project, reads each item's fixed relations endpoint with bounded
-  concurrency, rejects incomplete or cross-project data, and publishes an immutable epoch only
-  after the closing node set remains stable. A provider mutation acknowledgement is not transition
-  proof. Symphony rereads the provider and reassesses lifecycle authority. Plane capability does
-  not establish Symphony authority or completion proof.
+  concurrency, and accepts either bare target IDs or `{issue_id, project_id}` relation entries.
+  Bare IDs must resolve within the fully enumerated project, and explicit project IDs must match it.
+  The adapter rejects incomplete or cross-project data and publishes an immutable epoch only after
+  the closing node set remains stable. A provider mutation acknowledgement is not transition proof.
+  Symphony rereads the provider and reassesses lifecycle authority. Plane capability does not
+  establish Symphony authority or completion proof.
 - The transition coordinator durably records `mutation_submitted` with an opaque
   `provider_request_id` before provider dispatch. In explicit witness-required mode, Req's
   request-specific Finch hook makes that ID available in private request metadata and requires a
