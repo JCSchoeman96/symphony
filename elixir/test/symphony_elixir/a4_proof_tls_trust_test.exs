@@ -108,10 +108,7 @@ defmodule SymphonyElixir.A4ProofTLSTrustTest do
           :exit_status,
           :use_stdio,
           {:line, 16_384},
-          {:args,
-           ["-I", fixture_script, "--serve", "--directory", directory,
-            "--expected-api-key", "local-qualification-only", "--expected-path", expected_path,
-            "--timeout", "10"]}
+          {:args, ["-I", fixture_script, "--serve", "--directory", directory, "--expected-api-key", "local-qualification-only", "--expected-path", expected_path, "--timeout", "10"]}
         ]
       )
 
