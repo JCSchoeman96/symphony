@@ -82,7 +82,8 @@ defmodule SymphonyElixir.H100HostQualificationRunner do
     }
 
     controller_ref = make_ref()
-    backend = controller_backend(socket)
+    backend_failures = :atomics.new(1, signed: false)
+    backend = controller_backend(socket, backend_failures)
     {:ok, controller} = A4HostRelayController.start_link(backend: backend, ref: controller_ref)
 
     capability = %{
@@ -100,7 +101,11 @@ defmodule SymphonyElixir.H100HostQualificationRunner do
           token
 
         {:error, {:dispatch_witness_failed, reason}} ->
-          Process.put(:h100_proof_failure_code, safe_a4_failure_code(reason))
+          Process.put(
+            :h100_proof_failure_code,
+            controller_failure_code(backend_failures) || safe_a4_failure_code(reason)
+          )
+
           raise ArgumentError, "A4 proof acquisition failed"
 
         _invalid ->
@@ -198,7 +203,7 @@ defmodule SymphonyElixir.H100HostQualificationRunner do
     end
   end
 
-  defp controller_backend(socket) do
+  defp controller_backend(socket, backend_failures) do
     receipt_key = {__MODULE__, :stage_b_receipt}
 
     %{
@@ -213,7 +218,12 @@ defmodule SymphonyElixir.H100HostQualificationRunner do
           {:ok, %{"canonical_json" => canonical, "sha256" => digest, "manifest" => manifest}} ->
             {:ok, %{canonical_json: canonical, sha256: digest, manifest: manifest}}
 
+          {:ok, _invalid} ->
+            :atomics.put(backend_failures, 1, 2)
+            {:error, :manifest_unavailable}
+
           _ ->
+            :atomics.put(backend_failures, 1, 1)
             {:error, :manifest_unavailable}
         end
       end,
@@ -225,7 +235,12 @@ defmodule SymphonyElixir.H100HostQualificationRunner do
             Process.put(receipt_key, {normalized_request, ready})
             {:ok, ready}
 
+          {:ok, _invalid} ->
+            :atomics.put(backend_failures, 1, 4)
+            {:error, :stage_b_not_verified}
+
           _ ->
+            :atomics.put(backend_failures, 1, 3)
             {:error, :stage_b_not_verified}
         end
       end,
@@ -233,6 +248,16 @@ defmodule SymphonyElixir.H100HostQualificationRunner do
         Process.get(receipt_key) == {stringify_keys(request), stringify_keys(ready)}
       end
     }
+  end
+
+  defp controller_failure_code(failures) do
+    case :atomics.get(failures, 1) do
+      1 -> "controller_manifest_ipc_failed"
+      2 -> "controller_manifest_response_invalid"
+      3 -> "controller_ready_ipc_failed"
+      4 -> "controller_ready_response_invalid"
+      _ -> nil
+    end
   end
 
   defp witness_sink(socket, request_id, ipv4_port, ipv6_port, ack_count) do

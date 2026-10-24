@@ -123,6 +123,8 @@ def proof_failure_detail(status_code, result, stderr=b""):
         failure_site = result.get("failure_site")
         allowed_failure_codes = {
             "not_available", "a4_rejected", "invalid_proof_preflight",
+            "controller_manifest_ipc_failed", "controller_manifest_response_invalid",
+            "controller_ready_ipc_failed", "controller_ready_response_invalid",
             "invalid_proof_controller_capability", "remote_proof_controller",
             "proof_controller_unavailable", "proof_already_active",
             "persisted_attempt_envelope_mismatch", "mutation_not_persisted", "witness_required",
@@ -1303,7 +1305,7 @@ def _inside_main(repo_root, temp_root, head, tree, request_id, outside_control_p
         expected = {"provider_request_id": request_id, "origin_authority": origin_authority,
                     "origin_url": origin_url, "transition_attempt_id": None,
                     "path": None, "body_bytes": None, "body_sha256": None}
-        state = {"manifest": None, "manifest_failure": None, "ready": None,
+        state = {"manifest": None, "manifest_seen": False, "manifest_failure": None, "ready": None,
                  "egress": None, "control_passed": False}
 
         def handler(message, peer):
@@ -1326,6 +1328,7 @@ def _inside_main(repo_root, temp_root, head, tree, request_id, outside_control_p
                                  "body_sha256": request["body_sha256"]})
                 return {"verified": True}
             if operation == "manifest":
+                state["manifest_seen"] = True
                 if expected["path"] is None:
                     state["manifest_failure"] = "manifest_before_capture"
                     raise QualificationFailure("manifest arrived before the captured request")
@@ -1415,6 +1418,13 @@ def _inside_main(repo_root, temp_root, head, tree, request_id, outside_control_p
             failure_detail = proof_failure_detail(status_code, proof_result, proof_stderr_file.read(8192))
             if state["manifest_failure"] is not None:
                 failure_detail += ": " + state["manifest_failure"]
+            elif proof_result and proof_result.get("failure_code", "").startswith("controller_manifest_"):
+                if state["manifest"] is not None:
+                    failure_detail += ": manifest_built_by_host"
+                elif state["manifest_seen"]:
+                    failure_detail += ": manifest_handler_did_not_complete"
+                else:
+                    failure_detail += ": manifest_handler_not_reached"
             raise QualificationFailure(
                 failure_detail
             )

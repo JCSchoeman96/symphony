@@ -52,6 +52,16 @@ class HostQualificationLauncherTests(unittest.TestCase):
         )
         self.assertEqual(detail, "proof BEAM failed manifest_origin_authority at run_proof:97")
 
+        detail = runner.proof_failure_detail(
+            1,
+            {
+                "type": "PROOF_ERROR", "reason": "proof_process_failed", "error_class": "argument_error",
+                "failure_code": "controller_manifest_ipc_failed",
+                "failure_site": {"function": "run_proof", "line": 97},
+            },
+        )
+        self.assertEqual(detail, "proof BEAM failed controller_manifest_ipc_failed at run_proof:97")
+
     def test_proof_failure_summary_reports_exit_status_without_raw_output(self):
         self.assertEqual(
             runner.proof_failure_detail(127, None, b"** (CompileError) sensitive details"),
