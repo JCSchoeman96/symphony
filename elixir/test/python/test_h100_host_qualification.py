@@ -27,6 +27,13 @@ class HostQualificationLauncherTests(unittest.TestCase):
                 self.assertEqual(runner.main(["--repo-root", "/tmp"]), 0)
         outer.assert_called_once_with("/tmp")
 
+    def test_launcher_reports_only_its_bounded_internal_failure_reason(self):
+        statuses = []
+        with patch.object(runner, "outer_main", side_effect=runner.QualificationFailure("fixture stage failed")):
+            with patch.object(runner, "_write_status", side_effect=statuses.append):
+                self.assertEqual(runner.main(["--repo-root", "/tmp"]), 1)
+        self.assertEqual(statuses, [{"type": "QUALIFICATION_ERROR", "reason": "fixture stage failed"}])
+
     def test_outside_control_listener_stops_promptly_when_closed(self):
         listener, _port, result, thread = runner._outer_listener()
         listener.close()

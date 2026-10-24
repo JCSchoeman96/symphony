@@ -41,6 +41,18 @@ class QualificationFailure(RuntimeError):
     """A local qualification assertion failed."""
 
 
+def _safe_failure_reason(value):
+    if not isinstance(value, str):
+        return None
+    try:
+        encoded = value.encode("ascii")
+    except UnicodeEncodeError:
+        return None
+    if not 0 < len(encoded) <= 160 or any(byte < 32 or byte > 126 for byte in encoded):
+        return None
+    return value
+
+
 def child_environment(values, *, home):
     """Build a clean child environment from fixed names and explicit values."""
     if not isinstance(values, dict) or not isinstance(home, str) or not home.startswith("/"):
@@ -828,6 +840,9 @@ def outer_main(repo_root):
             elif status_line.get("type") == "QUALIFICATION_RESULT":
                 result = status_line
                 break
+            elif status_line.get("type") == "QUALIFICATION_ERROR":
+                reason = _safe_failure_reason(status_line.get("reason"))
+                raise QualificationFailure(reason or "inner qualification failed")
             else:
                 raise QualificationFailure("local qualification emitted an unexpected status")
         if result is None:
@@ -1233,6 +1248,10 @@ def main(argv=None):
             signal.signal(signal.SIGTERM, previous_sigterm)
         _write_status(result)
         return 0
+    except QualificationFailure as exc:
+        reason = _safe_failure_reason(str(exc)) or "local_qualification_failed"
+        _write_status({"type": "QUALIFICATION_ERROR", "reason": reason})
+        return 1
     except Exception:
         _write_status({"type": "QUALIFICATION_ERROR", "reason": "local_qualification_failed"})
         return 1
