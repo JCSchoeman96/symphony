@@ -142,6 +142,25 @@ class HostQualificationLauncherTests(unittest.TestCase):
         ):
             runner._cleanup_preserving_failure(primary, cleanup_fails)
 
+    def test_policy_cleanup_uses_backend_removal_and_independent_verification(self):
+        class Policy:
+            def __init__(self, verified=True):
+                self.removed = False
+                self.verified = verified
+
+            def remove_policy_table(self):
+                self.removed = True
+
+            def verify_policy_removed(self):
+                return self.verified
+
+        policy = Policy()
+        runner._nft_delete_if_present(policy)
+        self.assertTrue(policy.removed)
+
+        with self.assertRaisesRegex(runner.QualificationFailure, "independently removed"):
+            runner._nft_delete_if_present(Policy(verified=False))
+
     def test_read_only_mount_is_removed_when_remount_setup_fails(self):
         with tempfile.TemporaryDirectory(prefix="h100-mount-rollback-") as directory:
             repo = pathlib.Path(directory) / "repo"

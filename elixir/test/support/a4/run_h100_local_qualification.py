@@ -685,10 +685,10 @@ def _read_status_line(stream, timeout=5):
 
 def _nft_delete_if_present(policy):
     try:
-        policy._nft_script(f"delete table inet {policy.TABLE}\n")
+        policy.remove_policy_table()
     except Exception:
         pass
-    if policy._run_verifier(["--table-absent"]).get("policy_table_absent") is not True:
+    if policy.verify_policy_removed() is not True:
         raise QualificationFailure("temporary host policy could not be independently removed")
 
 
