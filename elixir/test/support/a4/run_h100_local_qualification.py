@@ -185,6 +185,7 @@ def proof_failure_detail(status_code, result, stderr=b""):
         "policy_not_verified", "controller_failed", "manifest_unavailable", "stage_b_not_verified",
         "request_identity_mismatch",
         "direct_egress_not_denied", "canary_probe_failed", "local_qualification_gate_failed",
+        "sink_rejected", "sink_timeout", "sink_unavailable", "sink_exception",
         "econnrefused", "timeout", "closed",
     }
     manifest_failure_fields = {

@@ -463,7 +463,11 @@ defmodule SymphonyElixir.H100HostQualificationRunner do
               :request_identity_mismatch,
               :direct_egress_not_denied,
               :canary_probe_failed,
-              :local_qualification_gate_failed
+              :local_qualification_gate_failed,
+              :sink_rejected,
+              :sink_timeout,
+              :sink_unavailable,
+              :sink_exception
             ],
        do: Atom.to_string(reason)
 

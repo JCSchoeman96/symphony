@@ -174,6 +174,32 @@ class HostQualificationLauncherTests(unittest.TestCase):
             "[ipv4=not_observed,ipv6=not_observed,acks=0]",
         )
 
+    def test_proof_failure_summary_reports_allowlisted_dispatch_sink_failure(self):
+        result = {
+            "type": "PROOF_RESULT",
+            "failure_code": "sink_rejected",
+            "provider_request_id": "preq_fixture",
+            "manifest_finch_absent_before_ready": True,
+            "finch_started_at_witness": False,
+            "finch_stopped": True,
+            "dispatch_witness_ack_count": 0,
+            "retry_count": 0,
+            "replay_count": 0,
+            "transport_result": "transport_failure",
+            "direct_ipv4_canary": "not_observed",
+            "direct_ipv6_canary": "not_observed",
+            "canary_policy_verified": False,
+            "canary_drop_packets": 0,
+            "tls_verify_peer": True,
+            "tls_hostname_verification": True,
+            "shared_trust_unchanged": True,
+        }
+        self.assertEqual(
+            runner.proof_failure_detail(1, result),
+            "proof result rejected (sink_rejected) "
+            "[ipv4=not_observed,ipv6=not_observed,acks=0]",
+        )
+
     def test_proof_failure_summary_never_includes_untrusted_values(self):
         detail = runner.proof_failure_detail(
             1,
