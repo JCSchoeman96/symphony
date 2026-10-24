@@ -344,6 +344,115 @@ def _build_environment(mix_build_path, *, home, runtime_path):
     }
 
 
+def mix_rebar_home_key(mix_path):
+    if not isinstance(mix_path, str) or not mix_path.startswith("/") or "\x00" in mix_path:
+        raise QualificationFailure("Mix executable path is invalid")
+    install_name = pathlib.Path(mix_path).resolve().parent.parent.name
+    match = re.fullmatch(r"(\d+)\.(\d+)(?:\.\d+)?-otp-(\d+)", install_name)
+    if match is None:
+        raise QualificationFailure("Mix runtime path does not identify its Rebar3 home")
+    return f"{match.group(1)}-{match.group(2)}-otp-{match.group(3)}"
+
+
+def _copy_mix_archive(source, destination):
+    if source.is_symlink() or not source.is_dir():
+        raise QualificationFailure("installed Hex archive directory is invalid")
+    digest = hashlib.sha256()
+    entries = 0
+    total_bytes = 0
+    for path in sorted(source.rglob("*")):
+        if path.is_symlink():
+            raise QualificationFailure("installed Hex archive contains a symbolic link")
+        relative = path.relative_to(source)
+        target = destination / relative
+        if path.is_dir():
+            target.mkdir(mode=0o700, parents=True, exist_ok=True)
+            continue
+        file_stat = path.stat(follow_symlinks=False)
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise QualificationFailure("installed Hex archive contains a non-regular file")
+        entries += 1
+        total_bytes += file_stat.st_size
+        if entries > 5_000 or total_bytes > 67_108_864:
+            raise QualificationFailure("installed Hex archive exceeds its copy bound")
+        data = path.read_bytes()
+        file_digest = hashlib.sha256(data).hexdigest()
+        digest.update(relative.as_posix().encode("utf-8"))
+        digest.update(b"\x00")
+        digest.update(str(len(data)).encode("ascii"))
+        digest.update(b"\x00")
+        digest.update(file_digest.encode("ascii"))
+        digest.update(b"\n")
+        target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        target.write_bytes(data)
+        target.chmod(0o600)
+    if entries == 0:
+        raise QualificationFailure("installed Hex archive contains no files")
+    return digest.hexdigest()
+
+
+def prepare_isolated_mix_home(source_mix_home, target_mix_home, *, rebar_key):
+    """Copy only the installed Hex archive and matching Rebar3 into a clean Mix home."""
+    if (not isinstance(source_mix_home, str) or not source_mix_home.startswith("/") or
+            "\x00" in source_mix_home or not isinstance(target_mix_home, str) or
+            not target_mix_home.startswith("/") or "\x00" in target_mix_home or
+            not isinstance(rebar_key, str) or
+            re.fullmatch(r"\d+-\d+-otp-\d+", rebar_key) is None):
+        raise QualificationFailure("isolated Mix home paths are invalid")
+    source_home = pathlib.Path(source_mix_home)
+    target_home = pathlib.Path(target_mix_home)
+    archives = source_home / "archives"
+    if source_home.is_symlink() or archives.is_symlink() or not archives.is_dir():
+        raise QualificationFailure("installed Hex archive home is unavailable")
+    if target_home.exists() or target_home.is_symlink():
+        raise QualificationFailure("isolated Mix home path is not fresh")
+
+    candidates = []
+    for archive in archives.iterdir():
+        if archive.is_symlink() or not archive.is_dir():
+            continue
+        match = re.fullmatch(r"hex-(\d+(?:\.\d+){1,2})", archive.name)
+        if match is None:
+            continue
+        inner = archive / archive.name
+        if (inner.is_symlink() or not inner.is_dir() or
+                not (inner / ".elixir").is_file() or not (inner / "ebin").is_dir()):
+            continue
+        version_parts = tuple(int(part) for part in match.group(1).split("."))
+        candidates.append((version_parts, match.group(1), inner))
+    if not candidates:
+        raise QualificationFailure("installed Hex archive is unavailable")
+    _, hex_version, hex_source = max(candidates, key=lambda candidate: candidate[0])
+
+    rebar_source = source_home / "elixir" / rebar_key / "rebar3"
+    if (rebar_source.is_symlink() or not rebar_source.is_file() or
+            not rebar_source.stat(follow_symlinks=False).st_mode & 0o111 or
+            rebar_source.stat(follow_symlinks=False).st_size > 33_554_432):
+        raise QualificationFailure("matching installed Rebar3 binary is unavailable")
+
+    try:
+        target_home.mkdir(parents=True, mode=0o700, exist_ok=False)
+        hex_destination = target_home / "archives" / f"hex-{hex_version}" / f"hex-{hex_version}"
+        hex_archive_sha256 = _copy_mix_archive(hex_source, hex_destination)
+        rebar_destination = target_home / "elixir" / rebar_key / "rebar3"
+        rebar_destination.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        rebar_bytes = rebar_source.read_bytes()
+        rebar_destination.write_bytes(rebar_bytes)
+        rebar_destination.chmod(0o700)
+    except BaseException:
+        if target_home.is_symlink():
+            target_home.unlink()
+        elif target_home.exists():
+            shutil.rmtree(target_home, ignore_errors=True)
+        raise
+
+    return {
+        "hex_version": hex_version,
+        "hex_archive_sha256": hex_archive_sha256,
+        "rebar3_sha256": hashlib.sha256(rebar_bytes).hexdigest(),
+    }
+
+
 def build_artifact_inventory(build_lib_path):
     """Hash every regular file in the dedicated compiled application directory."""
     if not isinstance(build_lib_path, str) or not build_lib_path.startswith("/") or "\x00" in build_lib_path:
@@ -414,7 +523,8 @@ def _seal_proof_build(build_root):
 
 
 def compile_fresh_proof_build(mix_path, project_path, build_path, *, home, runtime_path,
-                              source_head_sha, source_tree_sha):
+                              source_head_sha, source_tree_sha, rebar_key=None,
+                              source_mix_home=None):
     """Compile the exact local project into a fresh, separate Mix build path."""
     if (not isinstance(mix_path, str) or not mix_path.startswith("/") or "\x00" in mix_path or
             not isinstance(project_path, str) or not project_path.startswith("/") or "\x00" in project_path or
@@ -436,6 +546,12 @@ def compile_fresh_proof_build(mix_path, project_path, build_path, *, home, runti
         build_root.mkdir(parents=True, mode=0o700, exist_ok=False)
     except OSError as exc:
         raise QualificationFailure("fresh proof build directory could not be created") from exc
+    if rebar_key is None:
+        rebar_key = mix_rebar_home_key(mix_path)
+    if source_mix_home is None:
+        source_mix_home = os.environ.get("MIX_HOME") or str(pathlib.Path.home() / ".mix")
+    mix_tools = prepare_isolated_mix_home(source_mix_home, str(pathlib.Path(home) / ".mix"),
+                                          rebar_key=rebar_key)
     environment = _build_environment(str(build_root), home=home, runtime_path=runtime_path)
     _run_bounded([mix_path, "compile", "--warnings-as-errors"], env=environment,
                  timeout=300, cwd=str(project), max_output_bytes=1_048_576)
@@ -449,6 +565,7 @@ def compile_fresh_proof_build(mix_path, project_path, build_path, *, home, runti
         "artifact_count": inventory["artifact_count"],
         "artifact_inventory_sha256": inventory["artifact_inventory_sha256"],
         "mix_lock_sha256": lock_digest,
+        **mix_tools,
     }
 
 
@@ -461,13 +578,18 @@ def proof_elixir_command(elixir_path, build_provenance, script_path):
     if (any(not isinstance(value, str) or not value.startswith("/") or "\x00" in value
             for value in (elixir_path, script_path)) or not isinstance(build_provenance, dict) or
             set(build_provenance) != {"build_lib_path", "source_head_sha", "source_tree_sha",
-                                      "artifact_count", "artifact_inventory_sha256", "mix_lock_sha256"}):
+                                      "artifact_count", "artifact_inventory_sha256", "mix_lock_sha256",
+                                      "hex_version", "hex_archive_sha256", "rebar3_sha256"}):
         raise QualificationFailure("proof BEAM command paths are invalid")
     if (not _valid_git_sha(build_provenance["source_head_sha"]) or
             not _valid_git_sha(build_provenance["source_tree_sha"]) or
             not isinstance(build_provenance["artifact_count"], int) or build_provenance["artifact_count"] < 1 or
             not _valid_sha256(build_provenance["artifact_inventory_sha256"]) or
-            not _valid_sha256(build_provenance["mix_lock_sha256"])):
+            not _valid_sha256(build_provenance["mix_lock_sha256"]) or
+            not isinstance(build_provenance["hex_version"], str) or
+            re.fullmatch(r"\d+(?:\.\d+){1,2}", build_provenance["hex_version"]) is None or
+            not _valid_sha256(build_provenance["hex_archive_sha256"]) or
+            not _valid_sha256(build_provenance["rebar3_sha256"])):
         raise QualificationFailure("proof build provenance is malformed")
     build_lib_path = build_provenance["build_lib_path"]
     if not isinstance(build_lib_path, str) or not build_lib_path.startswith("/") or "\x00" in build_lib_path:
@@ -1434,6 +1556,9 @@ def outer_main(repo_root):
     if mix_path is None or elixir_path is None or erlang_path is None:
         raise QualificationFailure("Mix and the Elixir/Erlang runtime are required")
     runtime_path = runtime_path_for(mix_path, elixir_path, erlang_path)
+    source_mix_home = os.environ.get("MIX_HOME") or str(pathlib.Path.home() / ".mix")
+    if not source_mix_home.startswith("/") or "\x00" in source_mix_home:
+        raise QualificationFailure("installed Mix tool home path is invalid")
 
     temp_root = pathlib.Path(tempfile.mkdtemp(prefix="h100-local-qualification-"))
     listener, outside_port, outside_result, outside_thread = _outer_listener()
@@ -1446,6 +1571,7 @@ def outer_main(repo_root):
                "--inside", "--repo-root", str(repo_root), "--temp-root", str(temp_root),
                "--head", head, "--tree", tree, "--request-id", "preq_" + str(uuid.uuid4()),
                "--mix-path", mix_path, "--runtime-path", runtime_path,
+               "--source-mix-home", source_mix_home,
                "--outside-control-port", str(outside_port)]
     try:
         process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -1517,7 +1643,7 @@ def outer_main(repo_root):
 
 
 def _inside_main(repo_root, temp_root, head, tree, request_id, outside_control_port,
-                 mix_path, runtime_path):
+                 mix_path, runtime_path, source_mix_home):
     global POLICY_PATH_OVERRIDE
     repo_root = pathlib.Path(repo_root).resolve()
     temp_root = pathlib.Path(temp_root).resolve()
@@ -1572,6 +1698,8 @@ def _inside_main(repo_root, temp_root, head, tree, request_id, outside_control_p
             runtime_path=runtime_plan["runtime_path"],
             source_head_sha=head,
             source_tree_sha=tree,
+            rebar_key=mix_rebar_home_key(mix_path),
+            source_mix_home=source_mix_home,
         )
         _bind_read_only_path(proof_build_source, proof_build_mount, unmount=_unmount_mount)
         runtime_mounts.append(proof_build_mount)
@@ -1875,6 +2003,9 @@ def _inside_main(repo_root, temp_root, head, tree, request_id, outside_control_p
             "proof_build_artifact_count": proof_build["artifact_count"],
             "proof_build_artifact_inventory_sha256": proof_build["artifact_inventory_sha256"],
             "proof_build_mix_lock_sha256": proof_build["mix_lock_sha256"],
+            "proof_build_hex_version": proof_build["hex_version"],
+            "proof_build_hex_archive_sha256": proof_build["hex_archive_sha256"],
+            "proof_build_rebar3_sha256": proof_build["rebar3_sha256"],
         }
         return {"type": "QUALIFICATION_RESULT", "qualified": True, "evidence": evidence}
     finally:
@@ -1932,6 +2063,7 @@ def main(argv=None):
     parser.add_argument("--request-id")
     parser.add_argument("--mix-path")
     parser.add_argument("--runtime-path")
+    parser.add_argument("--source-mix-home")
     parser.add_argument("--outside-control-port", type=int)
     args = parser.parse_args(argv)
     try:
@@ -1944,6 +2076,8 @@ def main(argv=None):
                 "\x00" in args.temp_root or
                 not isinstance(args.mix_path, str) or not args.mix_path.startswith("/") or
                 "\x00" in args.mix_path or not _valid_runtime_path(args.runtime_path) or
+                not isinstance(args.source_mix_home, str) or not args.source_mix_home.startswith("/") or
+                "\x00" in args.source_mix_home or
                 not isinstance(args.request_id, str) or not args.request_id.startswith("preq_") or
                 not 1 <= len(args.request_id) <= 128 or
                 not isinstance(args.outside_control_port, int) or not 1 <= args.outside_control_port <= 65535):
@@ -1952,7 +2086,7 @@ def main(argv=None):
         try:
             result = _inside_main(args.repo_root, args.temp_root, args.head, args.tree,
                                   args.request_id, args.outside_control_port,
-                                  args.mix_path, args.runtime_path)
+                                  args.mix_path, args.runtime_path, args.source_mix_home)
         finally:
             signal.signal(signal.SIGTERM, previous_sigterm)
         _write_status(result)

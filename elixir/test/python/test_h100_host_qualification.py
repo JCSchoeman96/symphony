@@ -29,6 +29,47 @@ class HostQualificationLauncherTests(unittest.TestCase):
         )
         self.assertEqual(environment["MIX_ENV"], "prod")
 
+    def test_isolated_mix_home_copies_only_hex_and_rebar_tooling(self):
+        prepare = getattr(runner, "prepare_isolated_mix_home", None)
+        self.assertTrue(callable(prepare), "proof build does not seed its isolated Mix home")
+        with tempfile.TemporaryDirectory(prefix="h100-mix-home-") as directory:
+            root = pathlib.Path(directory)
+            source_home = root / "host-mix"
+            target_home = root / "build-home/.mix"
+            hex_root = source_home / "archives/hex-2.5.1/hex-2.5.1"
+            (hex_root / "ebin").mkdir(parents=True)
+            (hex_root / ".elixir").write_text("1.19.5", encoding="ascii")
+            (hex_root / "ebin/Elixir.Hex.beam").write_bytes(b"isolated Hex tooling")
+            rebar = source_home / "elixir/1-19-otp-28/rebar3"
+            rebar.parent.mkdir(parents=True)
+            rebar.write_bytes(b"isolated Rebar3 tooling")
+            rebar.chmod(0o700)
+            (source_home / "hex.config").write_text("credential-sentinel", encoding="ascii")
+
+            result = prepare(str(source_home), str(target_home), rebar_key="1-19-otp-28")
+
+            copied_hex = target_home / "archives/hex-2.5.1/hex-2.5.1"
+            copied_rebar = target_home / "elixir/1-19-otp-28/rebar3"
+            self.assertEqual(result["hex_version"], "2.5.1")
+            self.assertEqual(len(result["hex_archive_sha256"]), 64)
+            self.assertEqual(len(result["rebar3_sha256"]), 64)
+            self.assertTrue((copied_hex / "ebin/Elixir.Hex.beam").is_file())
+            self.assertTrue(copied_rebar.is_file())
+            self.assertTrue(copied_rebar.stat().st_mode & 0o100)
+            self.assertFalse((target_home / "hex.config").exists())
+            self.assertNotIn(
+                b"credential-sentinel",
+                b"".join(path.read_bytes() for path in target_home.rglob("*") if path.is_file()),
+            )
+
+    def test_mix_runtime_maps_to_its_rebar_home_key(self):
+        key = getattr(runner, "mix_rebar_home_key", None)
+        self.assertTrue(callable(key), "proof build cannot select its matching Rebar3 binary")
+        self.assertEqual(
+            key("/opt/elixir/1.19.3-otp-28/bin/mix"),
+            "1-19-otp-28",
+        )
+
     def test_proof_failure_summary_uses_only_bounded_exception_classes(self):
         detail = runner.proof_failure_detail(
             1,
@@ -520,6 +561,9 @@ class HostQualificationLauncherTests(unittest.TestCase):
                 "source_tree_sha": "b" * 40,
                 **inventory,
                 "mix_lock_sha256": "c" * 64,
+                "hex_version": "2.5.1",
+                "hex_archive_sha256": "d" * 64,
+                "rebar3_sha256": "e" * 64,
             }
             command = runner.proof_elixir_command(
                 "/runtime/elixir/bin/elixir", provenance, "/repo/test/support/proof.exs"
@@ -610,6 +654,9 @@ class HostQualificationLauncherTests(unittest.TestCase):
             self.assertEqual(result["source_tree_sha"], "b" * 40)
             self.assertGreater(result["artifact_count"], 0)
             self.assertEqual(len(result["artifact_inventory_sha256"]), 64)
+            self.assertEqual(result["hex_version"], "2.5.1")
+            self.assertEqual(len(result["hex_archive_sha256"]), 64)
+            self.assertEqual(len(result["rebar3_sha256"]), 64)
             self.assertTrue(stale.is_file(), "fresh compile modified the pre-existing build")
             for path in [build_path, *build_path.rglob("*")]:
                 mode = stat.S_IMODE(path.stat().st_mode)
@@ -953,7 +1000,8 @@ class HostQualificationLauncherTests(unittest.TestCase):
                 "                      '--head', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',",
                 "                      '--tree', 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',",
                 "                      '--request-id', 'preq_signal', '--mix-path', '/usr/bin/mix',",
-                "                      '--runtime-path', '/usr/bin:/bin', '--outside-control-port', '1']))",
+                "                      '--runtime-path', '/usr/bin:/bin', '--source-mix-home', '/tmp/mix-home',",
+                "                      '--outside-control-port', '1']))",
             ])
             process = subprocess.Popen([sys.executable, "-I", "-c", script, str(ready), str(cleaned)],
                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,

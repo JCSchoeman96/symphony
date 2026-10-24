@@ -4,6 +4,7 @@ import copy
 import importlib.util
 import json
 import pathlib
+import re
 import unittest
 
 
@@ -35,6 +36,7 @@ EVIDENCE_FIELDS = {
     "proof_build_fresh", "proof_build_read_only", "proof_build_source_head_sha",
     "proof_build_source_tree_sha", "proof_build_artifact_count",
     "proof_build_artifact_inventory_sha256", "proof_build_mix_lock_sha256",
+    "proof_build_hex_version", "proof_build_hex_archive_sha256", "proof_build_rebar3_sha256",
 }
 
 
@@ -55,7 +57,12 @@ def _sample(schema, root):
     if schema_type == "string":
         pattern = schema.get("pattern")
         if pattern:
-            return "a" * int(pattern.rsplit("{", 1)[1].split("}", 1)[0])
+            repeat = re.search(r"\{(\d+)\}", pattern)
+            if repeat:
+                return "a" * int(repeat.group(1))
+            if "[0-9]" in pattern:
+                return "1" + ".0" * pattern.count(r"\.")
+            return "x"
         return "x" * max(1, schema.get("minLength", 1))
     raise AssertionError(f"test schema has no sample value for {schema_type}")
 

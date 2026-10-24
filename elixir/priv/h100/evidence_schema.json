@@ -34,7 +34,8 @@
         "non_proof_control_exchange", "implementation_head_sha", "implementation_head_tree",
         "implementation_base", "spec_commit", "proof_build_fresh", "proof_build_read_only",
         "proof_build_source_head_sha", "proof_build_source_tree_sha", "proof_build_artifact_count",
-        "proof_build_artifact_inventory_sha256", "proof_build_mix_lock_sha256"
+        "proof_build_artifact_inventory_sha256", "proof_build_mix_lock_sha256",
+        "proof_build_hex_version", "proof_build_hex_archive_sha256", "proof_build_rebar3_sha256"
       ],
       "properties": {
         "policy_mechanism": {"type": "string", "maxLength": 256},
@@ -113,7 +114,10 @@
         "proof_build_source_tree_sha": {"$ref": "#/$defs/git_sha"},
         "proof_build_artifact_count": {"type": "integer", "minimum": 1, "maximum": 50000},
         "proof_build_artifact_inventory_sha256": {"$ref": "#/$defs/sha256"},
-        "proof_build_mix_lock_sha256": {"$ref": "#/$defs/sha256"}
+        "proof_build_mix_lock_sha256": {"$ref": "#/$defs/sha256"},
+        "proof_build_hex_version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"},
+        "proof_build_hex_archive_sha256": {"$ref": "#/$defs/sha256"},
+        "proof_build_rebar3_sha256": {"$ref": "#/$defs/sha256"}
       }
     }
   },
