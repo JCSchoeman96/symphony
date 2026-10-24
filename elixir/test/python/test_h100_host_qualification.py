@@ -353,6 +353,47 @@ class HostQualificationLauncherTests(unittest.TestCase):
             self.assertEqual(otp_release, "28")
             self.assertNotIn("/shims/", selected_path)
 
+    def test_erlang_shim_resolution_deduplicates_version_aliases(self):
+        resolve = getattr(runner, "resolve_erlang_runtime_path", None)
+        self.assertTrue(callable(resolve), "qualification must resolve Erlang install aliases")
+        with tempfile.TemporaryDirectory(prefix="h100-erlang-alias-") as directory:
+            root = pathlib.Path(directory)
+            installs = root / "mise/installs"
+            elixir = installs / "elixir/1.19.5-otp-28/bin/elixir"
+            elixir.parent.mkdir(parents=True)
+            elixir.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
+            elixir.chmod(0o700)
+            installed_erl = installs / "erlang/28.5/bin/erl"
+            installed_erl.parent.mkdir(parents=True)
+            installed_erl.write_text("#!/bin/sh\nprintf '28'\n", encoding="ascii")
+            installed_erl.chmod(0o700)
+            (installs / "erlang/28").symlink_to("28.5", target_is_directory=True)
+            shim = root / "mise/shims/erl"
+            shim.parent.mkdir(parents=True)
+            shim.write_text("#!/bin/sh\nexit 1\n", encoding="ascii")
+            shim.chmod(0o700)
+
+            selected_path, otp_release = resolve(
+                str(shim), selected_elixir_path=str(elixir), expected_otp_major=28,
+            )
+
+            self.assertEqual(selected_path, str(installed_erl))
+            self.assertEqual(otp_release, "28")
+
+    def test_expected_otp_major_reads_repository_root_runtime_config(self):
+        with tempfile.TemporaryDirectory(prefix="h100-erlang-project-config-") as directory:
+            root = pathlib.Path(directory)
+            project = root / "elixir"
+            project.mkdir()
+            (root / "mise.toml").write_text('[tools]\nerlang = "27"\n', encoding="ascii")
+            elixir = root / "mise/installs/elixir/1.19.5-otp-28/bin/elixir"
+            elixir.parent.mkdir(parents=True)
+            elixir.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
+            elixir.chmod(0o700)
+
+            with self.assertRaises(runner.QualificationFailure):
+                runner.expected_otp_major(str(project), str(elixir))
+
     def test_erlang_runtime_diagnostic_exposes_bounded_path_and_release(self):
         output = io.StringIO()
         with patch.object(runner.sys, "stderr", output):
@@ -1126,14 +1167,42 @@ class HostQualificationLauncherTests(unittest.TestCase):
         compile_build = getattr(runner, "compile_fresh_proof_build", None)
         self.assertTrue(callable(compile_build), "qualification lacks a fresh proof build compiler")
 
-        mix_path = runner.shutil.which("mix")
-        elixir_path = runner.shutil.which("elixir")
-        resolved_erlang_path = runner.shutil.which("erl")
-        if not all((mix_path, elixir_path, resolved_erlang_path)):
+        mix_entry = runner.shutil.which("mix")
+        elixir_entry = runner.shutil.which("elixir")
+        erlang_entry = runner.shutil.which("erl")
+        if not all((mix_entry, elixir_entry, erlang_entry)):
             self.skipTest("Mix and its pinned Elixir/Erlang runtime are unavailable")
+        source_mix_home = os.environ.get("MIX_HOME") or str(pathlib.Path.home() / ".mix")
+        host_mix_path, host_elixir_path = runner.resolve_mix_runtime_paths(mix_entry, source_mix_home)
+        project_elixir = pathlib.Path(__file__).resolve().parents[2]
+        host_otp_major = runner.expected_otp_major(str(project_elixir), host_elixir_path)
+        host_erlang_path, _host_otp_release = runner.resolve_erlang_runtime_path(
+            erlang_entry, selected_elixir_path=host_elixir_path, expected_otp_major=host_otp_major,
+        )
 
         with tempfile.TemporaryDirectory(prefix="h100-proof-build-") as directory:
             root = pathlib.Path(directory)
+            installs = root / "mise/installs"
+            elixir_install = installs / "elixir" / pathlib.Path(host_elixir_path).parent.parent.name
+            erlang_install = installs / "erlang" / pathlib.Path(host_erlang_path).parent.parent.name
+            mix_path = str(elixir_install / "bin/mix")
+            elixir_path = str(elixir_install / "bin/elixir")
+            concrete_erlang = erlang_install / "bin/erl"
+
+            def write_runtime_wrapper(path, target):
+                path = pathlib.Path(path)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(
+                    "#!/usr/bin/python3\nimport os, sys\n"
+                    f"program = {str(target)!r}\n"
+                    "os.execv(program, [program, *sys.argv[1:]])\n",
+                    encoding="ascii",
+                )
+                path.chmod(0o700)
+
+            write_runtime_wrapper(mix_path, host_mix_path)
+            write_runtime_wrapper(elixir_path, host_elixir_path)
+            write_runtime_wrapper(concrete_erlang, host_erlang_path)
             project = root / "project"
             (project / "lib").mkdir(parents=True)
             (project / "mix.exs").write_text(
@@ -1148,6 +1217,7 @@ class HostQualificationLauncherTests(unittest.TestCase):
                 "defmodule BuildFixture do\n  def ready, do: true\nend\n", encoding="utf-8"
             )
             (project / "mix.lock").write_text("%{}\n", encoding="utf-8")
+            (project / "mise.toml").write_text('[tools]\nerlang = "28"\n', encoding="ascii")
             stale = project / "_build/test/lib/build_fixture/ebin/stale.beam"
             stale.parent.mkdir(parents=True)
             stale.write_bytes(b"stale repository build")
@@ -1158,8 +1228,13 @@ class HostQualificationLauncherTests(unittest.TestCase):
                 "#!/bin/sh\necho 'mise ERROR erl is not a valid shim' >&2\nexit 1\n", encoding="ascii"
             )
             erlang_shim.chmod(0o700)
-            runtime_path = (runner.runtime_path_for(mix_path, elixir_path, str(erlang_shim)) +
-                            os.pathsep + os.path.dirname(resolved_erlang_path))
+            initial_erlang_path = runner.shutil.which("erl", path=str(erlang_shim.parent))
+            self.assertEqual(initial_erlang_path, str(erlang_shim))
+            expected_major = runner.expected_otp_major(str(project), elixir_path)
+            resolved_erlang_path, selected_otp_release = runner.resolve_erlang_runtime_path(
+                initial_erlang_path, selected_elixir_path=elixir_path, expected_otp_major=expected_major,
+            )
+            runtime_path = runner.runtime_path_for(mix_path, elixir_path, resolved_erlang_path)
 
             original_run = runner._run_bounded
             observed_mix_environments = []
@@ -1182,8 +1257,9 @@ class HostQualificationLauncherTests(unittest.TestCase):
                     runtime_path=runtime_path,
                     source_head_sha="a" * 40,
                     source_tree_sha="b" * 40,
+                    source_mix_home=source_mix_home,
                     selected_erlang_path=resolved_erlang_path,
-                    selected_otp_release="28",
+                    selected_otp_release=selected_otp_release,
                     failure_stderr_bytes=4096,
                 )
 
@@ -1196,6 +1272,8 @@ class HostQualificationLauncherTests(unittest.TestCase):
             self.assertGreater(result["artifact_count"], 0)
             self.assertEqual(len(observed_mix_environments), 1)
             self.assertNotIn(str(erlang_shim.parent), observed_mix_environments[0]["PATH"].split(os.pathsep))
+            self.assertIn(os.path.dirname(resolved_erlang_path),
+                          observed_mix_environments[0]["PATH"].split(os.pathsep))
             self.assertEqual(observed_erlang_probes, [b"28"])
             self.assertEqual(len(result["artifact_inventory_sha256"]), 64)
             self.assertRegex(result["hex_version"], r"\A\d+(?:\.\d+){1,2}\Z")

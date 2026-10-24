@@ -448,7 +448,10 @@ def expected_otp_major(project_path, elixir_path):
     """Bind the selected OTP family to both project config and the Elixir install."""
     if not isinstance(project_path, str) or not project_path.startswith("/") or "\x00" in project_path:
         raise QualificationFailure("Elixir runtime inputs are invalid")
-    config_path = pathlib.Path(project_path) / "mise.toml"
+    project = pathlib.Path(project_path)
+    config_path = project / "mise.toml"
+    if not config_path.exists():
+        config_path = project.parent / "mise.toml"
     config_major = None
     if config_path.exists():
         try:
@@ -553,7 +556,7 @@ def resolve_erlang_runtime_path(erlang_path, *, selected_elixir_path, expected_o
             if otp_release != str(expected_otp_major):
                 raise QualificationFailure("selected Erlang runtime does not match expected OTP family")
             return str(direct_path), otp_release
-    candidates = []
+    candidates = {}
     try:
         versions = sorted(erlang_root.iterdir(), key=lambda item: item.name)
     except OSError as exc:
@@ -574,10 +577,10 @@ def resolve_erlang_runtime_path(erlang_path, *, selected_elixir_path, expected_o
         if (not resolved.is_relative_to(install_root) or resolved.name != "erl" or
                 not stat.S_ISREG(metadata.st_mode) or not os.access(resolved, os.X_OK)):
             raise QualificationFailure("matching versioned Erlang executable is invalid")
-        candidates.append(str(candidate))
+        candidates.setdefault(str(resolved), str(resolved))
     if len(candidates) != 1:
         raise QualificationFailure("matching versioned Erlang installation is ambiguous")
-    selected_path = candidates[0]
+    selected_path = next(iter(candidates.values()))
     otp_release = _probe_otp_release(selected_path)
     if otp_release != str(expected_otp_major):
         raise QualificationFailure("selected Erlang runtime does not match expected OTP family")
