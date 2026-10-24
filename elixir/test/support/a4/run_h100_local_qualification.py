@@ -1201,7 +1201,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--inside", action="store_true")
     parser.add_argument("--repo-root", required=True)
-    parser.add_argument("--temp-root", required=True)
+    parser.add_argument("--temp-root")
     parser.add_argument("--head")
     parser.add_argument("--tree")
     parser.add_argument("--request-id")
@@ -1213,6 +1213,8 @@ def main(argv=None):
             _write_status(result)
             return 0
         if (not _valid_sha(args.head) or not _valid_sha(args.tree) or
+                not isinstance(args.temp_root, str) or not args.temp_root.startswith("/") or
+                "\x00" in args.temp_root or
                 not isinstance(args.request_id, str) or not args.request_id.startswith("preq_") or
                 not 1 <= len(args.request_id) <= 128 or
                 not isinstance(args.outside_control_port, int) or not 1 <= args.outside_control_port <= 65535):

@@ -21,6 +21,12 @@ spec.loader.exec_module(runner)
 
 
 class HostQualificationLauncherTests(unittest.TestCase):
+    def test_outer_launcher_does_not_require_namespace_only_arguments(self):
+        with patch.object(runner, "outer_main", return_value={"type": "TEST_RESULT"}) as outer:
+            with patch.object(runner, "_write_status"):
+                self.assertEqual(runner.main(["--repo-root", "/tmp"]), 0)
+        outer.assert_called_once_with("/tmp")
+
     def test_cleanup_attempts_every_resource_and_reports_a_child_that_would_not_stop(self):
         class Process:
             def __init__(self):
