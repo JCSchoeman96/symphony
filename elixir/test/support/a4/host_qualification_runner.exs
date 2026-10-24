@@ -136,6 +136,7 @@ defmodule SymphonyElixir.H100HostQualificationRunner do
 
     result = %{
       "type" => "PROOF_RESULT",
+      "failure_code" => proof_result_failure_code(response),
       "provider_request_id" => request_id,
       "manifest_finch_absent_before_ready" => finch_absent_after_manifest,
       "finch_started_at_witness" => Process.get(:h100_finch_started_at_witness, false),
@@ -388,6 +389,70 @@ defmodule SymphonyElixir.H100HostQualificationRunner do
 
   defp result_class({:error, _error}), do: "transport_failure"
   defp result_class(_result), do: "unexpected_success"
+
+  defp proof_result_failure_code({:error, {:dispatch_witness_failed, {:proof_manifest_mismatch, field}}})
+       when field in [
+              :schema,
+              :experiment_scope,
+              :provider_request_id,
+              :transition_attempt_id,
+              :work_item_id,
+              :workspace_id,
+              :project_id,
+              :target_state_id,
+              :method,
+              :origin_base_url,
+              :origin_authority,
+              :candidate_sha,
+              :candidate_tree,
+              :relay_script_blob_sha256,
+              :manifest_id,
+              :operator_authorization_ref,
+              :python_path,
+              :python_version,
+              :max_dispatch,
+              :max_connect,
+              :max_client_app_records,
+              :tls_versions,
+              :expires_at,
+              :manifest_bytes,
+              :shape,
+              :canonical_or_hash,
+              :canonical_json,
+              :body_bytes,
+              :path_bytes,
+              :ready
+            ],
+       do: "proof_manifest_mismatch_" <> Atom.to_string(field)
+
+  defp proof_result_failure_code({:error, {:dispatch_witness_failed, reason}})
+       when reason in [
+              :witness_required,
+              :request_fun_transport_not_supported,
+              :invalid_proof_session,
+              :proof_finch_start_failed,
+              :invalid_proof_tls_trust_context,
+              :proof_ready_already_received,
+              :proof_token_owner_mismatch,
+              :proof_token_expired,
+              :proof_controller_unavailable,
+              :proof_ready_already_requested,
+              :proof_token_consumed,
+              :proof_token_binding_mismatch,
+              :proof_token_not_ready,
+              :proof_reply_receiver_failed,
+              :duplicate_or_unsolicited_controller_message,
+              :invalid_ready_response,
+              :wrong_controller_reference,
+              :proof_ready_timeout
+            ],
+       do: Atom.to_string(reason)
+
+  defp proof_result_failure_code({:error, {:dispatch_witness_failed, _reason}}), do: "dispatch_witness_failed"
+  defp proof_result_failure_code({:error, :provider_unavailable}), do: "provider_unavailable"
+  defp proof_result_failure_code({:error, reason}) when reason in [:econnrefused, :timeout, :closed], do: Atom.to_string(reason)
+  defp proof_result_failure_code({:error, _error}), do: "transport_failure"
+  defp proof_result_failure_code(_result), do: "unexpected_success"
 
   defp atom_value(nil, _key), do: "failed"
   defp atom_value(map, key), do: Map.get(map, key, :failed) |> Atom.to_string()

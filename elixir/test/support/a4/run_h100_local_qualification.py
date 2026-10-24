@@ -161,13 +161,45 @@ def proof_failure_detail(status_code, result, stderr=b""):
         return "proof BEAM raised an unclassified exception" + location
 
     expected_fields = {
-        "type", "provider_request_id", "manifest_finch_absent_before_ready",
+        "type", "failure_code", "provider_request_id", "manifest_finch_absent_before_ready",
         "finch_started_at_witness", "finch_stopped", "dispatch_witness_ack_count",
         "retry_count", "replay_count", "transport_result", "direct_ipv4_canary",
         "direct_ipv6_canary", "canary_policy_verified", "canary_drop_packets",
         "tls_verify_peer", "tls_hostname_verification", "shared_trust_unchanged",
     }
     if result.get("type") != "PROOF_RESULT" or set(result) != expected_fields:
+        return "proof BEAM failed with an invalid bounded result"
+
+    proof_failure_codes = {
+        "unexpected_success", "transport_failure", "provider_unavailable", "dispatch_witness_failed",
+        "witness_required", "request_fun_transport_not_supported", "invalid_proof_session",
+        "proof_finch_start_failed", "invalid_proof_tls_trust_context", "proof_ready_already_received",
+        "proof_token_owner_mismatch",
+        "proof_token_expired", "proof_controller_unavailable", "proof_ready_already_requested",
+        "proof_token_consumed", "proof_token_binding_mismatch", "proof_token_not_ready",
+        "proof_reply_receiver_failed", "duplicate_or_unsolicited_controller_message",
+        "invalid_ready_response", "wrong_controller_reference", "proof_ready_timeout",
+        "econnrefused", "timeout", "closed",
+    }
+    manifest_failure_fields = {
+        "schema", "experiment_scope", "provider_request_id", "transition_attempt_id", "work_item_id",
+        "workspace_id", "project_id", "target_state_id", "method", "origin_base_url",
+        "origin_authority", "candidate_sha", "candidate_tree", "relay_script_blob_sha256", "manifest_id",
+        "operator_authorization_ref", "python_path", "python_version", "max_dispatch", "max_connect",
+        "max_client_app_records", "tls_versions", "expires_at", "manifest_bytes", "shape",
+        "canonical_or_hash", "canonical_json", "body_bytes", "path_bytes", "ready",
+    }
+    if not isinstance(result["failure_code"], str):
+        return "proof BEAM failed with an invalid bounded result"
+    if (result["failure_code"] not in proof_failure_codes and
+            not any(result["failure_code"] == "proof_manifest_mismatch_" + field
+                    for field in manifest_failure_fields)):
+        return "proof BEAM failed with an invalid bounded result"
+    if (not isinstance(result["dispatch_witness_ack_count"], int) or
+            isinstance(result["dispatch_witness_ack_count"], bool) or
+            result["dispatch_witness_ack_count"] not in (0, 1) or
+            result["direct_ipv4_canary"] not in ("blocked", "reachable", "failed") or
+            result["direct_ipv6_canary"] not in ("blocked", "reachable", "failed")):
         return "proof BEAM failed with an invalid bounded result"
 
     required = {
@@ -183,7 +215,19 @@ def proof_failure_detail(status_code, result, stderr=b""):
     }
     failures = sorted(name for name, value in required.items() if result.get(name) != value)
     if failures:
-        return "proof result rejected: " + ",".join(failures)
+        detail = "proof result rejected: " + ",".join(failures)
+        diagnostics = []
+        if result["direct_ipv4_canary"] != "blocked":
+            diagnostics.append("ipv4=" + result["direct_ipv4_canary"])
+        if result["direct_ipv6_canary"] != "blocked":
+            diagnostics.append("ipv6=" + result["direct_ipv6_canary"])
+        if result["dispatch_witness_ack_count"] != 1:
+            diagnostics.append("acks=" + str(result["dispatch_witness_ack_count"]))
+        if result["failure_code"] not in {"transport_failure", "provider_unavailable"}:
+            diagnostics.append("failure=" + result["failure_code"])
+        if diagnostics:
+            detail += " (" + ",".join(diagnostics) + ")"
+        return detail[:160]
     return "proof BEAM exited nonzero after an accepted bounded result"
 
 

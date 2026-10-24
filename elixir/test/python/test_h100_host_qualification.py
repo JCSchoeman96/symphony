@@ -91,6 +91,7 @@ class HostQualificationLauncherTests(unittest.TestCase):
     def test_proof_failure_summary_names_only_failed_contract_fields(self):
         result = {
             "type": "PROOF_RESULT",
+            "failure_code": "proof_manifest_mismatch_body_bytes",
             "provider_request_id": "preq_fixture",
             "manifest_finch_absent_before_ready": True,
             "finch_started_at_witness": True,
@@ -109,7 +110,8 @@ class HostQualificationLauncherTests(unittest.TestCase):
         }
         self.assertEqual(
             runner.proof_failure_detail(1, result),
-            "proof result rejected: dispatch_witness_ack_count,transport_result",
+            "proof result rejected: dispatch_witness_ack_count,transport_result "
+            "(acks=0,failure=proof_manifest_mismatch_body_bytes)",
         )
 
     def test_proof_failure_summary_never_includes_untrusted_values(self):
