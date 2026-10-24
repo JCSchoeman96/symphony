@@ -142,6 +142,14 @@ class HostQualificationLauncherTests(unittest.TestCase):
         self.assertNotIn("GH_TOKEN", child)
         self.assertNotIn("PATH_INFO", child)
 
+    def test_runtime_path_contains_only_resolved_elixir_and_erlang_bins(self):
+        runtime_path = runner.runtime_path_for(
+            "/opt/elixir/bin/mix", "/opt/elixir/bin/elixir", "/opt/erlang/bin/erl"
+        )
+        self.assertEqual(runtime_path, "/opt/elixir/bin:/opt/erlang/bin")
+        child = runner.child_environment({}, home="/tmp/proof-home", runtime_path=runtime_path)
+        self.assertEqual(child["PATH"], runtime_path + ":" + runner.SYSTEM_PATH)
+
     def test_origin_summary_must_match_the_exact_patch_without_returning_payload(self):
         raw = ('{"type":"LOCAL_TLS_RESULT","request_count":1,"complete_request":true,'
                '"method":"PATCH","path":"/api/v1/work-items/work-1/",'
@@ -319,7 +327,8 @@ class HostQualificationLauncherTests(unittest.TestCase):
                 "sys.exit(runner.main(['--inside', '--repo-root', '/tmp', '--temp-root', '/tmp',",
                 "                      '--head', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',",
                 "                      '--tree', 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',",
-                "                      '--request-id', 'preq_signal', '--outside-control-port', '1']))",
+                "                      '--request-id', 'preq_signal', '--mix-path', '/usr/bin/mix',",
+                "                      '--runtime-path', '/usr/bin:/bin', '--outside-control-port', '1']))",
             ])
             process = subprocess.Popen([sys.executable, "-I", "-c", script, str(ready), str(cleaned)],
                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,

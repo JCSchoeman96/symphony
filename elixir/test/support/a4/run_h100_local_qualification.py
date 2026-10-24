@@ -53,9 +53,30 @@ def _safe_failure_reason(value):
     return value
 
 
-def child_environment(values, *, home):
+def runtime_path_for(*executables):
+    """Return only the tool directories needed by the pinned Elixir runtime."""
+    directories = []
+    for executable in executables:
+        if not isinstance(executable, str) or not executable.startswith("/") or "\x00" in executable:
+            raise QualificationFailure("runtime executable path is invalid")
+        directory = os.path.dirname(executable)
+        if directory not in directories:
+            directories.append(directory)
+    runtime_path = os.pathsep.join(directories)
+    if not runtime_path or len(runtime_path) > 2048:
+        raise QualificationFailure("runtime executable path exceeds its bound")
+    return runtime_path
+
+
+def _valid_runtime_path(runtime_path):
+    return (isinstance(runtime_path, str) and 0 < len(runtime_path) <= 2048 and
+            all(part.startswith("/") and "\x00" not in part for part in runtime_path.split(os.pathsep)))
+
+
+def child_environment(values, *, home, runtime_path=SYSTEM_PATH):
     """Build a clean child environment from fixed names and explicit values."""
-    if not isinstance(values, dict) or not isinstance(home, str) or not home.startswith("/"):
+    if (not isinstance(values, dict) or not isinstance(home, str) or not home.startswith("/") or
+            not _valid_runtime_path(runtime_path)):
         raise QualificationFailure("invalid clean child environment")
     allowed = {
         "H100_QUAL_SOCKET", "H100_QUAL_CA_DER", "H100_QUAL_CANDIDATE_SHA",
@@ -69,7 +90,8 @@ def child_environment(values, *, home):
     if any(not isinstance(name, str) or not isinstance(value, str) or "\x00" in value
            for name, value in values.items()):
         raise QualificationFailure("child environment contains an invalid value")
-    return {"PATH": SYSTEM_PATH, "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "HOME": home,
+    return {"PATH": runtime_path + os.pathsep + SYSTEM_PATH,
+            "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "HOME": home,
             "MIX_HOME": os.path.join(home, ".mix"), "HEX_HOME": os.path.join(home, ".hex"),
             "MIX_ENV": "test", "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_TERMINAL_PROMPT": "0", **values}
@@ -820,6 +842,12 @@ def outer_main(repo_root):
     unshare = shutil.which("unshare")
     if unshare is None:
         raise QualificationFailure("rootless user, network, and mount namespaces are required")
+    mix_path = shutil.which("mix")
+    elixir_path = shutil.which("elixir")
+    erlang_path = shutil.which("erl")
+    if mix_path is None or elixir_path is None or erlang_path is None:
+        raise QualificationFailure("Mix and the Elixir/Erlang runtime are required")
+    runtime_path = runtime_path_for(mix_path, elixir_path, erlang_path)
 
     temp_root = pathlib.Path(tempfile.mkdtemp(prefix="h100-local-qualification-"))
     listener, outside_port, outside_result, outside_thread = _outer_listener()
@@ -831,6 +859,7 @@ def outer_main(repo_root):
                "--propagation", "private", "--", sys.executable, "-I", str(pathlib.Path(__file__).resolve()),
                "--inside", "--repo-root", str(repo_root), "--temp-root", str(temp_root),
                "--head", head, "--tree", tree, "--request-id", "preq_" + str(uuid.uuid4()),
+               "--mix-path", mix_path, "--runtime-path", runtime_path,
                "--outside-control-port", str(outside_port)]
     try:
         process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -901,7 +930,8 @@ def outer_main(repo_root):
             raise QualificationFailure("outer qualification cleanup failed: " + ",".join(cleanup_failures))
 
 
-def _inside_main(repo_root, temp_root, head, tree, request_id, outside_control_port):
+def _inside_main(repo_root, temp_root, head, tree, request_id, outside_control_port,
+                 mix_path, runtime_path):
     global POLICY_PATH_OVERRIDE
     repo_root = pathlib.Path(repo_root).resolve()
     temp_root = pathlib.Path(temp_root).resolve()
@@ -1071,11 +1101,8 @@ def _inside_main(repo_root, temp_root, head, tree, request_id, outside_control_p
             "H100_QUAL_EXPECTED_PATH": EXPECTED_PATH,
             "H100_QUAL_RESULT_FILE": str(result_path),
         }
-        mix = shutil.which("mix")
-        if mix is None:
-            raise QualificationFailure("Mix is unavailable for the proof runner")
-        proof_environment = child_environment(result_values, home=str(proof_home))
-        proof_command = _setpriv_command(PROOF_UID, [mix, "run", "--no-compile", "--no-start",
+        proof_environment = child_environment(result_values, home=str(proof_home), runtime_path=runtime_path)
+        proof_command = _setpriv_command(PROOF_UID, [mix_path, "run", "--no-compile", "--no-start",
                                                      str(proof_runner_path)])
         proof_process = subprocess.Popen(proof_command, cwd=str(source_elixir), stdin=subprocess.DEVNULL,
                                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -1245,6 +1272,8 @@ def main(argv=None):
     parser.add_argument("--head")
     parser.add_argument("--tree")
     parser.add_argument("--request-id")
+    parser.add_argument("--mix-path")
+    parser.add_argument("--runtime-path")
     parser.add_argument("--outside-control-port", type=int)
     args = parser.parse_args(argv)
     try:
@@ -1255,6 +1284,8 @@ def main(argv=None):
         if (not _valid_sha(args.head) or not _valid_sha(args.tree) or
                 not isinstance(args.temp_root, str) or not args.temp_root.startswith("/") or
                 "\x00" in args.temp_root or
+                not isinstance(args.mix_path, str) or not args.mix_path.startswith("/") or
+                "\x00" in args.mix_path or not _valid_runtime_path(args.runtime_path) or
                 not isinstance(args.request_id, str) or not args.request_id.startswith("preq_") or
                 not 1 <= len(args.request_id) <= 128 or
                 not isinstance(args.outside_control_port, int) or not 1 <= args.outside_control_port <= 65535):
@@ -1262,7 +1293,8 @@ def main(argv=None):
         previous_sigterm = signal.signal(signal.SIGTERM, _interrupt_local_qualification)
         try:
             result = _inside_main(args.repo_root, args.temp_root, args.head, args.tree,
-                                  args.request_id, args.outside_control_port)
+                                  args.request_id, args.outside_control_port,
+                                  args.mix_path, args.runtime_path)
         finally:
             signal.signal(signal.SIGTERM, previous_sigterm)
         _write_status(result)
