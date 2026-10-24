@@ -45,6 +45,8 @@ class HostQualificationLauncherTests(unittest.TestCase):
                          "permission_error")
         self.assertEqual(runner.proof_stderr_category(b"Permission denied writing _build/test"),
                          "permission_build_output")
+        self.assertEqual(runner.proof_stderr_category(b"Permission denied proof-state/proof-result.json"),
+                         "permission_proof_result")
         self.assertEqual(runner.proof_stderr_category(b"unrecognized sensitive output"),
                          "unclassified_stderr")
 

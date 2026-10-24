@@ -63,6 +63,10 @@ def proof_stderr_category(stderr):
     if b"permission denied" in value:
         if b"_build" in value:
             return "permission_build_output"
+        if b"proof-result" in value or b"proof_state" in value:
+            return "permission_proof_result"
+        if b"controller.sock" in value:
+            return "permission_controller_socket"
         if b".mix" in value or b".hex" in value:
             return "permission_proof_home"
         if b"mix.exs" in value or b"/repo/" in value or b".exs" in value:
