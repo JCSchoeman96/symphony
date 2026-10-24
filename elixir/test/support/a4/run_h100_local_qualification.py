@@ -336,7 +336,7 @@ def _build_environment(mix_build_path, *, home, runtime_path):
         "HOME": home,
         "MIX_HOME": os.path.join(home, ".mix"),
         "HEX_HOME": os.path.join(home, ".hex"),
-        "MIX_ENV": "test",
+        "MIX_ENV": "prod",
         "MIX_BUILD_PATH": mix_build_path,
         "GIT_CONFIG_GLOBAL": "/dev/null",
         "GIT_CONFIG_NOSYSTEM": "1",

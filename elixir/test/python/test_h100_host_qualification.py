@@ -21,6 +21,14 @@ spec.loader.exec_module(runner)
 
 
 class HostQualificationLauncherTests(unittest.TestCase):
+    def test_proof_build_uses_production_mix_environment(self):
+        environment = runner._build_environment(
+            "/tmp/h100-proof-build",
+            home="/tmp/h100-build-home",
+            runtime_path="/runtime/elixir/bin:/runtime/erlang/bin",
+        )
+        self.assertEqual(environment["MIX_ENV"], "prod")
+
     def test_proof_failure_summary_uses_only_bounded_exception_classes(self):
         detail = runner.proof_failure_detail(
             1,
