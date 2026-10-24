@@ -45,7 +45,10 @@ defmodule SymphonyElixir.WorkControl.A4HostRelayIPC do
   defp safe_term?(_term), do: false
 
   defp safe_key?(key) when is_binary(key) do
-    String.downcase(key) not in @forbidden_keys and not String.contains?(String.downcase(key), "authorization")
+    lowered = String.downcase(key)
+
+    lowered not in @forbidden_keys and
+      (lowered == "operator_authorization_ref" or not String.contains?(lowered, "authorization"))
   end
 
   defp safe_key?(_key), do: false

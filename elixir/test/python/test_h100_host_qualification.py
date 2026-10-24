@@ -155,6 +155,18 @@ class HostQualificationLauncherTests(unittest.TestCase):
                 relay_hash="d" * 64, python_path="/usr/bin/python3", python_version="3.14.0",
             )
 
+    def test_ipc_filter_allows_only_frozen_operator_authorization_reference(self):
+        self.assertTrue(
+            runner._safe_ipc_value(
+                {"manifest": {"operator_authorization_ref": "local-test-only"}}
+            )
+        )
+        self.assertFalse(
+            runner._safe_ipc_value(
+                {"manifest": {"authorization_header": "fixture-sentinel"}}
+            )
+        )
+
     def test_outer_launcher_does_not_require_namespace_only_arguments(self):
         with patch.object(runner, "outer_main", return_value={"type": "TEST_RESULT"}) as outer:
             with patch.object(runner, "_write_status"):

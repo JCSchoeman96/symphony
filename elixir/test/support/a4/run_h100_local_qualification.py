@@ -398,7 +398,7 @@ def _safe_ipc_value(value):
             lowered = key.lower()
             if (lowered in {"api_key", "authorization", "authorization_header", "body",
                             "request_body", "payload", "secret", "token", "tls_plaintext"} or
-                    "authorization" in lowered):
+                    ("authorization" in lowered and lowered != "operator_authorization_ref")):
                 return False
             if not _safe_ipc_value(item):
                 return False
