@@ -274,6 +274,40 @@ class HostQualificationLauncherTests(unittest.TestCase):
             finally:
                 server.close()
 
+    def test_controller_listener_waits_for_live_proof_pid_binding(self):
+        with tempfile.TemporaryDirectory(prefix="h100-ipc-bind-") as directory:
+            path = pathlib.Path(directory) / "controller.sock"
+            server = runner.ControllerIPCServer(
+                path,
+                expected_uid=os.geteuid(),
+                expected_pid=0,
+                handler=lambda _message, _peer: {"verified": True},
+            )
+            server.start()
+            client_code = (
+                "import socket,sys; s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); "
+                "s.connect(sys.argv[1]); s.sendall(b'{\\\"op\\\":\\\"stage_a\\\"}\\n'); "
+                "print(s.recv(4096).decode()); s.close()"
+            )
+            child = subprocess.Popen(
+                [sys.executable, "-I", "-c", client_code, str(path)],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"},
+            )
+            try:
+                time.sleep(0.05)
+                self.assertIsNone(child.poll(), "IPC request was handled before PID binding")
+                server.set_expected_pid(child.pid)
+                output, _ = child.communicate(timeout=3)
+                self.assertEqual(json.loads(output), {"verified": True})
+            finally:
+                if child.poll() is None:
+                    child.terminate()
+                    child.wait(timeout=3)
+                if child.stdout is not None:
+                    child.stdout.close()
+                server.close()
+
     def test_relay_listener_verification_requires_one_ipv4_loopback_socket(self):
         tcp = ("  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid timeout inode\n"
                "   0: 0100007F:A869 00000000:0000 0A 00000000:00000000 00:00000000 00000000 1202 0 12345 1\n")

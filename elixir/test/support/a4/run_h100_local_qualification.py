@@ -219,6 +219,9 @@ class ControllerIPCServer:
         self.listener.listen(8)
         self.listener.settimeout(0.2)
         self.stopping = threading.Event()
+        self.identity_ready = threading.Event()
+        if expected_pid > 0:
+            self.identity_ready.set()
         self.thread = None
         self.last_error = None
 
@@ -228,8 +231,19 @@ class ControllerIPCServer:
         self.thread = threading.Thread(target=self._serve, name="h100-controller-ipc", daemon=True)
         self.thread.start()
 
+    def set_expected_pid(self, pid):
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+            raise QualificationFailure("proof PID binding is invalid")
+        if self.identity_ready.is_set():
+            if self.expected_pid != pid:
+                raise QualificationFailure("proof PID binding cannot be changed")
+            return
+        self.expected_pid = pid
+        self.identity_ready.set()
+
     def close(self):
         self.stopping.set()
+        self.identity_ready.set()
         self.listener.close()
         if self.thread is not None:
             self.thread.join(2)
@@ -255,7 +269,8 @@ class ControllerIPCServer:
     def _handle(self, connection):
         try:
             peer = peer_credentials(connection)
-            if peer[0] != self.expected_pid or peer[1] != self.expected_uid:
+            if (not self.identity_ready.wait(3) or peer[0] != self.expected_pid or
+                    peer[1] != self.expected_uid):
                 response = {"error": "unauthorized_controller_peer"}
             else:
                 raw = bytearray()
@@ -1115,12 +1130,12 @@ def _inside_main(repo_root, temp_root, head, tree, request_id, outside_control_p
         proof_environment = child_environment(result_values, home=str(proof_home), runtime_path=runtime_path)
         proof_command = _setpriv_command(PROOF_UID, [mix_path, "run", "--no-compile", "--no-start",
                                                      str(proof_runner_path)])
+        control_server.start()
         proof_process = subprocess.Popen(proof_command, cwd=str(source_elixir), stdin=subprocess.DEVNULL,
                                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                          env=proof_environment, start_new_session=True)
+        control_server.set_expected_pid(proof_process.pid)
         proof_identity = proof_process_identity(proof_process)
-        control_server.expected_pid = proof_process.pid
-        control_server.start()
         status_code = proof_process.wait(timeout=55)
         if status_code != 0 or not result_path.is_file():
             raise QualificationFailure("unprivileged proof BEAM failed")
