@@ -3,14 +3,12 @@
 import json
 import os
 import argparse
-import subprocess
 import sys
 
 
 TABLE = "symphony_h100"
 CHAIN = "output"
 MAX_RULESET_BYTES = 1_048_576
-SYSTEM_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
 
 
 class PolicyError(ValueError):
@@ -183,15 +181,13 @@ def parse_effective_ruleset(ruleset, *, proof_uid, proof_port=None, relay_uid=No
 
 
 def read_nft_ruleset():
-    """Read nftables JSON in the verifier's current network namespace."""
+    """Read the bounded kernel ruleset snapshot from the privileged caller's stdin."""
     try:
-        result = subprocess.run(["nft", "-a", "-j", "list", "ruleset"], check=True,
-                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                timeout=2, env={"PATH": SYSTEM_PATH})
-        if len(result.stdout) > MAX_RULESET_BYTES:
+        encoded = sys.stdin.buffer.read(MAX_RULESET_BYTES + 1)
+        if len(encoded) > MAX_RULESET_BYTES:
             raise PolicyError("nftables state exceeds verifier bound")
-        return json.loads(result.stdout)
-    except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
+        return json.loads(encoded)
+    except (OSError, json.JSONDecodeError) as exc:
         raise PolicyError("cannot read effective nftables state") from exc
 
 
@@ -221,13 +217,16 @@ def read_process_identity(pid):
         if directory_fd is not None:
             os.close(directory_fd)
     uid_line = next((line for line in status.splitlines() if line.startswith("Uid:")), None)
-    if uid_line is None:
-        raise PolicyError("process status has no UID")
+    cap_line = next((line for line in status.splitlines() if line.startswith("CapEff:")), None)
+    if uid_line is None or cap_line is None:
+        raise PolicyError("process status lacks UID or capability identity")
     try:
         values = uid_line.split()
-        if len(values) != 5:
-            raise ValueError("bad Uid field")
+        cap_values = cap_line.split()
+        if len(values) != 5 or len(cap_values) != 2:
+            raise ValueError("bad UID or capability field")
         effective_uid = int(values[2])
+        effective_capabilities = int(cap_values[1], 16)
         mappings = []
         for line in raw_map.splitlines():
             fields = line.split()
@@ -236,7 +235,8 @@ def read_process_identity(pid):
             mappings.append({"inside": int(fields[0]), "outside": int(fields[1]), "length": int(fields[2])})
     except ValueError as exc:
         raise PolicyError("malformed process identity") from exc
-    return {"uid": effective_uid, "uid_map": mappings, "netns_inode": netns_inode,
+    return {"uid": effective_uid, "cap_eff": effective_capabilities,
+            "uid_map": mappings, "netns_inode": netns_inode,
             "userns_inode": userns_inode, "cgroup": cgroup.strip()}
 
 
@@ -257,6 +257,7 @@ def verify_live_stage_a(*, proof_uid, relay_uid=None, fixture_port=None):
     parsed = parse_effective_ruleset(read_nft_ruleset(), proof_uid=proof_uid,
                                     relay_uid=relay_uid, fixture_port=fixture_port)
     return {"verified": True, "stage": "A", **parsed, "verifier_uid": verifier["uid"],
+            "verifier_cap_eff": verifier["cap_eff"],
             "verifier_uid_map": verifier["uid_map"], "netns_inode": verifier["netns_inode"],
             "userns_inode": verifier["userns_inode"], "cgroup": verifier["cgroup"]}
 
@@ -276,6 +277,7 @@ def verify_live_stage_b(*, pid, proof_uid, proof_port, relay_uid=None, fixture_p
     parsed = parse_effective_ruleset(read_nft_ruleset(), proof_uid=proof_uid, proof_port=proof_port,
                                     relay_uid=relay_uid, fixture_port=fixture_port)
     return {"verified": True, "stage": "B", "pid": pid, "uid": proof_uid,
+            "verifier_uid": verifier["uid"], "verifier_cap_eff": verifier["cap_eff"],
             "proof_uid_map": proof["uid_map"], "netns_inode": proof["netns_inode"],
             "userns_inode": proof["userns_inode"], "cgroup": proof["cgroup"], **parsed}
 
@@ -290,6 +292,7 @@ def verify_live_deny_all(*, proof_uid, relay_uid=None):
     parsed = parse_effective_ruleset(read_nft_ruleset(), proof_uid=proof_uid,
                                     relay_uid=relay_uid, deny_all=True)
     return {"verified": True, "stage": "DENY_ALL", **parsed,
+            "verifier_uid": verifier["uid"], "verifier_cap_eff": verifier["cap_eff"],
             "netns_inode": verifier["netns_inode"]}
 
 
@@ -310,8 +313,10 @@ def verify_table_absent(ruleset):
 
 def verify_live_table_absent():
     """Read current nftables state without modifying it and require full removal."""
+    verifier = read_process_identity(os.getpid())
     verify_table_absent(read_nft_ruleset())
-    return {"verified": True, "stage": "REMOVED", "policy_table_absent": True}
+    return {"verified": True, "stage": "REMOVED", "policy_table_absent": True,
+            "verifier_uid": verifier["uid"], "verifier_cap_eff": verifier["cap_eff"]}
 
 
 def main(argv=None):

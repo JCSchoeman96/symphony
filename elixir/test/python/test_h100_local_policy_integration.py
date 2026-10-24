@@ -7,6 +7,7 @@ import signal
 import shutil
 import socket
 import subprocess
+import tempfile
 import threading
 import unittest
 
@@ -16,6 +17,7 @@ INNER = r'''
 import json, pathlib, socket, subprocess, sys, threading
 sys.path.insert(0, sys.argv[1])
 import host_qualification as host
+host.POLICY_VERIFIER = pathlib.Path(sys.argv[2])
 
 subprocess.run(["ip", "link", "set", "lo", "up"], check=True,
                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -54,6 +56,7 @@ host.install_stage_a(proof_uid=1201, relay_uid=1202, fixture_port=fixture_port)
 stage_a = host._run_verifier(["--stage-a", "--proof-uid", "1201", "--relay-uid", "1202",
                               "--fixture-port", str(fixture_port)])
 assert stage_a["stage"] == "A" and stage_a["proof_drop"] is True
+assert stage_a["verifier_uid"] == 1201 and stage_a["verifier_cap_eff"] == 0
 print(json.dumps({"type": "POLICY_ACTIVE"}), flush=True)
 
 worker = r"""import json, os, socket, sys
@@ -115,6 +118,7 @@ stage_b = host._run_verifier(["--stage-b", "--proof-uid", "1201", "--proof-pid",
 assert stage_b["stage"] == "B" and stage_b["netns_inode"] > 0
 assert stage_b["userns_inode"] > 0 and stage_b["cgroup"]
 assert stage_b["proof_allow"]["rule_handle"] > 0 and stage_b["proof_drop_rule_handle"] > 0
+assert stage_b["verifier_uid"] == 1201 and stage_b["verifier_cap_eff"] == 0
 
 assert probe(proof, "127.0.0.1", relay_ready["port"], exchange=True) == "connected"
 assert probe(proof, "127.0.0.1", other_port) == "blocked"
@@ -174,6 +178,11 @@ class LocalPolicyIntegrationTests(unittest.TestCase):
         self.assertEqual(missing, [], f"rootless namespace tools unavailable: {missing}")
 
         host_listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        verifier_directory = tempfile.TemporaryDirectory(prefix="h100-policy-verifier-")
+        os.chmod(verifier_directory.name, 0o755)
+        verifier_path = pathlib.Path(verifier_directory.name) / "policy_verify.py"
+        shutil.copyfile(ROOT / "policy_verify.py", verifier_path)
+        os.chmod(verifier_path, 0o644)
         try:
             host_listener.bind(("127.0.0.1", 0))
             host_listener.listen(1)
@@ -181,7 +190,7 @@ class LocalPolicyIntegrationTests(unittest.TestCase):
 
             process = subprocess.Popen(
                 ["unshare", "--user", "--map-auto", "--map-root-user", "--net",
-                 "--", "python3", "-c", INNER, str(ROOT)],
+                 "--", "python3", "-c", INNER, str(ROOT), str(verifier_path)],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1,
                 start_new_session=True,
             )
@@ -229,6 +238,7 @@ class LocalPolicyIntegrationTests(unittest.TestCase):
             self.assertTrue(evidence["policy_table_absent"])
 
         finally:
+            verifier_directory.cleanup()
             host_listener.close()
 
 

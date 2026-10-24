@@ -1,7 +1,10 @@
 import importlib.util
 import concurrent.futures
 import copy
+import json
 import pathlib
+import subprocess
+import sys
 import threading
 import unittest
 from unittest.mock import patch
@@ -143,6 +146,29 @@ class PolicyVerifierTests(unittest.TestCase):
 
 
 class PreflightOrderingTests(unittest.TestCase):
+    def test_live_verifier_receives_kernel_snapshot_without_policy_capabilities(self):
+        snapshot = b'{"nftables":[]}'
+        results = [
+            subprocess.CompletedProcess(["nft"], 0, stdout=snapshot),
+            subprocess.CompletedProcess(
+                ["setpriv"], 0,
+                stdout=b'{"verified":true,"verifier_uid":1201,"verifier_cap_eff":0}',
+            ),
+        ]
+        with patch.object(qualification.subprocess, "run", side_effect=results) as run:
+            self.assertEqual(qualification._run_verifier(["--table-absent"]), {
+                "verified": True, "verifier_uid": 1201, "verifier_cap_eff": 0,
+            })
+
+        read_command = run.call_args_list[0].args[0]
+        verifier_command = run.call_args_list[1].args[0]
+        self.assertEqual(read_command, ["nft", "-a", "-j", "list", "ruleset"])
+        self.assertIn("--reuid=1201", verifier_command)
+        self.assertIn("--bounding-set=-all", verifier_command)
+        self.assertIn("--no-new-privs", verifier_command)
+        self.assertNotIn("nft", verifier_command)
+        self.assertEqual(run.call_args_list[1].kwargs["input"], snapshot)
+
     def test_preflight_precedes_beam_spawn_and_ready_starts_relay_then_verifies_policy(self):
         events = []
         ready = {"type": "READY", "provider_request_id": "req", "listen_host": "127.0.0.1",

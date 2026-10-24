@@ -9,6 +9,7 @@ import threading
 
 TABLE = "symphony_h100"
 SYSTEM_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
+VERIFIER_UID = 1201
 READY_FIELDS = {"type", "provider_request_id", "listen_host", "bound_port",
                 "python_version", "script_blob_sha256", "environment_names"}
 POLICY_VERIFIER = Path(__file__).with_name("policy_verify.py")
@@ -100,7 +101,15 @@ def revoke_stage_b(*, proof_uid, proof_port):
 
 def _run_verifier(args):
     try:
-        result = subprocess.run([sys.executable, str(POLICY_VERIFIER), *args], check=True,
+        ruleset = subprocess.run(["nft", "-a", "-j", "list", "ruleset"], check=True,
+                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                 timeout=3, env={"PATH": SYSTEM_PATH})
+        if len(ruleset.stdout) > 1_048_576:
+            raise QualificationError("effective nftables state exceeds verifier bound")
+        command = ["setpriv", "--bounding-set=-all", "--inh-caps=-all", "--ambient-caps=-all",
+                   f"--reuid={VERIFIER_UID}", f"--regid={VERIFIER_UID}", "--clear-groups",
+                   "--no-new-privs", sys.executable, str(POLICY_VERIFIER), *args]
+        result = subprocess.run(command, input=ruleset.stdout, check=True,
                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                 timeout=4, env={"PATH": SYSTEM_PATH})
         if len(result.stdout) > 8192:
@@ -108,7 +117,8 @@ def _run_verifier(args):
         response = json.loads(result.stdout)
     except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
         raise QualificationError("independent policy verifier failed") from exc
-    if not isinstance(response, dict) or response.get("verified") is not True:
+    if (not isinstance(response, dict) or response.get("verified") is not True or
+            response.get("verifier_uid") != VERIFIER_UID or response.get("verifier_cap_eff") != 0):
         raise QualificationError("independent policy verifier rejected effective state")
     return response
 
