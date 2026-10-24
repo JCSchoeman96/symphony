@@ -314,7 +314,7 @@ defmodule SymphonyElixir.H100HostQualificationRunner do
   end
 
   defp finish_witness(
-         {:ok, {:ok, %{"verified" => true, "proof_drop_packets" => count}}},
+         {:ok, %{"verified" => true, "proof_drop_packets" => count}},
          witness,
          finch_started,
          ack_count,
