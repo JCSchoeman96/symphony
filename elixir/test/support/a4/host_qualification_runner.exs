@@ -15,6 +15,7 @@ defmodule SymphonyElixir.H100HostQualificationRunner do
     Application.put_env(:symphony_elixir, :a4_qualification_local_only, true)
 
     try do
+      {:ok, _started_apps} = Application.ensure_all_started(:ssl)
       run_proof()
     rescue
       error ->

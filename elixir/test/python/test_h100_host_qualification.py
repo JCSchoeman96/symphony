@@ -265,6 +265,7 @@ class HostQualificationLauncherTests(unittest.TestCase):
                 ],
             )
             self.assertEqual(plan["mix_path"], str(root / "namespace/runtime/elixir/bin/mix"))
+            self.assertEqual(plan["elixir_path"], str(root / "namespace/runtime/elixir/bin/elixir"))
             self.assertEqual(
                 plan["runtime_path"],
                 os.pathsep.join((
@@ -272,6 +273,27 @@ class HostQualificationLauncherTests(unittest.TestCase):
                     str(root / "namespace/runtime/erlang/bin"),
                 )),
             )
+
+    def test_proof_elixir_command_uses_only_pinned_build_code_paths(self):
+        with tempfile.TemporaryDirectory(prefix="h100-proof-code-paths-") as directory:
+            build_lib = pathlib.Path(directory) / "_build/test/lib"
+            app_ebin = build_lib / "symphony_elixir/ebin"
+            dep_ebin = build_lib / "finch/ebin"
+            app_ebin.mkdir(parents=True)
+            dep_ebin.mkdir(parents=True)
+            command = runner.proof_elixir_command(
+                "/runtime/elixir/bin/elixir", str(build_lib), "/repo/test/support/proof.exs"
+            )
+        self.assertEqual(
+            command,
+            [
+                "/runtime/elixir/bin/elixir",
+                "-pa", str(dep_ebin),
+                "-pa", str(app_ebin),
+                "/repo/test/support/proof.exs",
+            ],
+        )
+        self.assertNotIn("mix", command[0])
 
     def test_proof_identity_failure_reports_only_child_exit_status(self):
         class ExitedProcess:

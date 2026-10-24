@@ -188,12 +188,41 @@ def runtime_mount_plan(mix_path, runtime_path, temp_root):
             {"source": str(erlang_bins[0].parent), "destination": str(erlang_destination)},
         ],
         "mix_path": str(elixir_destination / "bin/mix"),
+        "elixir_path": str(elixir_destination / "bin/elixir"),
         "runtime_path": runtime_path_for(
             str(elixir_destination / "bin/mix"),
             str(elixir_destination / "bin/elixir"),
             str(erlang_destination / "bin/erl"),
         ),
     }
+
+
+def proof_elixir_command(elixir_path, build_lib_path, script_path):
+    """Launch the proof script with code paths pinned to this read-only build."""
+    if any(not isinstance(value, str) or not value.startswith("/") or "\x00" in value
+           for value in (elixir_path, build_lib_path, script_path)):
+        raise QualificationFailure("proof BEAM command paths are invalid")
+    build_lib = pathlib.Path(build_lib_path).resolve()
+    try:
+        code_paths = sorted(
+            ebin.resolve()
+            for app in build_lib.iterdir()
+            if app.is_dir()
+            for ebin in [app / "ebin"]
+            if ebin.is_dir() and ebin.resolve().is_relative_to(build_lib)
+        )
+    except OSError as exc:
+        raise QualificationFailure("proof build code paths are unavailable") from exc
+    if (len(code_paths) > 128 or not any(path.parent.name == "symphony_elixir" for path in code_paths) or
+            not any(path.parent.name == "finch" for path in code_paths)):
+        raise QualificationFailure("proof build lacks the required pinned application paths")
+    command = [elixir_path]
+    for code_path in code_paths:
+        command.extend(("-pa", str(code_path)))
+    command.append(script_path)
+    if sum(len(value) + 1 for value in command) > 65_536:
+        raise QualificationFailure("proof BEAM command exceeds its fixed bound")
+    return command
 
 
 def child_environment(values, *, home, runtime_path=SYSTEM_PATH):
@@ -1297,7 +1326,9 @@ def _inside_main(repo_root, temp_root, head, tree, request_id, outside_control_p
         proof_environment = child_environment(
             result_values, home=str(proof_home), runtime_path=runtime_plan["runtime_path"]
         )
-        target = [runtime_plan["mix_path"], "run", "--no-compile", "--no-start", str(proof_runner_path)]
+        target = proof_elixir_command(
+            runtime_plan["elixir_path"], str(source_elixir / "_build/test/lib"), str(proof_runner_path)
+        )
         proof_command = _setpriv_command(PROOF_UID, proof_launch_command(target))
         control_server.start()
         proof_stderr_file = tempfile.TemporaryFile()
