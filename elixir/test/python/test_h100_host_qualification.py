@@ -110,8 +110,32 @@ class HostQualificationLauncherTests(unittest.TestCase):
         }
         self.assertEqual(
             runner.proof_failure_detail(1, result),
-            "proof result rejected: dispatch_witness_ack_count,transport_result "
-            "(acks=0,failure=proof_manifest_mismatch_body_bytes)",
+            "proof result rejected (proof_manifest_mismatch_body_bytes) [acks=0]",
+        )
+
+    def test_proof_failure_summary_prioritizes_ready_gate_failure(self):
+        result = {
+            "type": "PROOF_RESULT",
+            "failure_code": "controller_ready_ipc_failed",
+            "provider_request_id": "preq_fixture",
+            "manifest_finch_absent_before_ready": True,
+            "finch_started_at_witness": False,
+            "finch_stopped": True,
+            "dispatch_witness_ack_count": 0,
+            "retry_count": 0,
+            "replay_count": 0,
+            "transport_result": "transport_failure",
+            "direct_ipv4_canary": "failed",
+            "direct_ipv6_canary": "failed",
+            "canary_policy_verified": False,
+            "canary_drop_packets": 0,
+            "tls_verify_peer": True,
+            "tls_hostname_verification": True,
+            "shared_trust_unchanged": True,
+        }
+        self.assertEqual(
+            runner.proof_failure_detail(1, result),
+            "proof result rejected (controller_ready_ipc_failed) [ipv4=failed,ipv6=failed,acks=0]",
         )
 
     def test_proof_failure_summary_never_includes_untrusted_values(self):

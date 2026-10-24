@@ -136,7 +136,7 @@ defmodule SymphonyElixir.H100HostQualificationRunner do
 
     result = %{
       "type" => "PROOF_RESULT",
-      "failure_code" => proof_result_failure_code(response),
+      "failure_code" => controller_failure_code(backend_failures) || proof_result_failure_code(response),
       "provider_request_id" => request_id,
       "manifest_finch_absent_before_ready" => finch_absent_after_manifest,
       "finch_started_at_witness" => Process.get(:h100_finch_started_at_witness, false),
