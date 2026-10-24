@@ -77,12 +77,16 @@ def proof_stderr_category(stderr):
     if b"compileerror" in value or b"syntaxerror" in value:
         return "compile_error"
     if b"** (mix)" in value:
-        if b"could not find" in value or b"no mix.project" in value:
-            return "mix_component_not_found"
         if b"could not load" in value:
             return "mix_load_error"
         if b"could not compile" in value:
             return "mix_compile_error"
+        if b"mix.project" in value or b"mix.exs" in value:
+            return "mix_project_error"
+        if b"dependency" in value or b"deps" in value:
+            return "mix_dependency_error"
+        if b"could not find" in value or b"no mix.project" in value:
+            return "mix_component_not_found"
         return "mix_error"
     return "unclassified_stderr"
 
