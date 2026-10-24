@@ -53,12 +53,32 @@ def _safe_failure_reason(value):
     return value
 
 
-def proof_failure_detail(status_code, result):
+def proof_stderr_category(stderr):
+    """Classify startup diagnostics without returning their text or paths."""
+    if not isinstance(stderr, bytes) or not stderr:
+        return "no_stderr"
+    value = stderr[:8192].lower()
+    if b"failed to create scheduler thread" in value or b"could not start vm" in value:
+        return "erlang_startup_error"
+    if b"permission denied" in value:
+        return "permission_error"
+    if b"no such file or directory" in value:
+        return "file_missing"
+    if b"compileerror" in value or b"syntaxerror" in value:
+        return "compile_error"
+    if b"** (mix)" in value:
+        return "mix_error"
+    return "unclassified_stderr"
+
+
+def proof_failure_detail(status_code, result, stderr=b""):
     """Summarize only allowlisted proof failures; never surface exception text."""
     if not isinstance(status_code, int) or isinstance(status_code, bool) or status_code == 0:
         return "unprivileged proof BEAM failed without a bounded result"
     if not isinstance(result, dict):
-        return f"unprivileged proof BEAM exited with status {status_code} without a bounded result"
+        category = proof_stderr_category(stderr)
+        return (f"unprivileged proof BEAM exited with status {status_code} without a bounded result: "
+                + category)
 
     if (set(result) == {"type", "reason", "error_class"} and
             result.get("type") == "PROOF_ERROR" and result.get("reason") == "proof_process_failed"):
@@ -1035,6 +1055,7 @@ def _inside_main(repo_root, temp_root, head, tree, request_id, outside_control_p
     policy = None
     session = None
     proof_process = None
+    proof_stderr_file = None
     relay_process = None
     origin_process = None
     control_server = None
@@ -1198,8 +1219,9 @@ def _inside_main(repo_root, temp_root, head, tree, request_id, outside_control_p
         target = [mix_path, "run", "--no-compile", "--no-start", str(proof_runner_path)]
         proof_command = _setpriv_command(PROOF_UID, proof_launch_command(target))
         control_server.start()
+        proof_stderr_file = tempfile.TemporaryFile()
         proof_process = subprocess.Popen(proof_command, cwd=str(source_elixir), stdin=subprocess.PIPE,
-                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                         stdout=subprocess.DEVNULL, stderr=proof_stderr_file,
                                          env=proof_environment, start_new_session=True)
         control_server.set_expected_pid(proof_process.pid)
         proof_identity = proof_process_identity(proof_process)
@@ -1209,7 +1231,10 @@ def _inside_main(repo_root, temp_root, head, tree, request_id, outside_control_p
         status_code = proof_process.wait(timeout=55)
         proof_result = _read_bounded_proof_result(result_path)
         if status_code != 0 or proof_result is None:
-            raise QualificationFailure(proof_failure_detail(status_code, proof_result))
+            proof_stderr_file.seek(0)
+            raise QualificationFailure(
+                proof_failure_detail(status_code, proof_result, proof_stderr_file.read(8192))
+            )
         if proof_result.get("type") != "PROOF_RESULT":
             raise QualificationFailure("proof BEAM did not produce a bounded result")
         origin_summary = _read_json_status(origin_reader, 8)
@@ -1326,17 +1351,21 @@ def _inside_main(repo_root, temp_root, head, tree, request_id, outside_control_p
         return {"type": "QUALIFICATION_RESULT", "qualified": True, "evidence": evidence}
     finally:
         primary_failure = sys.exception()
-        _cleanup_preserving_failure(
-            primary_failure,
-            lambda: _cleanup_inside_resources(
-                control_server=control_server,
-                processes=(("proof_process", proof_process), ("relay_process", relay_process),
-                           ("origin_process", origin_process)),
-                canaries=(canary4, canary6), ca_path=ca_path,
-                cert_directory=cert_directory, policy=policy,
-                mount_path=mount_path, mounted=mounted, temp_root=temp_root,
-            ),
-        )
+        try:
+            _cleanup_preserving_failure(
+                primary_failure,
+                lambda: _cleanup_inside_resources(
+                    control_server=control_server,
+                    processes=(("proof_process", proof_process), ("relay_process", relay_process),
+                               ("origin_process", origin_process)),
+                    canaries=(canary4, canary6), ca_path=ca_path,
+                    cert_directory=cert_directory, policy=policy,
+                    mount_path=mount_path, mounted=mounted, temp_root=temp_root,
+                ),
+            )
+        finally:
+            if proof_stderr_file is not None:
+                proof_stderr_file.close()
 
 
 def _unmount_repo(mount_path):

@@ -34,9 +34,17 @@ class HostQualificationLauncherTests(unittest.TestCase):
 
     def test_proof_failure_summary_reports_exit_status_without_raw_output(self):
         self.assertEqual(
-            runner.proof_failure_detail(127, None),
-            "unprivileged proof BEAM exited with status 127 without a bounded result",
+            runner.proof_failure_detail(127, None, b"** (CompileError) sensitive details"),
+            "unprivileged proof BEAM exited with status 127 without a bounded result: compile_error",
         )
+
+    def test_proof_stderr_classifier_returns_only_fixed_categories(self):
+        self.assertEqual(runner.proof_stderr_category(b"Failed to create scheduler thread 3"),
+                         "erlang_startup_error")
+        self.assertEqual(runner.proof_stderr_category(b"Permission denied: secret path"),
+                         "permission_error")
+        self.assertEqual(runner.proof_stderr_category(b"unrecognized sensitive output"),
+                         "unclassified_stderr")
 
     def test_proof_failure_summary_names_only_failed_contract_fields(self):
         result = {
