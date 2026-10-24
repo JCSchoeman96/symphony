@@ -583,6 +583,21 @@ class HostQualificationLauncherTests(unittest.TestCase):
                 expected_body_sha256="a" * 64,
             )
 
+    def test_origin_error_summary_reports_only_allowlisted_stage_and_class(self):
+        raw = json.dumps({
+            "type": "LOCAL_TLS_ERROR",
+            "reason": "origin_failed",
+            "stage": "response_write",
+            "error_class": "SSLEOFError",
+        })
+        with self.assertRaisesRegex(runner.QualificationFailure, "local TLS origin failed at response_write"):
+            runner.validate_origin_summary(
+                raw,
+                expected_path="/expected/",
+                expected_body_bytes=16,
+                expected_body_sha256="a" * 64,
+            )
+
     def test_peer_credentials_report_the_actual_unix_socket_client(self):
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         path = pathlib.Path("/tmp") / f"h100-peer-{os.getpid()}-{id(self)}.sock"

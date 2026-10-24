@@ -35,6 +35,13 @@ EXPECTED_PATH = "/api/v1/workspaces/workspace/projects/project-1/work-items/work
 LOCAL_SENTINEL = "local-qualification-only"
 AUTHORIZATION_SENTINEL = "Bearer " + LOCAL_SENTINEL
 POLICY_PATH_OVERRIDE = None
+ORIGIN_FAILURE_STAGES = {
+    "accept", "request_read", "response_write", "tls_handshake", "tls_setup", "unknown", "watchdog",
+}
+ORIGIN_FAILURE_CLASSES = {
+    "BrokenPipeError", "ConnectionAbortedError", "ConnectionResetError", "OSError", "SSLEOFError",
+    "SSLError", "SSLSyscallError", "SSLZeroReturnError", "TimeoutError", "ValueError", "other",
+}
 
 
 class QualificationFailure(RuntimeError):
@@ -377,6 +384,15 @@ def validate_origin_summary(raw, *, expected_path, expected_body_bytes, expected
         summary = json.loads(raw)
     except (TypeError, json.JSONDecodeError) as exc:
         raise QualificationFailure("origin summary is malformed") from exc
+    if isinstance(summary, dict) and summary.get("type") == "LOCAL_TLS_ERROR":
+        if (set(summary) == {"type", "reason", "stage", "error_class"} and
+                summary.get("reason") == "origin_failed" and
+                summary.get("stage") in ORIGIN_FAILURE_STAGES and
+                summary.get("error_class") in ORIGIN_FAILURE_CLASSES):
+            raise QualificationFailure(
+                "local TLS origin failed at " + summary["stage"] + " (" + summary["error_class"] + ")"
+            )
+        raise QualificationFailure("local TLS origin error summary is invalid")
     required = {"type", "request_count", "complete_request", "method", "path", "body_bytes",
                 "body_sha256", "authorization_valid", "tls_version"}
     if not isinstance(summary, dict) or set(summary) != required:

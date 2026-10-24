@@ -18,6 +18,19 @@ import signal
 
 MAX_HEADER_BYTES = 16 * 1024
 MAX_BODY_BYTES = 64 * 1024
+SAFE_ERROR_CLASSES = {
+    "BrokenPipeError", "ConnectionAbortedError", "ConnectionResetError", "OSError",
+    "SSLEOFError", "SSLError", "SSLSyscallError", "SSLZeroReturnError", "TimeoutError",
+    "ValueError",
+}
+SAFE_FAILURE_STAGES = {
+    "accept", "request_read", "response_write", "tls_handshake", "tls_setup", "unknown", "watchdog",
+}
+
+
+def _safe_error_class(error):
+    name = type(error).__name__
+    return name if name in SAFE_ERROR_CLASSES else "other"
 
 
 class LocalTLSFixture:
@@ -52,6 +65,7 @@ class LocalTLSFixture:
         self._thread = None
         self._result = None
         self._error = None
+        self._failure_stage = None
         self._done = threading.Event()
         self._closed = False
         self._deadline = None
@@ -139,12 +153,14 @@ class LocalTLSFixture:
         return f"{self.host}:{self.port}"
 
     def _serve_one(self):
+        stage = "accept"
         try:
             self._listener.settimeout(max(0.001, self._deadline_at() - time.monotonic()))
             connection, _ = self._listener.accept()
             self._active_connection = connection
             with connection:
                 connection.settimeout(max(0.001, self._deadline_at() - time.monotonic()))
+                stage = "tls_setup"
                 context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
                 if self.tls11_only:
                     context.minimum_version = ssl.TLSVersion.TLSv1_1
@@ -154,7 +170,9 @@ class LocalTLSFixture:
                     context.minimum_version = ssl.TLSVersion.TLSv1_2
                     context.maximum_version = ssl.TLSVersion.TLSv1_2
                 context.load_cert_chain(str(self.directory / "server.pem"), str(self.directory / "server.key"))
+                stage = "tls_handshake"
                 with context.wrap_socket(connection, server_side=True) as tls:
+                    stage = "request_read"
                     self._result = self._read_patch(
                         tls, self._deadline_at, self.expected_authorization, self.expected_path, self.authority
                     )
@@ -164,9 +182,11 @@ class LocalTLSFixture:
                         "method": "PATCH",
                         "tls_version": tls.version(),
                     }
+                    stage = "response_write"
                     self._send_response(tls)
         except (OSError, ssl.SSLError, ValueError) as exc:
-            self._error = type(exc).__name__
+            self._error = _safe_error_class(exc)
+            self._failure_stage = stage
         finally:
             self._done.set()
             if self._deadline is not None:
@@ -264,6 +284,7 @@ class LocalTLSFixture:
         """Return the bounded origin result; only this in-process value contains the body."""
         wait_for = self.timeout if timeout is None else min(timeout, self.timeout)
         if not self._done.wait(wait_for):
+            self._failure_stage = "watchdog"
             raise TimeoutError("local TLS origin did not finish within its watchdog")
         if self._error:
             raise RuntimeError(f"local TLS origin failed: {self._error}")
@@ -338,8 +359,20 @@ def _serve_cli(argv=None):
         sys.stdout.write(json.dumps(summary, sort_keys=True, separators=(",", ":")) + "\n")
         sys.stdout.flush()
         return 0
-    except (OSError, RuntimeError, TimeoutError, ValueError, ssl.SSLError):
-        sys.stdout.write('{"type":"LOCAL_TLS_ERROR","reason":"origin_failed"}\n')
+    except (OSError, RuntimeError, TimeoutError, ValueError, ssl.SSLError) as exc:
+        stage = fixture._failure_stage
+        if stage not in SAFE_FAILURE_STAGES:
+            stage = "unknown"
+        error_class = fixture._error or _safe_error_class(exc)
+        if error_class not in SAFE_ERROR_CLASSES:
+            error_class = "other"
+        error = {
+            "type": "LOCAL_TLS_ERROR",
+            "reason": "origin_failed",
+            "stage": stage,
+            "error_class": error_class,
+        }
+        sys.stdout.write(json.dumps(error, sort_keys=True, separators=(",", ":")) + "\n")
         sys.stdout.flush()
         return 1
     finally:
