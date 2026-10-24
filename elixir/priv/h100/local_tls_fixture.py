@@ -37,15 +37,15 @@ class LocalTLSFixture:
     """Generate a private CA and serve one bounded PATCH request over loopback."""
 
     def __init__(self, timeout=10, wrong_hostname=False, tls11_only=False,
-                 expected_authorization=None, directory=None, expected_path=None):
+                 expected_api_key=None, directory=None, expected_path=None):
         if not 0 < timeout <= 60:
             raise ValueError("timeout must be between 0 and 60 seconds")
         self.timeout = timeout
         self.wrong_hostname = bool(wrong_hostname)
         self.tls11_only = bool(tls11_only)
-        self.expected_authorization = expected_authorization
-        if expected_authorization is not None and expected_authorization != "Bearer local-qualification-only":
-            raise ValueError("fixture authorization must use the local qualification sentinel")
+        self.expected_api_key = expected_api_key
+        if expected_api_key is not None and expected_api_key != "local-qualification-only":
+            raise ValueError("fixture API key must use the local qualification sentinel")
         if (expected_path is not None and
                 (not isinstance(expected_path, str) or not expected_path.startswith("/") or
                  len(expected_path.encode("ascii", errors="ignore")) != len(expected_path) or
@@ -174,7 +174,7 @@ class LocalTLSFixture:
                 with context.wrap_socket(connection, server_side=True) as tls:
                     stage = "request_read"
                     self._result = self._read_patch(
-                        tls, self._deadline_at, self.expected_authorization, self.expected_path, self.authority
+                        tls, self._deadline_at, self.expected_api_key, self.expected_path, self.authority
                     )
                     self._result["tls_version"] = tls.version()
                     self._result["evidence"] = {
@@ -227,7 +227,7 @@ class LocalTLSFixture:
                 pass
 
     @staticmethod
-    def _read_patch(connection, deadline_at, expected_authorization=None, expected_path=None,
+    def _read_patch(connection, deadline_at, expected_api_key=None, expected_path=None,
                     expected_host=None):
         request = bytearray()
         while b"\r\n\r\n" not in request:
@@ -257,14 +257,14 @@ class LocalTLSFixture:
         lengths = headers.get("content-length", [])
         if len(lengths) != 1 or not lengths[0].isdigit():
             raise ValueError("request must have one content length")
-        authorization = headers.get("authorization", [])
+        api_keys = headers.get("x-api-key", [])
         hosts = headers.get("host", [])
         if len(hosts) != 1 or (expected_host is not None and hosts[0] != expected_host):
             raise ValueError("request Host does not match the local TLS listener")
-        authorization_valid = (expected_authorization is None or
-                               len(authorization) == 1 and authorization[0] == expected_authorization)
-        if not authorization_valid:
-            raise ValueError("local authorization sentinel mismatch")
+        credential_valid = (expected_api_key is None or
+                            len(api_keys) == 1 and api_keys[0] == expected_api_key)
+        if not credential_valid:
+            raise ValueError("local API-key sentinel mismatch")
         length = int(lengths[0])
         if length > MAX_BODY_BYTES:
             raise ValueError("request body exceeds limit")
@@ -278,7 +278,7 @@ class LocalTLSFixture:
             raise ValueError("unexpected bytes after request body")
         return {"request_count": 1, "method": "PATCH", "request_body": bytes(body),
                 "path": request_parts[1], "body_bytes": length,
-                "authorization_valid": authorization_valid}
+                "credential_valid": credential_valid}
 
     def result(self, timeout=None):
         """Return the bounded origin result; only this in-process value contains the body."""
@@ -318,14 +318,14 @@ def _serve_cli(argv=None):
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--serve", action="store_true")
     parser.add_argument("--directory", required=True)
-    parser.add_argument("--expected-authorization", required=True)
+    parser.add_argument("--expected-api-key", required=True)
     parser.add_argument("--expected-path")
     parser.add_argument("--timeout", type=float, default=15)
     args = parser.parse_args(argv)
-    if not args.serve or args.expected_authorization != "Bearer local-qualification-only":
+    if not args.serve or args.expected_api_key != "local-qualification-only":
         parser.error("local-only fixture sentinel and serve mode are required")
 
-    fixture = LocalTLSFixture(timeout=args.timeout, expected_authorization=args.expected_authorization,
+    fixture = LocalTLSFixture(timeout=args.timeout, expected_api_key=args.expected_api_key,
                               directory=args.directory, expected_path=args.expected_path)
 
     def stop_on_sigterm(signum, _frame):
@@ -353,7 +353,7 @@ def _serve_cli(argv=None):
             "path": result["path"],
             "body_bytes": result["body_bytes"],
             "body_sha256": hashlib.sha256(result["request_body"]).hexdigest(),
-            "authorization_valid": result["authorization_valid"],
+            "credential_valid": result["credential_valid"],
             "tls_version": result["tls_version"],
         }
         sys.stdout.write(json.dumps(summary, sort_keys=True, separators=(",", ":")) + "\n")

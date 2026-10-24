@@ -15,6 +15,24 @@ spec.loader.exec_module(fixture_module)
 
 
 class LocalTLSFixtureTests(unittest.TestCase):
+    def test_client_api_key_sentinel_is_accepted_without_entering_evidence(self):
+        sentinel = "local-qualification-only"
+        with fixture_module.LocalTLSFixture(timeout=2, expected_api_key=sentinel) as fixture:
+            with socket.create_connection((fixture.host, fixture.port), timeout=2) as raw:
+                with self.verified_context(fixture).wrap_socket(
+                    raw, server_hostname=fixture.server_hostname
+                ) as connection:
+                    connection.sendall(
+                        f"PATCH /local HTTP/1.1\r\nHost: {fixture.authority}\r\n"
+                        f"X-API-Key: {sentinel}\r\nContent-Length: 7\r\n"
+                        "Connection: close\r\n\r\nbody-01".encode("ascii")
+                    )
+                    self.assertIn(b"200 OK", connection.recv(1024))
+            result = fixture.result()
+            self.assertTrue(result["credential_valid"])
+            self.assertNotIn("api_key", result["evidence"])
+            self.assertNotIn(sentinel, repr(result["evidence"]))
+
     def test_response_write_failure_after_complete_request_is_tolerated(self):
         class ClosedTLSConnection:
             def sendall(self, _data):
@@ -22,11 +40,11 @@ class LocalTLSFixtureTests(unittest.TestCase):
 
         self.assertFalse(fixture_module.LocalTLSFixture._send_response(ClosedTLSConnection()))
 
-    def request(self, fixture, context, authorization=None):
+    def request(self, fixture, context, api_key=None):
         with socket.create_connection((fixture.host, fixture.port), timeout=2) as raw:
             with context.wrap_socket(raw, server_hostname=fixture.server_hostname) as connection:
-                auth = "" if authorization is None else f"Authorization: {authorization}\r\n"
-                connection.sendall(f"PATCH /local HTTP/1.1\r\nHost: {fixture.authority}\r\n{auth}Content-Length: 7\r\nConnection: close\r\n\r\n".encode("ascii") + b"body-01")
+                key_header = "" if api_key is None else f"X-API-Key: {api_key}\r\n"
+                connection.sendall(f"PATCH /local HTTP/1.1\r\nHost: {fixture.authority}\r\n{key_header}Content-Length: 7\r\nConnection: close\r\n\r\n".encode("ascii") + b"body-01")
                 return connection.recv(1024)
 
     def verified_context(self, fixture):
@@ -72,12 +90,12 @@ class LocalTLSFixtureTests(unittest.TestCase):
         self.assertFalse(directory.exists())
 
     def test_local_sentinel_is_checked_without_entering_evidence(self):
-        sentinel = "Bearer local-qualification-only"
-        with fixture_module.LocalTLSFixture(timeout=2, expected_authorization=sentinel) as fixture:
-            self.request(fixture, self.verified_context(fixture), authorization=sentinel)
+        sentinel = "local-qualification-only"
+        with fixture_module.LocalTLSFixture(timeout=2, expected_api_key=sentinel) as fixture:
+            self.request(fixture, self.verified_context(fixture), api_key=sentinel)
             result = fixture.result()
-            self.assertTrue(result["authorization_valid"])
-            self.assertNotIn("authorization", result["evidence"])
+            self.assertTrue(result["credential_valid"])
+            self.assertNotIn("api_key", result["evidence"])
             self.assertNotIn(sentinel, repr(result["evidence"]))
             self.assertNotIn(b"body-01", repr(result["evidence"]).encode())
 
@@ -90,7 +108,7 @@ class LocalTLSFixtureTests(unittest.TestCase):
                 ) as connection:
                     connection.sendall(
                         f"PATCH {expected_path} HTTP/1.1\r\nHost: {fixture.authority}\r\n"
-                        "Authorization: Bearer local-qualification-only\r\n"
+                        "X-API-Key: local-qualification-only\r\n"
                         "Content-Length: 2\r\nConnection: close\r\n\r\nok".encode("ascii")
                     )
                     self.assertIn(b"200 OK", connection.recv(1024))
@@ -101,7 +119,7 @@ class LocalTLSFixtureTests(unittest.TestCase):
         command = [
             "python3", "-I", str(MODULE), "--serve",
             "--directory", str(directory),
-            "--expected-authorization", "Bearer local-qualification-only",
+            "--expected-api-key", "local-qualification-only",
             "--timeout", "4",
         ]
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -116,7 +134,7 @@ class LocalTLSFixtureTests(unittest.TestCase):
                 with context.wrap_socket(raw, server_hostname=ready["server_hostname"]) as connection:
                     connection.sendall(
                         f"PATCH /local HTTP/1.1\r\nHost: {ready['authority']}\r\n"
-                        "Authorization: Bearer local-qualification-only\r\n"
+                        "X-API-Key: local-qualification-only\r\n"
                         "Content-Length: 7\r\nConnection: close\r\n\r\nbody-01".encode("ascii")
                     )
                     self.assertIn(b"200 OK", connection.recv(1024))
@@ -124,11 +142,11 @@ class LocalTLSFixtureTests(unittest.TestCase):
             self.assertEqual(summary["type"], "LOCAL_TLS_RESULT")
             self.assertEqual(summary["request_count"], 1)
             self.assertTrue(summary["complete_request"])
-            self.assertTrue(summary["authorization_valid"])
+            self.assertTrue(summary["credential_valid"])
             self.assertEqual(summary["tls_version"], "TLSv1.2")
             self.assertNotIn("request_body", summary)
-            self.assertNotIn("authorization", summary)
-            self.assertNotIn("Bearer local-qualification-only", repr(summary))
+            self.assertNotIn("api_key", summary)
+            self.assertNotIn("local-qualification-only", repr(summary))
             self.assertNotIn("body-01", repr(summary))
             self.assertEqual(process.wait(timeout=2), 0)
             self.assertFalse(directory.exists())
@@ -150,7 +168,7 @@ class LocalTLSFixtureTests(unittest.TestCase):
         command = [
             "python3", "-I", str(MODULE), "--serve",
             "--directory", str(directory),
-            "--expected-authorization", "Bearer local-qualification-only",
+            "--expected-api-key", "local-qualification-only",
             "--expected-path", "/local",
             "--timeout", "20",
         ]

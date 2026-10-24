@@ -33,7 +33,6 @@ SPEC_COMMIT = "5b3ecadeafa3c43ece8fe43099be56892d11d410"
 IMPLEMENTATION_BASE = SPEC_COMMIT
 EXPECTED_PATH = "/api/v1/workspaces/workspace/projects/project-1/work-items/work-1/"
 LOCAL_SENTINEL = "local-qualification-only"
-AUTHORIZATION_SENTINEL = "Bearer " + LOCAL_SENTINEL
 POLICY_PATH_OVERRIDE = None
 ORIGIN_FAILURE_STAGES = {
     "accept", "request_read", "response_write", "tls_handshake", "tls_setup", "unknown", "watchdog",
@@ -394,17 +393,17 @@ def validate_origin_summary(raw, *, expected_path, expected_body_bytes, expected
             )
         raise QualificationFailure("local TLS origin error summary is invalid")
     required = {"type", "request_count", "complete_request", "method", "path", "body_bytes",
-                "body_sha256", "authorization_valid", "tls_version"}
+                "body_sha256", "credential_valid", "tls_version"}
     if not isinstance(summary, dict) or set(summary) != required:
         raise QualificationFailure("origin summary fields differ from the bounded fixture contract")
     if (summary["type"] != "LOCAL_TLS_RESULT" or summary["request_count"] != 1 or
             summary["complete_request"] is not True or summary["method"] != "PATCH" or
             summary["path"] != expected_path or summary["body_bytes"] != expected_body_bytes or
             summary["body_sha256"] != expected_body_sha256 or
-            summary["authorization_valid"] is not True or summary["tls_version"] != "TLSv1.2"):
+            summary["credential_valid"] is not True or summary["tls_version"] != "TLSv1.2"):
         raise QualificationFailure("local origin did not receive the exact bounded TLS 1.2 PATCH")
     return {"request_count": 1, "complete_request": True, "method": "PATCH",
-            "tls_version": "TLSv1.2", "authorization_valid": True}
+            "tls_version": "TLSv1.2", "credential_valid": True}
 
 
 def peer_credentials(connection):
@@ -1090,7 +1089,7 @@ def _launch_origin(python_path, fixture_path, origin_home, expected_path):
     cert_directory = origin_home / "generated-certs"
     command = _setpriv_command(ORIGIN_UID, [python_path, "-I", str(fixture_path), "--serve",
                                             "--directory", str(cert_directory),
-                                            "--expected-authorization", AUTHORIZATION_SENTINEL,
+                                            "--expected-api-key", LOCAL_SENTINEL,
                                             "--expected-path", expected_path, "--timeout", "25"])
     process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                stderr=subprocess.DEVNULL, env=service_environment(str(origin_home)),

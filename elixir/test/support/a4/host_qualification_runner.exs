@@ -11,7 +11,7 @@ defmodule SymphonyElixir.H100HostQualificationRunner do
   alias SymphonyElixir.WorkControl.TransitionAttemptLedger
 
   @timeout_ms 30_000
-  @authorization "local-qualification-only"
+  @local_api_key "local-qualification-only"
 
   def run do
     Application.put_env(:symphony_elixir, :a4_qualification_local_only, true)
@@ -197,7 +197,7 @@ defmodule SymphonyElixir.H100HostQualificationRunner do
       workspace_slug: "workspace",
       workspace_id: "workspace-1",
       project_id: "project-1",
-      api_key: @authorization
+      api_key: @local_api_key
     }
   end
 

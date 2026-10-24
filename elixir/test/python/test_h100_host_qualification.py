@@ -557,7 +557,7 @@ class HostQualificationLauncherTests(unittest.TestCase):
         raw = ('{"type":"LOCAL_TLS_RESULT","request_count":1,"complete_request":true,'
                '"method":"PATCH","path":"/api/v1/work-items/work-1/",'
                '"body_bytes":16,"body_sha256":"' + "a" * 64 + '",'
-               '"authorization_valid":true,"tls_version":"TLSv1.2"}')
+               '"credential_valid":true,"tls_version":"TLSv1.2"}')
         result = runner.validate_origin_summary(
             raw,
             expected_path="/api/v1/work-items/work-1/",
@@ -573,7 +573,7 @@ class HostQualificationLauncherTests(unittest.TestCase):
     def test_origin_summary_rejects_a_different_path_or_body(self):
         raw = ('{"type":"LOCAL_TLS_RESULT","request_count":1,"complete_request":true,'
                '"method":"PATCH","path":"/wrong/", "body_bytes":16,'
-               '"body_sha256":"' + "a" * 64 + '","authorization_valid":true,'
+               '"body_sha256":"' + "a" * 64 + '","credential_valid":true,'
                '"tls_version":"TLSv1.2"}')
         with self.assertRaises(runner.QualificationFailure):
             runner.validate_origin_summary(
