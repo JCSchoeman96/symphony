@@ -417,6 +417,8 @@ class SocketRelayTests(unittest.TestCase):
                 self.assertEqual(fixture_result["request"], handshake)
                 evidence = json.loads(evidence_path.read_text())
                 self.assertTrue(evidence["server_app_suppressed"])
+                self.assertTrue(evidence["server_app_observed"])
+                self.assertFalse(evidence["server_app_forwarded"])
                 self.assertEqual(evidence["close_reason"], "SERVER_APP_SUPPRESSED")
                 self.assertEqual(evidence["upstream_connections"], 1)
                 self.assertLessEqual(evidence_path.stat().st_size, relay.MAX_EVIDENCE_BYTES)

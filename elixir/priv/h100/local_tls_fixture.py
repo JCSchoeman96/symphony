@@ -9,6 +9,12 @@ import subprocess
 import tempfile
 import threading
 import time
+import argparse
+import base64
+import hashlib
+import json
+import sys
+import signal
 
 MAX_HEADER_BYTES = 16 * 1024
 MAX_BODY_BYTES = 64 * 1024
@@ -17,14 +23,26 @@ MAX_BODY_BYTES = 64 * 1024
 class LocalTLSFixture:
     """Generate a private CA and serve one bounded PATCH request over loopback."""
 
-    def __init__(self, timeout=10, wrong_hostname=False, tls11_only=False):
+    def __init__(self, timeout=10, wrong_hostname=False, tls11_only=False,
+                 expected_authorization=None, directory=None, expected_path=None):
         if not 0 < timeout <= 60:
             raise ValueError("timeout must be between 0 and 60 seconds")
         self.timeout = timeout
         self.wrong_hostname = bool(wrong_hostname)
         self.tls11_only = bool(tls11_only)
+        self.expected_authorization = expected_authorization
+        if expected_authorization is not None and expected_authorization != "Bearer local-qualification-only":
+            raise ValueError("fixture authorization must use the local qualification sentinel")
+        if (expected_path is not None and
+                (not isinstance(expected_path, str) or not expected_path.startswith("/") or
+                 len(expected_path.encode("ascii", errors="ignore")) != len(expected_path) or
+                 len(expected_path.encode("ascii", errors="ignore")) > 2048 or
+                 any(ord(character) < 33 or ord(character) == 127 for character in expected_path))):
+            raise ValueError("fixture path must be a bounded ASCII origin path")
+        self.expected_path = expected_path
+        self._requested_directory = pathlib.Path(directory) if directory is not None else None
         self.host = "127.0.0.1"
-        self.server_hostname = "localhost"
+        self.server_hostname = self.host
         self.port = None
         self.directory = None
         self.ca_pem = None
@@ -48,7 +66,11 @@ class LocalTLSFixture:
     def start(self):
         if self._listener is not None or self._closed:
             raise RuntimeError("fixture cannot be started in its current state")
-        self.directory = pathlib.Path(tempfile.mkdtemp(prefix="h100-tls-"))
+        if self._requested_directory is None:
+            self.directory = pathlib.Path(tempfile.mkdtemp(prefix="h100-tls-"))
+        else:
+            self.directory = self._requested_directory
+            self.directory.mkdir(mode=0o700, parents=False, exist_ok=False)
         os.chmod(self.directory, 0o700)
         try:
             self._generate_certificates()
@@ -82,11 +104,12 @@ class LocalTLSFixture:
         server_cert = root / "server.pem"
         extensions = root / "server.ext"
         san_dns = "wrong.invalid" if self.wrong_hostname else "localhost"
+        san = f"DNS:{san_dns}" if self.wrong_hostname else f"DNS:{san_dns},IP:127.0.0.1"
         extensions.write_text(
             "basicConstraints=critical,CA:FALSE\n"
             "keyUsage=critical,digitalSignature,keyEncipherment\n"
             "extendedKeyUsage=serverAuth\n"
-            f"subjectAltName=DNS:{san_dns},IP:127.0.0.1\n",
+            f"subjectAltName={san}\n",
             encoding="ascii",
         )
         os.chmod(extensions, 0o600)
@@ -113,7 +136,7 @@ class LocalTLSFixture:
     def authority(self):
         if self.port is None:
             raise RuntimeError("fixture has not started")
-        return f"localhost:{self.port}"
+        return f"{self.host}:{self.port}"
 
     def _serve_one(self):
         try:
@@ -132,7 +155,9 @@ class LocalTLSFixture:
                     context.maximum_version = ssl.TLSVersion.TLSv1_2
                 context.load_cert_chain(str(self.directory / "server.pem"), str(self.directory / "server.key"))
                 with context.wrap_socket(connection, server_side=True) as tls:
-                    self._result = self._read_patch(tls, self._deadline_at)
+                    self._result = self._read_patch(
+                        tls, self._deadline_at, self.expected_authorization, self.expected_path, self.authority
+                    )
                     self._result["tls_version"] = tls.version()
                     self._result["evidence"] = {
                         "request_count": 1,
@@ -174,7 +199,8 @@ class LocalTLSFixture:
                 pass
 
     @staticmethod
-    def _read_patch(connection, deadline_at):
+    def _read_patch(connection, deadline_at, expected_authorization=None, expected_path=None,
+                    expected_host=None):
         request = bytearray()
         while b"\r\n\r\n" not in request:
             if len(request) >= MAX_HEADER_BYTES:
@@ -187,11 +213,30 @@ class LocalTLSFixture:
         split = request.index(b"\r\n\r\n") + 4
         head, body = bytes(request[:split]), bytearray(request[split:])
         lines = head[:-4].decode("ascii").split("\r\n")
-        if not lines or lines[0] != "PATCH /local HTTP/1.1":
-            raise ValueError("expected one PATCH /local HTTP/1.1 request")
-        lengths = [line.split(":", 1)[1].strip() for line in lines[1:] if line.lower().startswith("content-length:")]
+        if not lines:
+            raise ValueError("missing request line")
+        request_parts = lines[0].split(" ")
+        if (len(request_parts) != 3 or request_parts[0] != "PATCH" or request_parts[2] != "HTTP/1.1" or
+                not request_parts[1].startswith("/") or
+                (expected_path is not None and request_parts[1] != expected_path)):
+            raise ValueError("request line does not match the bounded PATCH contract")
+        headers = {}
+        for line in lines[1:]:
+            if ":" not in line:
+                raise ValueError("malformed request header")
+            name, value = line.split(":", 1)
+            headers.setdefault(name.lower(), []).append(value.strip())
+        lengths = headers.get("content-length", [])
         if len(lengths) != 1 or not lengths[0].isdigit():
             raise ValueError("request must have one content length")
+        authorization = headers.get("authorization", [])
+        hosts = headers.get("host", [])
+        if len(hosts) != 1 or (expected_host is not None and hosts[0] != expected_host):
+            raise ValueError("request Host does not match the local TLS listener")
+        authorization_valid = (expected_authorization is None or
+                               len(authorization) == 1 and authorization[0] == expected_authorization)
+        if not authorization_valid:
+            raise ValueError("local authorization sentinel mismatch")
         length = int(lengths[0])
         if length > MAX_BODY_BYTES:
             raise ValueError("request body exceeds limit")
@@ -203,7 +248,9 @@ class LocalTLSFixture:
             body.extend(part)
         if len(body) != length:
             raise ValueError("unexpected bytes after request body")
-        return {"request_count": 1, "method": "PATCH", "request_body": bytes(body)}
+        return {"request_count": 1, "method": "PATCH", "request_body": bytes(body),
+                "path": request_parts[1], "body_bytes": length,
+                "authorization_valid": authorization_valid}
 
     def result(self, timeout=None):
         """Return the bounded origin result; only this in-process value contains the body."""
@@ -236,3 +283,61 @@ class LocalTLSFixture:
             shutil.rmtree(self.directory, ignore_errors=True)
         self.ca_pem = None
         self.ca_der = None
+
+
+def _serve_cli(argv=None):
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--serve", action="store_true")
+    parser.add_argument("--directory", required=True)
+    parser.add_argument("--expected-authorization", required=True)
+    parser.add_argument("--expected-path")
+    parser.add_argument("--timeout", type=float, default=15)
+    args = parser.parse_args(argv)
+    if not args.serve or args.expected_authorization != "Bearer local-qualification-only":
+        parser.error("local-only fixture sentinel and serve mode are required")
+
+    fixture = LocalTLSFixture(timeout=args.timeout, expected_authorization=args.expected_authorization,
+                              directory=args.directory, expected_path=args.expected_path)
+
+    def stop_on_sigterm(signum, _frame):
+        raise SystemExit(128 + signum)
+
+    previous_sigterm = signal.signal(signal.SIGTERM, stop_on_sigterm)
+    try:
+        fixture.start()
+        ready = {
+            "type": "LOCAL_TLS_READY",
+            "host": fixture.host,
+            "port": fixture.port,
+            "authority": fixture.authority,
+            "server_hostname": fixture.server_hostname,
+            "ca_der_base64": base64.b64encode(fixture.ca_der).decode("ascii"),
+        }
+        sys.stdout.write(json.dumps(ready, sort_keys=True, separators=(",", ":")) + "\n")
+        sys.stdout.flush()
+        result = fixture.result()
+        summary = {
+            "type": "LOCAL_TLS_RESULT",
+            "request_count": result["request_count"],
+            "complete_request": True,
+            "method": result["method"],
+            "path": result["path"],
+            "body_bytes": result["body_bytes"],
+            "body_sha256": hashlib.sha256(result["request_body"]).hexdigest(),
+            "authorization_valid": result["authorization_valid"],
+            "tls_version": result["tls_version"],
+        }
+        sys.stdout.write(json.dumps(summary, sort_keys=True, separators=(",", ":")) + "\n")
+        sys.stdout.flush()
+        return 0
+    except (OSError, RuntimeError, TimeoutError, ValueError, ssl.SSLError):
+        sys.stdout.write('{"type":"LOCAL_TLS_ERROR","reason":"origin_failed"}\n')
+        sys.stdout.flush()
+        return 1
+    finally:
+        fixture.close()
+        signal.signal(signal.SIGTERM, previous_sigterm)
+
+
+if __name__ == "__main__":
+    raise SystemExit(_serve_cli())

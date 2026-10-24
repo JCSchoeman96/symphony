@@ -320,6 +320,8 @@ def handle_client(client, upstream_factory, expected_request_id, expected_author
                     _send_record(client, wire, deadline)
                 else:
                     evidence["server_app_suppressed"] = True
+                    evidence["server_app_observed"] = True
+                    evidence["server_app_forwarded"] = False
                     evidence["server_app_record_length"] = decision.evidence["server_app_record_length"]
                     evidence["server_app_fragment_sha256"] = decision.evidence["server_app_fragment_sha256"]
                     evidence["close_reason"] = "SERVER_APP_SUPPRESSED"
@@ -352,7 +354,8 @@ def handle_client(client, upstream_factory, expected_request_id, expected_author
 def _new_evidence(request_id, authority):
     return {"provider_request_id": request_id, "authority": authority,
             "connect_count": 0, "upstream_connections": 0, "client_app_records": 0,
-            "server_app_suppressed": False, "close_reason": "WATCHDOG_EXPIRED"}
+            "server_app_suppressed": False, "server_app_observed": False,
+            "server_app_forwarded": False, "close_reason": "WATCHDOG_EXPIRED"}
 
 
 def _evidence_file(path, evidence):
