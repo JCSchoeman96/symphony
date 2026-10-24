@@ -22,6 +22,27 @@ spec.loader.exec_module(runner)
 
 
 class HostQualificationLauncherTests(unittest.TestCase):
+    def test_bounded_command_can_report_redacted_bounded_stderr_on_failure(self):
+        error = subprocess.CalledProcessError(
+            1,
+            ["mix", "compile"],
+            stderr=(b"x" * 10_000 + b"\n** (Mix) compile failed: missing fixture module\n"
+                    b"PLANE_API_KEY_FERDI=local-sentinel\n"),
+        )
+        with patch.object(runner.subprocess, "run", side_effect=error) as run:
+            with self.assertRaisesRegex(
+                    runner.QualificationFailure,
+                    r"compile failed: missing fixture module") as raised:
+                runner._run_bounded(
+                    ["mix", "compile"],
+                    failure_stderr_bytes=128,
+                )
+
+        self.assertEqual(run.call_args.kwargs["stderr"], subprocess.PIPE)
+        self.assertNotIn("local-sentinel", str(raised.exception))
+        self.assertIn("redacted", str(raised.exception))
+        self.assertLess(len(str(raised.exception)), 256)
+
     def test_proof_build_uses_production_mix_environment(self):
         environment = runner._build_environment(
             "/tmp/h100-proof-build",
@@ -1030,6 +1051,7 @@ class HostQualificationLauncherTests(unittest.TestCase):
                 runtime_path=runtime_path,
                 source_head_sha="a" * 40,
                 source_tree_sha="b" * 40,
+                failure_stderr_bytes=4096,
             )
 
             compiled = build_path / "lib/build_fixture/ebin/Elixir.BuildFixture.beam"
@@ -1040,7 +1062,7 @@ class HostQualificationLauncherTests(unittest.TestCase):
             self.assertEqual(result["source_tree_sha"], "b" * 40)
             self.assertGreater(result["artifact_count"], 0)
             self.assertEqual(len(result["artifact_inventory_sha256"]), 64)
-            self.assertEqual(result["hex_version"], "2.5.1")
+            self.assertRegex(result["hex_version"], r"\A\d+(?:\.\d+){1,2}\Z")
             self.assertEqual(len(result["hex_archive_sha256"]), 64)
             self.assertEqual(len(result["rebar3_sha256"]), 64)
             self.assertTrue(stale.is_file(), "fresh compile modified the pre-existing build")

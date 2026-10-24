@@ -746,7 +746,8 @@ def copy_dependency_tree(source_path, destination_path, *, maximum_files=50_000,
 
 def compile_fresh_proof_build(mix_path, project_path, build_path, *, home, runtime_path,
                               source_head_sha, source_tree_sha, rebar_key=None,
-                              source_mix_home=None, selected_elixir_path=None):
+                              source_mix_home=None, selected_elixir_path=None,
+                              failure_stderr_bytes=0):
     """Compile the exact local project into a fresh, separate Mix build path."""
     if (not isinstance(mix_path, str) or not mix_path.startswith("/") or "\x00" in mix_path or
             not isinstance(project_path, str) or not project_path.startswith("/") or "\x00" in project_path or
@@ -802,7 +803,8 @@ def compile_fresh_proof_build(mix_path, project_path, build_path, *, home, runti
                                           rebar_key=rebar_key)
     environment = _build_environment(str(build_root), home=home, runtime_path=runtime_path)
     _run_bounded([mix_path, "compile", "--warnings-as-errors"], env=environment,
-                 timeout=300, cwd=str(project), max_output_bytes=1_048_576)
+                 timeout=300, cwd=str(project), max_output_bytes=1_048_576,
+                 failure_stderr_bytes=failure_stderr_bytes)
     _seal_proof_build(build_root, project)
     build_lib_path = build_root / "lib"
     inventory = build_artifact_inventory(str(build_root), source_root=str(project))
@@ -1271,18 +1273,45 @@ def service_environment(home):
 
 
 def _run_bounded(command, *, env=None, timeout=5, input_data=None, cwd=None,
-                 max_output_bytes=MAX_IPC_BYTES):
+                 max_output_bytes=MAX_IPC_BYTES, failure_stderr_bytes=0):
     if not isinstance(max_output_bytes, int) or not 1 <= max_output_bytes <= 1_048_576:
         raise QualificationFailure("local qualification output bound is invalid")
+    if (not isinstance(failure_stderr_bytes, int) or
+            not 0 <= failure_stderr_bytes <= 8192):
+        raise QualificationFailure("local qualification diagnostic bound is invalid")
     try:
         result = subprocess.run(command, input=input_data, stdout=subprocess.PIPE,
-                                stderr=subprocess.DEVNULL, check=True, timeout=timeout, env=env,
+                                stderr=subprocess.PIPE if failure_stderr_bytes else subprocess.DEVNULL,
+                                check=True, timeout=timeout, env=env,
                                 cwd=cwd)
         if len(result.stdout) > max_output_bytes:
             raise QualificationFailure("local qualification command output exceeds its bound")
         return result.stdout
+    except subprocess.CalledProcessError as exc:
+        diagnostic = _safe_command_failure_diagnostic(exc.stderr, failure_stderr_bytes)
+        if diagnostic:
+            raise QualificationFailure(f"local qualification command failed: {diagnostic}") from exc
+        raise QualificationFailure("local qualification command failed") from exc
     except (OSError, subprocess.SubprocessError) as exc:
         raise QualificationFailure("local qualification command failed") from exc
+
+
+def _safe_command_failure_diagnostic(stderr, maximum):
+    if not maximum or not isinstance(stderr, bytes) or not stderr:
+        return ""
+    sensitive = re.compile(
+        r"(?i)(?:authorization|api[\s_-]?key|access[\s_-]?token|token|credential|secret|private[\s_-]?key)"
+    )
+    text = stderr[-maximum:].decode("utf-8", errors="replace")
+    lines = []
+    for line in text.splitlines()[-8:]:
+        if sensitive.search(line):
+            line = "[redacted sensitive diagnostic]"
+        else:
+            line = "".join(character if character.isprintable() else " " for character in line)
+            line = line[:256]
+        lines.append(line)
+    return " | ".join(lines)[:maximum]
 
 
 def _process_identity(pid, expected_uid):
