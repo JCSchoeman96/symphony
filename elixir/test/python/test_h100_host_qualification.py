@@ -49,6 +49,10 @@ class HostQualificationLauncherTests(unittest.TestCase):
                          "permission_proof_result")
         self.assertEqual(runner.proof_stderr_category(b"unrecognized sensitive output"),
                          "unclassified_stderr")
+        self.assertEqual(runner.proof_stderr_category(b"** (Mix) Could not find a Mix.Project"),
+                         "mix_component_not_found")
+        self.assertEqual(runner.proof_stderr_category(b"** (Mix) Could not load dependency"),
+                         "mix_load_error")
 
     def test_proof_failure_summary_names_only_failed_contract_fields(self):
         result = {
