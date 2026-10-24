@@ -2,12 +2,15 @@
 """Single-use, payload-blind CONNECT relay for local H100 qualification."""
 
 import argparse
+import errno
 import hashlib
 import json
 import os
+import queue
 import select
 import socket
 import sys
+import threading
 import time
 import re
 from dataclasses import dataclass, field
@@ -189,6 +192,7 @@ def _read_connect(sock, deadline):
 
 
 def _send_all(sock, data, deadline):
+    sock.setblocking(False)
     view = memoryview(data)
     while view:
         remaining = deadline - time.monotonic()
@@ -198,7 +202,7 @@ def _send_all(sock, data, deadline):
         if not writable:
             raise ProtocolError("watchdog expired during write")
         try:
-            sent = sock.send(view, getattr(socket, "MSG_DONTWAIT", 0))
+            sent = sock.send(view)
         except (BlockingIOError, InterruptedError):
             continue
         if sent <= 0:
@@ -222,22 +226,71 @@ def accept_one(listener, deadline):
         raise ProtocolError("watchdog expired before CONNECT") from exc
 
 
-def handle_client(client, upstream_factory, expected_request_id, expected_authority, watchdog=10, evidence_sink=None):
+def connect_once(authority, deadline):
+    host, separator, service = authority.rpartition(":")
+    if not separator or not service.isdigit():
+        raise ProtocolError("invalid configured authority")
+    port = int(service)
+    if time.monotonic() >= deadline:
+        raise ProtocolError("watchdog expired before name resolution")
+    resolved = queue.Queue(maxsize=1)
+
+    def resolve():
+        try:
+            resolved.put((True, socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)))
+        except OSError:
+            resolved.put((False, None))
+
+    threading.Thread(target=resolve, daemon=True).start()
+    try:
+        ok, addresses = resolved.get(timeout=max(0, deadline - time.monotonic()))
+    except queue.Empty as exc:
+        raise ProtocolError("watchdog expired during name resolution") from exc
+    if not ok or not addresses:
+        raise ProtocolError("configured authority resolution failed")
+
+    family, socktype, proto, _, sockaddr = addresses[0]
+    upstream = socket.socket(family, socktype, proto)
+    try:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ProtocolError("watchdog expired before upstream connect")
+        upstream.setblocking(False)
+        result = upstream.connect_ex(sockaddr)
+        pending = (errno.EINPROGRESS, errno.EWOULDBLOCK, errno.EALREADY, errno.EINTR)
+        if result and result not in pending:
+            raise OSError(result, "upstream connect failed")
+        if result:
+            _, writable, _ = select.select([], [upstream], [], remaining)
+            if not writable:
+                raise ProtocolError("watchdog expired during upstream connect")
+            error = upstream.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+            if error:
+                raise OSError(error, "upstream connect failed")
+        return upstream
+    except (OSError, ProtocolError):
+        upstream.close()
+        raise
+
+
+def handle_client(client, upstream_factory, expected_request_id, expected_authority, watchdog=10,
+                  evidence_sink=None, deadline=None):
     """Authorize one CONNECT before dialing; then forward complete TLS records only."""
     evidence = _new_evidence(expected_request_id, expected_authority)
     evidence["connect_count"] = 1
     upstream = None
     started = time.monotonic()
+    deadline = started + watchdog if deadline is None else deadline
     stage = "connect"
     evidence["close_reason"] = "CONNECT_REJECTED"
     try:
-        raw, pending = _read_connect(client, started + watchdog)
+        raw, pending = _read_connect(client, deadline)
         parsed = parse_connect(raw, expected_request_id, expected_authority)
         stage = "upstream"
         evidence["close_reason"] = "TRANSPORT_ERROR"
-        upstream = upstream_factory(parsed.authority)
+        upstream = upstream_factory(parsed.authority, deadline)
         evidence["upstream_connections"] = 1
-        _send_all(client, b"HTTP/1.1 200 Connection Established\r\n\r\n", started + watchdog)
+        _send_all(client, b"HTTP/1.1 200 Connection Established\r\n\r\n", deadline)
         stage = "tunnel"
         evidence["close_reason"] = "WATCHDOG_EXPIRED"
         gate = RecordGate(1)
@@ -246,7 +299,7 @@ def handle_client(client, upstream_factory, expected_request_id, expected_author
             if client_prefix:
                 source = client
             else:
-                remaining = started + watchdog - time.monotonic()
+                remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise ProtocolError("watchdog expired")
                 ready, _, _ = select.select([client, upstream], [], [], remaining)
@@ -254,17 +307,17 @@ def handle_client(client, upstream_factory, expected_request_id, expected_author
                     raise ProtocolError("watchdog expired")
                 source = ready[0]
             prefix = client_prefix if source is client else b""
-            wire, remainder = _record_from_socket(source, started + watchdog, prefix)
+            wire, remainder = _record_from_socket(source, deadline, prefix)
             if source is client:
                 client_prefix = remainder
             if source is client:
                 decision = gate.client(wire)
                 evidence["client_app_records"] += int(wire[0] == 23)
-                _send_record(upstream, wire, started + watchdog)
+                _send_record(upstream, wire, deadline)
             else:
                 decision = gate.server(wire)
                 if decision.forward:
-                    _send_record(client, wire, started + watchdog)
+                    _send_record(client, wire, deadline)
                 else:
                     evidence["server_app_suppressed"] = True
                     evidence["server_app_record_length"] = decision.evidence["server_app_record_length"]
@@ -356,10 +409,11 @@ def main(argv=None):
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
     listener.bind((args.bind, args.port))
     listener.listen(1)
+    deadline = time.monotonic() + args.watchdog
     print(_ready_line(args.request_id, listener.getsockname()[1]), flush=True)
     evidence = _new_evidence(args.request_id, args.authority)
     try:
-        client = accept_one(listener, time.monotonic() + args.watchdog)
+        client = accept_one(listener, deadline)
     except ProtocolError:
         evidence["failed_closed"] = True
         evidence["close_reason"] = "WATCHDOG_EXPIRED"
@@ -372,11 +426,10 @@ def main(argv=None):
         return 1
     finally:
         listener.close()
-    def upstream_factory(authority):
-        name, _, service = authority.rpartition(":")
-        return socket.create_connection((name, int(service)), timeout=args.watchdog)
+    def upstream_factory(authority, upstream_deadline):
+        return connect_once(authority, upstream_deadline)
     result = handle_client(client, upstream_factory, args.request_id, args.authority, args.watchdog,
-                           lambda ev: _evidence_file(args.evidence, ev))
+                           lambda ev: _evidence_file(args.evidence, ev), deadline=deadline)
     return 1 if result.get("failed_closed") else 0
 
 

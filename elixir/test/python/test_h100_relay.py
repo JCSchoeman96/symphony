@@ -1,5 +1,6 @@
 import importlib.util
 import hashlib
+import errno
 import json
 import os
 import pathlib
@@ -11,6 +12,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 MODULE = pathlib.Path(__file__).parents[2] / "priv/h100/relay.py"
 spec = importlib.util.spec_from_file_location("h100_relay", MODULE)
@@ -34,7 +36,7 @@ class ConnectParserTests(unittest.TestCase):
                 calls = []
                 result = {}
                 authority = "fixture.test:443"
-                def factory(target):
+                def factory(target, deadline):
                     calls.append(target)
                     return relay_upstream
                 thread = threading.Thread(target=lambda: result.update(relay.handle_client(
@@ -123,6 +125,92 @@ class RecordTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertEqual(result.stdout, "")
 
+    def test_upstream_connect_uses_only_first_resolved_address(self):
+        class FakeSocket:
+            def __init__(self):
+                self.attempts = []
+            def setblocking(self, value):
+                pass
+            def connect_ex(self, address):
+                self.attempts.append(address)
+                return 0
+            def close(self):
+                pass
+        fake = FakeSocket()
+        addresses = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.1", 443)),
+                     (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2001:db8::1", 443, 0, 0))]
+        with mock.patch.object(relay.socket, "getaddrinfo", return_value=addresses), \
+             mock.patch.object(relay.socket, "socket", return_value=fake):
+            result = relay.connect_once("fixture.test:443", time.monotonic() + 1)
+        self.assertIs(result, fake)
+        self.assertEqual(fake.attempts, [addresses[0][4]])
+
+    def test_stalled_single_address_dial_expires_deadline(self):
+        class FakeSocket:
+            def __init__(self):
+                self.attempts = []
+                self.closed = False
+            def setblocking(self, value):
+                pass
+            def connect_ex(self, address):
+                self.attempts.append(address)
+                return errno.EINPROGRESS
+            def close(self):
+                self.closed = True
+        fake = FakeSocket()
+        address = (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.1", 443))
+        with mock.patch.object(relay.socket, "getaddrinfo", return_value=[address]), \
+             mock.patch.object(relay.socket, "socket", return_value=fake), \
+             mock.patch.object(relay.select, "select", return_value=([], [], [])):
+            with self.assertRaises(relay.ProtocolError):
+                relay.connect_once("fixture.test:443", time.monotonic() + 0.02)
+        self.assertEqual(fake.attempts, [address[4]])
+        self.assertTrue(fake.closed)
+
+    def test_stalled_name_resolution_expires_shared_deadline(self):
+        started = threading.Event()
+        release = threading.Event()
+        def blocked_resolver(*args, **kwargs):
+            started.set()
+            release.wait(1)
+            return []
+        before = time.monotonic()
+        with mock.patch.object(relay.socket, "getaddrinfo", side_effect=blocked_resolver):
+            with self.assertRaises(relay.ProtocolError):
+                relay.connect_once("fixture.test:443", before + 0.05)
+        elapsed = time.monotonic() - before
+        release.set()
+        self.assertTrue(started.is_set())
+        self.assertLess(elapsed, 0.2)
+
+    def test_stalled_dial_fails_closed_without_upstream_count(self):
+        class FakeSocket:
+            def __init__(self):
+                self.closed = False
+            def setblocking(self, value):
+                pass
+            def connect_ex(self, address):
+                return errno.EINPROGRESS
+            def close(self):
+                self.closed = True
+        fake = FakeSocket()
+        address = (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.1", 443))
+        client, relay_client = socket.socketpair()
+        client.sendall(b"CONNECT fixture.test:443 HTTP/1.1\r\nHost: fixture.test:443\r\n"
+                       b"x-symphony-provider-request-id: req-123\r\n\r\n")
+        with mock.patch.object(relay.socket, "getaddrinfo", return_value=[address]), \
+             mock.patch.object(relay.socket, "socket", return_value=fake), \
+             mock.patch.object(relay.select, "select", return_value=([], [], [])):
+            result = relay.handle_client(client=relay_client,
+                                         upstream_factory=relay.connect_once,
+                                         expected_request_id="req-123",
+                                         expected_authority="fixture.test:443", watchdog=0.1)
+        self.assertTrue(result["failed_closed"])
+        self.assertEqual(result["close_reason"], "WATCHDOG_EXPIRED")
+        self.assertEqual(result["upstream_connections"], 0)
+        self.assertTrue(fake.closed)
+        client.close()
+
     def test_serialized_evidence_has_fixed_upper_bound(self):
         evidence = {"provider_request_id": "i" * 128, "authority": "a" * 259,
                     "connect_count": 1, "upstream_connections": 1,
@@ -153,7 +241,7 @@ class SocketRelayTests(unittest.TestCase):
         calls = []
         result = {}
         # The factory must return the relay end, while tests retain its peer.
-        def factory(authority):
+        def factory(authority, deadline):
             calls.append(authority)
             return relay_upstream
         def run():
@@ -162,6 +250,33 @@ class SocketRelayTests(unittest.TestCase):
         thread = threading.Thread(target=run)
         thread.start()
         return client, thread, calls, result, upstream_peer
+
+    def test_client_accepted_late_gets_only_remaining_watchdog_budget(self):
+        with tempfile.TemporaryDirectory() as directory:
+            evidence_path = pathlib.Path(directory) / "evidence.json"
+            command = [sys.executable, str(MODULE), "--bind", "127.0.0.1", "--port", "0",
+                       "--request-id", "req-123", "--authority", "fixture.test:443",
+                       "--record-limit", "1", "--watchdog", "0.8", "--evidence", str(evidence_path)]
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            client = None
+            try:
+                self.assertTrue(select.select([process.stdout], [], [], 1)[0])
+                ready = json.loads(process.stdout.readline())
+                time.sleep(0.55)
+                accepted_at = time.monotonic()
+                client = socket.create_connection((ready["listen_host"], ready["bound_port"]))
+                self.assertEqual(process.wait(timeout=0.45), 1)
+                self.assertLess(time.monotonic() - accepted_at, 0.45)
+                evidence = json.loads(evidence_path.read_text())
+                self.assertEqual(evidence["close_reason"], "WATCHDOG_EXPIRED")
+            finally:
+                if client is not None:
+                    client.close()
+                process.stdout.close()
+                process.stderr.close()
+                if process.poll() is None:
+                    process.terminate()
+                    process.wait(timeout=2)
 
     def test_subprocess_emits_internal_ready_before_any_activity(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -321,7 +436,7 @@ class SocketRelayTests(unittest.TestCase):
         calls = []
         result = {}
         thread = threading.Thread(target=lambda: result.update(relay.handle_client(
-            peer, lambda authority: calls.append(authority), "req-123", "fixture.test:443", 1)))
+            peer, lambda authority, deadline: calls.append(authority), "req-123", "fixture.test:443", 1)))
         thread.start()
         client.sendall(self.request.replace(b"req-123", b"bad"))
         thread.join(2)
@@ -390,14 +505,15 @@ class SocketRelayTests(unittest.TestCase):
         upstream_peer, relay_upstream = socket.socketpair()
         relay_upstream.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024)
         result = {}
-        thread = threading.Thread(target=lambda: result.update(relay.handle_client(
-            relay_client, lambda authority: relay_upstream, "req-123", "fixture.test:443", 0.1)))
-        thread.start()
-        tunnel.sendall(self.request)
-        self.assertIn(b"200 Connection Established", tunnel.recv(4096))
-        payload = b"x" * 16000
-        tunnel.sendall(b"\x16\x03\x03" + len(payload).to_bytes(2, "big") + payload)
-        thread.join(0.5)
+        with mock.patch.object(relay.socket, "MSG_DONTWAIT", 0, create=True):
+            thread = threading.Thread(target=lambda: result.update(relay.handle_client(
+                relay_client, lambda authority, deadline: relay_upstream, "req-123", "fixture.test:443", 0.1)))
+            thread.start()
+            tunnel.sendall(self.request)
+            self.assertIn(b"200 Connection Established", tunnel.recv(4096))
+            payload = b"x" * 16000
+            tunnel.sendall(b"\x16\x03\x03" + len(payload).to_bytes(2, "big") + payload)
+            thread.join(0.5)
         finished = not thread.is_alive()
         if not finished:
             upstream_peer.close()
