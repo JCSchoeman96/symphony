@@ -1,14 +1,14 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://symphony.local/h100/p0/qualification-evidence/v2",
+  "$id": "https://symphony.local/h100/p0/qualification-evidence/v3",
   "title": "H100 P0 local host relay qualification evidence",
-  "schema_version": 2,
+  "schema_version": 3,
   "type": "object",
   "additionalProperties": false,
   "required": ["type", "schema_version", "qualified", "evidence"],
   "properties": {
     "type": {"const": "QUALIFICATION_RESULT"},
-    "schema_version": {"const": 2},
+    "schema_version": {"const": 3},
     "qualified": {"const": true},
     "evidence": {
       "type": "object",
@@ -35,7 +35,9 @@
         "implementation_base", "spec_commit", "proof_build_fresh", "proof_build_read_only",
         "proof_build_source_head_sha", "proof_build_source_tree_sha", "proof_build_artifact_count",
         "proof_build_artifact_inventory_sha256", "proof_build_mix_lock_sha256",
-        "proof_build_hex_version", "proof_build_hex_archive_sha256", "proof_build_rebar3_sha256"
+        "proof_build_hex_version", "proof_build_hex_archive_sha256", "proof_build_rebar3_sha256",
+        "proof_build_dependency_file_count", "proof_build_dependency_total_bytes",
+        "proof_build_dependency_source_sha256"
       ],
       "properties": {
         "policy_mechanism": {"type": "string", "maxLength": 256},
@@ -117,7 +119,10 @@
         "proof_build_mix_lock_sha256": {"$ref": "#/$defs/sha256"},
         "proof_build_hex_version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"},
         "proof_build_hex_archive_sha256": {"$ref": "#/$defs/sha256"},
-        "proof_build_rebar3_sha256": {"$ref": "#/$defs/sha256"}
+        "proof_build_rebar3_sha256": {"$ref": "#/$defs/sha256"},
+        "proof_build_dependency_file_count": {"type": "integer", "minimum": 1, "maximum": 50000},
+        "proof_build_dependency_total_bytes": {"type": "integer", "minimum": 1, "maximum": 536870912},
+        "proof_build_dependency_source_sha256": {"$ref": "#/$defs/sha256"}
       }
     }
   },

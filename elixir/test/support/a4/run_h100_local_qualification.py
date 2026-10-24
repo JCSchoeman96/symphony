@@ -25,7 +25,7 @@ import re
 
 
 MAX_IPC_BYTES = 16_384
-EVIDENCE_SCHEMA_VERSION = 2
+EVIDENCE_SCHEMA_VERSION = 3
 SYSTEM_PATH = "/usr/local/bin:/usr/bin:/bin"
 PROOF_UID = 1201
 RELAY_UID = 1202
@@ -520,6 +520,110 @@ def _seal_proof_build(build_root):
         root.chmod(0o555)
     except OSError as exc:
         raise QualificationFailure("proof build could not be sealed read-only") from exc
+
+
+def copy_dependency_tree(source_path, destination_path, *, maximum_files=50_000,
+                         maximum_bytes=536_870_912):
+    """Copy bounded, regular dependency sources to a fresh writable tree."""
+    if (not isinstance(source_path, str) or not source_path.startswith("/") or "\x00" in source_path or
+            not isinstance(destination_path, str) or not destination_path.startswith("/") or
+            "\x00" in destination_path or not isinstance(maximum_files, int) or
+            isinstance(maximum_files, bool) or maximum_files < 1 or
+            not isinstance(maximum_bytes, int) or isinstance(maximum_bytes, bool) or maximum_bytes < 1):
+        raise QualificationFailure("dependency copy inputs are invalid")
+    source = pathlib.Path(source_path)
+    destination = pathlib.Path(destination_path)
+    created_destination = False
+    try:
+        source_stat = source.lstat()
+        if stat.S_ISLNK(source_stat.st_mode) or not stat.S_ISDIR(source_stat.st_mode):
+            raise QualificationFailure("dependency source is not a real directory")
+        if destination.is_symlink() or destination.exists():
+            raise QualificationFailure("dependency copy destination is not fresh")
+        source = source.resolve(strict=True)
+        destination_parent = destination.parent.resolve(strict=True)
+        destination = destination_parent / destination.name
+        if destination == source or destination.is_relative_to(source):
+            raise QualificationFailure("dependency copy destination is inside its source")
+
+        files = []
+        directories = [pathlib.Path()]
+        total_bytes = 0
+        pending_directories = [pathlib.Path()]
+        while pending_directories:
+            relative_directory = pending_directories.pop()
+            directory = source / relative_directory
+            with os.scandir(directory) as iterator:
+                children = sorted(iterator, key=lambda entry: entry.name)
+            for entry in children:
+                relative = relative_directory / entry.name
+                item_stat = entry.stat(follow_symlinks=False)
+                if stat.S_ISLNK(item_stat.st_mode):
+                    raise QualificationFailure("dependency source contains a symbolic link")
+                if stat.S_ISDIR(item_stat.st_mode):
+                    directories.append(relative)
+                    pending_directories.append(relative)
+                    if len(directories) + len(files) > maximum_files * 2:
+                        raise QualificationFailure("dependency source exceeds its path bound")
+                    continue
+                if not stat.S_ISREG(item_stat.st_mode):
+                    raise QualificationFailure("dependency source contains a non-regular path")
+                files.append((relative, item_stat.st_size, stat.S_IMODE(item_stat.st_mode)))
+                total_bytes += item_stat.st_size
+                if (len(files) > maximum_files or len(directories) + len(files) > maximum_files * 2 or
+                        total_bytes > maximum_bytes):
+                    raise QualificationFailure("dependency source exceeds its copy bound")
+        destination.mkdir(mode=0o755, parents=True, exist_ok=False)
+        created_destination = True
+        for relative_directory in directories[1:]:
+            (destination / relative_directory).mkdir(mode=0o755)
+
+        inventory = hashlib.sha256()
+        copied_bytes = 0
+        for relative, expected_size, source_mode in files:
+            source_file = source / relative
+            target_file = destination / relative
+            current_stat = source_file.lstat()
+            if (stat.S_ISLNK(current_stat.st_mode) or not stat.S_ISREG(current_stat.st_mode) or
+                    current_stat.st_size != expected_size):
+                raise QualificationFailure("dependency source changed during its copy")
+            file_digest = hashlib.sha256()
+            copied_size = 0
+            with source_file.open("rb") as incoming, target_file.open("xb") as outgoing:
+                while True:
+                    block = incoming.read(65_536)
+                    if not block:
+                        break
+                    outgoing.write(block)
+                    file_digest.update(block)
+                    copied_size += len(block)
+            if copied_size != expected_size:
+                raise QualificationFailure("dependency source changed during its copy")
+            os.chmod(target_file, 0o644 | (source_mode & 0o111))
+            relative_bytes = os.fsencode(relative.as_posix())
+            inventory.update(len(relative_bytes).to_bytes(4, "big"))
+            inventory.update(relative_bytes)
+            inventory.update(copied_size.to_bytes(8, "big"))
+            inventory.update(file_digest.digest())
+            copied_bytes += copied_size
+
+        for relative_directory in directories:
+            os.chmod(destination / relative_directory, 0o755)
+        if copied_bytes != total_bytes:
+            raise QualificationFailure("dependency copy byte count changed")
+        return {
+            "file_count": len(files),
+            "total_bytes": copied_bytes,
+            "source_sha256": inventory.hexdigest(),
+        }
+    except QualificationFailure:
+        if created_destination and destination.exists() and not destination.is_symlink():
+            shutil.rmtree(destination, ignore_errors=True)
+        raise
+    except (OSError, OverflowError, ValueError) as exc:
+        if created_destination and destination.exists() and not destination.is_symlink():
+            shutil.rmtree(destination, ignore_errors=True)
+        raise QualificationFailure("dependency sources could not be copied safely") from exc
 
 
 def compile_fresh_proof_build(mix_path, project_path, build_path, *, home, runtime_path,
@@ -1409,6 +1513,41 @@ def _bind_repo_read_only(repo_root, mount_path):
     _bind_read_only_path(repo_root, mount_path, unmount=_unmount_repo)
 
 
+def _bind_writable_dependency_copy(source_path, mount_path):
+    """Overlay only the project's dependency sources with the bounded writable copy."""
+    source = pathlib.Path(source_path)
+    target = pathlib.Path(mount_path)
+    try:
+        source_stat = source.lstat()
+        target_stat = target.lstat()
+        if (stat.S_ISLNK(source_stat.st_mode) or not stat.S_ISDIR(source_stat.st_mode) or
+                stat.S_ISLNK(target_stat.st_mode) or not stat.S_ISDIR(target_stat.st_mode) or
+                target.parts[-3:] != ("repo", "elixir", "deps") or target.is_mount()):
+            raise QualificationFailure("writable dependency overlay target is invalid")
+        source = source.resolve(strict=True)
+        target = target.resolve(strict=True)
+        if source == target or source.is_relative_to(target) or target.is_relative_to(source):
+            raise QualificationFailure("writable dependency overlay paths overlap")
+
+        _run_bounded(["mount", "--bind", str(source), str(target)], env=service_environment("/"))
+        options = None
+        for line in pathlib.Path("/proc/self/mountinfo").read_text(encoding="ascii").splitlines():
+            fields = line.split()
+            if len(fields) >= 6 and fields[4] == str(target):
+                options = fields[5].split(",")
+                break
+        if (options is None or "rw" not in options or
+                os.statvfs(target).f_flag & getattr(os, "ST_RDONLY", 1)):
+            raise QualificationFailure("writable dependency overlay is not effectively writable")
+    except BaseException as primary:
+        try:
+            if "target" in locals() and target.is_mount():
+                _unmount_mount(target)
+        except Exception as cleanup_error:
+            raise QualificationFailure("writable dependency overlay cleanup failed") from cleanup_error
+        raise primary
+
+
 def _bind_runtime_installations(plan):
     mounted = []
     try:
@@ -1651,6 +1790,7 @@ def _inside_main(repo_root, temp_root, head, tree, request_id, outside_control_p
     os.chmod(temp_root, 0o711)
     mount_path = temp_root / "repo"
     mounted = False
+    dependency_mount = None
     runtime_mounts = []
     policy = None
     session = None
@@ -1689,6 +1829,10 @@ def _inside_main(repo_root, temp_root, head, tree, request_id, outside_control_p
 
         runtime_plan = runtime_mount_plan(mix_path, runtime_path, str(temp_root))
         runtime_mounts = _bind_runtime_installations(runtime_plan)
+        dependency_mount = source_elixir / "deps"
+        dependency_copy = copy_dependency_tree(str(dependency_mount), str(temp_root / "proof-deps"))
+        _bind_writable_dependency_copy(str(temp_root / "proof-deps"), str(dependency_mount))
+        runtime_mounts.append(dependency_mount)
         build_home.mkdir(mode=0o700)
         proof_build = compile_fresh_proof_build(
             runtime_plan["mix_path"],
@@ -1701,6 +1845,8 @@ def _inside_main(repo_root, temp_root, head, tree, request_id, outside_control_p
             rebar_key=mix_rebar_home_key(mix_path),
             source_mix_home=source_mix_home,
         )
+        _unmount_mount(dependency_mount)
+        runtime_mounts.remove(dependency_mount)
         _bind_read_only_path(proof_build_source, proof_build_mount, unmount=_unmount_mount)
         runtime_mounts.append(proof_build_mount)
         proof_build = {
@@ -2006,6 +2152,9 @@ def _inside_main(repo_root, temp_root, head, tree, request_id, outside_control_p
             "proof_build_hex_version": proof_build["hex_version"],
             "proof_build_hex_archive_sha256": proof_build["hex_archive_sha256"],
             "proof_build_rebar3_sha256": proof_build["rebar3_sha256"],
+            "proof_build_dependency_file_count": dependency_copy["file_count"],
+            "proof_build_dependency_total_bytes": dependency_copy["total_bytes"],
+            "proof_build_dependency_source_sha256": dependency_copy["source_sha256"],
         }
         return {"type": "QUALIFICATION_RESULT", "qualified": True, "evidence": evidence}
     finally:

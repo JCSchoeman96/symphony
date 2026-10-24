@@ -87,11 +87,13 @@
 **Files:**
 - Create: `elixir/priv/h100/local_tls_fixture.py` (loopback TLS 1.2 fixture and generated CA/server certificate lifecycle).
 - Create: `elixir/test/support/a4/host_qualification_runner.exs` (fresh, unprivileged proof BEAM entry point using the real A4 proof, witness, Client, and Finch path).
+- Modify: `elixir/test/support/a4/run_h100_local_qualification.py` to copy the locked dependency source tree into a bounded writable scratch directory, hash that copy, bind it over only the read-only repository's `elixir/deps` mountpoint for compilation, and unmount it before proof startup.
 - Modify: `elixir/test/support/a4/transport_fixture.exs` only for shared test utilities that retain no global trust mutation.
 
 **Tests:**
 - Generate CA/key/server material under a private temporary directory, restrict file access to the origin UID, trust only the generated CA in the one proof connection, and assert exact hostname verification.
 - Confirm a peer-verified TLS 1.1-only fixture fails while the TLS 1.2 fixture succeeds; the relay itself only observes record framing, content type, and length.
+- Test dependency-copy bounds, source symlink rejection, writable directory modes, content inventory hashing, and rejection of mount targets outside the exact project `elixir/deps` path.
 - Send the exact bounded local PATCH once; fixture confirms one complete request without writing its body to logs/evidence.
 - Confirm origin emits a server application-data record, relay suppresses the full record, Finch reports transport failure, and there is one dispatch, one CONNECT, one upstream, one client application-data record, zero retries, and zero replays.
 - Failure/interrupt paths remove CA, certificate, key, temporary trust files, sockets, and all fixture children.
@@ -124,6 +126,7 @@
 - Modify: `.github/workflows/make-all.yml` to run Python unit tests in CI and make the final aggregate depend on them; do not run the real local host qualification in CI.
 - Modify: `elixir/README.md` with safe local-only qualification instructions and explicit prohibitions on production credentials and live Plane access.
 - Create: `elixir/test/support/a4/evidence_schema.json` or equivalent versioned field contract for secret-free evidence.
+- Bump the separate host-qualification evidence contract to v3 to record the copied dependency file count, byte count, and source inventory hash; do not change the accepted A4 manifest or READY schema.
 - Output only at runtime: `elixir/_build/h100-p0-host-relay-evidence.json` (ignored build output, not a tracked self-referential artifact).
 
 **Tests/verification:**

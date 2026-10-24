@@ -62,6 +62,71 @@ class HostQualificationLauncherTests(unittest.TestCase):
                 b"".join(path.read_bytes() for path in target_home.rglob("*") if path.is_file()),
             )
 
+    def test_dependency_copy_is_bounded_writable_and_content_identical(self):
+        copy_tree = getattr(runner, "copy_dependency_tree", None)
+        self.assertTrue(callable(copy_tree), "proof build does not copy writable dependency sources")
+        with tempfile.TemporaryDirectory(prefix="h100-deps-copy-") as directory:
+            root = pathlib.Path(directory)
+            source = root / "source-deps"
+            package = source / "phoenix/priv/installer/templates"
+            package.mkdir(parents=True)
+            (source / "phoenix/mix.exs").write_text("package-source", encoding="ascii")
+            template = package / "core_components.ex.eex"
+            template.write_text("template-source", encoding="ascii")
+            destination = root / "writable-deps"
+
+            result = copy_tree(str(source), str(destination))
+
+            copied_template = destination / "phoenix/priv/installer/templates/core_components.ex.eex"
+            self.assertEqual(result["file_count"], 2)
+            self.assertEqual(len(result["source_sha256"]), 64)
+            self.assertEqual(copied_template.read_text(encoding="ascii"), "template-source")
+            self.assertTrue(os.access(copied_template.parent, os.W_OK))
+            copied_template.write_text("compiler-output", encoding="ascii")
+            self.assertEqual(template.read_text(encoding="ascii"), "template-source")
+
+    def test_dependency_copy_rejects_symlinks_and_removes_partial_output(self):
+        with tempfile.TemporaryDirectory(prefix="h100-deps-link-") as directory:
+            root = pathlib.Path(directory)
+            source = root / "source-deps"
+            source.mkdir()
+            (source / "regular.txt").write_text("regular", encoding="ascii")
+            (source / "linked.txt").symlink_to(source / "regular.txt")
+            destination = root / "writable-deps"
+
+            with self.assertRaises(runner.QualificationFailure):
+                runner.copy_dependency_tree(str(source), str(destination))
+
+            self.assertFalse(destination.exists())
+
+    def test_dependency_copy_rejects_dangling_destination_symlink(self):
+        with tempfile.TemporaryDirectory(prefix="h100-deps-dangling-") as directory:
+            root = pathlib.Path(directory)
+            source = root / "source-deps"
+            source.mkdir()
+            (source / "regular.txt").write_text("regular", encoding="ascii")
+            destination = root / "writable-deps"
+            dangling_target = root / "future-target"
+            destination.symlink_to(dangling_target, target_is_directory=True)
+
+            with self.assertRaises(runner.QualificationFailure):
+                runner.copy_dependency_tree(str(source), str(destination))
+
+            self.assertFalse(dangling_target.exists())
+
+    def test_writable_dependency_overlay_requires_the_project_deps_mountpoint(self):
+        bind_copy = getattr(runner, "_bind_writable_dependency_copy", None)
+        self.assertTrue(callable(bind_copy), "qualification does not bind a writable dependency overlay")
+        with tempfile.TemporaryDirectory(prefix="h100-deps-mount-") as directory:
+            root = pathlib.Path(directory)
+            source = root / "copy"
+            target = root / "unexpected-target"
+            source.mkdir()
+            target.mkdir()
+
+            with self.assertRaises(runner.QualificationFailure):
+                bind_copy(str(source), str(target))
+
     def test_mix_runtime_maps_to_its_rebar_home_key(self):
         key = getattr(runner, "mix_rebar_home_key", None)
         self.assertTrue(callable(key), "proof build cannot select its matching Rebar3 binary")
