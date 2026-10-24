@@ -100,13 +100,25 @@ def proof_failure_detail(status_code, result, stderr=b""):
         return (f"unprivileged proof BEAM exited with status {status_code} without a bounded result: "
                 + category)
 
-    if (set(result) == {"type", "reason", "error_class"} and
+    if (set(result) == {"type", "reason", "error_class", "failure_site"} and
             result.get("type") == "PROOF_ERROR" and result.get("reason") == "proof_process_failed"):
         error_class = result.get("error_class")
+        failure_site = result.get("failure_site")
+        allowed_functions = {
+            "run_proof", "capture_request", "patch_bounds", "ipc_ack", "attempt_persistence",
+            "mutation_envelope", "controller_setup", "witness_gate", "canary_probe",
+            "local_client_setup", "proof_result_check", "proof_runner",
+        }
+        if (not isinstance(failure_site, dict) or set(failure_site) != {"function", "line"} or
+                failure_site.get("function") not in allowed_functions or
+                not isinstance(failure_site.get("line"), int) or isinstance(failure_site.get("line"), bool) or
+                not 0 <= failure_site["line"] <= 500):
+            return "proof BEAM failed with an invalid bounded result"
+        location = f" at {failure_site['function']}:{failure_site['line']}"
         if error_class in {"argument_error", "match_error", "function_clause", "case_clause",
                            "key_error", "runtime_error"}:
-            return "proof BEAM raised " + error_class
-        return "proof BEAM raised an unclassified exception"
+            return "proof BEAM raised " + error_class + location
+        return "proof BEAM raised an unclassified exception" + location
 
     expected_fields = {
         "type", "provider_request_id", "manifest_finch_absent_before_ready",

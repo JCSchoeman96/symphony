@@ -23,14 +23,22 @@ spec.loader.exec_module(runner)
 class HostQualificationLauncherTests(unittest.TestCase):
     def test_proof_failure_summary_uses_only_bounded_exception_classes(self):
         detail = runner.proof_failure_detail(
-            1, {"type": "PROOF_ERROR", "reason": "proof_process_failed", "error_class": "match_error"}
+            1,
+            {
+                "type": "PROOF_ERROR", "reason": "proof_process_failed", "error_class": "match_error",
+                "failure_site": {"function": "run_proof", "line": 97},
+            },
         )
-        self.assertEqual(detail, "proof BEAM raised match_error")
+        self.assertEqual(detail, "proof BEAM raised match_error at run_proof:97")
 
         detail = runner.proof_failure_detail(
-            1, {"type": "PROOF_ERROR", "reason": "proof_process_failed", "error_class": "unsafe secret text"}
+            1,
+            {
+                "type": "PROOF_ERROR", "reason": "proof_process_failed", "error_class": "unsafe secret text",
+                "failure_site": {"function": "run_proof", "line": 97},
+            },
         )
-        self.assertEqual(detail, "proof BEAM raised an unclassified exception")
+        self.assertEqual(detail, "proof BEAM raised an unclassified exception at run_proof:97")
 
     def test_proof_failure_summary_reports_exit_status_without_raw_output(self):
         self.assertEqual(
@@ -89,6 +97,7 @@ class HostQualificationLauncherTests(unittest.TestCase):
                 "type": "PROOF_ERROR",
                 "reason": "proof_process_failed",
                 "error_class": "match_error",
+                "failure_site": {"function": "run_proof", "line": 97},
                 "authorization": "secret-value",
             },
         )

@@ -22,7 +22,8 @@ defmodule SymphonyElixir.H100HostQualificationRunner do
         safe_result_file(%{
           "type" => "PROOF_ERROR",
           "reason" => "proof_process_failed",
-          "error_class" => safe_exception_class(error)
+          "error_class" => safe_exception_class(error),
+          "failure_site" => safe_failure_site(__STACKTRACE__)
         })
 
         System.halt(1)
@@ -377,6 +378,44 @@ defmodule SymphonyElixir.H100HostQualificationRunner do
   defp safe_exception_class(%KeyError{}), do: "key_error"
   defp safe_exception_class(%RuntimeError{}), do: "runtime_error"
   defp safe_exception_class(_error), do: "other_exception"
+
+  defp safe_failure_site(stacktrace) do
+    case Enum.find(stacktrace, fn
+           {module, _function, _arity, _location} -> module == __MODULE__
+           _frame -> false
+         end) do
+      {__MODULE__, function, _arity, location} ->
+        %{
+          "function" => safe_function_name(function),
+          "line" => safe_line_number(location)
+        }
+
+      _frame ->
+        %{"function" => "proof_runner", "line" => 0}
+    end
+  end
+
+  defp safe_function_name(:run_proof), do: "run_proof"
+  defp safe_function_name(:capture_request!), do: "capture_request"
+  defp safe_function_name(:ensure_bounded_patch!), do: "patch_bounds"
+  defp safe_function_name(:ipc_ack!), do: "ipc_ack"
+  defp safe_function_name(:durable_attempt!), do: "attempt_persistence"
+  defp safe_function_name(:mutation_envelope), do: "mutation_envelope"
+  defp safe_function_name(:controller_backend), do: "controller_setup"
+  defp safe_function_name(:witness_sink), do: "witness_gate"
+  defp safe_function_name(:probe_canaries), do: "canary_probe"
+  defp safe_function_name(:local_config), do: "local_client_setup"
+  defp safe_function_name(:acceptable_proof_result?), do: "proof_result_check"
+  defp safe_function_name(_function), do: "proof_runner"
+
+  defp safe_line_number(location) do
+    case Keyword.get(location, :line) do
+      line when is_integer(line) and line in 1..500 -> line
+      _line -> 0
+    end
+  rescue
+    _error -> 0
+  end
 end
 
 SymphonyElixir.H100HostQualificationRunner.run()
