@@ -1,3 +1,5 @@
+Code.require_file("host_qualification_proof.ex", __DIR__)
+
 defmodule SymphonyElixir.H100HostQualificationRunner do
   alias SymphonyElixir.Plane.Client
   alias SymphonyElixir.WorkControl.A4HostRelayController
