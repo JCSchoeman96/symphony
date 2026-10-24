@@ -115,19 +115,20 @@ defmodule SymphonyElixir.H100HostQualificationRunner do
 
     finch_absent_after_manifest = is_nil(Process.whereis(A4Proof.finch_name()))
     ack_count = :atomics.new(1, signed: false)
+    canary_evidence = SymphonyElixir.A4HostQualificationProof.new_canary_evidence()
 
     response =
       Client.update_work_item_state(config, "work-1", "state-1",
         provider_mutation_envelope: envelope,
         dispatch_witness_required?: true,
         dispatch_witness_timeout_ms: @timeout_ms,
-        dispatch_witness_sink: witness_sink(socket, request_id, ipv4_port, ipv6_port, ack_count),
+        dispatch_witness_sink: witness_sink(socket, request_id, ipv4_port, ipv6_port, ack_count, canary_evidence),
         a4_session: token,
         a4_proof_cacerts: [ca_der]
       )
 
     proof_finch_stopped = is_nil(Process.whereis(A4Proof.finch_name()))
-    canary_evidence = Process.get(:h100_canary_evidence)
+    canary_state = SymphonyElixir.A4HostQualificationProof.read_canary_evidence(canary_evidence)
     trust_unchanged = shared_trust_before == :public_key.cacerts_get()
 
     tls_options_valid =
@@ -139,16 +140,16 @@ defmodule SymphonyElixir.H100HostQualificationRunner do
       "failure_code" => controller_failure_code(backend_failures) || proof_result_failure_code(response),
       "provider_request_id" => request_id,
       "manifest_finch_absent_before_ready" => finch_absent_after_manifest,
-      "finch_started_at_witness" => Process.get(:h100_finch_started_at_witness, false),
+      "finch_started_at_witness" => canary_state.finch_started?,
       "finch_stopped" => proof_finch_stopped,
       "dispatch_witness_ack_count" => :atomics.get(ack_count, 1),
       "retry_count" => 0,
       "replay_count" => 0,
       "transport_result" => result_class(response),
-      "direct_ipv4_canary" => atom_value(canary_evidence, :ipv4),
-      "direct_ipv6_canary" => atom_value(canary_evidence, :ipv6),
-      "canary_policy_verified" => canary_evidence != nil,
-      "canary_drop_packets" => canary_drop_packets(canary_evidence),
+      "direct_ipv4_canary" => Atom.to_string(canary_state.ipv4),
+      "direct_ipv6_canary" => Atom.to_string(canary_state.ipv6),
+      "canary_policy_verified" => canary_state.policy_verified?,
+      "canary_drop_packets" => canary_state.drop_packets,
       "tls_verify_peer" => tls_options_valid,
       "tls_hostname_verification" => tls_options_valid,
       "shared_trust_unchanged" => trust_unchanged
@@ -261,12 +262,13 @@ defmodule SymphonyElixir.H100HostQualificationRunner do
     end
   end
 
-  defp witness_sink(socket, request_id, ipv4_port, ipv6_port, ack_count) do
+  defp witness_sink(socket, request_id, ipv4_port, ipv6_port, ack_count, canary_evidence) do
     fn witness ->
       finch_started = not is_nil(Process.whereis(A4Proof.finch_name()))
-      Process.put(:h100_finch_started_at_witness, finch_started)
       canaries = probe_canaries(ipv4_port, ipv6_port)
-      Process.put(:h100_canary_evidence, canaries)
+      :ok = SymphonyElixir.A4HostQualificationProof.record_canary_probes(canary_evidence, canaries)
+      :ok = SymphonyElixir.A4HostQualificationProof.record_finch_started(canary_evidence, finch_started)
+      :ok = SymphonyElixir.A4HostQualificationProof.record_canary_policy(canary_evidence, false, 0)
 
       case {SymphonyElixir.A4HostQualificationProof.validate_canary_results(canaries),
             A4HostRelayIPC.call(
@@ -281,9 +283,16 @@ defmodule SymphonyElixir.H100HostQualificationRunner do
               },
               @timeout_ms
             )} do
-        {:ok, {:ok, %{"verified" => true, "proof_drop_packets" => count}}} when count >= 2 and finch_started ->
-          :atomics.add(ack_count, 1, 1)
-          {:ok, witness.provider_request_id}
+        {:ok, {:ok, %{"verified" => true, "proof_drop_packets" => count}}}
+        when is_integer(count) and count in 0..1_000_000 ->
+          :ok = SymphonyElixir.A4HostQualificationProof.record_canary_policy(canary_evidence, true, count)
+
+          if count >= 2 and finch_started do
+            :atomics.add(ack_count, 1, 1)
+            {:ok, witness.provider_request_id}
+          else
+            {:error, :local_qualification_gate_failed}
+          end
 
         _ ->
           {:error, :local_qualification_gate_failed}
@@ -449,7 +458,10 @@ defmodule SymphonyElixir.H100HostQualificationRunner do
               :controller_failed,
               :manifest_unavailable,
               :stage_b_not_verified,
-              :request_identity_mismatch
+              :request_identity_mismatch,
+              :direct_egress_not_denied,
+              :canary_probe_failed,
+              :local_qualification_gate_failed
             ],
        do: Atom.to_string(reason)
 
@@ -464,12 +476,6 @@ defmodule SymphonyElixir.H100HostQualificationRunner do
   defp proof_result_failure_code({:error, reason}) when reason in [:econnrefused, :timeout, :closed], do: Atom.to_string(reason)
   defp proof_result_failure_code({:error, _error}), do: "transport_failure"
   defp proof_result_failure_code(_result), do: "unexpected_success"
-
-  defp atom_value(nil, _key), do: "failed"
-  defp atom_value(map, key), do: Map.get(map, key, :failed) |> Atom.to_string()
-
-  defp canary_drop_packets(%{"proof_drop_packets" => count}) when is_integer(count), do: count
-  defp canary_drop_packets(_), do: 0
 
   defp sha256(value), do: :crypto.hash(:sha256, value) |> Base.encode16(case: :lower)
 

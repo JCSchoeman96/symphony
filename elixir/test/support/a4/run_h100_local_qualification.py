@@ -184,6 +184,7 @@ def proof_failure_detail(status_code, result, stderr=b""):
         "invalid_ready_response", "wrong_controller_reference", "proof_ready_timeout",
         "policy_not_verified", "controller_failed", "manifest_unavailable", "stage_b_not_verified",
         "request_identity_mismatch",
+        "direct_egress_not_denied", "canary_probe_failed", "local_qualification_gate_failed",
         "econnrefused", "timeout", "closed",
     }
     manifest_failure_fields = {
@@ -203,8 +204,8 @@ def proof_failure_detail(status_code, result, stderr=b""):
     if (not isinstance(result["dispatch_witness_ack_count"], int) or
             isinstance(result["dispatch_witness_ack_count"], bool) or
             result["dispatch_witness_ack_count"] not in (0, 1) or
-            result["direct_ipv4_canary"] not in ("blocked", "reachable", "failed") or
-            result["direct_ipv6_canary"] not in ("blocked", "reachable", "failed")):
+            result["direct_ipv4_canary"] not in ("not_observed", "blocked", "reachable", "failed") or
+            result["direct_ipv6_canary"] not in ("not_observed", "blocked", "reachable", "failed")):
         return "proof BEAM failed with an invalid bounded result"
 
     required = {
