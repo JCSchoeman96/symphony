@@ -236,19 +236,19 @@ defmodule SymphonyElixir.A4ProofTLSTrustTest do
       {:ok, stat} ->
         fields = stat |> String.split(")", parts: 2) |> List.last() |> String.trim_leading() |> String.split()
 
-        case Enum.at(fields, 19) do
-          nil ->
-            nil
-
-          value ->
-            case Integer.parse(value) do
-              {start_time, ""} -> start_time
-              _ -> nil
-            end
-        end
+        fields |> Enum.at(19) |> parse_fixture_start_time()
 
       {:error, _reason} ->
         nil
+    end
+  end
+
+  defp parse_fixture_start_time(nil), do: nil
+
+  defp parse_fixture_start_time(value) do
+    case Integer.parse(value) do
+      {start_time, ""} -> start_time
+      _ -> nil
     end
   end
 
