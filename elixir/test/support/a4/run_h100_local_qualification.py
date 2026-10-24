@@ -595,6 +595,21 @@ def _remove_generated_trust_material(ca_path, cert_directory):
     return True
 
 
+def _cleanup_preserving_failure(primary_failure, cleanup):
+    try:
+        cleanup()
+    except QualificationFailure as cleanup_failure:
+        if isinstance(primary_failure, QualificationFailure):
+            primary_reason = _safe_failure_reason(str(primary_failure)) or "local_qualification_failed"
+            cleanup_reason = _safe_failure_reason(str(cleanup_failure)) or "cleanup_failed"
+            suffix = "; " + cleanup_reason
+            primary_reason = primary_reason[:max(1, 160 - len(suffix))]
+            raise QualificationFailure(primary_reason + suffix) from cleanup_failure
+        if primary_failure is not None:
+            raise cleanup_failure from primary_failure
+        raise
+
+
 def _cleanup_inside_resources(*, control_server, processes, canaries, ca_path,
                               cert_directory, policy, mount_path, mounted, temp_root):
     """Attempt every teardown action and fail qualification if any cannot be verified."""
@@ -1187,13 +1202,17 @@ def _inside_main(repo_root, temp_root, head, tree, request_id, outside_control_p
         mounted = False
         return {"type": "QUALIFICATION_RESULT", "qualified": True, "evidence": evidence}
     finally:
-        _cleanup_inside_resources(
-            control_server=control_server,
-            processes=(("proof_process", proof_process), ("relay_process", relay_process),
-                       ("origin_process", origin_process)),
-            canaries=(canary4, canary6), ca_path=ca_path,
-            cert_directory=cert_directory, policy=policy,
-            mount_path=mount_path, mounted=mounted, temp_root=temp_root,
+        primary_failure = sys.exception()
+        _cleanup_preserving_failure(
+            primary_failure,
+            lambda: _cleanup_inside_resources(
+                control_server=control_server,
+                processes=(("proof_process", proof_process), ("relay_process", relay_process),
+                           ("origin_process", origin_process)),
+                canaries=(canary4, canary6), ca_path=ca_path,
+                cert_directory=cert_directory, policy=policy,
+                mount_path=mount_path, mounted=mounted, temp_root=temp_root,
+            ),
         )
 
 

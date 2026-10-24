@@ -77,6 +77,18 @@ class HostQualificationLauncherTests(unittest.TestCase):
         remove_policy.assert_called_once_with(policy)
         unmount.assert_called_once_with(pathlib.Path("/unused"))
 
+    def test_cleanup_failure_preserves_primary_qualification_failure(self):
+        primary = runner.QualificationFailure("Stage A verifier rejected policy")
+
+        def cleanup_fails():
+            raise runner.QualificationFailure("qualification cleanup failed: policy")
+
+        with self.assertRaisesRegex(
+            runner.QualificationFailure,
+            "Stage A verifier rejected policy; qualification cleanup failed: policy",
+        ):
+            runner._cleanup_preserving_failure(primary, cleanup_fails)
+
     def test_read_only_mount_is_removed_when_remount_setup_fails(self):
         with tempfile.TemporaryDirectory(prefix="h100-mount-rollback-") as directory:
             repo = pathlib.Path(directory) / "repo"
