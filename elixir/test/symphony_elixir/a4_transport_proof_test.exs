@@ -4,6 +4,7 @@ defmodule SymphonyElixir.A4TransportProofTest do
   use ExUnit.Case, async: false
 
   test "suppresses the first Plane response after one complete PATCH over verified TLS 1.2" do
+    shared_trust_before = :public_key.cacerts_get()
     evidence = SymphonyElixir.A4TransportProofFixture.run!(:suppressed_tls12)
 
     assert {:error, _transport_error} = evidence.result
@@ -25,5 +26,6 @@ defmodule SymphonyElixir.A4TransportProofTest do
     assert evidence.ordering.ready_response_sent_at < evidence.ordering.witness_ack_at
     assert evidence.ordering.witness_ack_at < evidence.ordering.origin_patch_at
     assert evidence.ordering.proof_finch_started_at_ack?
+    assert :public_key.cacerts_get() == shared_trust_before
   end
 end
