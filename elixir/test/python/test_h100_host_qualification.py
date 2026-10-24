@@ -170,6 +170,20 @@ class HostQualificationLauncherTests(unittest.TestCase):
             "1-19-otp-28",
         )
 
+    def test_mix_runtime_key_survives_a_symlinked_distribution_layout(self):
+        key = getattr(runner, "mix_rebar_home_key", None)
+        self.assertTrue(callable(key), "proof build cannot select its matching Rebar3 binary")
+        with tempfile.TemporaryDirectory(prefix="h100-mix-layout-") as directory:
+            root = pathlib.Path(directory)
+            mix_target = root / "external/lib/elixir/bin/mix"
+            mix_target.parent.mkdir(parents=True)
+            mix_target.write_text("#!/bin/sh\n", encoding="ascii")
+            mix_link = root / "elixir/1.19.5-otp-28/bin/mix"
+            mix_link.parent.mkdir(parents=True)
+            mix_link.symlink_to(mix_target)
+
+            self.assertEqual(key(str(mix_link)), "1-19-otp-28")
+
     def test_proof_failure_summary_uses_only_bounded_exception_classes(self):
         detail = runner.proof_failure_detail(
             1,

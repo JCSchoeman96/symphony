@@ -347,11 +347,14 @@ def _build_environment(mix_build_path, *, home, runtime_path):
 def mix_rebar_home_key(mix_path):
     if not isinstance(mix_path, str) or not mix_path.startswith("/") or "\x00" in mix_path:
         raise QualificationFailure("Mix executable path is invalid")
-    install_name = pathlib.Path(mix_path).resolve().parent.parent.name
-    match = re.fullmatch(r"(\d+)\.(\d+)(?:\.\d+)?-otp-(\d+)", install_name)
-    if match is None:
-        raise QualificationFailure("Mix runtime path does not identify its Rebar3 home")
-    return f"{match.group(1)}-{match.group(2)}-otp-{match.group(3)}"
+    executable = pathlib.Path(mix_path)
+    install_pattern = re.compile(r"(\d+)\.(\d+)(?:\.\d+)?-otp-(\d+)")
+    for candidate in (executable, executable.resolve()):
+        for parent in candidate.parents:
+            match = install_pattern.fullmatch(parent.name)
+            if match is not None:
+                return f"{match.group(1)}-{match.group(2)}-otp-{match.group(3)}"
+    raise QualificationFailure("Mix runtime path does not identify its Rebar3 home")
 
 
 def _copy_mix_archive(source, destination):
