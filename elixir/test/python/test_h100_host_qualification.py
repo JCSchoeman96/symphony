@@ -369,6 +369,49 @@ class HostQualificationLauncherTests(unittest.TestCase):
             self.assertEqual(run.call_args.args[0][0], str(installed_mix))
             self.assertNotIn(str(shim.parent), run.call_args.kwargs["env"]["PATH"].split(os.pathsep))
 
+    def test_fresh_build_uses_the_preselected_namespace_runtime_mount(self):
+        with tempfile.TemporaryDirectory(prefix="h100-mounted-runtime-") as directory:
+            root = pathlib.Path(directory)
+            runtime = root / "runtime"
+            elixir_bin = runtime / "elixir/bin"
+            erlang_bin = runtime / "erlang/bin"
+            elixir_bin.mkdir(parents=True)
+            erlang_bin.mkdir(parents=True)
+            mix_path = elixir_bin / "mix"
+            elixir_path = elixir_bin / "elixir"
+            erlang_path = erlang_bin / "erl"
+            for executable in (mix_path, elixir_path, erlang_path):
+                executable.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
+                executable.chmod(0o700)
+            project = root / "project"
+            project.mkdir()
+            (project / "mix.exs").write_text("", encoding="ascii")
+            (project / "mix.lock").write_text("%{}\n", encoding="ascii")
+
+            with (patch.object(runner, "prepare_isolated_mix_home", return_value={
+                    "hex_version": "2.5.1", "hex_archive_sha256": "c" * 64,
+                    "rebar3_sha256": "d" * 64,
+                 }),
+                  patch.object(runner, "resolve_mix_runtime_paths", side_effect=AssertionError),
+                  patch.object(runner, "_run_bounded") as run,
+                  patch.object(runner, "_seal_proof_build"),
+                  patch.object(runner, "build_artifact_inventory", return_value={
+                      "artifact_count": 1, "artifact_inventory_sha256": "e" * 64,
+                  })):
+                result = runner.compile_fresh_proof_build(
+                    str(mix_path), str(project), str(root / "proof-build"),
+                    home=str(root / "build-home"),
+                    runtime_path=runner.runtime_path_for(
+                        str(mix_path), str(elixir_path), str(erlang_path),
+                    ),
+                    source_head_sha="a" * 40, source_tree_sha="b" * 40,
+                    rebar_key="1-19-otp-28", source_mix_home=str(root / ".mix"),
+                    selected_elixir_path=str(elixir_path),
+                )
+
+            self.assertEqual(run.call_args.args[0][0], str(mix_path))
+            self.assertEqual(result["source_root"], str(project))
+
     def test_proof_failure_summary_uses_only_bounded_exception_classes(self):
         detail = runner.proof_failure_detail(
             1,

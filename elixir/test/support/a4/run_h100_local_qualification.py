@@ -746,7 +746,7 @@ def copy_dependency_tree(source_path, destination_path, *, maximum_files=50_000,
 
 def compile_fresh_proof_build(mix_path, project_path, build_path, *, home, runtime_path,
                               source_head_sha, source_tree_sha, rebar_key=None,
-                              source_mix_home=None):
+                              source_mix_home=None, selected_elixir_path=None):
     """Compile the exact local project into a fresh, separate Mix build path."""
     if (not isinstance(mix_path, str) or not mix_path.startswith("/") or "\x00" in mix_path or
             not isinstance(project_path, str) or not project_path.startswith("/") or "\x00" in project_path or
@@ -766,7 +766,25 @@ def compile_fresh_proof_build(mix_path, project_path, build_path, *, home, runti
     lock_digest = hashlib.sha256(lock_path.read_bytes()).hexdigest()
     if source_mix_home is None:
         source_mix_home = os.environ.get("MIX_HOME") or str(pathlib.Path.home() / ".mix")
-    mix_path, elixir_path = resolve_mix_runtime_paths(mix_path, source_mix_home)
+    if selected_elixir_path is None:
+        mix_path, elixir_path = resolve_mix_runtime_paths(mix_path, source_mix_home)
+    else:
+        if (not isinstance(selected_elixir_path, str) or not selected_elixir_path.startswith("/") or
+                "\x00" in selected_elixir_path):
+            raise QualificationFailure("preselected Elixir runtime path is invalid")
+        try:
+            selected_mix = pathlib.Path(mix_path).resolve(strict=True)
+            selected_elixir = pathlib.Path(selected_elixir_path).resolve(strict=True)
+            mix_stat = selected_mix.stat(follow_symlinks=False)
+            elixir_stat = selected_elixir.stat(follow_symlinks=False)
+        except (OSError, RuntimeError) as exc:
+            raise QualificationFailure("preselected Elixir runtime is unavailable") from exc
+        if (selected_mix.name != "mix" or selected_elixir.name != "elixir" or
+                selected_mix.parent != selected_elixir.parent or
+                not stat.S_ISREG(mix_stat.st_mode) or not stat.S_ISREG(elixir_stat.st_mode) or
+                not os.access(selected_mix, os.X_OK) or not os.access(selected_elixir, os.X_OK)):
+            raise QualificationFailure("preselected Mix and Elixir runtime do not match")
+        mix_path, elixir_path = str(selected_mix), str(selected_elixir)
     if not _valid_runtime_path(runtime_path):
         raise QualificationFailure("proof build runtime path is invalid")
     erlang_executables = [pathlib.Path(directory) / "erl" for directory in runtime_path.split(os.pathsep)
@@ -2267,6 +2285,7 @@ def _inside_main(repo_root, temp_root, head, tree, request_id, outside_control_p
             source_tree_sha=tree,
             rebar_key=mix_rebar_home_key(mix_path, mix_home=source_mix_home),
             source_mix_home=source_mix_home,
+            selected_elixir_path=runtime_plan["elixir_path"],
         )
         _unmount_mount(dependency_mount)
         runtime_mounts.remove(dependency_mount)
