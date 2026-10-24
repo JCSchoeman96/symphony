@@ -162,6 +162,34 @@ class HostQualificationLauncherTests(unittest.TestCase):
             with self.assertRaisesRegex(runner.QualificationFailure, "status 127"):
                 runner.proof_process_identity(ExitedProcess())
 
+    def test_proof_launch_gate_holds_then_execs_target_in_the_same_pid(self):
+        with tempfile.TemporaryDirectory(prefix="h100-proof-gate-") as directory:
+            marker = pathlib.Path(directory) / "target-pid"
+            target = [
+                sys.executable, "-I", "-c",
+                "import os,pathlib,sys; pathlib.Path(sys.argv[1]).write_text(str(os.getpid()))",
+                str(marker),
+            ]
+            process = subprocess.Popen(
+                runner.proof_launch_command(target), stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}, start_new_session=True,
+            )
+            try:
+                time.sleep(0.05)
+                self.assertIsNone(process.poll())
+                self.assertFalse(marker.exists())
+                process.stdin.write(b"GO\n")
+                process.stdin.flush()
+                process.stdin.close()
+                self.assertEqual(process.wait(timeout=3), 0)
+                self.assertEqual(marker.read_text(), str(process.pid))
+            finally:
+                if process.poll() is None:
+                    runner._stop_process(process)
+                if process.stdin is not None and not process.stdin.closed:
+                    process.stdin.close()
+
     def test_origin_summary_must_match_the_exact_patch_without_returning_payload(self):
         raw = ('{"type":"LOCAL_TLS_RESULT","request_count":1,"complete_request":true,'
                '"method":"PATCH","path":"/api/v1/work-items/work-1/",'

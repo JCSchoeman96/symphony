@@ -395,6 +395,21 @@ def proof_process_identity(process):
         raise
 
 
+def proof_launch_command(target):
+    """Wait for the launcher gate, then exec the target without changing PID."""
+    if (not isinstance(target, list) or not target or
+            any(not isinstance(value, str) or not value or "\x00" in value for value in target) or
+            not target[0].startswith("/")):
+        raise QualificationFailure("proof launch target is invalid")
+    gate = (
+        "import os,sys\n"
+        "target=sys.argv[1:]\n"
+        "if not target or sys.stdin.buffer.readline(4) != b'GO\\n': sys.exit(1)\n"
+        "os.execve(target[0], target, os.environ)\n"
+    )
+    return [sys.executable, "-I", "-c", gate, *target]
+
+
 def _pid_socket_inodes(pid):
     return process_socket_inodes(pid)
 
@@ -1128,14 +1143,17 @@ def _inside_main(repo_root, temp_root, head, tree, request_id, outside_control_p
             "H100_QUAL_RESULT_FILE": str(result_path),
         }
         proof_environment = child_environment(result_values, home=str(proof_home), runtime_path=runtime_path)
-        proof_command = _setpriv_command(PROOF_UID, [mix_path, "run", "--no-compile", "--no-start",
-                                                     str(proof_runner_path)])
+        target = [mix_path, "run", "--no-compile", "--no-start", str(proof_runner_path)]
+        proof_command = _setpriv_command(PROOF_UID, proof_launch_command(target))
         control_server.start()
-        proof_process = subprocess.Popen(proof_command, cwd=str(source_elixir), stdin=subprocess.DEVNULL,
+        proof_process = subprocess.Popen(proof_command, cwd=str(source_elixir), stdin=subprocess.PIPE,
                                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                          env=proof_environment, start_new_session=True)
         control_server.set_expected_pid(proof_process.pid)
         proof_identity = proof_process_identity(proof_process)
+        proof_process.stdin.write(b"GO\n")
+        proof_process.stdin.flush()
+        proof_process.stdin.close()
         status_code = proof_process.wait(timeout=55)
         if status_code != 0 or not result_path.is_file():
             raise QualificationFailure("unprivileged proof BEAM failed")
