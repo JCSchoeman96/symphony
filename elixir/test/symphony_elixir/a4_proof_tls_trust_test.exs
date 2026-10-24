@@ -144,10 +144,8 @@ defmodule SymphonyElixir.A4ProofTLSTrustTest do
   end
 
   defp stop_local_fixture(port) do
-    try do
-      Port.close(port)
-    rescue
-      ArgumentError -> :ok
-    end
+    Port.close(port)
+  rescue
+    ArgumentError -> :ok
   end
 end
