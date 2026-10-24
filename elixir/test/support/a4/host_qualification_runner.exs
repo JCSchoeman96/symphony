@@ -17,8 +17,13 @@ defmodule SymphonyElixir.H100HostQualificationRunner do
     try do
       run_proof()
     rescue
-      _error ->
-        safe_result_file(%{"type" => "PROOF_ERROR", "reason" => "proof_process_failed"})
+      error ->
+        safe_result_file(%{
+          "type" => "PROOF_ERROR",
+          "reason" => "proof_process_failed",
+          "error_class" => safe_exception_class(error)
+        })
+
         System.halt(1)
     end
   end
@@ -363,6 +368,14 @@ defmodule SymphonyElixir.H100HostQualificationRunner do
     File.write!(path, Jason.encode!(result), [:binary])
     File.chmod!(path, 0o600)
   end
+
+  defp safe_exception_class(%ArgumentError{}), do: "argument_error"
+  defp safe_exception_class(%MatchError{}), do: "match_error"
+  defp safe_exception_class(%FunctionClauseError{}), do: "function_clause"
+  defp safe_exception_class(%CaseClauseError{}), do: "case_clause"
+  defp safe_exception_class(%KeyError{}), do: "key_error"
+  defp safe_exception_class(%RuntimeError{}), do: "runtime_error"
+  defp safe_exception_class(_error), do: "other_exception"
 end
 
 SymphonyElixir.H100HostQualificationRunner.run()

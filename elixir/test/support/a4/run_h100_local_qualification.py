@@ -53,6 +53,56 @@ def _safe_failure_reason(value):
     return value
 
 
+def proof_failure_detail(status_code, result):
+    """Summarize only allowlisted proof failures; never surface exception text."""
+    if not isinstance(status_code, int) or status_code == 0 or not isinstance(result, dict):
+        return "unprivileged proof BEAM failed without a bounded result"
+
+    if (set(result) == {"type", "reason", "error_class"} and
+            result.get("type") == "PROOF_ERROR" and result.get("reason") == "proof_process_failed"):
+        error_class = result.get("error_class")
+        if error_class in {"argument_error", "match_error", "function_clause", "case_clause",
+                           "key_error", "runtime_error"}:
+            return "proof BEAM raised " + error_class
+        return "proof BEAM raised an unclassified exception"
+
+    expected_fields = {
+        "type", "provider_request_id", "manifest_finch_absent_before_ready",
+        "finch_started_at_witness", "finch_stopped", "dispatch_witness_ack_count",
+        "retry_count", "replay_count", "transport_result", "direct_ipv4_canary",
+        "direct_ipv6_canary", "canary_policy_verified", "canary_drop_packets",
+        "tls_verify_peer", "tls_hostname_verification", "shared_trust_unchanged",
+    }
+    if result.get("type") != "PROOF_RESULT" or set(result) != expected_fields:
+        return "proof BEAM failed with an invalid bounded result"
+
+    required = {
+        "transport_result": "transport_failure",
+        "finch_stopped": True,
+        "dispatch_witness_ack_count": 1,
+        "canary_policy_verified": True,
+        "direct_ipv4_canary": "blocked",
+        "direct_ipv6_canary": "blocked",
+        "tls_verify_peer": True,
+        "tls_hostname_verification": True,
+        "shared_trust_unchanged": True,
+    }
+    failures = sorted(name for name, value in required.items() if result.get(name) != value)
+    if failures:
+        return "proof result rejected: " + ",".join(failures)
+    return "proof BEAM exited nonzero after an accepted bounded result"
+
+
+def _read_bounded_proof_result(path):
+    try:
+        if path.stat().st_size > 4096:
+            return None
+        value = json.loads(path.read_text(encoding="ascii"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
 def runtime_path_for(*executables):
     """Return only the tool directories needed by the pinned Elixir runtime."""
     directories = []
@@ -1155,9 +1205,9 @@ def _inside_main(repo_root, temp_root, head, tree, request_id, outside_control_p
         proof_process.stdin.flush()
         proof_process.stdin.close()
         status_code = proof_process.wait(timeout=55)
-        if status_code != 0 or not result_path.is_file():
-            raise QualificationFailure("unprivileged proof BEAM failed")
-        proof_result = _json_line(result_path.read_text(encoding="ascii"))
+        proof_result = _read_bounded_proof_result(result_path)
+        if status_code != 0 or proof_result is None:
+            raise QualificationFailure(proof_failure_detail(status_code, proof_result))
         if proof_result.get("type") != "PROOF_RESULT":
             raise QualificationFailure("proof BEAM did not produce a bounded result")
         origin_summary = _read_json_status(origin_reader, 8)

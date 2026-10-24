@@ -21,6 +21,53 @@ spec.loader.exec_module(runner)
 
 
 class HostQualificationLauncherTests(unittest.TestCase):
+    def test_proof_failure_summary_uses_only_bounded_exception_classes(self):
+        detail = runner.proof_failure_detail(
+            1, {"type": "PROOF_ERROR", "reason": "proof_process_failed", "error_class": "match_error"}
+        )
+        self.assertEqual(detail, "proof BEAM raised match_error")
+
+        detail = runner.proof_failure_detail(
+            1, {"type": "PROOF_ERROR", "reason": "proof_process_failed", "error_class": "unsafe secret text"}
+        )
+        self.assertEqual(detail, "proof BEAM raised an unclassified exception")
+
+    def test_proof_failure_summary_names_only_failed_contract_fields(self):
+        result = {
+            "type": "PROOF_RESULT",
+            "provider_request_id": "preq_fixture",
+            "manifest_finch_absent_before_ready": True,
+            "finch_started_at_witness": True,
+            "transport_result": "unexpected_success",
+            "finch_stopped": True,
+            "dispatch_witness_ack_count": 0,
+            "retry_count": 0,
+            "replay_count": 0,
+            "canary_policy_verified": True,
+            "direct_ipv4_canary": "blocked",
+            "direct_ipv6_canary": "blocked",
+            "canary_drop_packets": 2,
+            "tls_verify_peer": True,
+            "tls_hostname_verification": True,
+            "shared_trust_unchanged": True,
+        }
+        self.assertEqual(
+            runner.proof_failure_detail(1, result),
+            "proof result rejected: dispatch_witness_ack_count,transport_result",
+        )
+
+    def test_proof_failure_summary_never_includes_untrusted_values(self):
+        detail = runner.proof_failure_detail(
+            1,
+            {
+                "type": "PROOF_ERROR",
+                "reason": "proof_process_failed",
+                "error_class": "match_error",
+                "authorization": "secret-value",
+            },
+        )
+        self.assertEqual(detail, "proof BEAM failed with an invalid bounded result")
+
     def test_outer_launcher_does_not_require_namespace_only_arguments(self):
         with patch.object(runner, "outer_main", return_value={"type": "TEST_RESULT"}) as outer:
             with patch.object(runner, "_write_status"):
