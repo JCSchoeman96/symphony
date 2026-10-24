@@ -127,7 +127,16 @@ defmodule SymphonyElixir.H100HostQualificationRunner do
         provider_mutation_envelope: envelope,
         dispatch_witness_required?: true,
         dispatch_witness_timeout_ms: dispatch_timeout_ms,
-        dispatch_witness_sink: witness_sink(socket, request_id, ipv4_port, ipv6_port, ack_count, canary_evidence),
+        dispatch_witness_sink:
+          witness_sink(
+            socket,
+            request_id,
+            ipv4_port,
+            ipv6_port,
+            ack_count,
+            canary_evidence,
+            witness_ipc_timeout_ms
+          ),
         a4_session: token,
         a4_proof_cacerts: [ca_der]
       )
@@ -267,7 +276,7 @@ defmodule SymphonyElixir.H100HostQualificationRunner do
     end
   end
 
-  defp witness_sink(socket, request_id, ipv4_port, ipv6_port, ack_count, canary_evidence) do
+  defp witness_sink(socket, request_id, ipv4_port, ipv6_port, ack_count, canary_evidence, ipc_timeout_ms) do
     fn witness ->
       finch_started = not is_nil(Process.whereis(A4Proof.finch_name()))
       canaries = probe_canaries(ipv4_port, ipv6_port)
@@ -286,7 +295,7 @@ defmodule SymphonyElixir.H100HostQualificationRunner do
                   "ipv6" => Atom.to_string(canaries.ipv6)
                 }
               },
-              witness_ipc_timeout_ms
+              ipc_timeout_ms
             )} do
         {:ok, {:ok, %{"verified" => true, "proof_drop_packets" => count}}}
         when is_integer(count) and count in 0..1_000_000 ->
