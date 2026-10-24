@@ -100,10 +100,30 @@ def proof_failure_detail(status_code, result, stderr=b""):
         return (f"unprivileged proof BEAM exited with status {status_code} without a bounded result: "
                 + category)
 
-    if (set(result) == {"type", "reason", "error_class", "failure_site"} and
+    if (set(result) == {"type", "reason", "error_class", "failure_code", "failure_site"} and
             result.get("type") == "PROOF_ERROR" and result.get("reason") == "proof_process_failed"):
         error_class = result.get("error_class")
+        failure_code = result.get("failure_code")
         failure_site = result.get("failure_site")
+        allowed_failure_codes = {
+            "not_available", "a4_rejected", "invalid_proof_preflight",
+            "invalid_proof_controller_capability", "remote_proof_controller",
+            "proof_controller_unavailable", "proof_already_active",
+            "persisted_attempt_envelope_mismatch", "mutation_not_persisted", "witness_required",
+            "durable_proof_ledger_required", "invalid_origin", "proof_manifest_timeout",
+            "proof_ready_timeout", "duplicate_or_unsolicited_controller_message",
+            "proof_reply_receiver_failed", "wrong_controller_reference", "invalid_manifest_response",
+            "manifest_schema", "manifest_experiment_scope", "manifest_provider_request_id",
+            "manifest_transition_attempt_id", "manifest_work_item_id", "manifest_workspace_id",
+            "manifest_project_id", "manifest_target_state_id", "manifest_method",
+            "manifest_origin_base_url", "manifest_origin_authority", "manifest_candidate_sha",
+            "manifest_candidate_tree", "manifest_relay_script_blob_sha256", "manifest_manifest_id",
+            "manifest_operator_authorization_ref", "manifest_python_path", "manifest_python_version",
+            "manifest_max_dispatch", "manifest_max_connect", "manifest_max_client_app_records",
+            "manifest_tls_versions", "manifest_expires_at", "manifest_manifest_bytes",
+            "manifest_shape", "manifest_canonical_or_hash", "manifest_canonical_json",
+            "manifest_body_bytes", "manifest_path_bytes",
+        }
         allowed_functions = {
             "run_proof", "capture_request", "patch_bounds", "ipc_ack", "attempt_persistence",
             "mutation_envelope", "controller_setup", "witness_gate", "canary_probe",
@@ -112,9 +132,11 @@ def proof_failure_detail(status_code, result, stderr=b""):
         if (not isinstance(failure_site, dict) or set(failure_site) != {"function", "line"} or
                 failure_site.get("function") not in allowed_functions or
                 not isinstance(failure_site.get("line"), int) or isinstance(failure_site.get("line"), bool) or
-                not 0 <= failure_site["line"] <= 500):
+                not 0 <= failure_site["line"] <= 500 or failure_code not in allowed_failure_codes):
             return "proof BEAM failed with an invalid bounded result"
         location = f" at {failure_site['function']}:{failure_site['line']}"
+        if failure_code != "not_available":
+            return "proof BEAM failed " + failure_code + location
         if error_class in {"argument_error", "match_error", "function_clause", "case_clause",
                            "key_error", "runtime_error"}:
             return "proof BEAM raised " + error_class + location

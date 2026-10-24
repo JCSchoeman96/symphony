@@ -23,6 +23,7 @@ defmodule SymphonyElixir.H100HostQualificationRunner do
           "type" => "PROOF_ERROR",
           "reason" => "proof_process_failed",
           "error_class" => safe_exception_class(error),
+          "failure_code" => Process.get(:h100_proof_failure_code, "not_available"),
           "failure_site" => safe_failure_site(__STACKTRACE__)
         })
 
@@ -93,7 +94,20 @@ defmodule SymphonyElixir.H100HostQualificationRunner do
       gate: :atomics.new(1, signed: false)
     }
 
-    {:ok, token} = A4Proof.acquire(capability, attempt, envelope, binding)
+    token =
+      case A4Proof.acquire(capability, attempt, envelope, binding) do
+        {:ok, token} ->
+          token
+
+        {:error, {:dispatch_witness_failed, reason}} ->
+          Process.put(:h100_proof_failure_code, safe_a4_failure_code(reason))
+          raise ArgumentError, "A4 proof acquisition failed"
+
+        _invalid ->
+          Process.put(:h100_proof_failure_code, "a4_rejected")
+          raise ArgumentError, "A4 proof acquisition failed"
+      end
+
     finch_absent_after_manifest = is_nil(Process.whereis(A4Proof.finch_name()))
     ack_count = :atomics.new(1, signed: false)
 
@@ -378,6 +392,63 @@ defmodule SymphonyElixir.H100HostQualificationRunner do
   defp safe_exception_class(%KeyError{}), do: "key_error"
   defp safe_exception_class(%RuntimeError{}), do: "runtime_error"
   defp safe_exception_class(_error), do: "other_exception"
+
+  defp safe_a4_failure_code({:proof_manifest_mismatch, field})
+       when field in [
+              :schema,
+              :experiment_scope,
+              :provider_request_id,
+              :transition_attempt_id,
+              :work_item_id,
+              :workspace_id,
+              :project_id,
+              :target_state_id,
+              :method,
+              :origin_base_url,
+              :origin_authority,
+              :candidate_sha,
+              :candidate_tree,
+              :relay_script_blob_sha256,
+              :manifest_id,
+              :operator_authorization_ref,
+              :python_path,
+              :python_version,
+              :max_dispatch,
+              :max_connect,
+              :max_client_app_records,
+              :tls_versions,
+              :expires_at,
+              :manifest_bytes,
+              :shape,
+              :canonical_or_hash,
+              :canonical_json,
+              :body_bytes,
+              :path_bytes
+            ],
+       do: "manifest_" <> Atom.to_string(field)
+
+  defp safe_a4_failure_code(reason)
+       when reason in [
+              :invalid_proof_preflight,
+              :invalid_proof_controller_capability,
+              :remote_proof_controller,
+              :proof_controller_unavailable,
+              :proof_already_active,
+              :persisted_attempt_envelope_mismatch,
+              :mutation_not_persisted,
+              :witness_required,
+              :durable_proof_ledger_required,
+              :invalid_origin,
+              :proof_manifest_timeout,
+              :proof_ready_timeout,
+              :duplicate_or_unsolicited_controller_message,
+              :proof_reply_receiver_failed,
+              :wrong_controller_reference,
+              :invalid_manifest_response
+            ],
+       do: Atom.to_string(reason)
+
+  defp safe_a4_failure_code(_reason), do: "a4_rejected"
 
   defp safe_failure_site(stacktrace) do
     case Enum.find(stacktrace, fn
