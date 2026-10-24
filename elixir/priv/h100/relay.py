@@ -17,6 +17,8 @@ from dataclasses import dataclass, field
 
 MAX_CONNECT_BYTES = 8192
 MAX_RECORD_LENGTH = 18432
+TLS_1_2_RECORD_VERSION = b"\x03\x03"
+TLS_INITIAL_CLIENT_COMPAT_VERSION = b"\x03\x01"
 MAX_REQUEST_ID_BYTES = 128
 MAX_AUTHORITY_BYTES = 259
 MAX_EVIDENCE_BYTES = 2048
@@ -97,12 +99,20 @@ def parse_connect(data, expected_request_id, expected_authority):
     return Connect(ids[0], expected_authority)
 
 
-def parse_record(data, max_length=MAX_RECORD_LENGTH):
+def parse_record(data, max_length=MAX_RECORD_LENGTH, *, allow_initial_client_handshake_compat=False):
     if not isinstance(data, bytes) or len(data) < 5:
         raise ProtocolError("truncated TLS record header")
-    content_type, major, minor = data[0], data[1], data[2]
+    content_type = data[0]
+    version = data[1:3]
     length = int.from_bytes(data[3:5], "big")
-    if content_type not in (20, 21, 22, 23) or major != 3 or minor not in (1, 2, 3, 4):
+    initial_client_compat = (
+        allow_initial_client_handshake_compat
+        and content_type == 22
+        and version == TLS_INITIAL_CLIENT_COMPAT_VERSION
+    )
+    if content_type not in (20, 21, 22, 23) or (
+        version != TLS_1_2_RECORD_VERSION and not initial_client_compat
+    ):
         raise ProtocolError("invalid TLS record header")
     if length > min(max_length, MAX_RECORD_LENGTH):
         raise ProtocolError("TLS record too large")
@@ -116,10 +126,15 @@ class RecordGate:
         if max_client_app_records != 1:
             raise ValueError("the qualification gate permits exactly one client application record")
         self.client_app_records = 0
+        self.client_records = 0
         self.server_app_seen = False
 
     def client(self, wire):
-        record = parse_record(wire)
+        record = parse_record(
+            wire,
+            allow_initial_client_handshake_compat=self.client_records == 0,
+        )
+        self.client_records += 1
         if record.content_type == 23:
             self.client_app_records += 1
             if self.client_app_records > 1:
@@ -156,7 +171,7 @@ def _recv_exact(sock, count, deadline):
     return bytes(chunks)
 
 
-def _record_from_socket(sock, deadline, prefix=b""):
+def _record_from_socket(sock, deadline, prefix=b"", *, allow_initial_client_handshake_compat=False):
     def take(count):
         nonlocal prefix
         part = prefix[:count]
@@ -167,7 +182,13 @@ def _record_from_socket(sock, deadline, prefix=b""):
 
     header = take(5)
     length = int.from_bytes(header[3:5], "big")
-    if length > MAX_RECORD_LENGTH or header[0] not in (20, 21, 22, 23) or header[1] != 3 or header[2] not in (1, 2, 3, 4):
+    initial_client_compat = (
+        allow_initial_client_handshake_compat
+        and header[0] == 22
+        and header[1:3] == TLS_INITIAL_CLIENT_COMPAT_VERSION
+    )
+    if (length > MAX_RECORD_LENGTH or header[0] not in (20, 21, 22, 23) or
+            (header[1:3] != TLS_1_2_RECORD_VERSION and not initial_client_compat)):
         raise ProtocolError("invalid TLS record")
     wire = header + take(length)
     return wire, prefix
@@ -307,7 +328,14 @@ def handle_client(client, upstream_factory, expected_request_id, expected_author
                     raise ProtocolError("watchdog expired")
                 source = ready[0]
             prefix = client_prefix if source is client else b""
-            wire, remainder = _record_from_socket(source, deadline, prefix)
+            wire, remainder = _record_from_socket(
+                source,
+                deadline,
+                prefix,
+                allow_initial_client_handshake_compat=(
+                    source is client and gate.client_records == 0
+                ),
+            )
             if source is client:
                 client_prefix = remainder
             if source is client:

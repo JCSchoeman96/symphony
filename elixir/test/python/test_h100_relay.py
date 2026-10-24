@@ -82,6 +82,22 @@ class RecordTests(unittest.TestCase):
         record = b"\x16\x03\x03\x00\x03abc"
         self.assertEqual(relay.parse_record(record, 1024).wire, record)
 
+    def test_tls_1_2_client_application_data_rejects_other_record_versions(self):
+        for minor in (1, 2, 4):
+            with self.subTest(minor=minor):
+                gate = relay.RecordGate(max_client_app_records=1)
+                record = bytes((23, 3, minor, 0, 1)) + b"x"
+                with self.assertRaises(relay.ProtocolError):
+                    gate.client(record)
+
+    def test_initial_client_handshake_allows_tls_1_0_compatibility_record_version(self):
+        gate = relay.RecordGate(max_client_app_records=1)
+        client_hello_record = b"\x16\x03\x01\x00\x03abc"
+        self.assertTrue(gate.client(client_hello_record).forward)
+
+        with self.assertRaises(relay.ProtocolError):
+            gate.client(b"\x17\x03\x01\x00\x01x")
+
     def test_gate_closes_on_second_client_app_or_first_server_app(self):
         gate = relay.RecordGate(max_client_app_records=1)
         app = b"\x17\x03\x03\x00\x01x"
@@ -485,6 +501,26 @@ class SocketRelayTests(unittest.TestCase):
         self.assertEqual(upstream_peer.recv(1), b"")
         tunnel.close()
         upstream_peer.close()
+
+    def test_disallowed_client_application_record_is_not_forwarded(self):
+        for minor in (1, 2, 4):
+            with self.subTest(minor=minor):
+                tunnel, thread, calls, result, upstream_peer = self.start()
+                try:
+                    tunnel.sendall(self.request)
+                    self.assertIn(b"200 Connection Established", tunnel.recv(4096))
+                    upstream_peer.settimeout(1)
+
+                    tunnel.sendall(bytes((23, 3, minor, 0, 1)) + b"x")
+                    self.assertEqual(upstream_peer.recv(1), b"")
+                    thread.join(2)
+                    self.assertFalse(thread.is_alive())
+                    self.assertTrue(result["failed_closed"])
+                    self.assertEqual(result["close_reason"], "PROTOCOL_ERROR")
+                    self.assertEqual(calls, ["fixture.test:443"])
+                finally:
+                    tunnel.close()
+                    upstream_peer.close()
 
     def test_connect_and_buffered_tls_records_forward_without_new_readiness(self):
         tunnel, thread, calls, result, upstream_peer = self.start(watchdog=0.15)
