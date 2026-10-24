@@ -97,23 +97,7 @@ defmodule SymphonyElixir.H100HostQualificationRunner do
       gate: :atomics.new(1, signed: false)
     }
 
-    token =
-      case A4Proof.acquire(capability, attempt, envelope, binding) do
-        {:ok, token} ->
-          token
-
-        {:error, {:dispatch_witness_failed, reason}} ->
-          Process.put(
-            :h100_proof_failure_code,
-            controller_failure_code(backend_failures) || safe_a4_failure_code(reason)
-          )
-
-          raise ArgumentError, "A4 proof acquisition failed"
-
-        _invalid ->
-          Process.put(:h100_proof_failure_code, "a4_rejected")
-          raise ArgumentError, "A4 proof acquisition failed"
-      end
+    token = acquire_token!(capability, attempt, envelope, binding, backend_failures)
 
     finch_absent_after_manifest = is_nil(Process.whereis(A4Proof.finch_name()))
     ack_count = :atomics.new(1, signed: false)
@@ -276,6 +260,25 @@ defmodule SymphonyElixir.H100HostQualificationRunner do
     end
   end
 
+  defp acquire_token!(capability, attempt, envelope, binding, backend_failures) do
+    case A4Proof.acquire(capability, attempt, envelope, binding) do
+      {:ok, token} ->
+        token
+
+      {:error, {:dispatch_witness_failed, reason}} ->
+        Process.put(
+          :h100_proof_failure_code,
+          controller_failure_code(backend_failures) || safe_a4_failure_code(reason)
+        )
+
+        raise ArgumentError, "A4 proof acquisition failed"
+
+      _invalid ->
+        Process.put(:h100_proof_failure_code, "a4_rejected")
+        raise ArgumentError, "A4 proof acquisition failed"
+    end
+  end
+
   defp witness_sink(socket, request_id, ipv4_port, ipv6_port, ack_count, canary_evidence, ipc_timeout_ms) do
     fn witness ->
       finch_started = not is_nil(Process.whereis(A4Proof.finch_name()))
@@ -284,35 +287,54 @@ defmodule SymphonyElixir.H100HostQualificationRunner do
       :ok = SymphonyElixir.A4HostQualificationProof.record_finch_started(canary_evidence, finch_started)
       :ok = SymphonyElixir.A4HostQualificationProof.record_canary_policy(canary_evidence, false, 0)
 
-      case {SymphonyElixir.A4HostQualificationProof.validate_canary_results(canaries),
-            A4HostRelayIPC.call(
-              socket,
-              %{
-                "op" => "canaries",
-                "request" => %{
-                  "provider_request_id" => request_id,
-                  "ipv4" => Atom.to_string(canaries.ipv4),
-                  "ipv6" => Atom.to_string(canaries.ipv6)
-                }
-              },
-              ipc_timeout_ms
-            )} do
-        {:ok, {:ok, %{"verified" => true, "proof_drop_packets" => count}}}
-        when is_integer(count) and count in 0..1_000_000 ->
-          :ok = SymphonyElixir.A4HostQualificationProof.record_canary_policy(canary_evidence, true, count)
+      case SymphonyElixir.A4HostQualificationProof.validate_canary_results(canaries) do
+        :ok ->
+          response = canary_verification(socket, request_id, canaries, ipc_timeout_ms)
+          finish_witness(response, witness, finch_started, ack_count, canary_evidence)
 
-          if count >= 2 and finch_started do
-            :atomics.add(ack_count, 1, 1)
-            {:ok, witness.provider_request_id}
-          else
-            {:error, :local_qualification_gate_failed}
-          end
-
-        _ ->
+        {:error, _reason} ->
           {:error, :local_qualification_gate_failed}
       end
     end
   end
+
+  defp canary_verification(socket, request_id, canaries, ipc_timeout_ms) do
+    A4HostRelayIPC.call(
+      socket,
+      %{
+        "op" => "canaries",
+        "request" => %{
+          "provider_request_id" => request_id,
+          "ipv4" => Atom.to_string(canaries.ipv4),
+          "ipv6" => Atom.to_string(canaries.ipv6)
+        }
+      },
+      ipc_timeout_ms
+    )
+  end
+
+  defp finish_witness(
+         {:ok, {:ok, %{"verified" => true, "proof_drop_packets" => count}}},
+         witness,
+         finch_started,
+         ack_count,
+         canary_evidence
+       )
+       when is_integer(count) and count in 0..1_000_000 do
+    :ok = SymphonyElixir.A4HostQualificationProof.record_canary_policy(canary_evidence, true, count)
+    acknowledge_witness(count, finch_started, witness, ack_count)
+  end
+
+  defp finish_witness(_response, _witness, _finch_started, _ack_count, _canary_evidence),
+    do: {:error, :local_qualification_gate_failed}
+
+  defp acknowledge_witness(count, true, witness, ack_count) when count >= 2 do
+    :atomics.add(ack_count, 1, 1)
+    {:ok, witness.provider_request_id}
+  end
+
+  defp acknowledge_witness(_count, _finch_started, _witness, _ack_count),
+    do: {:error, :local_qualification_gate_failed}
 
   defp probe_canaries(ipv4_port, ipv6_port) do
     %{ipv4: probe({127, 0, 0, 1}, ipv4_port, []), ipv6: probe({0, 0, 0, 0, 0, 0, 0, 1}, ipv6_port, [:inet6])}

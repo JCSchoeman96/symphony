@@ -4,6 +4,7 @@ defmodule SymphonyElixir.A4HostQualificationProofTest do
   use ExUnit.Case, async: true
 
   alias SymphonyElixir.A4HostQualificationProof
+  alias SymphonyElixir.WorkControl.ProviderDispatchWitness
 
   test "canary verification requires both live IPv4 and IPv6 listeners to be blocked" do
     assert :ok = A4HostQualificationProof.validate_canary_results(%{ipv4: :blocked, ipv6: :blocked})
@@ -23,7 +24,7 @@ defmodule SymphonyElixir.A4HostQualificationProofTest do
   test "qualification witness and IPC deadlines fit the witness timeout bound" do
     %{dispatch_ms: dispatch_ms, ipc_ms: ipc_ms} = A4HostQualificationProof.dispatch_timeouts()
 
-    assert SymphonyElixir.WorkControl.ProviderDispatchWitness.valid_timeout?(dispatch_ms)
+    assert ProviderDispatchWitness.valid_timeout?(dispatch_ms)
     assert ipc_ms > 0
     assert ipc_ms < dispatch_ms
   end
