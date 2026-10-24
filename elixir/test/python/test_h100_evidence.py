@@ -32,6 +32,9 @@ EVIDENCE_FIELDS = {
     "finch_started_after_ready_validation", "ready_withheld_until_stage_b_verified",
     "non_proof_control_exchange", "implementation_head_sha", "implementation_head_tree",
     "implementation_base", "spec_commit",
+    "proof_build_fresh", "proof_build_read_only", "proof_build_source_head_sha",
+    "proof_build_source_tree_sha", "proof_build_artifact_count",
+    "proof_build_artifact_inventory_sha256", "proof_build_mix_lock_sha256",
 }
 
 
@@ -65,7 +68,9 @@ def valid_result():
 class QualificationEvidenceTests(unittest.TestCase):
     def test_schema_is_versioned_and_names_every_evidence_field(self):
         schema = json.loads(SCHEMA_PATH.read_text(encoding="ascii"))
-        self.assertEqual(schema["schema_version"], 1)
+        self.assertEqual(schema["schema_version"], 2)
+        self.assertTrue(schema["$id"].endswith("/v2"))
+        self.assertEqual(runner.EVIDENCE_SCHEMA_VERSION, 2)
         self.assertEqual(set(schema["properties"]["evidence"]["required"]), EVIDENCE_FIELDS)
 
     def test_validator_accepts_the_exact_payload_free_evidence_shape(self):
@@ -81,13 +86,21 @@ class QualificationEvidenceTests(unittest.TestCase):
 
     def test_validator_rejects_wrong_version_and_unbounded_evidence(self):
         result = valid_result()
-        result["schema_version"] = 2
+        result["schema_version"] = 3
         with self.assertRaises(runner.QualificationFailure):
             runner.validate_qualification_result(result)
         result = valid_result()
         result["evidence"]["provider_request_id"] = "x" * 32_768
         with self.assertRaises(runner.QualificationFailure):
             runner.validate_qualification_result(result)
+
+    def test_validator_requires_the_fresh_build_to_match_the_candidate_sha_and_tree(self):
+        for field in ("proof_build_source_head_sha", "proof_build_source_tree_sha"):
+            with self.subTest(field=field):
+                result = valid_result()
+                result["evidence"][field] = "b" * 40
+                with self.assertRaises(runner.QualificationFailure):
+                    runner.validate_qualification_result(result)
 
 
 if __name__ == "__main__":

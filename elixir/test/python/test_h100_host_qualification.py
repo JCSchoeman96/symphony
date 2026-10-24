@@ -332,7 +332,7 @@ class HostQualificationLauncherTests(unittest.TestCase):
         self.assertFalse(thread.is_alive())
         self.assertFalse(result["complete"])
 
-    def test_cleanup_attempts_every_resource_and_reports_a_child_that_would_not_stop(self):
+    def test_cleanup_keeps_policy_and_mounts_when_a_process_group_would_not_stop(self):
         class Process:
             def __init__(self):
                 self.stdout = None
@@ -351,22 +351,26 @@ class HostQualificationLauncherTests(unittest.TestCase):
         canary = Closable()
         controller = Closable()
         policy = object()
-        with patch.object(runner, "_stop_process", side_effect=[False, True]) as stop:
-            with patch.object(runner, "_nft_delete_if_present") as remove_policy:
-                with patch.object(runner, "_unmount_repo") as unmount:
-                    with self.assertRaisesRegex(runner.QualificationFailure, "cleanup"):
-                        runner._cleanup_inside_resources(
-                            control_server=controller,
-                            processes=(("proof", proof), ("relay", relay)),
-                            canaries=(canary,), ca_path=None, cert_directory=None,
-                            policy=policy, mount_path=pathlib.Path("/unused"), mounted=True,
-                            temp_root=None,
-                        )
-        self.assertEqual(stop.call_count, 2)
-        self.assertTrue(controller.closed)
-        self.assertTrue(canary.closed)
-        remove_policy.assert_called_once_with(policy)
-        unmount.assert_called_once_with(pathlib.Path("/unused"))
+        with tempfile.TemporaryDirectory(prefix="h100-retained-policy-") as directory:
+            temp_root = pathlib.Path(directory) / "active-namespace"
+            temp_root.mkdir()
+            with patch.object(runner, "_stop_process", side_effect=[False, True]) as stop:
+                with patch.object(runner, "_nft_delete_if_present") as remove_policy:
+                    with patch.object(runner, "_unmount_repo") as unmount:
+                        with self.assertRaisesRegex(runner.QualificationFailure, "cleanup"):
+                            runner._cleanup_inside_resources(
+                                control_server=controller,
+                                processes=(("proof", proof), ("relay", relay)),
+                                canaries=(canary,), ca_path=None, cert_directory=None,
+                                policy=policy, mount_path=pathlib.Path("/unused"), mounted=True,
+                                temp_root=temp_root,
+                            )
+            self.assertTrue(temp_root.exists(), "resources were removed while a process group remained")
+            self.assertEqual(stop.call_count, 2)
+            self.assertTrue(controller.closed)
+            self.assertTrue(canary.closed)
+            remove_policy.assert_not_called()
+            unmount.assert_not_called()
 
     def test_cleanup_failure_preserves_primary_qualification_failure(self):
         primary = runner.QualificationFailure("Stage A verifier rejected policy")
@@ -499,8 +503,18 @@ class HostQualificationLauncherTests(unittest.TestCase):
             dep_ebin = build_lib / "finch/ebin"
             app_ebin.mkdir(parents=True)
             dep_ebin.mkdir(parents=True)
+            (app_ebin / "symphony.beam").write_bytes(b"application artifact")
+            (dep_ebin / "finch.beam").write_bytes(b"dependency artifact")
+            inventory = runner.build_artifact_inventory(str(build_lib))
+            provenance = {
+                "build_lib_path": str(build_lib),
+                "source_head_sha": "a" * 40,
+                "source_tree_sha": "b" * 40,
+                **inventory,
+                "mix_lock_sha256": "c" * 64,
+            }
             command = runner.proof_elixir_command(
-                "/runtime/elixir/bin/elixir", str(build_lib), "/repo/test/support/proof.exs"
+                "/runtime/elixir/bin/elixir", provenance, "/repo/test/support/proof.exs"
             )
         self.assertEqual(
             command,
@@ -512,6 +526,90 @@ class HostQualificationLauncherTests(unittest.TestCase):
             ],
         )
         self.assertNotIn("mix", command[0])
+
+    def test_proof_elixir_command_rejects_an_unverified_existing_build(self):
+        with tempfile.TemporaryDirectory(prefix="h100-unverified-proof-build-") as directory:
+            build_lib = pathlib.Path(directory) / "_build/test/lib"
+            for app in ("symphony_elixir", "finch"):
+                ebin = build_lib / app / "ebin"
+                ebin.mkdir(parents=True)
+                (ebin / "stale.beam").write_bytes(b"stale build artifact")
+
+            with self.assertRaises(runner.QualificationFailure):
+                runner.proof_elixir_command(
+                    "/runtime/elixir/bin/elixir", str(build_lib), "/repo/test/support/proof.exs"
+                )
+
+    def test_build_artifact_inventory_rejects_a_symlinked_directory(self):
+        with tempfile.TemporaryDirectory(prefix="h100-proof-build-link-") as directory:
+            root = pathlib.Path(directory)
+            real_build = root / "real-build"
+            ebin = real_build / "symphony_elixir/ebin"
+            ebin.mkdir(parents=True)
+            (ebin / "module.beam").write_bytes(b"compiled module")
+            linked_build = root / "linked-build"
+            linked_build.symlink_to(real_build, target_is_directory=True)
+
+            with self.assertRaises(runner.QualificationFailure):
+                runner.build_artifact_inventory(str(linked_build))
+
+    def test_fresh_proof_build_compiles_and_hashes_a_dedicated_mix_build(self):
+        compile_build = getattr(runner, "compile_fresh_proof_build", None)
+        self.assertTrue(callable(compile_build), "qualification lacks a fresh proof build compiler")
+
+        mix_path = runner.shutil.which("mix")
+        elixir_path = runner.shutil.which("elixir")
+        erlang_path = runner.shutil.which("erl")
+        if not all((mix_path, elixir_path, erlang_path)):
+            self.skipTest("Mix and its pinned Elixir/Erlang runtime are unavailable")
+
+        with tempfile.TemporaryDirectory(prefix="h100-proof-build-") as directory:
+            root = pathlib.Path(directory)
+            project = root / "project"
+            (project / "lib").mkdir(parents=True)
+            (project / "mix.exs").write_text(
+                "defmodule BuildFixture.MixProject do\n"
+                "  use Mix.Project\n"
+                "  def project, do: [app: :build_fixture, version: \"0.1.0\", elixirc_paths: [\"lib\"]]\n"
+                "  def application, do: []\n"
+                "end\n",
+                encoding="utf-8",
+            )
+            (project / "lib/build_fixture.ex").write_text(
+                "defmodule BuildFixture do\n  def ready, do: true\nend\n", encoding="utf-8"
+            )
+            (project / "mix.lock").write_text("%{}\n", encoding="utf-8")
+            stale = project / "_build/test/lib/build_fixture/ebin/stale.beam"
+            stale.parent.mkdir(parents=True)
+            stale.write_bytes(b"stale repository build")
+            build_path = root / "fresh-proof-build"
+            runtime_path = runner.runtime_path_for(mix_path, elixir_path, erlang_path)
+
+            result = compile_build(
+                mix_path,
+                str(project),
+                str(build_path),
+                home=str(root / "build-home"),
+                runtime_path=runtime_path,
+                source_head_sha="a" * 40,
+                source_tree_sha="b" * 40,
+            )
+
+            compiled = build_path / "lib/build_fixture/ebin/Elixir.BuildFixture.beam"
+            self.assertTrue(compiled.is_file())
+            self.assertEqual(result["build_lib_path"], str(build_path / "lib"))
+            self.assertEqual(result["source_head_sha"], "a" * 40)
+            self.assertEqual(result["source_tree_sha"], "b" * 40)
+            self.assertGreater(result["artifact_count"], 0)
+            self.assertEqual(len(result["artifact_inventory_sha256"]), 64)
+            self.assertTrue(stale.is_file(), "fresh compile modified the pre-existing build")
+            for path in [build_path, *build_path.rglob("*")]:
+                mode = stat.S_IMODE(path.stat().st_mode)
+                self.assertEqual(mode & 0o222, 0, f"proof build path is writable: {path.name}")
+                if path.is_dir():
+                    self.assertEqual(mode & 0o555, 0o555)
+                else:
+                    self.assertNotEqual(mode & 0o444, 0)
 
     def test_proof_identity_failure_reports_only_child_exit_status(self):
         class ExitedProcess:
@@ -742,6 +840,73 @@ class HostQualificationLauncherTests(unittest.TestCase):
             self.assertTrue(ready.exists(), "child did not install its signal handler")
             self.assertTrue(runner._stop_process(process, timeout=3))
             self.assertEqual(marker.read_text(), "done")
+
+    def test_process_group_wait_stops_polling_at_its_deadline(self):
+        wait_calls = []
+
+        class StillRunningProcess:
+            @staticmethod
+            def poll():
+                return None
+
+            @staticmethod
+            def wait(timeout):
+                wait_calls.append(timeout)
+                if len(wait_calls) > 1:
+                    raise AssertionError("process-group wait continued after its deadline")
+                raise subprocess.TimeoutExpired("still-running", timeout)
+
+        with patch.object(runner, "_active_process_group_members", return_value=[]), \
+                patch.object(runner.time, "monotonic", side_effect=[0.0, 0.05]):
+            self.assertFalse(runner._wait_for_process_group(StillRunningProcess(), 123, 0.05))
+        self.assertEqual(len(wait_calls), 1)
+
+    def test_process_teardown_kills_descendants_after_leader_exits(self):
+        with tempfile.TemporaryDirectory(prefix="h100-stop-descendant-") as directory:
+            marker = pathlib.Path(directory) / "child-pid"
+            child_script = (
+                "import os, pathlib, signal, sys, time\n"
+                "pid = os.fork()\n"
+                "if pid == 0:\n"
+                "    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                "    pathlib.Path(sys.argv[1]).write_text(str(os.getpid()))\n"
+                "    time.sleep(30)\n"
+                "    os._exit(0)\n"
+            )
+            process = subprocess.Popen(
+                [sys.executable, "-c", child_script, str(marker)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+            )
+            child_pid = None
+            try:
+                self.assertEqual(process.wait(timeout=3), 0)
+                deadline = time.monotonic() + 3
+                while not marker.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(marker.exists(), "descendant did not start")
+                child_pid = int(marker.read_text())
+                self.assertTrue(runner._stop_process(process, timeout=0.1))
+
+                deadline = time.monotonic() + 3
+                while pathlib.Path(f"/proc/{child_pid}/stat").exists() and time.monotonic() < deadline:
+                    stat_line = pathlib.Path(f"/proc/{child_pid}/stat").read_text()
+                    if stat_line.rsplit(")", 1)[1].split()[0] == "Z":
+                        break
+                    time.sleep(0.01)
+                stat_path = pathlib.Path(f"/proc/{child_pid}/stat")
+                if stat_path.exists():
+                    state = stat_path.read_text().rsplit(")", 1)[1].split()[0]
+                    self.assertEqual(state, "Z", "surviving descendant remained runnable")
+            finally:
+                if child_pid is not None:
+                    try:
+                        os.kill(child_pid, 9)
+                    except ProcessLookupError:
+                        pass
+                try:
+                    os.killpg(process.pid, 9)
+                except ProcessLookupError:
+                    pass
 
     def test_origin_launcher_stops_child_when_identity_check_fails(self):
         self._assert_launcher_stops_child(

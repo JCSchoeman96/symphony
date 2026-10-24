@@ -98,7 +98,9 @@ class LocalTLSFixture:
             self._deadline = threading.Timer(self.timeout, self._expire)
             self._deadline.daemon = True
             self._deadline.start()
-            self._thread = threading.Thread(target=self._serve_one, name="h100-tls-origin", daemon=True)
+            self._thread = threading.Thread(
+                target=self._serve_one, args=(self._listener,), name="h100-tls-origin", daemon=True
+            )
             self._thread.start()
             return self
         except BaseException:
@@ -152,11 +154,11 @@ class LocalTLSFixture:
             raise RuntimeError("fixture has not started")
         return f"{self.host}:{self.port}"
 
-    def _serve_one(self):
+    def _serve_one(self, listener):
         stage = "accept"
         try:
-            self._listener.settimeout(max(0.001, self._deadline_at() - time.monotonic()))
-            connection, _ = self._listener.accept()
+            listener.settimeout(max(0.001, self._deadline_at() - time.monotonic()))
+            connection, _ = listener.accept()
             self._active_connection = connection
             with connection:
                 connection.settimeout(max(0.001, self._deadline_at() - time.monotonic()))

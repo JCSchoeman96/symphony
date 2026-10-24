@@ -1,14 +1,14 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://symphony.local/h100/p0/qualification-evidence/v1",
+  "$id": "https://symphony.local/h100/p0/qualification-evidence/v2",
   "title": "H100 P0 local host relay qualification evidence",
-  "schema_version": 1,
+  "schema_version": 2,
   "type": "object",
   "additionalProperties": false,
   "required": ["type", "schema_version", "qualified", "evidence"],
   "properties": {
     "type": {"const": "QUALIFICATION_RESULT"},
-    "schema_version": {"const": 1},
+    "schema_version": {"const": 2},
     "qualified": {"const": true},
     "evidence": {
       "type": "object",
@@ -32,7 +32,9 @@
         "controller_socket_removed", "manifest_finch_absent_before_ready",
         "finch_started_after_ready_validation", "ready_withheld_until_stage_b_verified",
         "non_proof_control_exchange", "implementation_head_sha", "implementation_head_tree",
-        "implementation_base", "spec_commit"
+        "implementation_base", "spec_commit", "proof_build_fresh", "proof_build_read_only",
+        "proof_build_source_head_sha", "proof_build_source_tree_sha", "proof_build_artifact_count",
+        "proof_build_artifact_inventory_sha256", "proof_build_mix_lock_sha256"
       ],
       "properties": {
         "policy_mechanism": {"type": "string", "maxLength": 256},
@@ -104,7 +106,14 @@
         "implementation_head_sha": {"$ref": "#/$defs/git_sha"},
         "implementation_head_tree": {"$ref": "#/$defs/git_sha"},
         "implementation_base": {"const": "5b3ecadeafa3c43ece8fe43099be56892d11d410"},
-        "spec_commit": {"const": "5b3ecadeafa3c43ece8fe43099be56892d11d410"}
+        "spec_commit": {"const": "5b3ecadeafa3c43ece8fe43099be56892d11d410"},
+        "proof_build_fresh": {"const": true},
+        "proof_build_read_only": {"const": true},
+        "proof_build_source_head_sha": {"$ref": "#/$defs/git_sha"},
+        "proof_build_source_tree_sha": {"$ref": "#/$defs/git_sha"},
+        "proof_build_artifact_count": {"type": "integer", "minimum": 1, "maximum": 50000},
+        "proof_build_artifact_inventory_sha256": {"$ref": "#/$defs/sha256"},
+        "proof_build_mix_lock_sha256": {"$ref": "#/$defs/sha256"}
       }
     }
   },

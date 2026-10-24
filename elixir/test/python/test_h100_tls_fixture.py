@@ -6,7 +6,9 @@ import socket
 import ssl
 import subprocess
 import tempfile
+import threading
 import unittest
+from unittest import mock
 
 MODULE = pathlib.Path(__file__).parents[2] / "priv/h100/local_tls_fixture.py"
 spec = importlib.util.spec_from_file_location("h100_local_tls_fixture", MODULE)
@@ -88,6 +90,35 @@ class LocalTLSFixtureTests(unittest.TestCase):
         self.assertEqual(directory.stat().st_mode & 0o777, 0o700)
         fixture.close()
         self.assertFalse(directory.exists())
+
+    def test_close_before_worker_accept_does_not_raise_in_background_thread(self):
+        fixture = fixture_module.LocalTLSFixture(timeout=0.1)
+        worker_entered = threading.Event()
+        release_worker = threading.Event()
+        unexpected = []
+        serve_one = fixture._serve_one
+        fixture._generate_certificates = lambda: None
+
+        def held_worker(*args):
+            worker_entered.set()
+            release_worker.wait(timeout=3)
+            serve_one(*args)
+
+        fixture._serve_one = held_worker
+        try:
+            with mock.patch.object(
+                threading, "excepthook", side_effect=lambda args: unexpected.append(args.exc_type)
+            ):
+                fixture.start()
+                self.assertTrue(worker_entered.wait(timeout=2))
+                fixture.close()
+                release_worker.set()
+                fixture._thread.join(timeout=2)
+            self.assertFalse(fixture._thread.is_alive())
+            self.assertEqual(unexpected, [])
+        finally:
+            release_worker.set()
+            fixture.close()
 
     def test_local_sentinel_is_checked_without_entering_evidence(self):
         sentinel = "local-qualification-only"

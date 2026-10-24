@@ -13,6 +13,7 @@ import select
 import signal
 import shutil
 import socket
+import stat
 import struct
 import subprocess
 import sys
@@ -24,7 +25,7 @@ import re
 
 
 MAX_IPC_BYTES = 16_384
-EVIDENCE_SCHEMA_VERSION = 1
+EVIDENCE_SCHEMA_VERSION = 2
 SYSTEM_PATH = "/usr/local/bin:/usr/bin:/bin"
 PROOF_UID = 1201
 RELAY_UID = 1202
@@ -323,12 +324,159 @@ def runtime_mount_plan(mix_path, runtime_path, temp_root):
     }
 
 
-def proof_elixir_command(elixir_path, build_lib_path, script_path):
+def _build_environment(mix_build_path, *, home, runtime_path):
+    if (not isinstance(mix_build_path, str) or not mix_build_path.startswith("/") or
+            "\x00" in mix_build_path or not isinstance(home, str) or not home.startswith("/") or
+            not _valid_runtime_path(runtime_path)):
+        raise QualificationFailure("proof build environment is invalid")
+    return {
+        "PATH": runtime_path + os.pathsep + SYSTEM_PATH,
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "HOME": home,
+        "MIX_HOME": os.path.join(home, ".mix"),
+        "HEX_HOME": os.path.join(home, ".hex"),
+        "MIX_ENV": "test",
+        "MIX_BUILD_PATH": mix_build_path,
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+    }
+
+
+def build_artifact_inventory(build_lib_path):
+    """Hash every regular file in the dedicated compiled application directory."""
+    if not isinstance(build_lib_path, str) or not build_lib_path.startswith("/") or "\x00" in build_lib_path:
+        raise QualificationFailure("proof build inventory path is invalid")
+    source_root = pathlib.Path(build_lib_path)
+    current = pathlib.Path(source_root.anchor)
+    for part in source_root.parts[1:]:
+        current = current / part
+        if current.is_symlink():
+            raise QualificationFailure("proof build inventory contains a symbolic link")
+    root = source_root.resolve()
+    if not root.is_dir():
+        raise QualificationFailure("proof build inventory directory is unavailable")
+    entries = []
+    total_bytes = 0
+    try:
+        paths = sorted(root.rglob("*"))
+        for path in paths:
+            if path.is_symlink():
+                raise QualificationFailure("proof build inventory contains a symbolic link")
+            if path.is_dir():
+                continue
+            file_stat = path.stat(follow_symlinks=False)
+            if not stat.S_ISREG(file_stat.st_mode):
+                raise QualificationFailure("proof build inventory contains a non-regular file")
+            total_bytes += file_stat.st_size
+            if len(entries) >= 50_000 or total_bytes > 536_870_912:
+                raise QualificationFailure("proof build inventory exceeds its fixed bound")
+            file_digest = hashlib.sha256()
+            with path.open("rb") as source:
+                for chunk in iter(lambda: source.read(65_536), b""):
+                    file_digest.update(chunk)
+            entries.append((path.relative_to(root).as_posix(), file_stat.st_size, file_digest.hexdigest()))
+    except OSError as exc:
+        raise QualificationFailure("proof build inventory could not be read") from exc
+    if not entries:
+        raise QualificationFailure("proof build has no compiled artifacts")
+    inventory = hashlib.sha256()
+    for relative_path, size, digest in entries:
+        inventory.update(relative_path.encode("utf-8"))
+        inventory.update(b"\x00")
+        inventory.update(str(size).encode("ascii"))
+        inventory.update(b"\x00")
+        inventory.update(digest.encode("ascii"))
+        inventory.update(b"\n")
+    return {"artifact_count": len(entries), "artifact_inventory_sha256": inventory.hexdigest()}
+
+
+def _seal_proof_build(build_root):
+    """Remove write permission from every build path before it is mounted for proof use."""
+    root = pathlib.Path(build_root)
+    try:
+        paths = sorted(root.rglob("*"), key=lambda path: len(path.parts), reverse=True)
+        for path in paths:
+            if path.is_symlink():
+                raise QualificationFailure("proof build contains a symbolic link")
+            file_stat = path.stat(follow_symlinks=False)
+            if stat.S_ISDIR(file_stat.st_mode):
+                mode = (stat.S_IMODE(file_stat.st_mode) | 0o555) & ~0o222
+            elif stat.S_ISREG(file_stat.st_mode):
+                mode = (stat.S_IMODE(file_stat.st_mode) | 0o444) & ~0o222
+            else:
+                raise QualificationFailure("proof build contains a non-regular path")
+            path.chmod(mode)
+        root.chmod(0o555)
+    except OSError as exc:
+        raise QualificationFailure("proof build could not be sealed read-only") from exc
+
+
+def compile_fresh_proof_build(mix_path, project_path, build_path, *, home, runtime_path,
+                              source_head_sha, source_tree_sha):
+    """Compile the exact local project into a fresh, separate Mix build path."""
+    if (not isinstance(mix_path, str) or not mix_path.startswith("/") or "\x00" in mix_path or
+            not isinstance(project_path, str) or not project_path.startswith("/") or "\x00" in project_path or
+            not isinstance(build_path, str) or not build_path.startswith("/") or "\x00" in build_path or
+            not _valid_git_sha(source_head_sha) or not _valid_git_sha(source_tree_sha)):
+        raise QualificationFailure("fresh proof build inputs are invalid")
+    project = pathlib.Path(project_path).resolve()
+    build_root = pathlib.Path(build_path).resolve()
+    if (not project.is_dir() or not (project / "mix.exs").is_file() or
+            build_root == project or build_root.is_relative_to(project)):
+        raise QualificationFailure("proof build must be separate from the source project")
+    if build_root.exists() or build_root.is_symlink():
+        raise QualificationFailure("proof build path is not fresh")
+    lock_path = project / "mix.lock"
+    if lock_path.is_symlink() or not lock_path.is_file():
+        raise QualificationFailure("proof build lock file is unavailable")
+    lock_digest = hashlib.sha256(lock_path.read_bytes()).hexdigest()
+    try:
+        build_root.mkdir(parents=True, mode=0o700, exist_ok=False)
+    except OSError as exc:
+        raise QualificationFailure("fresh proof build directory could not be created") from exc
+    environment = _build_environment(str(build_root), home=home, runtime_path=runtime_path)
+    _run_bounded([mix_path, "compile", "--warnings-as-errors"], env=environment,
+                 timeout=300, cwd=str(project), max_output_bytes=1_048_576)
+    _seal_proof_build(build_root)
+    build_lib_path = build_root / "lib"
+    inventory = build_artifact_inventory(str(build_lib_path))
+    return {
+        "build_lib_path": str(build_lib_path),
+        "source_head_sha": source_head_sha,
+        "source_tree_sha": source_tree_sha,
+        "artifact_count": inventory["artifact_count"],
+        "artifact_inventory_sha256": inventory["artifact_inventory_sha256"],
+        "mix_lock_sha256": lock_digest,
+    }
+
+
+def _valid_git_sha(value):
+    return isinstance(value, str) and len(value) == 40 and all(char in "0123456789abcdef" for char in value)
+
+
+def proof_elixir_command(elixir_path, build_provenance, script_path):
     """Launch the proof script with code paths pinned to this read-only build."""
-    if any(not isinstance(value, str) or not value.startswith("/") or "\x00" in value
-           for value in (elixir_path, build_lib_path, script_path)):
+    if (any(not isinstance(value, str) or not value.startswith("/") or "\x00" in value
+            for value in (elixir_path, script_path)) or not isinstance(build_provenance, dict) or
+            set(build_provenance) != {"build_lib_path", "source_head_sha", "source_tree_sha",
+                                      "artifact_count", "artifact_inventory_sha256", "mix_lock_sha256"}):
         raise QualificationFailure("proof BEAM command paths are invalid")
+    if (not _valid_git_sha(build_provenance["source_head_sha"]) or
+            not _valid_git_sha(build_provenance["source_tree_sha"]) or
+            not isinstance(build_provenance["artifact_count"], int) or build_provenance["artifact_count"] < 1 or
+            not _valid_sha256(build_provenance["artifact_inventory_sha256"]) or
+            not _valid_sha256(build_provenance["mix_lock_sha256"])):
+        raise QualificationFailure("proof build provenance is malformed")
+    build_lib_path = build_provenance["build_lib_path"]
+    if not isinstance(build_lib_path, str) or not build_lib_path.startswith("/") or "\x00" in build_lib_path:
+        raise QualificationFailure("proof build path is invalid")
     build_lib = pathlib.Path(build_lib_path).resolve()
+    inventory = build_artifact_inventory(str(build_lib))
+    if (inventory["artifact_count"] != build_provenance["artifact_count"] or
+            inventory["artifact_inventory_sha256"] != build_provenance["artifact_inventory_sha256"]):
+        raise QualificationFailure("proof build artifacts changed after compilation")
     try:
         code_paths = sorted(
             ebin.resolve()
@@ -627,11 +775,15 @@ def service_environment(home):
     return {"PATH": SYSTEM_PATH, "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "HOME": home}
 
 
-def _run_bounded(command, *, env=None, timeout=5, input_data=None):
+def _run_bounded(command, *, env=None, timeout=5, input_data=None, cwd=None,
+                 max_output_bytes=MAX_IPC_BYTES):
+    if not isinstance(max_output_bytes, int) or not 1 <= max_output_bytes <= 1_048_576:
+        raise QualificationFailure("local qualification output bound is invalid")
     try:
         result = subprocess.run(command, input=input_data, stdout=subprocess.PIPE,
-                                stderr=subprocess.DEVNULL, check=True, timeout=timeout, env=env)
-        if len(result.stdout) > MAX_IPC_BYTES:
+                                stderr=subprocess.DEVNULL, check=True, timeout=timeout, env=env,
+                                cwd=cwd)
+        if len(result.stdout) > max_output_bytes:
             raise QualificationFailure("local qualification command output exceeds its bound")
         return result.stdout
     except (OSError, subprocess.SubprocessError) as exc:
@@ -719,20 +871,84 @@ def _setpriv_command(uid, command):
 
 
 def _stop_process(process, *, timeout=3):
-    if process is None or process.poll() is not None:
+    if process is None:
         return True
     if not isinstance(timeout, (int, float)) or timeout <= 0:
         raise QualificationFailure("process teardown timeout must be positive")
+    group_id = process.pid
     try:
-        os.killpg(process.pid, signal.SIGTERM)
-        process.wait(timeout=timeout)
-    except (OSError, subprocess.TimeoutExpired):
+        os.killpg(group_id, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    except OSError:
+        return False
+    if _wait_for_process_group(process, group_id, time.monotonic() + timeout):
+        return True
+    try:
+        os.killpg(group_id, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except OSError:
+        return False
+    if _wait_for_process_group(process, group_id, time.monotonic() + 3):
+        return True
+    return False
+
+
+def _active_process_group_members(group_id):
+    """Return runnable process IDs in a session-owned process group."""
+    active = []
+    try:
+        entries = pathlib.Path("/proc").iterdir()
+        for entry in entries:
+            if not entry.name.isdigit():
+                continue
+            try:
+                stat_line = (entry / "stat").read_text(encoding="ascii")
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise QualificationFailure("process group state is not readable") from exc
+            try:
+                fields = stat_line.rsplit(")", 1)[1].split()
+                state = fields[0]
+                process_group = int(fields[2])
+            except (IndexError, ValueError) as exc:
+                raise QualificationFailure("process group state is malformed") from exc
+            if process_group == group_id and state not in ("Z", "X"):
+                active.append(int(entry.name))
+    except OSError as exc:
+        raise QualificationFailure("process table is unavailable during teardown") from exc
+    return active
+
+
+def _wait_for_process_group(process, group_id, deadline):
+    while True:
         try:
-            os.killpg(process.pid, signal.SIGKILL)
-            process.wait(timeout=3)
-        except (OSError, subprocess.TimeoutExpired):
+            members = _active_process_group_members(group_id)
+        except QualificationFailure:
             return False
-    return process.poll() is not None
+        if not members:
+            if process.poll() is None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                try:
+                    process.wait(timeout=min(0.05, remaining))
+                except subprocess.TimeoutExpired:
+                    pass
+                continue
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        if process.poll() is None:
+            try:
+                process.wait(timeout=min(0.05, remaining))
+            except subprocess.TimeoutExpired:
+                pass
+        else:
+            time.sleep(min(0.05, remaining))
 
 
 def _stop_failed_launch(process):
@@ -855,6 +1071,10 @@ def validate_qualification_result(result):
     try:
         schema = json.loads(schema_path.read_text(encoding="ascii"))
         _validate_schema_value(result, schema, schema)
+        evidence = result["evidence"]
+        if (evidence["proof_build_source_head_sha"] != evidence["implementation_head_sha"] or
+                evidence["proof_build_source_tree_sha"] != evidence["implementation_head_tree"]):
+            raise QualificationFailure("proof build provenance differs from the implementation candidate")
         encoded = json.dumps(result, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
     except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
         raise QualificationFailure("qualification evidence is invalid") from exc
@@ -974,6 +1194,7 @@ def _cleanup_inside_resources(*, control_server, processes, canaries, ca_path,
                               runtime_mounts=()):
     """Attempt every teardown action and fail qualification if any cannot be verified."""
     failures = []
+    process_groups_stopped = True
 
     def attempt(name, action):
         try:
@@ -988,11 +1209,12 @@ def _cleanup_inside_resources(*, control_server, processes, canaries, ca_path,
         if process is None:
             continue
 
-        def stop_child(child=process):
-            if not _stop_process(child, timeout=20):
+        try:
+            if not _stop_process(process, timeout=20):
                 raise QualificationFailure("child process remained alive")
-
-        attempt(name, stop_child)
+        except Exception:
+            process_groups_stopped = False
+            failures.append(name)
         for stream_name in ("stdin", "stdout", "stderr"):
             stream = getattr(process, stream_name, None)
             if stream is not None and not stream.closed:
@@ -1005,25 +1227,28 @@ def _cleanup_inside_resources(*, control_server, processes, canaries, ca_path,
     if ca_path is not None or cert_directory is not None:
         attempt("trust_material", lambda: _remove_generated_trust_material(ca_path, cert_directory))
 
-    if policy is not None:
-        attempt("policy", lambda: _nft_delete_if_present(policy))
+    if process_groups_stopped:
+        if policy is not None:
+            attempt("policy", lambda: _nft_delete_if_present(policy))
 
-    for index, runtime_mount in enumerate(reversed(runtime_mounts)):
-        attempt("runtime_mount_" + str(index), lambda path=runtime_mount: _unmount_mount(path))
+        for index, runtime_mount in enumerate(reversed(runtime_mounts)):
+            attempt("runtime_mount_" + str(index), lambda path=runtime_mount: _unmount_mount(path))
 
-    if mounted:
-        attempt("source_mount", lambda: _unmount_repo(mount_path))
+        if mounted:
+            attempt("source_mount", lambda: _unmount_repo(mount_path))
 
-    if temp_root is not None:
-        def remove_temporary_root():
-            if temp_root.is_symlink():
-                temp_root.unlink()
-            elif temp_root.exists():
-                shutil.rmtree(temp_root)
-            if temp_root.exists() or temp_root.is_symlink():
-                raise QualificationFailure("qualification temporary root remains")
+        if temp_root is not None:
+            def remove_temporary_root():
+                if temp_root.is_symlink():
+                    temp_root.unlink()
+                elif temp_root.exists():
+                    shutil.rmtree(temp_root)
+                if temp_root.exists() or temp_root.is_symlink():
+                    raise QualificationFailure("qualification temporary root remains")
 
-        attempt("temporary_root", remove_temporary_root)
+            attempt("temporary_root", remove_temporary_root)
+    else:
+        failures.append("policy_mounts_and_temporary_root_preserved")
 
     if failures:
         raise QualificationFailure("qualification cleanup failed: " + ",".join(failures))
@@ -1229,7 +1454,7 @@ def outer_main(repo_root):
         reader = BoundedLineReader(process.stdout, maximum=65_536)
         active_seen = False
         result = None
-        deadline = time.monotonic() + 60
+        deadline = time.monotonic() + 420
         while time.monotonic() < deadline:
             status_line = _read_json_status(reader, max(0.1, deadline - time.monotonic()))
             if status_line.get("type") == "STAGE_B_VERIFIED":
@@ -1316,6 +1541,9 @@ def _inside_main(repo_root, temp_root, head, tree, request_id, outside_control_p
     origin_home = temp_root / "origin"
     proof_home = temp_root / "proof-home"
     proof_state = temp_root / "proof-state"
+    build_home = temp_root / "build-home"
+    proof_build_source = temp_root / "proof-build-source"
+    proof_build_mount = temp_root / "proof-build"
     relay_evidence_path = temp_root / "relay-evidence" / "relay.json"
     result_path = proof_state / "proof-result.json"
     try:
@@ -1335,6 +1563,22 @@ def _inside_main(repo_root, temp_root, head, tree, request_id, outside_control_p
 
         runtime_plan = runtime_mount_plan(mix_path, runtime_path, str(temp_root))
         runtime_mounts = _bind_runtime_installations(runtime_plan)
+        build_home.mkdir(mode=0o700)
+        proof_build = compile_fresh_proof_build(
+            runtime_plan["mix_path"],
+            str(source_elixir),
+            str(proof_build_source),
+            home=str(build_home),
+            runtime_path=runtime_plan["runtime_path"],
+            source_head_sha=head,
+            source_tree_sha=tree,
+        )
+        _bind_read_only_path(proof_build_source, proof_build_mount, unmount=_unmount_mount)
+        runtime_mounts.append(proof_build_mount)
+        proof_build = {
+            **proof_build,
+            "build_lib_path": str(proof_build_mount / "lib"),
+        }
 
         _set_owner(relay_home, RELAY_UID, 0o700)
         _set_owner(origin_home, ORIGIN_UID, 0o700)
@@ -1481,7 +1725,7 @@ def _inside_main(repo_root, temp_root, head, tree, request_id, outside_control_p
             result_values, home=str(proof_home), runtime_path=runtime_plan["runtime_path"]
         )
         target = proof_elixir_command(
-            runtime_plan["elixir_path"], str(source_elixir / "_build/test/lib"), str(proof_runner_path)
+            runtime_plan["elixir_path"], proof_build, str(proof_runner_path)
         )
         proof_command = _setpriv_command(PROOF_UID, proof_launch_command(target))
         control_server.start()
@@ -1549,7 +1793,10 @@ def _inside_main(repo_root, temp_root, head, tree, request_id, outside_control_p
             control_server = None
         if proof_process.poll() is None:
             raise QualificationFailure("proof BEAM process did not stop after the one-use request")
-        if not _stop_process(relay_process) or not _stop_process(origin_process):
+        proof_process_stopped = _stop_process(proof_process)
+        relay_process_stopped = _stop_process(relay_process)
+        origin_process_stopped = _stop_process(origin_process)
+        if not proof_process_stopped or not relay_process_stopped or not origin_process_stopped:
             raise QualificationFailure("local relay or TLS origin did not stop")
 
         policy.revoke_stage_b(PROOF_UID, state["ready"]["bound_port"])
@@ -1613,14 +1860,21 @@ def _inside_main(repo_root, temp_root, head, tree, request_id, outside_control_p
             "trust_material_removed": trust_material_removed,
             "policy_deny_all_restored": deny_all,
             "policy_table_removed_and_verified": True,
-            "proof_process_stopped": proof_process.poll() is not None,
-            "relay_process_stopped": relay_process.poll() is not None,
-            "origin_process_stopped": origin_process.poll() is not None,
+            "proof_process_stopped": proof_process_stopped,
+            "relay_process_stopped": relay_process_stopped,
+            "origin_process_stopped": origin_process_stopped,
             "controller_socket_removed": not socket_path.exists(),
             "manifest_finch_absent_before_ready": proof_result["manifest_finch_absent_before_ready"],
             "finch_started_after_ready_validation": proof_result["finch_started_at_witness"],
             "ready_withheld_until_stage_b_verified": state["control_passed"] and
                 stage_b["pid"] == proof_identity["pid"] and stage_b["proof_allow"]["port"] == ready["bound_port"],
+            "proof_build_fresh": True,
+            "proof_build_read_only": True,
+            "proof_build_source_head_sha": proof_build["source_head_sha"],
+            "proof_build_source_tree_sha": proof_build["source_tree_sha"],
+            "proof_build_artifact_count": proof_build["artifact_count"],
+            "proof_build_artifact_inventory_sha256": proof_build["artifact_inventory_sha256"],
+            "proof_build_mix_lock_sha256": proof_build["mix_lock_sha256"],
         }
         return {"type": "QUALIFICATION_RESULT", "qualified": True, "evidence": evidence}
     finally:
