@@ -45,6 +45,147 @@ defmodule SymphonyElixir.WorkControl.A4HostRelayControllerTest do
     refute_receive {:backend, :manifest, _}
   end
 
+  test "rejects non-ok and raising Stage A backends" do
+    Process.flag(:trap_exit, true)
+
+    assert {:error, :stage_a_failed} =
+             A4HostRelayController.start_link(backend: backend(self(), stage_a: :unexpected), ref: make_ref())
+
+    assert {:error, :stage_a_failed} =
+             A4HostRelayController.start_link(
+               backend: %{verify_stage_a: fn -> raise "fixture backend failure" end},
+               ref: make_ref()
+             )
+  end
+
+  test "fails closed on malformed manifest and READY backend responses" do
+    parent = self()
+    ref = make_ref()
+
+    manifest_backend =
+      backend(parent, stage_a: :ok)
+      |> Map.put(:manifest, fn _request -> {:ok, %{value: String.duplicate("x", 17_000)}} end)
+
+    assert {:ok, manifest_controller} =
+             A4HostRelayController.start_link(backend: manifest_backend, ref: ref)
+
+    manifest_request_id = make_ref()
+
+    send(
+      manifest_controller,
+      {:a4_manifest_request, self(), ref, manifest_request_id, %{provider_request_id: "req-1"}}
+    )
+
+    assert_controller_response(
+      :a4_manifest_response,
+      manifest_controller,
+      ref,
+      manifest_request_id,
+      :invalid_manifest
+    )
+
+    unavailable_manifest_backend =
+      backend(parent, stage_a: :ok)
+      |> Map.delete(:manifest)
+
+    assert {:ok, unavailable_manifest_controller} =
+             A4HostRelayController.start_link(backend: unavailable_manifest_backend, ref: ref)
+
+    unavailable_manifest_request_id = make_ref()
+
+    send(
+      unavailable_manifest_controller,
+      {:a4_manifest_request, self(), ref, unavailable_manifest_request_id, %{provider_request_id: "req-1"}}
+    )
+
+    assert_controller_response(
+      :a4_manifest_response,
+      unavailable_manifest_controller,
+      ref,
+      unavailable_manifest_request_id,
+      :invalid_manifest
+    )
+
+    ready_backend =
+      backend(parent, stage_a: :ok)
+      |> Map.put(:ready, fn _request -> {:error, :not_ready} end)
+
+    assert {:ok, ready_controller} = A4HostRelayController.start_link(backend: ready_backend, ref: ref)
+    ready_request_id = make_ref()
+
+    send(
+      ready_controller,
+      {:a4_ready_request, self(), ref, ready_request_id, %{provider_request_id: "req-1"}}
+    )
+
+    assert_receive {:a4_ready_response, ^ready_controller, ^ref, ^ready_request_id, {:error, :policy_not_verified}}
+
+    raising_ready_backend =
+      backend(parent, stage_a: :ok)
+      |> Map.put(:ready, fn _request -> raise "fixture READY failure" end)
+
+    assert {:ok, raising_ready_controller} =
+             A4HostRelayController.start_link(backend: raising_ready_backend, ref: ref)
+
+    raising_ready_request_id = make_ref()
+
+    send(
+      raising_ready_controller,
+      {:a4_ready_request, self(), ref, raising_ready_request_id, %{provider_request_id: "req-1"}}
+    )
+
+    assert_controller_response(
+      :a4_ready_response,
+      raising_ready_controller,
+      ref,
+      raising_ready_request_id,
+      :controller_failed
+    )
+  end
+
+  test "contains callback exceptions and ignores messages outside the A4 protocol" do
+    parent = self()
+    ref = make_ref()
+
+    manifest_backend =
+      backend(parent, stage_a: :ok)
+      |> Map.put(:manifest, fn _request -> raise "fixture manifest failure" end)
+
+    assert {:ok, manifest_controller} =
+             A4HostRelayController.start_link(backend: manifest_backend, ref: ref)
+
+    manifest_request_id = make_ref()
+
+    send(
+      manifest_controller,
+      {:a4_manifest_request, self(), ref, manifest_request_id, %{provider_request_id: "req-1"}}
+    )
+
+    assert_controller_response(
+      :a4_manifest_response,
+      manifest_controller,
+      ref,
+      manifest_request_id,
+      :controller_failed
+    )
+
+    ready_backend =
+      backend(parent, stage_a: :ok, ready: {:ok, @ready})
+      |> Map.put(:stage_b_verified?, fn _request, _ready -> raise "fixture verifier failure" end)
+
+    assert {:ok, ready_controller} = A4HostRelayController.start_link(backend: ready_backend, ref: ref)
+    ready_request_id = make_ref()
+    send(ready_controller, :unrelated_message)
+
+    send(
+      ready_controller,
+      {:a4_ready_request, self(), ref, ready_request_id, %{provider_request_id: "req-1"}}
+    )
+
+    assert_receive {:a4_ready_response, ^ready_controller, ^ref, ^ready_request_id, {:error, :policy_not_verified}}
+    assert Process.alive?(ready_controller)
+  end
+
   test "Stage B failure withholds READY" do
     ready = @ready
     backend = backend(self(), stage_a: :ok, ready: {:ok, @ready}, stage_b: false)
@@ -80,5 +221,10 @@ defmodule SymphonyElixir.WorkControl.A4HostRelayControllerTest do
         stage_b
       end
     }
+  end
+
+  defp assert_controller_response(type, controller, ref, request_id, error) do
+    assert_receive {^type, ^controller, ^ref, ^request_id, response}
+    assert response == {:error, error}
   end
 end
