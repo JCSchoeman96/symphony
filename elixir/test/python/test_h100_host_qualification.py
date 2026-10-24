@@ -36,6 +36,20 @@ class HostQualificationLauncherTests(unittest.TestCase):
             with self.assertRaises(runner.QualificationFailure):
                 verify("/repo")
 
+    def test_unrelated_control_listener_starts_only_when_requested(self):
+        listener, port, result, thread = runner._outer_listener()
+        try:
+            self.assertFalse(thread.is_alive(), "control accept window began before Stage B")
+            thread.start()
+            self.assertTrue(runner._outside_control_exchange(port))
+            thread.join(2)
+            self.assertFalse(thread.is_alive())
+            self.assertTrue(result["complete"])
+        finally:
+            listener.close()
+            if thread.is_alive():
+                thread.join(2)
+
     def test_isolated_mix_home_copies_only_hex_and_rebar_tooling(self):
         prepare = getattr(runner, "prepare_isolated_mix_home", None)
         self.assertTrue(callable(prepare), "proof build does not seed its isolated Mix home")
@@ -446,10 +460,9 @@ class HostQualificationLauncherTests(unittest.TestCase):
                 self.assertEqual(runner.main(["--repo-root", "/tmp"]), 1)
         self.assertEqual(statuses, [{"type": "QUALIFICATION_ERROR", "reason": "fixture stage failed"}])
 
-    def test_outside_control_listener_stops_promptly_when_closed(self):
+    def test_outside_control_listener_can_close_before_activation(self):
         listener, _port, result, thread = runner._outer_listener()
         listener.close()
-        thread.join(timeout=1)
         self.assertFalse(thread.is_alive())
         self.assertFalse(result["complete"])
 

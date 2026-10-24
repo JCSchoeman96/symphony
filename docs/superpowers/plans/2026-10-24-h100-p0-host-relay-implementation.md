@@ -57,12 +57,14 @@
 - The external launcher owns the temporary namespace and policy. It communicates over a mode-0600 Unix-domain socket located in a private runtime directory; protocol messages are bounded, typed, and contain no credentials or request payload.
 - The read-only verifier independently reads namespace UID maps, actual `/proc` PID identity, nftables JSON state/counters, and exact relay listener exception. The verifier has no policy mutation functions.
 - The BEAM controller implements the existing `A4Proof` callback protocol and stays unprivileged. It withholds the READY response until the launcher reports successful second verification for the actual proof PID and exact relay port.
+- Start the separate non-proof control listener only when Stage B has been verified, so its fixed 15-second exchange window measures the control itself and does not expire during the fresh proof build.
 
 **Tests:**
 - RED/GREEN ordering tests for pre-spawn deny-all verification, proof spawn, relay readiness, exact-port rule installation, second verification, and READY exposure.
 - Stage A failure proves no proof process, relay, Finch, or transport starts.
 - Stage B failure proves READY is withheld, egress stays denied, relay stops, and the session fails closed.
 - Test actual identity-to-scope binding, exact TCP loopback-port allow rule, IPv4/IPv6 default-deny behavior, and that another UID/process remains outside the scope.
+- Test the unrelated-process control listener is dormant until its explicit Stage B start.
 - Verify no Finch startup occurs before A4 validates and consumes READY.
 
 **Commit:** `feat(h100): gate proof readiness on verified host policy`.

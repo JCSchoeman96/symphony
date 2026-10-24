@@ -1704,7 +1704,6 @@ def _outer_listener():
                 return
 
     thread = threading.Thread(target=accept_control, name="h100-outside-control", daemon=True)
-    thread.start()
     return listener, port, result, thread
 
 
@@ -1772,6 +1771,7 @@ def outer_main(repo_root):
 
     temp_root = pathlib.Path(tempfile.mkdtemp(prefix="h100-local-qualification-"))
     listener, outside_port, outside_result, outside_thread = _outer_listener()
+    outside_thread_started = False
     process = None
     clean_env = {"PATH": SYSTEM_PATH, "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8",
                  "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1",
@@ -1797,6 +1797,8 @@ def outer_main(repo_root):
                 if active_seen:
                     raise QualificationFailure("outside control window was requested more than once")
                 active_seen = True
+                outside_thread.start()
+                outside_thread_started = True
                 outside_ok = _outside_control_exchange(outside_port)
                 outside_thread.join(3)
                 if not outside_ok or not outside_result["complete"]:
@@ -1836,9 +1838,10 @@ def outer_main(repo_root):
                         stream.close()
                     except OSError:
                         cleanup_failures.append("namespace_pipe")
-        outside_thread.join(1)
-        if outside_thread.is_alive():
-            cleanup_failures.append("outside_control_listener")
+        if outside_thread_started:
+            outside_thread.join(1)
+            if outside_thread.is_alive():
+                cleanup_failures.append("outside_control_listener")
         try:
             if temp_root.is_symlink():
                 temp_root.unlink()
