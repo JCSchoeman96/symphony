@@ -1622,8 +1622,6 @@ def _inside_main(repo_root, temp_root, head, tree, request_id, outside_control_p
             "ready_withheld_until_stage_b_verified": state["control_passed"] and
                 stage_b["pid"] == proof_identity["pid"] and stage_b["proof_allow"]["port"] == ready["bound_port"],
         }
-        _unmount_repo(mount_path)
-        mounted = False
         return {"type": "QUALIFICATION_RESULT", "qualified": True, "evidence": evidence}
     finally:
         primary_failure = sys.exception()
