@@ -444,7 +444,12 @@ defmodule SymphonyElixir.H100HostQualificationRunner do
               :duplicate_or_unsolicited_controller_message,
               :invalid_ready_response,
               :wrong_controller_reference,
-              :proof_ready_timeout
+              :proof_ready_timeout,
+              :policy_not_verified,
+              :controller_failed,
+              :manifest_unavailable,
+              :stage_b_not_verified,
+              :request_identity_mismatch
             ],
        do: Atom.to_string(reason)
 

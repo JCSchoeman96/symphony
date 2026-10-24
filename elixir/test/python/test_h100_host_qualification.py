@@ -137,6 +137,11 @@ class HostQualificationLauncherTests(unittest.TestCase):
             runner.proof_failure_detail(1, result),
             "proof result rejected (controller_ready_ipc_failed) [ipv4=failed,ipv6=failed,acks=0]",
         )
+        result["failure_code"] = "policy_not_verified"
+        self.assertEqual(
+            runner.proof_failure_detail(1, result),
+            "proof result rejected (policy_not_verified) [ipv4=failed,ipv6=failed,acks=0]",
+        )
 
     def test_proof_failure_summary_never_includes_untrusted_values(self):
         detail = runner.proof_failure_detail(

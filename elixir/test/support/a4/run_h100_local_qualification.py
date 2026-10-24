@@ -181,6 +181,8 @@ def proof_failure_detail(status_code, result, stderr=b""):
         "proof_token_consumed", "proof_token_binding_mismatch", "proof_token_not_ready",
         "proof_reply_receiver_failed", "duplicate_or_unsolicited_controller_message",
         "invalid_ready_response", "wrong_controller_reference", "proof_ready_timeout",
+        "policy_not_verified", "controller_failed", "manifest_unavailable", "stage_b_not_verified",
+        "request_identity_mismatch",
         "econnrefused", "timeout", "closed",
     }
     manifest_failure_fields = {
