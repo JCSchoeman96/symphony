@@ -453,45 +453,91 @@ def prepare_isolated_mix_home(source_mix_home, target_mix_home, *, rebar_key):
     }
 
 
-def build_artifact_inventory(build_lib_path):
-    """Hash every regular file in the dedicated compiled application directory."""
-    if not isinstance(build_lib_path, str) or not build_lib_path.startswith("/") or "\x00" in build_lib_path:
+def _safe_build_symlink_target(link_path, build_root, source_root):
+    try:
+        resolved_target = link_path.resolve(strict=False)
+    except (OSError, RuntimeError) as exc:
+        raise QualificationFailure("proof build contains an unsafe symbolic link") from exc
+    if resolved_target.is_relative_to(build_root):
+        if not resolved_target.exists():
+            raise QualificationFailure("proof build contains a dangling build link")
+        target_name = "build/" + resolved_target.relative_to(build_root).as_posix()
+    elif resolved_target.is_relative_to(source_root):
+        source_relative = resolved_target.relative_to(source_root)
+        source_name = source_relative.as_posix()
+        source_is_dependency = source_relative.parts and source_relative.parts[0] == "deps"
+        source_is_application_priv = source_relative == pathlib.Path("priv")
+        source_is_known_missing_asset_target = (
+            source_relative == pathlib.Path("assets/node_modules") and not resolved_target.exists()
+        )
+        if not (source_is_dependency or source_is_application_priv or source_is_known_missing_asset_target):
+            raise QualificationFailure("proof build contains an unbound source link")
+        target_name = "source/" + source_name
+    else:
+        raise QualificationFailure("proof build contains a link outside the candidate")
+    return target_name
+
+
+def build_artifact_inventory(build_path, *, source_root=None):
+    """Hash build files and Mix links, restricting links to the candidate or build tree."""
+    if not isinstance(build_path, str) or not build_path.startswith("/") or "\x00" in build_path:
         raise QualificationFailure("proof build inventory path is invalid")
-    source_root = pathlib.Path(build_lib_path)
-    current = pathlib.Path(source_root.anchor)
-    for part in source_root.parts[1:]:
+    source_path = pathlib.Path(build_path)
+    current = pathlib.Path(source_path.anchor)
+    for part in source_path.parts[1:]:
         current = current / part
         if current.is_symlink():
             raise QualificationFailure("proof build inventory contains a symbolic link")
-    root = source_root.resolve()
+    root = source_path.resolve()
     if not root.is_dir():
         raise QualificationFailure("proof build inventory directory is unavailable")
+    if source_root is None:
+        project_root = None
+    else:
+        if not isinstance(source_root, str) or not source_root.startswith("/") or "\x00" in source_root:
+            raise QualificationFailure("proof source root is invalid")
+        project_root = pathlib.Path(source_root)
+        if project_root.is_symlink() or not project_root.is_dir():
+            raise QualificationFailure("proof source root is unavailable")
+        project_root = project_root.resolve(strict=True)
+
     entries = []
     total_bytes = 0
     try:
         paths = sorted(root.rglob("*"))
         for path in paths:
+            relative_path = path.relative_to(root).as_posix()
             if path.is_symlink():
-                raise QualificationFailure("proof build inventory contains a symbolic link")
+                if project_root is None:
+                    raise QualificationFailure("proof build inventory has an unbound symbolic link")
+                target_name = _safe_build_symlink_target(path, root, project_root)
+                target_bytes = target_name.encode("utf-8")
+                entries.append(("link/" + relative_path, len(target_bytes),
+                                hashlib.sha256(target_bytes).hexdigest()))
+                if len(entries) > 50_000:
+                    raise QualificationFailure("proof build inventory exceeds its fixed bound")
+                continue
             if path.is_dir():
                 continue
             file_stat = path.stat(follow_symlinks=False)
             if not stat.S_ISREG(file_stat.st_mode):
-                raise QualificationFailure("proof build inventory contains a non-regular file")
+                raise QualificationFailure("proof build contains a non-regular file")
             total_bytes += file_stat.st_size
-            if len(entries) >= 50_000 or total_bytes > 536_870_912:
+            if total_bytes > 536_870_912:
                 raise QualificationFailure("proof build inventory exceeds its fixed bound")
             file_digest = hashlib.sha256()
             with path.open("rb") as source:
                 for chunk in iter(lambda: source.read(65_536), b""):
                     file_digest.update(chunk)
-            entries.append((path.relative_to(root).as_posix(), file_stat.st_size, file_digest.hexdigest()))
+            entries.append(("file/" + relative_path, file_stat.st_size, file_digest.hexdigest()))
+            if len(entries) > 50_000:
+                raise QualificationFailure("proof build inventory exceeds its fixed bound")
     except OSError as exc:
         raise QualificationFailure("proof build inventory could not be read") from exc
     if not entries:
         raise QualificationFailure("proof build has no compiled artifacts")
     inventory = hashlib.sha256()
-    for relative_path, size, digest in entries:
+    for relative_path, size, digest in sorted(entries):
         inventory.update(relative_path.encode("utf-8"))
         inventory.update(b"\x00")
         inventory.update(str(size).encode("ascii"))
@@ -501,14 +547,15 @@ def build_artifact_inventory(build_lib_path):
     return {"artifact_count": len(entries), "artifact_inventory_sha256": inventory.hexdigest()}
 
 
-def _seal_proof_build(build_root):
+def _seal_proof_build(build_root, source_root):
     """Remove write permission from every build path before it is mounted for proof use."""
     root = pathlib.Path(build_root)
     try:
         paths = sorted(root.rglob("*"), key=lambda path: len(path.parts), reverse=True)
         for path in paths:
             if path.is_symlink():
-                raise QualificationFailure("proof build contains a symbolic link")
+                _safe_build_symlink_target(path, root.resolve(), pathlib.Path(source_root).resolve())
+                continue
             file_stat = path.stat(follow_symlinks=False)
             if stat.S_ISDIR(file_stat.st_mode):
                 mode = (stat.S_IMODE(file_stat.st_mode) | 0o555) & ~0o222
@@ -659,11 +706,12 @@ def compile_fresh_proof_build(mix_path, project_path, build_path, *, home, runti
     environment = _build_environment(str(build_root), home=home, runtime_path=runtime_path)
     _run_bounded([mix_path, "compile", "--warnings-as-errors"], env=environment,
                  timeout=300, cwd=str(project), max_output_bytes=1_048_576)
-    _seal_proof_build(build_root)
+    _seal_proof_build(build_root, project)
     build_lib_path = build_root / "lib"
-    inventory = build_artifact_inventory(str(build_lib_path))
+    inventory = build_artifact_inventory(str(build_root), source_root=str(project))
     return {
         "build_lib_path": str(build_lib_path),
+        "source_root": str(project),
         "source_head_sha": source_head_sha,
         "source_tree_sha": source_tree_sha,
         "artifact_count": inventory["artifact_count"],
@@ -681,7 +729,7 @@ def proof_elixir_command(elixir_path, build_provenance, script_path):
     """Launch the proof script with code paths pinned to this read-only build."""
     if (any(not isinstance(value, str) or not value.startswith("/") or "\x00" in value
             for value in (elixir_path, script_path)) or not isinstance(build_provenance, dict) or
-            set(build_provenance) != {"build_lib_path", "source_head_sha", "source_tree_sha",
+            set(build_provenance) != {"build_lib_path", "source_root", "source_head_sha", "source_tree_sha",
                                       "artifact_count", "artifact_inventory_sha256", "mix_lock_sha256",
                                       "hex_version", "hex_archive_sha256", "rebar3_sha256"}):
         raise QualificationFailure("proof BEAM command paths are invalid")
@@ -698,8 +746,12 @@ def proof_elixir_command(elixir_path, build_provenance, script_path):
     build_lib_path = build_provenance["build_lib_path"]
     if not isinstance(build_lib_path, str) or not build_lib_path.startswith("/") or "\x00" in build_lib_path:
         raise QualificationFailure("proof build path is invalid")
+    source_root_path = build_provenance["source_root"]
+    if not isinstance(source_root_path, str) or not source_root_path.startswith("/") or "\x00" in source_root_path:
+        raise QualificationFailure("proof source root path is invalid")
     build_lib = pathlib.Path(build_lib_path).resolve()
-    inventory = build_artifact_inventory(str(build_lib))
+    project_root = pathlib.Path(source_root_path).resolve()
+    inventory = build_artifact_inventory(str(build_lib.parent), source_root=str(project_root))
     if (inventory["artifact_count"] != build_provenance["artifact_count"] or
             inventory["artifact_inventory_sha256"] != build_provenance["artifact_inventory_sha256"]):
         raise QualificationFailure("proof build artifacts changed after compilation")
@@ -1666,6 +1718,24 @@ def _outside_control_exchange(port):
     return completed.returncode == 0
 
 
+def verify_private_source_cleanliness(repo_root):
+    """Reject ignored or untracked files that could enter proof code paths."""
+    if not isinstance(repo_root, str) or not repo_root.startswith("/") or "\x00" in repo_root:
+        raise QualificationFailure("candidate repository path is invalid")
+    status = _run_bounded(
+        ["git", "-C", repo_root, "status", "--porcelain", "--ignored=matching",
+         "--untracked-files=all", "--", "elixir/lib", "elixir/priv"],
+        env={"PATH": SYSTEM_PATH, "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8",
+             "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1",
+             "GIT_TERMINAL_PROMPT": "0"},
+        timeout=5,
+        max_output_bytes=65_536,
+    )
+    if status.strip():
+        raise QualificationFailure("candidate code directories contain untracked or ignored paths")
+    return True
+
+
 def outer_main(repo_root):
     repo_root = pathlib.Path(repo_root).resolve()
     if not repo_root.is_dir():
@@ -1675,6 +1745,7 @@ def outer_main(repo_root):
                                "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0"})
     if status.strip():
         raise QualificationFailure("local qualification requires a clean implementation worktree")
+    verify_private_source_cleanliness(str(repo_root))
     head = _run_bounded(["git", "-C", str(repo_root), "rev-parse", "HEAD"],
                         env={"PATH": SYSTEM_PATH, "LANG": "C.UTF-8", "GIT_CONFIG_GLOBAL": "/dev/null",
                              "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0"}).decode().strip()

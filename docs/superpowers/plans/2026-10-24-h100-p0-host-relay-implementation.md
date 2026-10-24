@@ -88,12 +88,13 @@
 - Create: `elixir/priv/h100/local_tls_fixture.py` (loopback TLS 1.2 fixture and generated CA/server certificate lifecycle).
 - Create: `elixir/test/support/a4/host_qualification_runner.exs` (fresh, unprivileged proof BEAM entry point using the real A4 proof, witness, Client, and Finch path).
 - Modify: `elixir/test/support/a4/run_h100_local_qualification.py` to copy the locked dependency source tree into a bounded writable scratch directory, hash that copy, bind it over only the read-only repository's `elixir/deps` mountpoint for compilation, and unmount it before proof startup.
+- Build sealing and artifact inventory allow only Mix links rooted in the fresh build, `elixir/deps`, or the candidate's `elixir/priv`; only the absent `assets/node_modules` target is accepted as a dangling link. Hash link names and targets, and reject ignored/untracked files under `elixir/lib` and `elixir/priv` before qualification.
 - Modify: `elixir/test/support/a4/transport_fixture.exs` only for shared test utilities that retain no global trust mutation.
 
 **Tests:**
 - Generate CA/key/server material under a private temporary directory, restrict file access to the origin UID, trust only the generated CA in the one proof connection, and assert exact hostname verification.
 - Confirm a peer-verified TLS 1.1-only fixture fails while the TLS 1.2 fixture succeeds; the relay itself only observes record framing, content type, and length.
-- Test dependency-copy bounds, source symlink rejection, writable directory modes, content inventory hashing, and rejection of mount targets outside the exact project `elixir/deps` path.
+- Test dependency-copy bounds, source symlink rejection, writable directory modes, content inventory hashing, rejection of mount targets outside the exact project `elixir/deps` path, and safe/unsafe Mix build symlinks.
 - Send the exact bounded local PATCH once; fixture confirms one complete request without writing its body to logs/evidence.
 - Confirm origin emits a server application-data record, relay suppresses the full record, Finch reports transport failure, and there is one dispatch, one CONNECT, one upstream, one client application-data record, zero retries, and zero replays.
 - Failure/interrupt paths remove CA, certificate, key, temporary trust files, sockets, and all fixture children.

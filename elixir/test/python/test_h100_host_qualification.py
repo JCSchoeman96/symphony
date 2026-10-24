@@ -29,6 +29,13 @@ class HostQualificationLauncherTests(unittest.TestCase):
         )
         self.assertEqual(environment["MIX_ENV"], "prod")
 
+    def test_candidate_private_source_preflight_rejects_ignored_code_files(self):
+        verify = getattr(runner, "verify_private_source_cleanliness", None)
+        self.assertTrue(callable(verify), "candidate source preflight ignores private source artifacts")
+        with patch.object(runner, "_run_bounded", return_value=b"!! elixir/priv/h100/__pycache__/relay.pyc\n"):
+            with self.assertRaises(runner.QualificationFailure):
+                verify("/repo")
+
     def test_isolated_mix_home_copies_only_hex_and_rebar_tooling(self):
         prepare = getattr(runner, "prepare_isolated_mix_home", None)
         self.assertTrue(callable(prepare), "proof build does not seed its isolated Mix home")
@@ -612,16 +619,21 @@ class HostQualificationLauncherTests(unittest.TestCase):
 
     def test_proof_elixir_command_uses_only_pinned_build_code_paths(self):
         with tempfile.TemporaryDirectory(prefix="h100-proof-code-paths-") as directory:
-            build_lib = pathlib.Path(directory) / "_build/test/lib"
+            root = pathlib.Path(directory)
+            build_root = root / "_build/test"
+            build_lib = build_root / "lib"
             app_ebin = build_lib / "symphony_elixir/ebin"
             dep_ebin = build_lib / "finch/ebin"
+            source_root = root / "project"
+            source_root.mkdir()
             app_ebin.mkdir(parents=True)
             dep_ebin.mkdir(parents=True)
             (app_ebin / "symphony.beam").write_bytes(b"application artifact")
             (dep_ebin / "finch.beam").write_bytes(b"dependency artifact")
-            inventory = runner.build_artifact_inventory(str(build_lib))
+            inventory = runner.build_artifact_inventory(str(build_root), source_root=str(source_root))
             provenance = {
                 "build_lib_path": str(build_lib),
+                "source_root": str(source_root),
                 "source_head_sha": "a" * 40,
                 "source_tree_sha": "b" * 40,
                 **inventory,
@@ -670,6 +682,45 @@ class HostQualificationLauncherTests(unittest.TestCase):
             with self.assertRaises(runner.QualificationFailure):
                 runner.build_artifact_inventory(str(linked_build))
 
+    def test_build_artifact_inventory_binds_mix_symlinks_to_the_candidate_tree(self):
+        with tempfile.TemporaryDirectory(prefix="h100-proof-build-source-link-") as directory:
+            root = pathlib.Path(directory)
+            project = root / "project"
+            source_priv = project / "priv"
+            (source_priv / "static").mkdir(parents=True)
+            (source_priv / "static/asset.txt").write_text("candidate asset", encoding="ascii")
+            build = root / "proof-build"
+            ebin = build / "lib/app/ebin"
+            ebin.mkdir(parents=True)
+            (ebin / "module.beam").write_bytes(b"compiled module")
+            (build / "lib/app/priv").symlink_to(source_priv, target_is_directory=True)
+            (build / "phoenix-colocated/app/node_modules").parent.mkdir(parents=True)
+            (build / "phoenix-colocated/app/node_modules").symlink_to(
+                project / "assets/node_modules", target_is_directory=True
+            )
+
+            inventory = runner.build_artifact_inventory(str(build), source_root=str(project))
+
+            self.assertEqual(inventory["artifact_count"], 3)
+            self.assertEqual(len(inventory["artifact_inventory_sha256"]), 64)
+
+    def test_build_artifact_inventory_rejects_symlinks_outside_candidate_and_build(self):
+        with tempfile.TemporaryDirectory(prefix="h100-proof-build-escape-") as directory:
+            root = pathlib.Path(directory)
+            project = root / "project"
+            project.mkdir()
+            outside = root / "outside"
+            outside.mkdir()
+            (outside / "asset.txt").write_text("unbound", encoding="ascii")
+            build = root / "proof-build"
+            ebin = build / "lib/app/ebin"
+            ebin.mkdir(parents=True)
+            (ebin / "module.beam").write_bytes(b"compiled module")
+            (build / "lib/app/priv").symlink_to(outside, target_is_directory=True)
+
+            with self.assertRaises(runner.QualificationFailure):
+                runner.build_artifact_inventory(str(build), source_root=str(project))
+
     def test_fresh_proof_build_compiles_and_hashes_a_dedicated_mix_build(self):
         compile_build = getattr(runner, "compile_fresh_proof_build", None)
         self.assertTrue(callable(compile_build), "qualification lacks a fresh proof build compiler")
@@ -715,6 +766,7 @@ class HostQualificationLauncherTests(unittest.TestCase):
             compiled = build_path / "lib/build_fixture/ebin/Elixir.BuildFixture.beam"
             self.assertTrue(compiled.is_file())
             self.assertEqual(result["build_lib_path"], str(build_path / "lib"))
+            self.assertEqual(result["source_root"], str(project))
             self.assertEqual(result["source_head_sha"], "a" * 40)
             self.assertEqual(result["source_tree_sha"], "b" * 40)
             self.assertGreater(result["artifact_count"], 0)
