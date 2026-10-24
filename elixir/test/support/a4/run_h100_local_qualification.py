@@ -344,16 +344,30 @@ def _build_environment(mix_build_path, *, home, runtime_path):
     }
 
 
-def mix_rebar_home_key(mix_path):
+def mix_rebar_home_key(mix_path, *, mix_home=None):
     if not isinstance(mix_path, str) or not mix_path.startswith("/") or "\x00" in mix_path:
         raise QualificationFailure("Mix executable path is invalid")
-    executable = pathlib.Path(mix_path)
+    if (mix_home is not None and
+            (not isinstance(mix_home, str) or not mix_home.startswith("/") or "\x00" in mix_home)):
+        raise QualificationFailure("Mix home path is invalid")
+    paths = [pathlib.Path(mix_path)]
+    if mix_home is not None:
+        paths.append(pathlib.Path(mix_home))
     install_pattern = re.compile(r"(\d+)\.(\d+)(?:\.\d+)?-otp-(\d+)")
-    for candidate in (executable, executable.resolve()):
-        for parent in candidate.parents:
-            match = install_pattern.fullmatch(parent.name)
-            if match is not None:
-                return f"{match.group(1)}-{match.group(2)}-otp-{match.group(3)}"
+    rebar_keys = set()
+    try:
+        for path in paths:
+            for candidate in (path, path.resolve()):
+                for parent in candidate.parents:
+                    match = install_pattern.fullmatch(parent.name)
+                    if match is not None:
+                        rebar_keys.add(f"{match.group(1)}-{match.group(2)}-otp-{match.group(3)}")
+    except (OSError, RuntimeError) as exc:
+        raise QualificationFailure("Mix runtime path could not be resolved") from exc
+    if len(rebar_keys) == 1:
+        return rebar_keys.pop()
+    if len(rebar_keys) > 1:
+        raise QualificationFailure("Mix executable and home identify different Rebar3 homes")
     raise QualificationFailure("Mix runtime path does not identify its Rebar3 home")
 
 
@@ -700,10 +714,10 @@ def compile_fresh_proof_build(mix_path, project_path, build_path, *, home, runti
         build_root.mkdir(parents=True, mode=0o700, exist_ok=False)
     except OSError as exc:
         raise QualificationFailure("fresh proof build directory could not be created") from exc
-    if rebar_key is None:
-        rebar_key = mix_rebar_home_key(mix_path)
     if source_mix_home is None:
         source_mix_home = os.environ.get("MIX_HOME") or str(pathlib.Path.home() / ".mix")
+    if rebar_key is None:
+        rebar_key = mix_rebar_home_key(mix_path, mix_home=source_mix_home)
     mix_tools = prepare_isolated_mix_home(source_mix_home, str(pathlib.Path(home) / ".mix"),
                                           rebar_key=rebar_key)
     environment = _build_environment(str(build_root), home=home, runtime_path=runtime_path)
@@ -2054,7 +2068,7 @@ def _inside_main(repo_root, temp_root, head, tree, request_id, outside_control_p
             runtime_path=runtime_plan["runtime_path"],
             source_head_sha=head,
             source_tree_sha=tree,
-            rebar_key=mix_rebar_home_key(mix_path),
+            rebar_key=mix_rebar_home_key(mix_path, mix_home=source_mix_home),
             source_mix_home=source_mix_home,
         )
         _unmount_mount(dependency_mount)

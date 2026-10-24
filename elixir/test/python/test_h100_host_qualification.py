@@ -184,6 +184,36 @@ class HostQualificationLauncherTests(unittest.TestCase):
 
             self.assertEqual(key(str(mix_link)), "1-19-otp-28")
 
+    def test_mix_runtime_key_uses_versioned_mix_home_for_unversioned_path(self):
+        key = getattr(runner, "mix_rebar_home_key", None)
+        self.assertTrue(callable(key), "proof build cannot select its matching Rebar3 binary")
+        with tempfile.TemporaryDirectory(prefix="h100-mix-home-layout-") as directory:
+            root = pathlib.Path(directory)
+            mix_shim = root / "mise/shims/mix"
+            mix_shim.parent.mkdir(parents=True)
+            mix_shim.write_text("#!/bin/sh\n", encoding="ascii")
+            mix_home = root / "mise/installs/elixir/1.19.5-otp-28/.mix"
+            mix_home.mkdir(parents=True)
+
+            self.assertEqual(
+                key(str(mix_shim), mix_home=str(mix_home)),
+                "1-19-otp-28",
+            )
+
+    def test_mix_runtime_key_rejects_disagreeing_executable_and_mix_home(self):
+        key = getattr(runner, "mix_rebar_home_key", None)
+        self.assertTrue(callable(key), "proof build cannot select its matching Rebar3 binary")
+        with tempfile.TemporaryDirectory(prefix="h100-mix-home-mismatch-") as directory:
+            root = pathlib.Path(directory)
+            mix_path = root / "elixir/1.19.3-otp-28/bin/mix"
+            mix_path.parent.mkdir(parents=True)
+            mix_path.write_text("#!/bin/sh\n", encoding="ascii")
+            mix_home = root / "elixir/1.19.5-otp-27/.mix"
+            mix_home.mkdir(parents=True)
+
+            with self.assertRaises(runner.QualificationFailure):
+                key(str(mix_path), mix_home=str(mix_home))
+
     def test_proof_failure_summary_uses_only_bounded_exception_classes(self):
         detail = runner.proof_failure_detail(
             1,
