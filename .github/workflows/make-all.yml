@@ -112,6 +112,9 @@ jobs:
       - name: Run specs and Credo
         run: make -C elixir lint
 
+      - name: Run H100 relay Python unit tests
+        run: make -C elixir python-test
+
   linux-coverage-partitions:
     name: linux-coverage-partition-${{ matrix.partition }}
     runs-on: ubuntu-latest

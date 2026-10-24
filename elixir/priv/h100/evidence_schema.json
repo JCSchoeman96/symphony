@@ -1,0 +1,136 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://symphony.local/h100/p0/qualification-evidence/v1",
+  "title": "H100 P0 local host relay qualification evidence",
+  "schema_version": 1,
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["type", "schema_version", "qualified", "evidence"],
+  "properties": {
+    "type": {"const": "QUALIFICATION_RESULT"},
+    "schema_version": {"const": 1},
+    "qualified": {"const": true},
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "policy_mechanism", "policy_scope", "pre_spawn_deny_all_verified",
+        "pre_spawn_deny_rule_handle", "proof_identity", "relay_identity",
+        "relay_bound_host", "relay_bound_port", "relay_listener_socket_inode",
+        "second_exact_port_policy_verified", "stage_b_allow_rule_handle",
+        "stage_b_deny_rule_handle", "manifest_sha256", "relay_script_sha256",
+        "provider_request_id", "connect_count", "upstream_connection_count",
+        "client_application_data_record_count", "origin_request_count", "complete_request",
+        "server_application_data_observed", "server_application_data_forwarded",
+        "suppressed_encrypted_record_length", "suppressed_encrypted_record_sha256",
+        "finch_result", "retry_count", "replay_count", "ipv4_egress_canary",
+        "ipv6_egress_canary", "proof_drop_packets_after_canaries",
+        "unrelated_control_exchange", "tls_version", "tls_verify_peer",
+        "tls_hostname_verification", "shared_trust_unchanged", "trust_material_removed",
+        "policy_deny_all_restored", "policy_table_removed_and_verified",
+        "proof_process_stopped", "relay_process_stopped", "origin_process_stopped",
+        "controller_socket_removed", "manifest_finch_absent_before_ready",
+        "finch_started_after_ready_validation", "ready_withheld_until_stage_b_verified",
+        "non_proof_control_exchange", "implementation_head_sha", "implementation_head_tree",
+        "implementation_base", "spec_commit"
+      ],
+      "properties": {
+        "policy_mechanism": {"type": "string", "maxLength": 256},
+        "policy_scope": {
+          "type": "object", "additionalProperties": false,
+          "required": ["proof_uid", "relay_uid", "origin_uid", "netns_inode", "userns_inode", "proof_cgroup", "proof_uid_map"],
+          "properties": {
+            "proof_uid": {"type": "integer", "minimum": 0},
+            "relay_uid": {"type": "integer", "minimum": 0},
+            "origin_uid": {"type": "integer", "minimum": 0},
+            "netns_inode": {"type": "integer", "minimum": 1},
+            "userns_inode": {"type": "integer", "minimum": 1},
+            "proof_cgroup": {"type": "string", "maxLength": 1024},
+            "proof_uid_map": {"type": "array", "maxItems": 16, "items": {
+              "type": "object", "additionalProperties": false,
+              "required": ["inside", "outside", "length"],
+              "properties": {
+                "inside": {"type": "integer", "minimum": 0},
+                "outside": {"type": "integer", "minimum": 0},
+                "length": {"type": "integer", "minimum": 1}
+              }
+            }}
+          }
+        },
+        "pre_spawn_deny_all_verified": {"type": "boolean"},
+        "pre_spawn_deny_rule_handle": {"type": "integer", "minimum": 1},
+        "proof_identity": {"$ref": "#/$defs/process_identity"},
+        "relay_identity": {"$ref": "#/$defs/process_identity"},
+        "relay_bound_host": {"const": "127.0.0.1"},
+        "relay_bound_port": {"type": "integer", "minimum": 1, "maximum": 65535},
+        "relay_listener_socket_inode": {"type": "integer", "minimum": 1},
+        "second_exact_port_policy_verified": {"const": true},
+        "stage_b_allow_rule_handle": {"type": "integer", "minimum": 1},
+        "stage_b_deny_rule_handle": {"type": "integer", "minimum": 1},
+        "manifest_sha256": {"$ref": "#/$defs/sha256"},
+        "relay_script_sha256": {"$ref": "#/$defs/sha256"},
+        "provider_request_id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "connect_count": {"const": 1},
+        "upstream_connection_count": {"const": 1},
+        "client_application_data_record_count": {"const": 1},
+        "origin_request_count": {"const": 1},
+        "complete_request": {"const": true},
+        "server_application_data_observed": {"const": true},
+        "server_application_data_forwarded": {"const": false},
+        "suppressed_encrypted_record_length": {"type": "integer", "minimum": 6, "maximum": 18437},
+        "suppressed_encrypted_record_sha256": {"$ref": "#/$defs/sha256"},
+        "finch_result": {"const": "transport_failure"},
+        "retry_count": {"const": 0},
+        "replay_count": {"const": 0},
+        "ipv4_egress_canary": {"const": "blocked"},
+        "ipv6_egress_canary": {"const": "blocked"},
+        "proof_drop_packets_after_canaries": {"type": "integer", "minimum": 2},
+        "unrelated_control_exchange": {"const": "passed"},
+        "tls_version": {"const": "TLSv1.2"},
+        "tls_verify_peer": {"const": true},
+        "tls_hostname_verification": {"const": true},
+        "shared_trust_unchanged": {"const": true},
+        "trust_material_removed": {"const": true},
+        "policy_deny_all_restored": {"const": true},
+        "policy_table_removed_and_verified": {"const": true},
+        "proof_process_stopped": {"const": true},
+        "relay_process_stopped": {"const": true},
+        "origin_process_stopped": {"const": true},
+        "controller_socket_removed": {"const": true},
+        "manifest_finch_absent_before_ready": {"const": true},
+        "finch_started_after_ready_validation": {"const": true},
+        "ready_withheld_until_stage_b_verified": {"const": true},
+        "non_proof_control_exchange": {"const": "passed"},
+        "implementation_head_sha": {"$ref": "#/$defs/git_sha"},
+        "implementation_head_tree": {"$ref": "#/$defs/git_sha"},
+        "implementation_base": {"const": "5b3ecadeafa3c43ece8fe43099be56892d11d410"},
+        "spec_commit": {"const": "5b3ecadeafa3c43ece8fe43099be56892d11d410"}
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "git_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "process_identity": {
+      "type": "object", "additionalProperties": false,
+      "required": ["pid", "uid", "uid_map", "netns_inode", "userns_inode", "cgroup", "cap_eff"],
+      "properties": {
+        "pid": {"type": "integer", "minimum": 1},
+        "uid": {"type": "integer", "minimum": 0},
+        "uid_map": {"type": "array", "maxItems": 16, "items": {
+          "type": "object", "additionalProperties": false,
+          "required": ["inside", "outside", "length"],
+          "properties": {
+            "inside": {"type": "integer", "minimum": 0},
+            "outside": {"type": "integer", "minimum": 0},
+            "length": {"type": "integer", "minimum": 1}
+          }
+        }},
+        "netns_inode": {"type": "integer", "minimum": 1},
+        "userns_inode": {"type": "integer", "minimum": 1},
+        "cgroup": {"type": "string", "maxLength": 1024},
+        "cap_eff": {"const": "0"}
+      }
+    }
+  }
+}
