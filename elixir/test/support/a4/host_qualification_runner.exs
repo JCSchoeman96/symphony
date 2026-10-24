@@ -119,11 +119,14 @@ defmodule SymphonyElixir.H100HostQualificationRunner do
     ack_count = :atomics.new(1, signed: false)
     canary_evidence = SymphonyElixir.A4HostQualificationProof.new_canary_evidence()
 
+    %{dispatch_ms: dispatch_timeout_ms, ipc_ms: witness_ipc_timeout_ms} =
+      SymphonyElixir.A4HostQualificationProof.dispatch_timeouts()
+
     response =
       Client.update_work_item_state(config, "work-1", "state-1",
         provider_mutation_envelope: envelope,
         dispatch_witness_required?: true,
-        dispatch_witness_timeout_ms: @timeout_ms,
+        dispatch_witness_timeout_ms: dispatch_timeout_ms,
         dispatch_witness_sink: witness_sink(socket, request_id, ipv4_port, ipv6_port, ack_count, canary_evidence),
         a4_session: token,
         a4_proof_cacerts: [ca_der]
@@ -283,7 +286,7 @@ defmodule SymphonyElixir.H100HostQualificationRunner do
                   "ipv6" => Atom.to_string(canaries.ipv6)
                 }
               },
-              @timeout_ms
+              witness_ipc_timeout_ms
             )} do
         {:ok, {:ok, %{"verified" => true, "proof_drop_packets" => count}}}
         when is_integer(count) and count in 0..1_000_000 ->

@@ -2,6 +2,10 @@ defmodule SymphonyElixir.A4HostQualificationProof do
   @moduledoc false
 
   @evidence_size 5
+  @dispatch_timeout_ms 5_000
+  @ipc_timeout_ms 4_000
+
+  def dispatch_timeouts, do: %{dispatch_ms: @dispatch_timeout_ms, ipc_ms: @ipc_timeout_ms}
 
   def new_canary_evidence, do: :atomics.new(@evidence_size, signed: false)
 

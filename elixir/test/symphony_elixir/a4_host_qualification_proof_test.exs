@@ -20,6 +20,14 @@ defmodule SymphonyElixir.A4HostQualificationProofTest do
     assert :unexpected_success = A4HostQualificationProof.classify_transport(:ok)
   end
 
+  test "qualification witness and IPC deadlines fit the witness timeout bound" do
+    %{dispatch_ms: dispatch_ms, ipc_ms: ipc_ms} = A4HostQualificationProof.dispatch_timeouts()
+
+    assert SymphonyElixir.WorkControl.ProviderDispatchWitness.valid_timeout?(dispatch_ms)
+    assert ipc_ms > 0
+    assert ipc_ms < dispatch_ms
+  end
+
   test "canary evidence written by the isolated witness process is visible to its parent" do
     evidence = A4HostQualificationProof.new_canary_evidence()
 
