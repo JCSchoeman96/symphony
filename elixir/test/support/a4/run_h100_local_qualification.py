@@ -53,6 +53,22 @@ def _safe_failure_reason(value):
     return value
 
 
+def _safe_manifest_failure(reason):
+    if reason == "manifest_request_shape":
+        return reason
+    prefix = "manifest_request_mismatch:"
+    if isinstance(reason, str) and reason.startswith(prefix):
+        fields = reason[len(prefix):].split(",")
+        allowed = {
+            "provider_request_id", "transition_attempt_id", "work_item_id", "workspace_id",
+            "project_id", "target_state_id", "candidate_sha", "candidate_tree",
+            "origin_base_url", "origin_authority", "method", "body_bytes", "path_bytes",
+        }
+        if fields and all(field in allowed for field in fields):
+            return prefix + ",".join(fields)
+    return "manifest_handler_failed"
+
+
 def proof_stderr_category(stderr):
     """Classify startup diagnostics without returning their text or paths."""
     if not isinstance(stderr, bytes) or not stderr:
@@ -769,16 +785,25 @@ def _manifest_for(request, expected, *, head, tree, relay_hash, python_path, pyt
         "origin_authority", "method", "body_bytes", "path_bytes",
     }
     if not isinstance(request, dict) or set(request) != required:
-        raise QualificationFailure("A4 manifest request differs from the accepted request contract")
-    if (request["provider_request_id"] != expected["provider_request_id"] or
-            request["transition_attempt_id"] != expected["transition_attempt_id"] or
-            request["work_item_id"] != "work-1" or request["workspace_id"] != "workspace-1" or
-            request["project_id"] != "project-1" or request["target_state_id"] != "state-1" or
-            request["candidate_sha"] != head or request["candidate_tree"] != tree or
-            request["origin_base_url"] != expected["origin_url"] or
-            request["origin_authority"] != expected["origin_authority"] or request["method"] != "PATCH" or
-            request["body_bytes"] != expected["body_bytes"] or request["path_bytes"] != len(EXPECTED_PATH.encode())):
-        raise QualificationFailure("A4 manifest request does not match the captured local PATCH")
+        raise QualificationFailure("manifest_request_shape")
+    checks = {
+        "provider_request_id": request["provider_request_id"] == expected["provider_request_id"],
+        "transition_attempt_id": request["transition_attempt_id"] == expected["transition_attempt_id"],
+        "work_item_id": request["work_item_id"] == "work-1",
+        "workspace_id": request["workspace_id"] == "workspace-1",
+        "project_id": request["project_id"] == "project-1",
+        "target_state_id": request["target_state_id"] == "state-1",
+        "candidate_sha": request["candidate_sha"] == head,
+        "candidate_tree": request["candidate_tree"] == tree,
+        "origin_base_url": request["origin_base_url"] == expected["origin_url"],
+        "origin_authority": request["origin_authority"] == expected["origin_authority"],
+        "method": request["method"] == "PATCH",
+        "body_bytes": request["body_bytes"] == expected["body_bytes"],
+        "path_bytes": request["path_bytes"] == len(EXPECTED_PATH.encode()),
+    }
+    mismatches = sorted(name for name, matches in checks.items() if not matches)
+    if mismatches:
+        raise QualificationFailure("manifest_request_mismatch:" + ",".join(mismatches))
     manifest = {
         "schema": "a4-v2_1",
         "manifest_id": "local-qualification-" + request["provider_request_id"],
@@ -1278,7 +1303,8 @@ def _inside_main(repo_root, temp_root, head, tree, request_id, outside_control_p
         expected = {"provider_request_id": request_id, "origin_authority": origin_authority,
                     "origin_url": origin_url, "transition_attempt_id": None,
                     "path": None, "body_bytes": None, "body_sha256": None}
-        state = {"manifest": None, "ready": None, "egress": None, "control_passed": False}
+        state = {"manifest": None, "manifest_failure": None, "ready": None,
+                 "egress": None, "control_passed": False}
 
         def handler(message, peer):
             operation = message["op"]
@@ -1301,11 +1327,19 @@ def _inside_main(repo_root, temp_root, head, tree, request_id, outside_control_p
                 return {"verified": True}
             if operation == "manifest":
                 if expected["path"] is None:
+                    state["manifest_failure"] = "manifest_before_capture"
                     raise QualificationFailure("manifest arrived before the captured request")
                 payload = message.get("request")
-                response = _manifest_for(payload, expected, head=head, tree=tree,
-                                         relay_hash=hashlib.sha256(relay_path.read_bytes()).hexdigest(),
-                                         python_path=python_path, python_version=sys.version.split()[0])
+                try:
+                    response = _manifest_for(payload, expected, head=head, tree=tree,
+                                             relay_hash=hashlib.sha256(relay_path.read_bytes()).hexdigest(),
+                                             python_path=python_path, python_version=sys.version.split()[0])
+                except QualificationFailure as error:
+                    state["manifest_failure"] = _safe_manifest_failure(str(error))
+                    raise
+                except Exception:
+                    state["manifest_failure"] = "manifest_handler_failed"
+                    raise
                 state["manifest"] = response
                 return response
             if operation == "ready":
@@ -1378,8 +1412,11 @@ def _inside_main(repo_root, temp_root, head, tree, request_id, outside_control_p
         proof_result = _read_bounded_proof_result(result_path)
         if status_code != 0 or proof_result is None:
             proof_stderr_file.seek(0)
+            failure_detail = proof_failure_detail(status_code, proof_result, proof_stderr_file.read(8192))
+            if state["manifest_failure"] is not None:
+                failure_detail += ": " + state["manifest_failure"]
             raise QualificationFailure(
-                proof_failure_detail(status_code, proof_result, proof_stderr_file.read(8192))
+                failure_detail
             )
         if proof_result.get("type") != "PROOF_RESULT":
             raise QualificationFailure("proof BEAM did not produce a bounded result")

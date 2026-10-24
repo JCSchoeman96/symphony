@@ -116,6 +116,35 @@ class HostQualificationLauncherTests(unittest.TestCase):
         )
         self.assertEqual(detail, "proof BEAM failed with an invalid bounded result")
 
+    def test_manifest_request_failure_reports_only_mismatched_field_names(self):
+        request = {
+            "provider_request_id": "preq_fixture",
+            "transition_attempt_id": "attempt-fixture",
+            "work_item_id": "work-1",
+            "workspace_id": "workspace-1",
+            "project_id": "project-1",
+            "target_state_id": "state-1",
+            "candidate_sha": "c" * 40,
+            "candidate_tree": "b" * 40,
+            "origin_base_url": "https://127.0.0.1:44321",
+            "origin_authority": "127.0.0.1:44321",
+            "method": "PATCH",
+            "body_bytes": 16,
+            "path_bytes": len(runner.EXPECTED_PATH.encode()),
+        }
+        expected = {
+            "provider_request_id": "preq_fixture",
+            "transition_attempt_id": "attempt-fixture",
+            "origin_url": "https://127.0.0.1:44321",
+            "origin_authority": "127.0.0.1:44321",
+            "body_bytes": 16,
+        }
+        with self.assertRaisesRegex(runner.QualificationFailure, "^manifest_request_mismatch:candidate_sha$"):
+            runner._manifest_for(
+                request, expected, head="a" * 40, tree="b" * 40,
+                relay_hash="d" * 64, python_path="/usr/bin/python3", python_version="3.14.0",
+            )
+
     def test_outer_launcher_does_not_require_namespace_only_arguments(self):
         with patch.object(runner, "outer_main", return_value={"type": "TEST_RESULT"}) as outer:
             with patch.object(runner, "_write_status"):
