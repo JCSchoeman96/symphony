@@ -191,6 +191,7 @@ def proof_failure_detail(status_code, result, stderr=b""):
         "request_identity_mismatch",
         "direct_egress_not_denied", "canary_probe_failed", "local_qualification_gate_failed",
         "sink_rejected", "sink_timeout", "sink_unavailable", "sink_exception",
+        "dispatch_witness_failed_nested", "dispatch_witness_failed_other",
         "econnrefused", "timeout", "closed",
     }
     manifest_failure_fields = {
@@ -204,6 +205,7 @@ def proof_failure_detail(status_code, result, stderr=b""):
     if not isinstance(result["failure_code"], str):
         return "proof BEAM failed with an invalid bounded result"
     if (result["failure_code"] not in proof_failure_codes and
+            not _bounded_dispatch_failure_code(result["failure_code"]) and
             not any(result["failure_code"] == "proof_manifest_mismatch_" + field
                     for field in manifest_failure_fields)):
         return "proof BEAM failed with an invalid bounded result"
@@ -242,6 +244,15 @@ def proof_failure_detail(status_code, result, stderr=b""):
             detail += " [" + ",".join(diagnostics) + "]"
         return detail[:160]
     return "proof BEAM exited nonzero after an accepted bounded result"
+
+
+def _bounded_dispatch_failure_code(value):
+    prefix = "dispatch_witness_failed_"
+    if not isinstance(value, str) or not value.startswith(prefix):
+        return False
+    suffix = value[len(prefix):]
+    return (1 <= len(suffix) <= 64 and "a" <= suffix[0] <= "z" and
+            all("a" <= char <= "z" or "0" <= char <= "9" or char == "_" for char in suffix))
 
 
 def _read_bounded_proof_result(path):

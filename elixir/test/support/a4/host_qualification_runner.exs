@@ -489,11 +489,27 @@ defmodule SymphonyElixir.H100HostQualificationRunner do
   defp proof_result_failure_code({:error, {:dispatch_witness_failed, {:proof_finch_start_failed, _reason}}}),
     do: "proof_finch_start_failed"
 
-  defp proof_result_failure_code({:error, {:dispatch_witness_failed, _reason}}), do: "dispatch_witness_failed"
+  defp proof_result_failure_code({:error, {:dispatch_witness_failed, reason}}) when is_atom(reason),
+    do: bounded_witness_failure_code(reason)
+
+  defp proof_result_failure_code({:error, {:dispatch_witness_failed, reason}}) when is_tuple(reason),
+    do: "dispatch_witness_failed_nested"
+
+  defp proof_result_failure_code({:error, {:dispatch_witness_failed, _reason}}),
+    do: "dispatch_witness_failed_other"
+
   defp proof_result_failure_code({:error, :provider_unavailable}), do: "provider_unavailable"
   defp proof_result_failure_code({:error, reason}) when reason in [:econnrefused, :timeout, :closed], do: Atom.to_string(reason)
   defp proof_result_failure_code({:error, _error}), do: "transport_failure"
   defp proof_result_failure_code(_result), do: "unexpected_success"
+
+  defp bounded_witness_failure_code(reason) do
+    suffix = Atom.to_string(reason)
+
+    if Regex.match?(~r/\A[a-z][a-z0-9_]{0,63}\z/, suffix),
+      do: "dispatch_witness_failed_" <> suffix,
+      else: "dispatch_witness_failed_other"
+  end
 
   defp sha256(value), do: :crypto.hash(:sha256, value) |> Base.encode16(case: :lower)
 
