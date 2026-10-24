@@ -453,6 +453,12 @@ defmodule SymphonyElixir.H100HostQualificationRunner do
             ],
        do: Atom.to_string(reason)
 
+  defp proof_result_failure_code({:error, {:dispatch_witness_failed, {:proof_finch_start_failed, :already_started}}}),
+    do: "proof_finch_already_started"
+
+  defp proof_result_failure_code({:error, {:dispatch_witness_failed, {:proof_finch_start_failed, _reason}}}),
+    do: "proof_finch_start_failed"
+
   defp proof_result_failure_code({:error, {:dispatch_witness_failed, _reason}}), do: "dispatch_witness_failed"
   defp proof_result_failure_code({:error, :provider_unavailable}), do: "provider_unavailable"
   defp proof_result_failure_code({:error, reason}) when reason in [:econnrefused, :timeout, :closed], do: Atom.to_string(reason)
