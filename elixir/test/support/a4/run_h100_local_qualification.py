@@ -369,6 +369,17 @@ def _process_identity(pid, expected_uid):
     raise QualificationFailure("qualification process did not become inspectable")
 
 
+def proof_process_identity(process):
+    """Inspect the proof PID and report only its exit status if it exited early."""
+    try:
+        return _process_identity(process.pid, PROOF_UID)
+    except QualificationFailure as exc:
+        status = process.poll()
+        if status is not None:
+            raise QualificationFailure(f"proof BEAM exited before identity check with status {status}") from exc
+        raise
+
+
 def _pid_socket_inodes(pid):
     return process_socket_inodes(pid)
 
@@ -1107,7 +1118,7 @@ def _inside_main(repo_root, temp_root, head, tree, request_id, outside_control_p
         proof_process = subprocess.Popen(proof_command, cwd=str(source_elixir), stdin=subprocess.DEVNULL,
                                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                          env=proof_environment, start_new_session=True)
-        proof_identity = _process_identity(proof_process.pid, PROOF_UID)
+        proof_identity = proof_process_identity(proof_process)
         control_server.expected_pid = proof_process.pid
         control_server.start()
         status_code = proof_process.wait(timeout=55)

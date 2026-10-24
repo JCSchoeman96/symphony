@@ -150,6 +150,18 @@ class HostQualificationLauncherTests(unittest.TestCase):
         child = runner.child_environment({}, home="/tmp/proof-home", runtime_path=runtime_path)
         self.assertEqual(child["PATH"], runtime_path + ":" + runner.SYSTEM_PATH)
 
+    def test_proof_identity_failure_reports_only_child_exit_status(self):
+        class ExitedProcess:
+            pid = 321
+
+            @staticmethod
+            def poll():
+                return 127
+
+        with patch.object(runner, "_process_identity", side_effect=runner.QualificationFailure("identity")):
+            with self.assertRaisesRegex(runner.QualificationFailure, "status 127"):
+                runner.proof_process_identity(ExitedProcess())
+
     def test_origin_summary_must_match_the_exact_patch_without_returning_payload(self):
         raw = ('{"type":"LOCAL_TLS_RESULT","request_count":1,"complete_request":true,'
                '"method":"PATCH","path":"/api/v1/work-items/work-1/",'
