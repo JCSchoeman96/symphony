@@ -50,6 +50,63 @@ class HostQualificationLauncherTests(unittest.TestCase):
             with self.assertRaises(runner.QualificationFailure):
                 runner.candidate_change_inventory("/repo")
 
+    def test_candidate_inventory_uses_the_captured_head(self):
+        head = "f" * 40
+        with patch.object(runner, "_run_bounded", side_effect=[b"a" * 40 + b"\n",
+                                                                b"elixir/priv/h100/relay.py\n"]) as run:
+            runner.candidate_change_inventory("/repo", head=head)
+
+        self.assertIn(".." + head, run.call_args_list[0].args[0][-1])
+        self.assertIn(".." + head, run.call_args_list[1].args[0][-1])
+
+    def test_candidate_snapshot_uses_the_exact_git_tree_not_the_live_worktree(self):
+        snapshot_source = getattr(runner, "materialize_candidate_source_snapshot", None)
+        self.assertTrue(callable(snapshot_source), "qualification must build from an immutable candidate tree")
+        with tempfile.TemporaryDirectory(prefix="h100-source-snapshot-") as directory:
+            root = pathlib.Path(directory)
+            repo = root / "repo"
+            source = repo / "elixir/lib/candidate.ex"
+            runner_source = repo / "elixir/test/support/a4/run_h100_local_qualification.py"
+            source.parent.mkdir(parents=True)
+            runner_source.parent.mkdir(parents=True)
+            source.write_text("committed source", encoding="ascii")
+            runner_source.write_text("committed qualification runner", encoding="ascii")
+            env = {
+                "PATH": runner.SYSTEM_PATH,
+                "LANG": "C.UTF-8",
+                "GIT_CONFIG_GLOBAL": "/dev/null",
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_TERMINAL_PROMPT": "0",
+            }
+            subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True, env=env)
+            subprocess.run(["git", "-C", str(repo), "config", "user.name", "H100 test"],
+                           check=True, env=env)
+            subprocess.run(["git", "-C", str(repo), "config", "user.email", "h100-test@example.invalid"],
+                           check=True, env=env)
+            subprocess.run(["git", "-C", str(repo), "add", "elixir/lib/candidate.ex",
+                            "elixir/test/support/a4/run_h100_local_qualification.py"], check=True, env=env)
+            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "candidate source"], check=True, env=env)
+            head = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], env=env).decode().strip()
+            tree = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD^{tree}"],
+                                           env=env).decode().strip()
+            source.write_text("changed live worktree", encoding="ascii")
+            (repo / "untracked.txt").write_text("not in candidate", encoding="ascii")
+            snapshot = root / "candidate-source"
+
+            actual = snapshot_source(str(repo), str(snapshot), head, tree)
+
+            self.assertEqual(actual, str(snapshot))
+            self.assertEqual((snapshot / "elixir/lib/candidate.ex").read_text(encoding="ascii"),
+                             "committed source")
+            runner_path = runner.candidate_qualification_runner_path(str(snapshot))
+            self.assertEqual(pathlib.Path(runner_path).read_text(encoding="ascii"),
+                             "committed qualification runner")
+            self.assertFalse((snapshot / "untracked.txt").exists())
+            self.assertFalse((snapshot / ".git").exists())
+            with self.assertRaises(runner.QualificationFailure):
+                snapshot_source(str(repo), str(root / "wrong-tree"), head, "0" * 40)
+            self.assertFalse((root / "wrong-tree").exists())
+
     def test_unrelated_control_listener_starts_only_when_requested(self):
         listener, port, result, thread = runner._outer_listener()
         try:
@@ -213,6 +270,104 @@ class HostQualificationLauncherTests(unittest.TestCase):
 
             with self.assertRaises(runner.QualificationFailure):
                 key(str(mix_path), mix_home=str(mix_home))
+
+    def test_mix_shim_resolves_to_the_matching_versioned_install(self):
+        resolve = getattr(runner, "resolve_mix_runtime_paths", None)
+        self.assertTrue(callable(resolve), "qualification must bypass mise shims in its clean environment")
+        with tempfile.TemporaryDirectory(prefix="h100-mix-shim-") as directory:
+            root = pathlib.Path(directory)
+            install = root / "installs/elixir/1.19.5-otp-28"
+            mix_home = install / ".mix"
+            mix_home.mkdir(parents=True)
+            bin_path = install / "bin"
+            bin_path.mkdir()
+            installed_mix = bin_path / "mix"
+            installed_elixir = bin_path / "elixir"
+            installed_mix.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
+            installed_elixir.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
+            installed_mix.chmod(0o700)
+            installed_elixir.chmod(0o700)
+            shim_path = root / "shims/mix"
+            shim_path.parent.mkdir()
+            shim_path.write_text("mise shim sentinel", encoding="ascii")
+            shim_path.chmod(0o700)
+            shim_elixir = shim_path.parent / "elixir"
+            shim_elixir.write_text("mise shim sentinel", encoding="ascii")
+            shim_elixir.chmod(0o700)
+
+            actual = resolve(str(shim_path), str(mix_home))
+
+            self.assertEqual(actual, (str(installed_mix), str(installed_elixir)))
+
+    def test_mix_runtime_resolution_rejects_a_mismatched_mix_home(self):
+        resolve = getattr(runner, "resolve_mix_runtime_paths", None)
+        self.assertTrue(callable(resolve), "qualification must bind Mix to its selected install")
+        with tempfile.TemporaryDirectory(prefix="h100-mix-shim-mismatch-") as directory:
+            root = pathlib.Path(directory)
+            install = root / "elixir/1.19.5-otp-28"
+            (install / ".mix").mkdir(parents=True)
+            (install / "bin").mkdir()
+            for name in ("mix", "elixir"):
+                executable = install / "bin" / name
+                executable.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
+                executable.chmod(0o700)
+            wrong_home = root / "elixir/1.19.5-otp-27/.mix"
+            wrong_home.mkdir(parents=True)
+
+            with self.assertRaises(runner.QualificationFailure):
+                resolve(str(install / "bin/mix"), str(wrong_home))
+
+    def test_fresh_proof_build_bypasses_mise_shim_in_the_clean_environment(self):
+        with tempfile.TemporaryDirectory(prefix="h100-mix-shim-build-") as directory:
+            root = pathlib.Path(directory)
+            install = root / "installs/elixir/1.19.5-otp-28"
+            mix_home = install / ".mix"
+            mix_home.mkdir(parents=True)
+            bin_path = install / "bin"
+            bin_path.mkdir()
+            installed_mix = bin_path / "mix"
+            installed_elixir = bin_path / "elixir"
+            for executable in (installed_mix, installed_elixir):
+                executable.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
+                executable.chmod(0o700)
+            shim = root / "mise/shims/mix"
+            shim.parent.mkdir(parents=True)
+            shim.write_text("#!/bin/sh\nexit 97\n", encoding="ascii")
+            shim.chmod(0o700)
+            elixir_shim = shim.parent / "elixir"
+            elixir_shim.write_text("#!/bin/sh\nexit 97\n", encoding="ascii")
+            elixir_shim.chmod(0o700)
+            erlang = root / "erlang/bin/erl"
+            erlang.parent.mkdir(parents=True)
+            erlang.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
+            erlang.chmod(0o700)
+            project = root / "project"
+            (project / "lib").mkdir(parents=True)
+            (project / "mix.exs").write_text(
+                "defmodule ShimBuild.MixProject do\n"
+                "  use Mix.Project\n"
+                "  def project, do: [app: :shim_build, version: \"0.1.0\"]\n"
+                "  def application, do: []\n"
+                "end\n",
+                encoding="utf-8",
+            )
+            (project / "mix.lock").write_text("%{}\n", encoding="ascii")
+            with (patch.object(runner, "prepare_isolated_mix_home", return_value={
+                    "hex_version": "2.5.1", "hex_archive_sha256": "c" * 64, "rebar3_sha256": "d" * 64,
+                 }),
+                  patch.object(runner, "_run_bounded") as run,
+                  patch.object(runner, "_seal_proof_build"),
+                  patch.object(runner, "build_artifact_inventory", return_value={
+                      "artifact_count": 1, "artifact_inventory_sha256": "e" * 64,
+                  })):
+                runner.compile_fresh_proof_build(
+                    str(shim), str(project), str(root / "proof-build"), home=str(root / "build-home"),
+                    runtime_path=runner.runtime_path_for(str(shim), str(installed_elixir), str(erlang)),
+                    source_head_sha="a" * 40, source_tree_sha="b" * 40, source_mix_home=str(mix_home),
+                )
+
+            self.assertEqual(run.call_args.args[0][0], str(installed_mix))
+            self.assertNotIn(str(shim.parent), run.call_args.kwargs["env"]["PATH"].split(os.pathsep))
 
     def test_proof_failure_summary_uses_only_bounded_exception_classes(self):
         detail = runner.proof_failure_detail(

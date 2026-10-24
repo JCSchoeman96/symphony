@@ -344,19 +344,12 @@ def _build_environment(mix_build_path, *, home, runtime_path):
     }
 
 
-def mix_rebar_home_key(mix_path, *, mix_home=None):
-    if not isinstance(mix_path, str) or not mix_path.startswith("/") or "\x00" in mix_path:
-        raise QualificationFailure("Mix executable path is invalid")
-    if (mix_home is not None and
-            (not isinstance(mix_home, str) or not mix_home.startswith("/") or "\x00" in mix_home)):
-        raise QualificationFailure("Mix home path is invalid")
-    paths = [pathlib.Path(mix_path)]
-    if mix_home is not None:
-        paths.append(pathlib.Path(mix_home))
+def _mix_rebar_keys(paths):
     install_pattern = re.compile(r"(\d+)\.(\d+)(?:\.\d+)?-otp-(\d+)")
     rebar_keys = set()
     try:
         for path in paths:
+            path = pathlib.Path(path)
             for candidate in (path, path.resolve()):
                 for parent in candidate.parents:
                     match = install_pattern.fullmatch(parent.name)
@@ -364,11 +357,72 @@ def mix_rebar_home_key(mix_path, *, mix_home=None):
                         rebar_keys.add(f"{match.group(1)}-{match.group(2)}-otp-{match.group(3)}")
     except (OSError, RuntimeError) as exc:
         raise QualificationFailure("Mix runtime path could not be resolved") from exc
+    return rebar_keys
+
+
+def mix_rebar_home_key(mix_path, *, mix_home=None):
+    if not isinstance(mix_path, str) or not mix_path.startswith("/") or "\x00" in mix_path:
+        raise QualificationFailure("Mix executable path is invalid")
+    if (mix_home is not None and
+            (not isinstance(mix_home, str) or not mix_home.startswith("/") or "\x00" in mix_home)):
+        raise QualificationFailure("Mix home path is invalid")
+    paths = [mix_path]
+    if mix_home is not None:
+        paths.append(mix_home)
+    rebar_keys = _mix_rebar_keys(paths)
     if len(rebar_keys) == 1:
         return rebar_keys.pop()
     if len(rebar_keys) > 1:
         raise QualificationFailure("Mix executable and home identify different Rebar3 homes")
     raise QualificationFailure("Mix runtime path does not identify its Rebar3 home")
+
+
+def resolve_mix_runtime_paths(mix_path, mix_home):
+    """Resolve a Mix shim to its matching installed Elixir runtime without executing it."""
+    if (not isinstance(mix_path, str) or not mix_path.startswith("/") or "\x00" in mix_path or
+            not isinstance(mix_home, str) or not mix_home.startswith("/") or "\x00" in mix_home):
+        raise QualificationFailure("Mix runtime inputs are invalid")
+
+    def executable(path):
+        try:
+            resolved = path.resolve(strict=True)
+            metadata = resolved.stat(follow_symlinks=False)
+        except (OSError, RuntimeError):
+            return None
+        if not stat.S_ISREG(metadata.st_mode) or not os.access(resolved, os.X_OK):
+            return None
+        return resolved
+
+    selected_mix = executable(pathlib.Path(mix_path))
+    selected_elixir = None
+    if selected_mix is not None and selected_mix.name == "mix":
+        selected_elixir = executable(selected_mix.parent / "elixir")
+
+    mix_keys = _mix_rebar_keys([selected_mix]) if selected_mix is not None else set()
+    home_keys = _mix_rebar_keys([mix_home])
+    if (selected_elixir is None or len(mix_keys) != 1 or
+            (home_keys and (len(home_keys) != 1 or mix_keys != home_keys))):
+        if len(home_keys) != 1:
+            raise QualificationFailure("Mix executable does not match its selected Mix home")
+        try:
+            resolved_home = pathlib.Path(mix_home).resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise QualificationFailure("versioned Mix home could not be resolved") from exc
+        install_root = resolved_home.parent if resolved_home.name == ".mix" else None
+        install_pattern = re.compile(r"\d+\.\d+(?:\.\d+)?-otp-\d+")
+        if install_root is None or install_pattern.fullmatch(install_root.name) is None:
+            raise QualificationFailure("Mix shim has no matching versioned install")
+        selected_mix = executable(install_root / "bin/mix")
+        selected_elixir = executable(install_root / "bin/elixir")
+        if selected_mix is None or selected_elixir is None:
+            raise QualificationFailure("matching installed Mix runtime is unavailable")
+        mix_keys = _mix_rebar_keys([selected_mix])
+        if len(mix_keys) != 1 or mix_keys != home_keys:
+            raise QualificationFailure("resolved Mix runtime does not match its selected Mix home")
+
+    if selected_mix.name != "mix" or selected_elixir.name != "elixir":
+        raise QualificationFailure("resolved Mix runtime executables are invalid")
+    return str(selected_mix), str(selected_elixir)
 
 
 def _copy_mix_archive(source, destination):
@@ -710,12 +764,20 @@ def compile_fresh_proof_build(mix_path, project_path, build_path, *, home, runti
     if lock_path.is_symlink() or not lock_path.is_file():
         raise QualificationFailure("proof build lock file is unavailable")
     lock_digest = hashlib.sha256(lock_path.read_bytes()).hexdigest()
+    if source_mix_home is None:
+        source_mix_home = os.environ.get("MIX_HOME") or str(pathlib.Path.home() / ".mix")
+    mix_path, elixir_path = resolve_mix_runtime_paths(mix_path, source_mix_home)
+    if not _valid_runtime_path(runtime_path):
+        raise QualificationFailure("proof build runtime path is invalid")
+    erlang_executables = [pathlib.Path(directory) / "erl" for directory in runtime_path.split(os.pathsep)
+                          if (pathlib.Path(directory) / "erl").is_file()]
+    if len(erlang_executables) != 1:
+        raise QualificationFailure("pinned Erlang runtime installation is ambiguous")
+    runtime_path = runtime_path_for(mix_path, elixir_path, str(erlang_executables[0]))
     try:
         build_root.mkdir(parents=True, mode=0o700, exist_ok=False)
     except OSError as exc:
         raise QualificationFailure("fresh proof build directory could not be created") from exc
-    if source_mix_home is None:
-        source_mix_home = os.environ.get("MIX_HOME") or str(pathlib.Path.home() / ".mix")
     if rebar_key is None:
         rebar_key = mix_rebar_home_key(mix_path, mix_home=source_mix_home)
     mix_tools = prepare_isolated_mix_home(source_mix_home, str(pathlib.Path(home) / ".mix"),
@@ -740,6 +802,126 @@ def compile_fresh_proof_build(mix_path, project_path, build_path, *, home, runti
 
 def _valid_git_sha(value):
     return isinstance(value, str) and len(value) == 40 and all(char in "0123456789abcdef" for char in value)
+
+
+def materialize_candidate_source_snapshot(repo_root, destination_path, head_sha, tree_sha):
+    """Materialize raw Git blobs from one immutable commit into a fresh directory."""
+    if (not isinstance(repo_root, str) or not repo_root.startswith("/") or "\x00" in repo_root or
+            not isinstance(destination_path, str) or not destination_path.startswith("/") or
+            "\x00" in destination_path or not _valid_git_sha(head_sha) or
+            not _valid_git_sha(tree_sha)):
+        raise QualificationFailure("candidate source snapshot inputs are invalid")
+    try:
+        repository = pathlib.Path(repo_root).resolve(strict=True)
+        destination = pathlib.Path(destination_path).resolve(strict=False)
+        if not repository.is_dir() or destination == repository or destination.is_relative_to(repository):
+            raise QualificationFailure("candidate source snapshot destination is unsafe")
+        if destination.exists() or destination.is_symlink() or not destination.parent.is_dir():
+            raise QualificationFailure("candidate source snapshot path is not fresh")
+    except (OSError, RuntimeError) as exc:
+        raise QualificationFailure("candidate source snapshot paths are invalid") from exc
+
+    environment = {"PATH": SYSTEM_PATH, "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8",
+                   "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1",
+                   "GIT_TERMINAL_PROMPT": "0"}
+    captured_tree = _run_bounded(
+        ["git", "-C", str(repository), "rev-parse", "--verify", f"{head_sha}^{{tree}}"],
+        env=environment, timeout=5, max_output_bytes=128,
+    ).decode("ascii").strip()
+    if captured_tree != tree_sha:
+        raise QualificationFailure("candidate source tree does not match its captured commit")
+    listing = _run_bounded(
+        ["git", "-C", str(repository), "ls-tree", "-r", "-l", "-z", "--full-tree", head_sha],
+        env=environment, timeout=10, max_output_bytes=1_048_576,
+    )
+    records = listing.split(b"\0")
+    if records and records[-1] == b"":
+        records.pop()
+    if not records or len(records) > 50_000:
+        raise QualificationFailure("candidate source tree entry count is invalid")
+
+    entries = []
+    total_bytes = 0
+    seen_paths = set()
+    try:
+        for record in records:
+            metadata, separator, path_bytes = record.partition(b"\t")
+            fields = metadata.split()
+            if not separator or len(fields) != 4:
+                raise QualificationFailure("candidate source tree entry is malformed")
+            mode, object_type, object_id, raw_size = fields
+            if mode not in (b"100644", b"100755") or object_type != b"blob" or \
+                    re.fullmatch(rb"[0-9a-f]{40}", object_id) is None or \
+                    re.fullmatch(rb"[0-9]+", raw_size) is None:
+                raise QualificationFailure("candidate source tree contains an unsupported entry")
+            try:
+                relative = path_bytes.decode("utf-8", errors="strict")
+                size = int(raw_size)
+            except (UnicodeDecodeError, ValueError) as exc:
+                raise QualificationFailure("candidate source tree path or size is invalid") from exc
+            parts = relative.split("/")
+            if (not relative or len(path_bytes) > 4096 or relative.startswith("/") or
+                    any(part in ("", ".", "..") for part in parts) or
+                    any(ord(char) < 32 or ord(char) == 127 for char in relative) or
+                    relative in seen_paths or size > 536_870_912):
+                raise QualificationFailure("candidate source tree path or size is unsafe")
+            seen_paths.add(relative)
+            total_bytes += size
+            if total_bytes > 536_870_912:
+                raise QualificationFailure("candidate source tree exceeds its fixed size bound")
+            entries.append((relative, mode, object_id.decode("ascii"), size))
+    except (OverflowError, RecursionError) as exc:
+        raise QualificationFailure("candidate source tree exceeds its fixed bounds") from exc
+
+    try:
+        destination.mkdir(mode=0o755)
+        for relative, mode, object_id, expected_size in entries:
+            target = destination.joinpath(*relative.split("/"))
+            target.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+            with target.open("xb") as output:
+                subprocess.run(["git", "-C", str(repository), "cat-file", "blob", object_id],
+                               stdout=output, stderr=subprocess.DEVNULL, check=True, timeout=10,
+                               env=environment)
+            if target.stat(follow_symlinks=False).st_size != expected_size:
+                raise QualificationFailure("candidate source blob size changed during materialization")
+            digest = hashlib.sha1()
+            digest.update(f"blob {expected_size}\0".encode("ascii"))
+            with target.open("rb") as source:
+                for chunk in iter(lambda: source.read(65_536), b""):
+                    digest.update(chunk)
+            if digest.hexdigest() != object_id:
+                raise QualificationFailure("candidate source blob hash changed during materialization")
+            target.chmod(0o755 if mode == b"100755" else 0o644)
+        directories = sorted((path for path in destination.rglob("*") if path.is_dir()),
+                             key=lambda path: len(path.parts), reverse=True)
+        for directory in directories:
+            directory.chmod(0o755)
+        destination.chmod(0o755)
+        return str(destination)
+    except QualificationFailure:
+        if destination.exists() and not destination.is_symlink():
+            shutil.rmtree(destination, ignore_errors=True)
+        raise
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        if destination.exists() and not destination.is_symlink():
+            shutil.rmtree(destination, ignore_errors=True)
+        raise QualificationFailure("candidate source snapshot could not be materialized") from exc
+
+
+def candidate_qualification_runner_path(source_root):
+    """Return the runner committed in the isolated candidate source snapshot."""
+    if not isinstance(source_root, str) or not source_root.startswith("/") or "\x00" in source_root:
+        raise QualificationFailure("candidate qualification source path is invalid")
+    try:
+        root = pathlib.Path(source_root).resolve(strict=True)
+        runner_path = root / "elixir/test/support/a4/run_h100_local_qualification.py"
+        resolved_runner = runner_path.resolve(strict=True)
+        if (not root.is_dir() or runner_path.is_symlink() or not resolved_runner.is_file() or
+                not resolved_runner.is_relative_to(root)):
+            raise QualificationFailure("candidate qualification runner is outside its source snapshot")
+    except (OSError, RuntimeError) as exc:
+        raise QualificationFailure("candidate qualification runner is unavailable") from exc
+    return str(resolved_runner)
 
 
 def proof_elixir_command(elixir_path, build_provenance, script_path):
@@ -1850,16 +2032,18 @@ def verify_private_source_cleanliness(repo_root):
     return True
 
 
-def candidate_change_inventory(repo_root):
+def candidate_change_inventory(repo_root, *, head="HEAD"):
     """Return bounded commit and file inventories derived from the accepted base."""
+    if not _valid_git_sha(head) and head != "HEAD":
+        raise QualificationFailure("candidate inventory head is invalid")
     environment = {"PATH": SYSTEM_PATH, "LANG": "C.UTF-8", "GIT_CONFIG_GLOBAL": "/dev/null",
                    "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0"}
     commits = _run_bounded(
-        ["git", "-C", str(repo_root), "rev-list", "--reverse", IMPLEMENTATION_BASE + "..HEAD"],
+        ["git", "-C", str(repo_root), "rev-list", "--reverse", IMPLEMENTATION_BASE + ".." + head],
         env=environment, max_output_bytes=65_536,
     ).decode("ascii").splitlines()
     files = _run_bounded(
-        ["git", "-C", str(repo_root), "diff", "--name-only", IMPLEMENTATION_BASE + "..HEAD"],
+        ["git", "-C", str(repo_root), "diff", "--name-only", IMPLEMENTATION_BASE + ".." + head],
         env=environment, max_output_bytes=65_536,
     ).decode("ascii").splitlines()
     if (not 1 <= len(commits) <= 128 or not 1 <= len(files) <= 128 or
@@ -1897,12 +2081,14 @@ def outer_main(repo_root):
     tree = _run_bounded(["git", "-C", str(repo_root), "rev-parse", "HEAD^{tree}"],
                         env={"PATH": SYSTEM_PATH, "LANG": "C.UTF-8", "GIT_CONFIG_GLOBAL": "/dev/null",
                              "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0"}).decode().strip()
-    base = _run_bounded(["git", "-C", str(repo_root), "merge-base", IMPLEMENTATION_BASE, "HEAD"],
+    base = _run_bounded(["git", "-C", str(repo_root), "merge-base", IMPLEMENTATION_BASE, head],
                         env={"PATH": SYSTEM_PATH, "LANG": "C.UTF-8", "GIT_CONFIG_GLOBAL": "/dev/null",
                              "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0"}).decode().strip()
-    if base != IMPLEMENTATION_BASE or len(head) != 40 or len(tree) != 40:
+    if base != IMPLEMENTATION_BASE or not _valid_git_sha(head) or not _valid_git_sha(tree):
         raise QualificationFailure("candidate is not based on the accepted implementation base")
-    implementation_commits, implementation_files_changed = candidate_change_inventory(str(repo_root))
+    implementation_commits, implementation_files_changed = candidate_change_inventory(
+        str(repo_root), head=head
+    )
     unshare = shutil.which("unshare")
     if unshare is None:
         raise QualificationFailure("rootless user, network, and mount namespaces are required")
@@ -1911,12 +2097,20 @@ def outer_main(repo_root):
     erlang_path = shutil.which("erl")
     if mix_path is None or elixir_path is None or erlang_path is None:
         raise QualificationFailure("Mix and the Elixir/Erlang runtime are required")
-    runtime_path = runtime_path_for(mix_path, elixir_path, erlang_path)
     source_mix_home = os.environ.get("MIX_HOME") or str(pathlib.Path.home() / ".mix")
     if not source_mix_home.startswith("/") or "\x00" in source_mix_home:
         raise QualificationFailure("installed Mix tool home path is invalid")
+    mix_path, elixir_path = resolve_mix_runtime_paths(mix_path, source_mix_home)
+    runtime_path = runtime_path_for(mix_path, elixir_path, erlang_path)
 
     temp_root = pathlib.Path(tempfile.mkdtemp(prefix="h100-local-qualification-"))
+    candidate_source = temp_root / "candidate-source"
+    try:
+        materialize_candidate_source_snapshot(str(repo_root), str(candidate_source), head, tree)
+        copy_dependency_tree(str(repo_root / "elixir/deps"), str(candidate_source / "elixir/deps"))
+    except BaseException:
+        shutil.rmtree(temp_root, ignore_errors=True)
+        raise
     listener, outside_port, outside_result, outside_thread = _outer_listener()
     outside_thread_started = False
     process = None
@@ -1924,8 +2118,8 @@ def outer_main(repo_root):
                  "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1",
                  "GIT_TERMINAL_PROMPT": "0"}
     command = [unshare, *namespace_unshare_options(), "--", sys.executable, "-I",
-               str(pathlib.Path(__file__).resolve()),
-               "--inside", "--repo-root", str(repo_root), "--temp-root", str(temp_root),
+               candidate_qualification_runner_path(str(candidate_source)),
+               "--inside", "--repo-root", str(candidate_source), "--temp-root", str(temp_root),
                "--head", head, "--tree", tree, "--request-id", "preq_" + str(uuid.uuid4()),
                "--mix-path", mix_path, "--runtime-path", runtime_path,
                "--source-mix-home", source_mix_home,
@@ -2011,6 +2205,9 @@ def _inside_main(repo_root, temp_root, head, tree, request_id, outside_control_p
                  mix_path, runtime_path, source_mix_home):
     global POLICY_PATH_OVERRIDE
     repo_root = pathlib.Path(repo_root).resolve()
+    if pathlib.Path(__file__).resolve(strict=True) != pathlib.Path(
+            candidate_qualification_runner_path(str(repo_root))):
+        raise QualificationFailure("qualification runner does not match the candidate source snapshot")
     temp_root = pathlib.Path(temp_root).resolve()
     temp_root.mkdir(parents=True, exist_ok=True)
     os.chmod(temp_root, 0o711)
