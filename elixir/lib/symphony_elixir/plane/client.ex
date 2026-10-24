@@ -750,7 +750,7 @@ defmodule SymphonyElixir.Plane.Client do
   end
 
   defp valid_proof_cacerts?(cacerts) do
-    is_list(cacerts) and length(cacerts) in 1..@max_proof_ca_certificates and
+    length(cacerts) in 1..@max_proof_ca_certificates and
       Enum.all?(cacerts, &(is_binary(&1) and byte_size(&1) in 1..@max_proof_ca_certificate_bytes)) and
       Enum.reduce(cacerts, 0, &(byte_size(&1) + &2)) <= @max_proof_ca_bundle_bytes
   end
