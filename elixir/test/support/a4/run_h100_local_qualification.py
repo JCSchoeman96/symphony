@@ -1786,6 +1786,17 @@ def candidate_change_inventory(repo_root):
     return commits, files
 
 
+def attach_candidate_inventory(result, implementation_commits, implementation_files_changed):
+    """Attach outer-process Git provenance to the result from the isolated launcher."""
+    if (not isinstance(result, dict) or not isinstance(result.get("evidence"), dict) or
+            "implementation_commits" in result["evidence"] or
+            "implementation_files_changed" in result["evidence"]):
+        raise QualificationFailure("qualification result cannot accept candidate inventory")
+    result["evidence"]["implementation_commits"] = implementation_commits
+    result["evidence"]["implementation_files_changed"] = implementation_files_changed
+    return result
+
+
 def outer_main(repo_root):
     repo_root = pathlib.Path(repo_root).resolve()
     if not repo_root.is_dir():
@@ -1870,6 +1881,9 @@ def outer_main(repo_root):
         status_code = process.wait(timeout=10)
         if status_code != 0 or result.get("qualified") is not True or not active_seen:
             raise QualificationFailure("local host relay qualification failed")
+        result = attach_candidate_inventory(
+            result, implementation_commits, implementation_files_changed
+        )
         result["evidence"]["non_proof_control_exchange"] = "passed"
         result["evidence"]["implementation_head_sha"] = head
         result["evidence"]["implementation_head_tree"] = tree
@@ -2277,8 +2291,6 @@ def _inside_main(repo_root, temp_root, head, tree, request_id, outside_control_p
             "proof_build_dependency_file_count": dependency_copy["file_count"],
             "proof_build_dependency_total_bytes": dependency_copy["total_bytes"],
             "proof_build_dependency_source_sha256": dependency_copy["source_sha256"],
-            "implementation_commits": implementation_commits,
-            "implementation_files_changed": implementation_files_changed,
         }
         return {"type": "QUALIFICATION_RESULT", "qualified": True, "evidence": evidence}
     finally:

@@ -24,7 +24,8 @@ defmodule SymphonyElixir.A4ProofTLSTrustTest do
   test "Finch accepts the local fixture only with its generated CA and matching hostname" do
     shared_trust_before = :public_key.cacerts_get()
     {fixture, ready} = start_local_fixture()
-    on_exit(fn -> stop_local_fixture(fixture) end)
+    fixture_identity = local_fixture_identity(fixture)
+    on_exit(fn -> stop_local_fixture(fixture_identity) end)
     ca_der = Base.decode64!(ready["ca_der_base64"])
 
     assert {:ok, response} = request_fixture(ready, "127.0.0.1", ca_der)
@@ -35,58 +36,72 @@ defmodule SymphonyElixir.A4ProofTLSTrustTest do
 
   test "trust fixture teardown stops the child process" do
     {fixture, _ready} = start_local_fixture()
-    {:os_pid, pid} = Port.info(fixture, :os_pid)
+    identity = local_fixture_identity(fixture)
+    pid = identity.pid
 
     try do
-      stop_local_fixture(fixture)
+      stop_local_fixture(identity)
       assert wait_for_fixture_exit(pid, 1_000)
     after
-      terminate_fixture(pid)
+      terminate_fixture(identity)
+    end
+  end
+
+  test "trust fixture teardown uses its captured PID after the port owner exits" do
+    {fixture, _ready} = start_local_fixture()
+    identity = local_fixture_identity(fixture)
+
+    try do
+      Port.close(fixture)
+      stop_local_fixture(identity)
+      assert wait_for_fixture_exit(identity.pid, 1_000)
+    after
+      terminate_fixture(identity)
     end
   end
 
   test "trust fixture teardown stops each concurrently running fixture" do
     {first, _first_ready} = start_local_fixture()
     {second, _second_ready} = start_local_fixture()
-    {:os_pid, first_pid} = Port.info(first, :os_pid)
-    {:os_pid, second_pid} = Port.info(second, :os_pid)
+    first_identity = local_fixture_identity(first)
+    second_identity = local_fixture_identity(second)
 
     try do
-      stop_local_fixture(first)
-      stop_local_fixture(second)
-      assert wait_for_fixture_exit(first_pid, 1_000)
-      assert wait_for_fixture_exit(second_pid, 1_000)
+      stop_local_fixture(first_identity)
+      stop_local_fixture(second_identity)
+      assert wait_for_fixture_exit(first_identity.pid, 1_000)
+      assert wait_for_fixture_exit(second_identity.pid, 1_000)
     after
-      terminate_fixture(first_pid)
-      terminate_fixture(second_pid)
+      terminate_fixture(first_identity)
+      terminate_fixture(second_identity)
     end
   end
 
   test "Finch rejects a locally trusted server when its CA is not trusted" do
     {fixture, ready} = start_local_fixture()
-    on_exit(fn -> stop_local_fixture(fixture) end)
+    fixture_identity = local_fixture_identity(fixture)
+    on_exit(fn -> stop_local_fixture(fixture_identity) end)
     {untrusted_fixture, untrusted_ready} = start_local_fixture()
-    on_exit(fn -> stop_local_fixture(untrusted_fixture) end)
-    {:os_pid, fixture_pid} = Port.info(fixture, :os_pid)
-    {:os_pid, untrusted_fixture_pid} = Port.info(untrusted_fixture, :os_pid)
+    untrusted_fixture_identity = local_fixture_identity(untrusted_fixture)
 
     try do
       untrusted_ca = Base.decode64!(untrusted_ready["ca_der_base64"])
       assert {:error, _transport_error} = request_fixture(ready, "127.0.0.1", untrusted_ca)
       assert {:LOCAL_TLS_ERROR, _stage} = await_fixture_result(fixture)
-      stop_local_fixture(untrusted_fixture)
-      stop_local_fixture(fixture)
-      assert wait_for_fixture_exit(untrusted_fixture_pid, 1_000)
-      assert wait_for_fixture_exit(fixture_pid, 1_000)
+      stop_local_fixture(untrusted_fixture_identity)
+      stop_local_fixture(fixture_identity)
+      assert wait_for_fixture_exit(untrusted_fixture_identity.pid, 1_000)
+      assert wait_for_fixture_exit(fixture_identity.pid, 1_000)
     after
-      terminate_fixture(untrusted_fixture_pid)
-      terminate_fixture(fixture_pid)
+      terminate_fixture(untrusted_fixture_identity)
+      terminate_fixture(fixture_identity)
     end
   end
 
   test "Finch rejects the trusted local certificate for a wrong hostname" do
     {fixture, ready} = start_local_fixture()
-    on_exit(fn -> stop_local_fixture(fixture) end)
+    fixture_identity = local_fixture_identity(fixture)
+    on_exit(fn -> stop_local_fixture(fixture_identity) end)
     ca_der = Base.decode64!(ready["ca_der_base64"])
 
     assert {:error, _transport_error} = request_fixture(ready, "wrong.invalid", ca_der)
@@ -203,25 +218,48 @@ defmodule SymphonyElixir.A4ProofTLSTrustTest do
     end
   end
 
-  defp stop_local_fixture(port) do
+  defp local_fixture_identity(port) do
     case Port.info(port, :os_pid) do
       {:os_pid, pid} ->
-        signal_fixture(pid)
-        await_local_fixture_exit(port)
+        case fixture_process_start_time(pid) do
+          start_time when is_integer(start_time) -> %{pid: pid, start_time: start_time}
+          _ -> raise "local TLS fixture process identity is unavailable"
+        end
 
       nil ->
-        :ok
+        raise "local TLS fixture port closed before process identity was captured"
     end
-  rescue
-    ArgumentError -> :ok
   end
 
-  defp await_local_fixture_exit(port) do
-    receive do
-      {^port, {:data, _line}} -> await_local_fixture_exit(port)
-      {^port, {:exit_status, _status}} -> :ok
-    after
-      3_000 -> raise "local TLS fixture did not stop during test teardown"
+  defp fixture_process_start_time(pid) do
+    case File.read("/proc/#{pid}/stat") do
+      {:ok, stat} ->
+        fields = stat |> String.split(")", parts: 2) |> List.last() |> String.trim_leading() |> String.split()
+
+        case Enum.at(fields, 19) do
+          nil ->
+            nil
+
+          value ->
+            case Integer.parse(value) do
+              {start_time, ""} -> start_time
+              _ -> nil
+            end
+        end
+
+      {:error, _reason} ->
+        nil
+    end
+  end
+
+  defp stop_local_fixture(%{pid: pid, start_time: expected_start_time}) do
+    case fixture_process_start_time(pid) do
+      ^expected_start_time ->
+        signal_fixture(pid)
+        unless wait_for_fixture_exit(pid, 3_000), do: raise("local TLS fixture did not stop during test teardown")
+
+      _ ->
+        :ok
     end
   end
 
@@ -253,8 +291,8 @@ defmodule SymphonyElixir.A4ProofTLSTrustTest do
     end
   end
 
-  defp terminate_fixture(pid) do
-    signal_fixture(pid)
+  defp terminate_fixture(identity) do
+    stop_local_fixture(identity)
   end
 
   defp signal_fixture(pid) do

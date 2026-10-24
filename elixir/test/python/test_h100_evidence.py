@@ -119,6 +119,20 @@ class QualificationEvidenceTests(unittest.TestCase):
         self.assertEqual(evidence["dispatch_witness_ack_count"], 1)
         self.assertEqual(evidence["retry_replay_count_basis"], "configuration_assertion")
 
+    def test_outer_launcher_attaches_candidate_inventory_to_inner_result(self):
+        result = valid_result()
+        result["evidence"].pop("implementation_commits")
+        result["evidence"].pop("implementation_files_changed")
+        commits = ["a" * 40]
+        files = ["elixir/priv/h100/relay.py"]
+
+        self.assertTrue(hasattr(runner, "attach_candidate_inventory"))
+        runner.attach_candidate_inventory(result, commits, files)
+
+        self.assertEqual(result["evidence"]["implementation_commits"], commits)
+        self.assertEqual(result["evidence"]["implementation_files_changed"], files)
+        self.assertEqual(runner.validate_qualification_result(result), result)
+
 
 if __name__ == "__main__":
     unittest.main()
