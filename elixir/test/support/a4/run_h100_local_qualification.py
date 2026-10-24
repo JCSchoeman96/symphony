@@ -55,8 +55,10 @@ def _safe_failure_reason(value):
 
 def proof_failure_detail(status_code, result):
     """Summarize only allowlisted proof failures; never surface exception text."""
-    if not isinstance(status_code, int) or status_code == 0 or not isinstance(result, dict):
+    if not isinstance(status_code, int) or isinstance(status_code, bool) or status_code == 0:
         return "unprivileged proof BEAM failed without a bounded result"
+    if not isinstance(result, dict):
+        return f"unprivileged proof BEAM exited with status {status_code} without a bounded result"
 
     if (set(result) == {"type", "reason", "error_class"} and
             result.get("type") == "PROOF_ERROR" and result.get("reason") == "proof_process_failed"):

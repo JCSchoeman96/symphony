@@ -32,6 +32,12 @@ class HostQualificationLauncherTests(unittest.TestCase):
         )
         self.assertEqual(detail, "proof BEAM raised an unclassified exception")
 
+    def test_proof_failure_summary_reports_exit_status_without_raw_output(self):
+        self.assertEqual(
+            runner.proof_failure_detail(127, None),
+            "unprivileged proof BEAM exited with status 127 without a bounded result",
+        )
+
     def test_proof_failure_summary_names_only_failed_contract_fields(self):
         result = {
             "type": "PROOF_RESULT",
