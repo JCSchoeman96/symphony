@@ -236,4 +236,3 @@ class LocalTLSFixture:
             shutil.rmtree(self.directory, ignore_errors=True)
         self.ca_pem = None
         self.ca_der = None
-
