@@ -1,6 +1,7 @@
 """Unit tests for the credential-free local qualification launcher."""
 
 import importlib.util
+import io
 import os
 import pathlib
 import socket
@@ -320,6 +321,112 @@ class HostQualificationLauncherTests(unittest.TestCase):
 
             self.assertEqual(actual, (str(installed_mix), str(installed_elixir)))
 
+    def test_erlang_mise_shim_resolves_to_one_matching_versioned_install(self):
+        resolve = getattr(runner, "resolve_erlang_runtime_path", None)
+        self.assertTrue(callable(resolve), "qualification must bypass Erlang tool-manager shims")
+        with tempfile.TemporaryDirectory(prefix="h100-erlang-shim-") as directory:
+            root = pathlib.Path(directory)
+            installs = root / "mise/installs"
+            elixir = installs / "elixir/1.19.5-otp-28/bin/elixir"
+            elixir.parent.mkdir(parents=True)
+            elixir.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
+            elixir.chmod(0o700)
+            installed_erl = installs / "erlang/28.5/bin/erl"
+            installed_erl.parent.mkdir(parents=True)
+            installed_erl.write_text("#!/bin/sh\nprintf '28'\n", encoding="ascii")
+            installed_erl.chmod(0o700)
+            other_major = installs / "erlang/27.3/bin/erl"
+            other_major.parent.mkdir(parents=True)
+            other_major.write_text("#!/bin/sh\nprintf '27'\n", encoding="ascii")
+            other_major.chmod(0o700)
+            shim = root / "mise/shims/erl"
+            shim.parent.mkdir(parents=True)
+            shim.write_text("#!/bin/sh\necho 'mise ERROR erl is not a valid shim' >&2\nexit 1\n",
+                            encoding="ascii")
+            shim.chmod(0o700)
+
+            selected_path, otp_release = resolve(
+                str(shim), selected_elixir_path=str(elixir), expected_otp_major=28,
+            )
+
+            self.assertEqual(selected_path, str(installed_erl))
+            self.assertEqual(otp_release, "28")
+            self.assertNotIn("/shims/", selected_path)
+
+    def test_erlang_runtime_diagnostic_exposes_bounded_path_and_release(self):
+        output = io.StringIO()
+        with patch.object(runner.sys, "stderr", output):
+            runner._emit_erlang_runtime_diagnostic("/mise/installs/erlang/28.5/bin/erl", "28")
+
+        self.assertEqual(
+            output.getvalue(),
+            'H100 qualification runtime {"erlang_path":"/mise/installs/erlang/28.5/bin/erl",'
+            '"otp_release":"28"}\n',
+        )
+
+        with self.assertRaises(runner.QualificationFailure):
+            runner._emit_erlang_runtime_diagnostic("/" + "x" * 1024, "28")
+
+    def test_erlang_resolution_rejects_missing_or_ambiguous_shim_targets(self):
+        resolve = getattr(runner, "resolve_erlang_runtime_path", None)
+        self.assertTrue(callable(resolve), "qualification must fail closed without one concrete Erlang runtime")
+        with tempfile.TemporaryDirectory(prefix="h100-erlang-no-runtime-") as directory:
+            root = pathlib.Path(directory)
+            installs = root / "mise/installs"
+            elixir = installs / "elixir/1.19.5-otp-28/bin/elixir"
+            elixir.parent.mkdir(parents=True)
+            elixir.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
+            elixir.chmod(0o700)
+            shim = root / "mise/shims/erl"
+            shim.parent.mkdir(parents=True)
+            shim.write_text("#!/bin/sh\nexit 1\n", encoding="ascii")
+            shim.chmod(0o700)
+
+            with self.assertRaises(runner.QualificationFailure):
+                resolve(str(shim), selected_elixir_path=str(elixir), expected_otp_major=28)
+
+            for version in ("28.4", "28.5"):
+                executable = installs / "erlang" / version / "bin/erl"
+                executable.parent.mkdir(parents=True)
+                executable.write_text("#!/bin/sh\nprintf '28'\n", encoding="ascii")
+                executable.chmod(0o700)
+            with self.assertRaises(runner.QualificationFailure):
+                resolve(str(shim), selected_elixir_path=str(elixir), expected_otp_major=28)
+
+    def test_fresh_proof_build_fails_before_mix_when_only_erlang_shim_exists(self):
+        with tempfile.TemporaryDirectory(prefix="h100-erlang-shim-fail-closed-") as directory:
+            root = pathlib.Path(directory)
+            install = root / "mise/installs/elixir/1.19.5-otp-28"
+            mix = install / "bin/mix"
+            elixir = install / "bin/elixir"
+            install.joinpath(".mix").mkdir(parents=True)
+            for executable in (mix, elixir):
+                executable.parent.mkdir(parents=True, exist_ok=True)
+                executable.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
+                executable.chmod(0o700)
+            shim = root / "mise/shims/erl"
+            shim.parent.mkdir(parents=True)
+            shim.write_text("#!/bin/sh\necho 'mise ERROR erl is not a valid shim' >&2\nexit 1\n",
+                            encoding="ascii")
+            shim.chmod(0o700)
+            project = root / "project"
+            project.mkdir()
+            (project / "mix.exs").write_text("", encoding="ascii")
+            (project / "mix.lock").write_text("%{}\n", encoding="ascii")
+
+            with (patch.object(runner, "_run_bounded") as run,
+                  patch.object(runner, "prepare_isolated_mix_home") as prepare):
+                with self.assertRaises(runner.QualificationFailure):
+                    runner.compile_fresh_proof_build(
+                        str(mix), str(project), str(root / "proof-build"), home=str(root / "build-home"),
+                        runtime_path=runner.runtime_path_for(str(mix), str(elixir), str(shim)),
+                        source_head_sha="a" * 40, source_tree_sha="b" * 40,
+                        source_mix_home=str(install / ".mix"), selected_elixir_path=str(elixir),
+                    )
+
+            self.assertFalse(any(call.args[0][0] == str(mix) for call in run.call_args_list))
+            prepare.assert_not_called()
+
     def test_mix_runtime_resolution_rejects_a_mismatched_mix_home(self):
         resolve = getattr(runner, "resolve_mix_runtime_paths", None)
         self.assertTrue(callable(resolve), "qualification must bind Mix to its selected install")
@@ -358,9 +465,9 @@ class HostQualificationLauncherTests(unittest.TestCase):
             elixir_shim = shim.parent / "elixir"
             elixir_shim.write_text("#!/bin/sh\nexit 97\n", encoding="ascii")
             elixir_shim.chmod(0o700)
-            erlang = root / "erlang/bin/erl"
+            erlang = root / "installs/erlang/28.5/bin/erl"
             erlang.parent.mkdir(parents=True)
-            erlang.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
+            erlang.write_text("#!/bin/sh\nprintf '28'\n", encoding="ascii")
             erlang.chmod(0o700)
             project = root / "project"
             (project / "lib").mkdir(parents=True)
@@ -376,7 +483,8 @@ class HostQualificationLauncherTests(unittest.TestCase):
             with (patch.object(runner, "prepare_isolated_mix_home", return_value={
                     "hex_version": "2.5.1", "hex_archive_sha256": "c" * 64, "rebar3_sha256": "d" * 64,
                  }),
-                  patch.object(runner, "_run_bounded") as run,
+                 patch.object(runner, "_run_bounded", side_effect=lambda command, **kwargs:
+                              b"28" if command[0] == str(erlang) else b"") as run,
                   patch.object(runner, "_seal_proof_build"),
                   patch.object(runner, "build_artifact_inventory", return_value={
                       "artifact_count": 1, "artifact_inventory_sha256": "e" * 64,
@@ -402,11 +510,12 @@ class HostQualificationLauncherTests(unittest.TestCase):
             elixir_path = elixir_bin / "elixir"
             erlang_path = erlang_bin / "erl"
             for executable in (mix_path, elixir_path, erlang_path):
-                executable.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
+                executable.write_text("#!/bin/sh\nprintf '28'\n", encoding="ascii")
                 executable.chmod(0o700)
             project = root / "project"
             project.mkdir()
             (project / "mix.exs").write_text("", encoding="ascii")
+            (project / "mise.toml").write_text('[tools]\nerlang = "28"\n', encoding="ascii")
             (project / "mix.lock").write_text("%{}\n", encoding="ascii")
 
             with (patch.object(runner, "prepare_isolated_mix_home", return_value={
@@ -414,7 +523,8 @@ class HostQualificationLauncherTests(unittest.TestCase):
                     "rebar3_sha256": "d" * 64,
                  }),
                   patch.object(runner, "resolve_mix_runtime_paths", side_effect=AssertionError),
-                  patch.object(runner, "_run_bounded") as run,
+                  patch.object(runner, "_run_bounded", side_effect=lambda command, **kwargs:
+                               b"28" if command[0] == str(erlang_path) else b"") as run,
                   patch.object(runner, "_seal_proof_build"),
                   patch.object(runner, "build_artifact_inventory", return_value={
                       "artifact_count": 1, "artifact_inventory_sha256": "e" * 64,
@@ -428,6 +538,7 @@ class HostQualificationLauncherTests(unittest.TestCase):
                     source_head_sha="a" * 40, source_tree_sha="b" * 40,
                     rebar_key="1-19-otp-28", source_mix_home=str(root / ".mix"),
                     selected_elixir_path=str(elixir_path),
+                    selected_erlang_path=str(erlang_path), selected_otp_release="28",
                 )
 
             self.assertEqual(run.call_args.args[0][0], str(mix_path))
@@ -1017,8 +1128,8 @@ class HostQualificationLauncherTests(unittest.TestCase):
 
         mix_path = runner.shutil.which("mix")
         elixir_path = runner.shutil.which("elixir")
-        erlang_path = runner.shutil.which("erl")
-        if not all((mix_path, elixir_path, erlang_path)):
+        resolved_erlang_path = runner.shutil.which("erl")
+        if not all((mix_path, elixir_path, resolved_erlang_path)):
             self.skipTest("Mix and its pinned Elixir/Erlang runtime are unavailable")
 
         with tempfile.TemporaryDirectory(prefix="h100-proof-build-") as directory:
@@ -1041,18 +1152,40 @@ class HostQualificationLauncherTests(unittest.TestCase):
             stale.parent.mkdir(parents=True)
             stale.write_bytes(b"stale repository build")
             build_path = root / "fresh-proof-build"
-            runtime_path = runner.runtime_path_for(mix_path, elixir_path, erlang_path)
-
-            result = compile_build(
-                mix_path,
-                str(project),
-                str(build_path),
-                home=str(root / "build-home"),
-                runtime_path=runtime_path,
-                source_head_sha="a" * 40,
-                source_tree_sha="b" * 40,
-                failure_stderr_bytes=4096,
+            erlang_shim = root / "mise/shims/erl"
+            erlang_shim.parent.mkdir(parents=True)
+            erlang_shim.write_text(
+                "#!/bin/sh\necho 'mise ERROR erl is not a valid shim' >&2\nexit 1\n", encoding="ascii"
             )
+            erlang_shim.chmod(0o700)
+            runtime_path = (runner.runtime_path_for(mix_path, elixir_path, str(erlang_shim)) +
+                            os.pathsep + os.path.dirname(resolved_erlang_path))
+
+            original_run = runner._run_bounded
+            observed_mix_environments = []
+            observed_erlang_probes = []
+
+            def record_mix_environment(command, **kwargs):
+                if command and command[0] == mix_path:
+                    observed_mix_environments.append(kwargs["env"])
+                output = original_run(command, **kwargs)
+                if command and command[0] == resolved_erlang_path:
+                    observed_erlang_probes.append(output)
+                return output
+
+            with patch.object(runner, "_run_bounded", side_effect=record_mix_environment):
+                result = compile_build(
+                    mix_path,
+                    str(project),
+                    str(build_path),
+                    home=str(root / "build-home"),
+                    runtime_path=runtime_path,
+                    source_head_sha="a" * 40,
+                    source_tree_sha="b" * 40,
+                    selected_erlang_path=resolved_erlang_path,
+                    selected_otp_release="28",
+                    failure_stderr_bytes=4096,
+                )
 
             compiled = build_path / "lib/build_fixture/ebin/Elixir.BuildFixture.beam"
             self.assertTrue(compiled.is_file())
@@ -1061,6 +1194,9 @@ class HostQualificationLauncherTests(unittest.TestCase):
             self.assertEqual(result["source_head_sha"], "a" * 40)
             self.assertEqual(result["source_tree_sha"], "b" * 40)
             self.assertGreater(result["artifact_count"], 0)
+            self.assertEqual(len(observed_mix_environments), 1)
+            self.assertNotIn(str(erlang_shim.parent), observed_mix_environments[0]["PATH"].split(os.pathsep))
+            self.assertEqual(observed_erlang_probes, [b"28"])
             self.assertEqual(len(result["artifact_inventory_sha256"]), 64)
             self.assertRegex(result["hex_version"], r"\A\d+(?:\.\d+){1,2}\Z")
             self.assertEqual(len(result["hex_archive_sha256"]), 64)

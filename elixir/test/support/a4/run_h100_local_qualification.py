@@ -292,7 +292,7 @@ def _valid_runtime_path(runtime_path):
             all(part.startswith("/") and "\x00" not in part for part in runtime_path.split(os.pathsep)))
 
 
-def runtime_mount_plan(mix_path, runtime_path, temp_root):
+def runtime_mount_plan(mix_path, runtime_path, temp_root, *, erlang_otp_release=None):
     """Map the exact Elixir and Erlang installs into namespace-readable paths."""
     if (not isinstance(mix_path, str) or not mix_path.startswith("/") or
             not _valid_runtime_path(runtime_path) or not isinstance(temp_root, str) or
@@ -316,6 +316,8 @@ def runtime_mount_plan(mix_path, runtime_path, temp_root):
         ],
         "mix_path": str(elixir_destination / "bin/mix"),
         "elixir_path": str(elixir_destination / "bin/elixir"),
+        "erlang_path": str(erlang_destination / "bin/erl"),
+        "otp_release": erlang_otp_release,
         "runtime_path": runtime_path_for(
             str(elixir_destination / "bin/mix"),
             str(elixir_destination / "bin/elixir"),
@@ -423,6 +425,178 @@ def resolve_mix_runtime_paths(mix_path, mix_home):
     if selected_mix.name != "mix" or selected_elixir.name != "elixir":
         raise QualificationFailure("resolved Mix runtime executables are invalid")
     return str(selected_mix), str(selected_elixir)
+
+
+def _elixir_install_otp_major(elixir_path):
+    if not isinstance(elixir_path, str) or not elixir_path.startswith("/") or "\x00" in elixir_path:
+        raise QualificationFailure("selected Elixir runtime path is invalid")
+    try:
+        resolved_elixir = pathlib.Path(elixir_path).resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise QualificationFailure("selected Elixir runtime could not be resolved") from exc
+    install_majors = set()
+    for parent in resolved_elixir.parents:
+        match = re.fullmatch(r"\d+\.\d+(?:\.\d+)?-otp-(\d+)", parent.name)
+        if match is not None:
+            install_majors.add(int(match.group(1)))
+    if len(install_majors) > 1:
+        raise QualificationFailure("selected Elixir runtime identifies multiple OTP families")
+    return next(iter(install_majors), None)
+
+
+def expected_otp_major(project_path, elixir_path):
+    """Bind the selected OTP family to both project config and the Elixir install."""
+    if not isinstance(project_path, str) or not project_path.startswith("/") or "\x00" in project_path:
+        raise QualificationFailure("Elixir runtime inputs are invalid")
+    config_path = pathlib.Path(project_path) / "mise.toml"
+    config_major = None
+    if config_path.exists():
+        try:
+            if config_path.stat().st_size > 65_536:
+                raise QualificationFailure("project runtime config exceeds its bound")
+            config = config_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise QualificationFailure("project OTP family could not be read") from exc
+        matches = re.findall(r"(?m)^\s*erlang\s*=\s*['\"](\d+)['\"]\s*(?:#.*)?$", config)
+        if len(matches) != 1:
+            raise QualificationFailure("project config does not select one Erlang major")
+        config_major = int(matches[0])
+
+    install_major = _elixir_install_otp_major(elixir_path)
+    if config_major is not None and install_major is not None and config_major != install_major:
+        raise QualificationFailure("selected Elixir runtime does not match project OTP family")
+    selected_major = config_major if config_major is not None else install_major
+    if selected_major is None or selected_major < 1:
+        raise QualificationFailure("selected Elixir runtime does not identify its OTP family")
+    return selected_major
+
+
+def _mise_installs_root(elixir_path):
+    try:
+        resolved = pathlib.Path(elixir_path).resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise QualificationFailure("selected Elixir runtime could not be resolved") from exc
+    version = resolved.parent.parent.name if resolved.parent.name == "bin" else ""
+    if (resolved.name != "elixir" or
+            re.fullmatch(r"\d+\.\d+(?:\.\d+)?-otp-\d+", version) is None or
+            resolved.parent.parent.parent.name != "elixir" or
+            resolved.parent.parent.parent.parent.name != "installs"):
+        raise QualificationFailure("selected Elixir runtime has no matching versioned install root")
+    return resolved.parent.parent.parent.parent
+
+
+def _probe_otp_release(erlang_path):
+    if (not isinstance(erlang_path, str) or not erlang_path.startswith("/") or "\x00" in erlang_path or
+            "shims" in pathlib.Path(erlang_path).parts):
+        raise QualificationFailure("selected Erlang executable is not a concrete install path")
+    try:
+        executable = pathlib.Path(erlang_path).resolve(strict=True)
+        metadata = executable.stat(follow_symlinks=False)
+    except (OSError, RuntimeError) as exc:
+        raise QualificationFailure("selected Erlang executable is unavailable") from exc
+    if (executable.name != "erl" or not stat.S_ISREG(metadata.st_mode) or
+            not os.access(executable, os.X_OK)):
+        raise QualificationFailure("selected Erlang executable is invalid")
+    try:
+        output = _run_bounded(
+            [erlang_path, "-noshell", "-eval",
+             'io:format("~s",[erlang:system_info(otp_release)]),halt().'],
+            env={"PATH": os.path.dirname(erlang_path) + os.pathsep + SYSTEM_PATH,
+                 "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"},
+            timeout=10, max_output_bytes=32,
+        )
+        otp_release = output.decode("ascii")
+    except (QualificationFailure, UnicodeError) as exc:
+        raise QualificationFailure("selected Erlang OTP release could not be verified") from exc
+    if re.fullmatch(r"\d{1,3}", otp_release) is None:
+        raise QualificationFailure("selected Erlang OTP release is invalid")
+    return otp_release
+
+
+def resolve_erlang_runtime_path(erlang_path, *, selected_elixir_path, expected_otp_major):
+    """Resolve Erlang only from the selected Elixir tool manager's versioned installs."""
+    if (erlang_path is not None and
+            (not isinstance(erlang_path, str) or not erlang_path.startswith("/") or "\x00" in erlang_path)):
+        raise QualificationFailure("Erlang runtime input path is invalid")
+    if (not isinstance(expected_otp_major, int) or isinstance(expected_otp_major, bool) or
+            expected_otp_major < 1 or expected_otp_major > 999):
+        raise QualificationFailure("expected Erlang major is invalid")
+    install_major = _elixir_install_otp_major(selected_elixir_path)
+    if install_major is not None and expected_otp_major != install_major:
+        raise QualificationFailure("selected Elixir runtime does not match expected Erlang major")
+    installs_root = _mise_installs_root(selected_elixir_path)
+    erlang_root = installs_root / "erlang"
+    version_pattern = re.compile(r"(\d+)(?:\.\d+)*")
+    if erlang_path is not None and "shims" not in pathlib.Path(erlang_path).parts:
+        direct_path = pathlib.Path(erlang_path)
+        direct_version = direct_path.parent.parent
+        direct_match = version_pattern.fullmatch(direct_version.name)
+        try:
+            direct_root = direct_version.parent.resolve(strict=True)
+            expected_root = erlang_root.resolve(strict=True)
+        except (OSError, RuntimeError):
+            direct_match = None
+        if (direct_match is not None and direct_path.name == "erl" and
+                direct_path.parent.name == "bin" and direct_root == expected_root):
+            if int(direct_match.group(1)) != expected_otp_major:
+                raise QualificationFailure("selected Erlang runtime does not match expected OTP family")
+            try:
+                resolved = direct_path.resolve(strict=True)
+                version_root = direct_version.resolve(strict=True)
+                metadata = resolved.stat(follow_symlinks=False)
+            except (OSError, RuntimeError) as exc:
+                raise QualificationFailure("selected versioned Erlang executable is unavailable") from exc
+            if (not resolved.is_relative_to(version_root) or resolved.name != "erl" or
+                    not stat.S_ISREG(metadata.st_mode) or not os.access(resolved, os.X_OK)):
+                raise QualificationFailure("selected versioned Erlang executable is invalid")
+            otp_release = _probe_otp_release(str(direct_path))
+            if otp_release != str(expected_otp_major):
+                raise QualificationFailure("selected Erlang runtime does not match expected OTP family")
+            return str(direct_path), otp_release
+    candidates = []
+    try:
+        versions = sorted(erlang_root.iterdir(), key=lambda item: item.name)
+    except OSError as exc:
+        raise QualificationFailure("matching versioned Erlang installation is unavailable") from exc
+    if len(versions) > 64:
+        raise QualificationFailure("versioned Erlang installation list exceeds its bound")
+    for version_dir in versions:
+        match = version_pattern.fullmatch(version_dir.name)
+        if match is None or int(match.group(1)) != expected_otp_major:
+            continue
+        candidate = version_dir / "bin/erl"
+        try:
+            resolved = candidate.resolve(strict=True)
+            install_root = version_dir.resolve(strict=True)
+            metadata = resolved.stat(follow_symlinks=False)
+        except (OSError, RuntimeError):
+            raise QualificationFailure("matching versioned Erlang executable is unavailable")
+        if (not resolved.is_relative_to(install_root) or resolved.name != "erl" or
+                not stat.S_ISREG(metadata.st_mode) or not os.access(resolved, os.X_OK)):
+            raise QualificationFailure("matching versioned Erlang executable is invalid")
+        candidates.append(str(candidate))
+    if len(candidates) != 1:
+        raise QualificationFailure("matching versioned Erlang installation is ambiguous")
+    selected_path = candidates[0]
+    otp_release = _probe_otp_release(selected_path)
+    if otp_release != str(expected_otp_major):
+        raise QualificationFailure("selected Erlang runtime does not match expected OTP family")
+    return selected_path, otp_release
+
+
+def _emit_erlang_runtime_diagnostic(erlang_path, otp_release):
+    if (not isinstance(erlang_path, str) or not erlang_path.startswith("/") or "\x00" in erlang_path or
+            len(erlang_path.encode("utf-8")) > 1024 or
+            re.fullmatch(r"\d{1,3}", str(otp_release)) is None):
+        raise QualificationFailure("selected Erlang runtime diagnostic is invalid")
+    diagnostic = json.dumps(
+        {"erlang_path": erlang_path, "otp_release": otp_release},
+        sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+    )
+    if len(diagnostic.encode("ascii")) > 4096:
+        raise QualificationFailure("selected Erlang runtime diagnostic exceeds its bound")
+    sys.stderr.write("H100 qualification runtime " + diagnostic + "\n")
+    sys.stderr.flush()
 
 
 def _copy_mix_archive(source, destination):
@@ -747,6 +921,7 @@ def copy_dependency_tree(source_path, destination_path, *, maximum_files=50_000,
 def compile_fresh_proof_build(mix_path, project_path, build_path, *, home, runtime_path,
                               source_head_sha, source_tree_sha, rebar_key=None,
                               source_mix_home=None, selected_elixir_path=None,
+                              selected_erlang_path=None, selected_otp_release=None,
                               failure_stderr_bytes=0):
     """Compile the exact local project into a fresh, separate Mix build path."""
     if (not isinstance(mix_path, str) or not mix_path.startswith("/") or "\x00" in mix_path or
@@ -788,11 +963,29 @@ def compile_fresh_proof_build(mix_path, project_path, build_path, *, home, runti
         mix_path, elixir_path = str(selected_mix), str(selected_elixir)
     if not _valid_runtime_path(runtime_path):
         raise QualificationFailure("proof build runtime path is invalid")
-    erlang_executables = [pathlib.Path(directory) / "erl" for directory in runtime_path.split(os.pathsep)
-                          if (pathlib.Path(directory) / "erl").is_file()]
-    if len(erlang_executables) != 1:
-        raise QualificationFailure("pinned Erlang runtime installation is ambiguous")
-    runtime_path = runtime_path_for(mix_path, elixir_path, str(erlang_executables[0]))
+    expected_major = expected_otp_major(project_path, elixir_path)
+    if selected_erlang_path is None:
+        erlang_executables = [pathlib.Path(directory) / "erl" for directory in runtime_path.split(os.pathsep)
+                              if (pathlib.Path(directory) / "erl").is_file()]
+        if len(erlang_executables) != 1:
+            raise QualificationFailure("pinned Erlang runtime installation is ambiguous")
+        erlang_path, otp_release = resolve_erlang_runtime_path(
+            str(erlang_executables[0]), selected_elixir_path=elixir_path,
+            expected_otp_major=expected_major,
+        )
+    else:
+        if (not isinstance(selected_erlang_path, str) or not selected_erlang_path.startswith("/") or
+                "\x00" in selected_erlang_path or "shims" in pathlib.Path(selected_erlang_path).parts):
+            raise QualificationFailure("preselected Erlang runtime path is invalid")
+        runtime_directories = {str(pathlib.Path(item).resolve()) for item in runtime_path.split(os.pathsep)}
+        if str(pathlib.Path(selected_erlang_path).parent.resolve()) not in runtime_directories:
+            raise QualificationFailure("preselected Erlang runtime is outside the proof build PATH")
+        otp_release = _probe_otp_release(selected_erlang_path)
+        if otp_release != str(expected_major):
+            raise QualificationFailure("preselected Erlang runtime does not match project OTP family")
+        if selected_otp_release is not None and selected_otp_release != otp_release:
+            raise QualificationFailure("preselected Erlang OTP release changed")
+    runtime_path = runtime_path_for(mix_path, elixir_path, selected_erlang_path or erlang_path)
     try:
         build_root.mkdir(parents=True, mode=0o700, exist_ok=False)
     except OSError as exc:
@@ -2142,12 +2335,17 @@ def outer_main(repo_root):
     mix_path = shutil.which("mix")
     elixir_path = shutil.which("elixir")
     erlang_path = shutil.which("erl")
-    if mix_path is None or elixir_path is None or erlang_path is None:
-        raise QualificationFailure("Mix and the Elixir/Erlang runtime are required")
+    if mix_path is None or elixir_path is None:
+        raise QualificationFailure("Mix and the Elixir runtime are required")
     source_mix_home = os.environ.get("MIX_HOME") or str(pathlib.Path.home() / ".mix")
     if not source_mix_home.startswith("/") or "\x00" in source_mix_home:
         raise QualificationFailure("installed Mix tool home path is invalid")
     mix_path, elixir_path = resolve_mix_runtime_paths(mix_path, source_mix_home)
+    otp_major = expected_otp_major(str(repo_root / "elixir"), elixir_path)
+    erlang_path, otp_release = resolve_erlang_runtime_path(
+        erlang_path, selected_elixir_path=elixir_path, expected_otp_major=otp_major,
+    )
+    _emit_erlang_runtime_diagnostic(erlang_path, otp_release)
     runtime_path = runtime_path_for(mix_path, elixir_path, erlang_path)
 
     temp_root = pathlib.Path(tempfile.mkdtemp(prefix="h100-local-qualification-"))
@@ -2297,7 +2495,21 @@ def _inside_main(repo_root, temp_root, head, tree, request_id, outside_control_p
         sys.path.insert(0, str(h100_directory))
         import host_qualification as host
 
-        runtime_plan = runtime_mount_plan(mix_path, runtime_path, str(temp_root))
+        selected_elixir = str(pathlib.Path(mix_path).parent / "elixir")
+        otp_major = expected_otp_major(str(source_elixir), selected_elixir)
+        erlang_executables = [pathlib.Path(directory) / "erl"
+                              for directory in runtime_path.split(os.pathsep)
+                              if (pathlib.Path(directory) / "erl").is_file()]
+        if len(erlang_executables) != 1:
+            raise QualificationFailure("pinned Erlang runtime installation is ambiguous")
+        selected_erlang, otp_release = resolve_erlang_runtime_path(
+            str(erlang_executables[0]), selected_elixir_path=selected_elixir,
+            expected_otp_major=otp_major,
+        )
+        runtime_path = runtime_path_for(mix_path, selected_elixir, selected_erlang)
+        runtime_plan = runtime_mount_plan(
+            mix_path, runtime_path, str(temp_root), erlang_otp_release=otp_release,
+        )
         runtime_mounts = _bind_runtime_installations(runtime_plan)
         dependency_mount = source_elixir / "deps"
         dependency_copy = copy_dependency_tree(str(dependency_mount), str(temp_root / "proof-deps"))
@@ -2315,6 +2527,8 @@ def _inside_main(repo_root, temp_root, head, tree, request_id, outside_control_p
             rebar_key=mix_rebar_home_key(mix_path, mix_home=source_mix_home),
             source_mix_home=source_mix_home,
             selected_elixir_path=runtime_plan["elixir_path"],
+            selected_erlang_path=runtime_plan["erlang_path"],
+            selected_otp_release=runtime_plan["otp_release"],
         )
         _unmount_mount(dependency_mount)
         runtime_mounts.remove(dependency_mount)
