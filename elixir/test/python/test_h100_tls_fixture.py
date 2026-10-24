@@ -220,6 +220,47 @@ class LocalTLSFixtureTests(unittest.TestCase):
             import shutil
             shutil.rmtree(root, ignore_errors=True)
 
+    def test_origin_preserves_a_prepared_group_reapable_certificate_directory(self):
+        root = pathlib.Path(tempfile.mkdtemp(prefix="h100-origin-prepared-test-"))
+        directory = root / "generated-certs"
+        directory.mkdir(mode=0o2770)
+        directory.chmod(0o2770)
+        command = [
+            "python3", "-I", str(MODULE), "--serve",
+            "--directory", str(directory), "--prepared-directory",
+            "--expected-api-key", "local-qualification-only",
+            "--expected-path", "/local", "--timeout", "4",
+        ]
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   text=True, env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"})
+        try:
+            ready = json.loads(process.stdout.readline())
+            self.assertEqual(ready["type"], "LOCAL_TLS_READY")
+            self.assertEqual(directory.stat().st_mode & 0o2777, 0o2770)
+            context = ssl.create_default_context(cadata=base64.b64decode(ready["ca_der_base64"]))
+            context.minimum_version = ssl.TLSVersion.TLSv1_2
+            context.maximum_version = ssl.TLSVersion.TLSv1_2
+            with socket.create_connection((ready["host"], ready["port"]), timeout=2) as raw:
+                with context.wrap_socket(raw, server_hostname=ready["server_hostname"]) as connection:
+                    connection.sendall(
+                        b"PATCH /local HTTP/1.1\r\nHost: " + ready["authority"].encode("ascii") +
+                        b"\r\nX-API-Key: local-qualification-only\r\nContent-Length: 2\r\n"
+                        b"Connection: close\r\n\r\nok"
+                    )
+                    self.assertIn(b"200 OK", connection.recv(1024))
+            summary = json.loads(process.stdout.readline())
+            self.assertEqual(summary["type"], "LOCAL_TLS_RESULT")
+            self.assertEqual(process.wait(timeout=3), 0)
+            self.assertFalse(directory.exists())
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=3)
+            process.stdout.close()
+            process.stderr.close()
+            import shutil
+            shutil.rmtree(root, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()

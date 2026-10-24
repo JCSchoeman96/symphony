@@ -1563,10 +1563,22 @@ def _cleanup_outer_resources(process, cleanup_failures):
     return namespace_stopped
 
 
-def _set_owner(path, uid, mode):
-    path.mkdir(parents=True, exist_ok=True)
-    os.chown(path, uid, uid)
-    os.chmod(path, mode)
+def _set_reapable_service_directory(path, service_uid):
+    """Give the namespace launcher cleanup rights and one service group access."""
+    if os.geteuid() != 0 or not isinstance(service_uid, int) or not 1 <= service_uid <= 65_535:
+        raise QualificationFailure("service directory must be prepared by namespace root")
+    path = pathlib.Path(path)
+    try:
+        path.mkdir(parents=True, exist_ok=False)
+        os.chown(path, 0, service_uid)
+        os.chmod(path, 0o2770)
+        result = os.lstat(path)
+    except OSError as exc:
+        raise QualificationFailure("service directory ownership could not be prepared") from exc
+    if (result.st_uid != 0 or result.st_gid != service_uid or
+            result.st_mode & 0o7777 != 0o2770):
+        raise QualificationFailure("service directory ownership is not host-reapable")
+    return True
 
 
 def _bind_read_only_path(source_path, mount_path, *, unmount):
@@ -1658,6 +1670,7 @@ def _launch_origin(python_path, fixture_path, origin_home, expected_path):
     cert_directory = origin_home / "generated-certs"
     command = _setpriv_command(ORIGIN_UID, [python_path, "-I", str(fixture_path), "--serve",
                                             "--directory", str(cert_directory),
+                                            "--prepared-directory",
                                             "--expected-api-key", LOCAL_SENTINEL,
                                             "--expected-path", expected_path, "--timeout", "25"])
     process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
@@ -1944,7 +1957,7 @@ def _inside_main(repo_root, temp_root, head, tree, request_id, outside_control_p
     build_home = temp_root / "build-home"
     proof_build_source = temp_root / "proof-build-source"
     proof_build_mount = temp_root / "proof-build"
-    relay_evidence_path = temp_root / "relay-evidence" / "relay.json"
+    relay_evidence_path = relay_home / "relay.json"
     result_path = proof_state / "proof-result.json"
     try:
         _bind_repo_read_only(repo_root, mount_path)
@@ -1988,19 +2001,17 @@ def _inside_main(repo_root, temp_root, head, tree, request_id, outside_control_p
             "build_lib_path": str(proof_build_mount / "lib"),
         }
 
-        _set_owner(relay_home, RELAY_UID, 0o700)
-        _set_owner(origin_home, ORIGIN_UID, 0o700)
-        _set_owner(proof_home, PROOF_UID, 0o700)
-        _set_owner(proof_state, PROOF_UID, 0o700)
-        relay_evidence_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        os.chown(relay_evidence_path.parent, RELAY_UID, RELAY_UID)
-        os.chmod(relay_evidence_path.parent, 0o700)
+        _set_reapable_service_directory(relay_home, RELAY_UID)
+        _set_reapable_service_directory(origin_home, ORIGIN_UID)
+        _set_reapable_service_directory(proof_home, PROOF_UID)
+        _set_reapable_service_directory(proof_state, PROOF_UID)
+        cert_directory = origin_home / "generated-certs"
+        _set_reapable_service_directory(cert_directory, ORIGIN_UID)
         if shutil.which("ip") is None:
             raise QualificationFailure("iproute2 is required for loopback qualification")
         _run_bounded(["ip", "link", "set", "lo", "up"], env=service_environment("/"))
 
         python_path = os.path.realpath(sys.executable)
-        cert_directory = origin_home / "generated-certs"
         origin_process, origin_reader, origin_identity, origin_ready, ca_der, cert_directory = _launch_origin(
             python_path, fixture_path, origin_home, EXPECTED_PATH
         )

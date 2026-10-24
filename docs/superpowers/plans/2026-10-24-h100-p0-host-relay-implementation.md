@@ -95,6 +95,8 @@
 
 **Tests:**
 - Generate CA/key/server material under a private temporary directory, restrict file access to the origin UID, trust only the generated CA in the one proof connection, and assert exact hostname verification.
+- Prepare service directories as namespace-root-owned, setgid directories with only the service UID's group access; keep generated private keys mode `0600` so the host launcher can remove the files after forced controller death without reading them.
+- Pre-create the TLS fixture's certificate directory under that same ownership contract and test the fixture's prepared-directory validation and teardown.
 - Confirm a peer-verified TLS 1.1-only fixture fails while the TLS 1.2 fixture succeeds; the relay itself only observes record framing, content type, and length.
 - Test dependency-copy bounds, source symlink rejection, writable directory modes, content inventory hashing, rejection of mount targets outside the exact project `elixir/deps` path, and safe/unsafe Mix build symlinks.
 - Send the exact bounded local PATCH once; fixture confirms one complete request without writing its body to logs/evidence.
@@ -119,6 +121,7 @@
 - Run the real Finch request. If it spans more than one client application-data record, fail qualification and stop without changing the accepted record limit.
 - Verify one exact local request arrives complete; the first encrypted server application-data record is observed and zero bytes from it reach Finch; both sockets close; no retry/replay occurs.
 - Exercise process/relay/fixture failure paths and prove teardown removes namespace policy, sockets, child processes in separate sessions, generated trust, and all temporary files. Outer teardown always checks the namespace process group even after its original leader exits.
+- Kill the namespace controller while the origin UID owns generated private material; prove the service process dies, the host cannot read the private key, and the host launcher can remove the complete temporary tree.
 
 **Commit:** `test(h100): qualify proof egress in isolated namespace`.
 

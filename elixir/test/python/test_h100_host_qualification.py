@@ -1206,6 +1206,93 @@ class HostQualificationLauncherTests(unittest.TestCase):
                     except ProcessLookupError:
                         pass
 
+    def test_host_reaps_service_owned_private_material_after_controller_death(self):
+        unshare = runner.shutil.which("unshare")
+        if unshare is None:
+            self.skipTest("unshare is unavailable")
+
+        with tempfile.TemporaryDirectory(prefix="h100-reapable-material-") as directory:
+            pathlib.Path(directory).chmod(0o711)
+            temp_root = pathlib.Path(directory) / "qualification"
+            temp_root.mkdir(mode=0o700)
+            temp_root.chmod(0o711)
+            ready = temp_root / "origin/service-ready"
+            uid = runner.ORIGIN_UID
+            script = (
+                "import importlib.util,os,pathlib,sys,time\n"
+                "source=pathlib.Path(sys.argv[1])\n"
+                "spec=importlib.util.spec_from_file_location('qualification',source)\n"
+                "module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)\n"
+                "directory=pathlib.Path(sys.argv[2])/'origin'\n"
+                "module._set_reapable_service_directory(directory,int(sys.argv[3]))\n"
+                "pid=os.fork()\n"
+                "if pid==0:\n"
+                " os.setgroups([]);os.setgid(int(sys.argv[3]));os.setuid(int(sys.argv[3]))\n"
+                " (directory/'server.key').write_bytes(b'private-key-sentinel')\n"
+                " os.chmod(directory/'server.key',0o600)\n"
+                " (directory/'service-ready').write_text('ready')\n"
+                " while True: time.sleep(1)\n"
+                "while True: time.sleep(1)\n"
+            )
+            process = subprocess.Popen(
+                [unshare, *runner.namespace_unshare_options(), "--", sys.executable, "-I",
+                 "-c", script, str(MODULE), str(temp_root), str(uid)],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"},
+                start_new_session=True,
+            )
+            try:
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline and not ready.exists() and process.poll() is None:
+                    time.sleep(0.01)
+                if not ready.exists():
+                    _output, error = process.communicate(timeout=3)
+                    if b"Operation not permitted" in error:
+                        self.skipTest("unprivileged user and PID namespaces are unavailable")
+                    self.fail("service process did not create its private material: " +
+                              error[:2048].decode("utf-8", errors="replace"))
+
+                namespace_init = int(pathlib.Path(
+                    f"/proc/{process.pid}/task/{process.pid}/children"
+                ).read_text().split()[0])
+                service_pid = int(pathlib.Path(
+                    f"/proc/{namespace_init}/task/{namespace_init}/children"
+                ).read_text().split()[0])
+                os.kill(process.pid, signal.SIGKILL)
+                try:
+                    _output, error = process.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    for pid in (service_pid, namespace_init):
+                        try:
+                            os.kill(pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                    process.communicate(timeout=5)
+                    self.fail("namespace controller death left a service process alive")
+                self.assertEqual(process.returncode, -signal.SIGKILL,
+                                 error[:256].decode("utf-8", errors="replace"))
+                private_key = temp_root / "origin/server.key"
+                with self.assertRaises(PermissionError):
+                    private_key.read_bytes()
+                self.assertEqual(private_key.stat().st_mode & 0o777, 0o600)
+
+                import shutil
+                shutil.rmtree(temp_root)
+                self.assertFalse(temp_root.exists())
+            finally:
+                if process.poll() is None:
+                    runner._stop_process(process, timeout=2)
+                if process.stderr is not None:
+                    process.stderr.close()
+                if temp_root.exists():
+                    import shutil
+                    shutil.rmtree(temp_root, ignore_errors=True)
+
+    def test_reapable_service_directory_requires_namespace_root(self):
+        with tempfile.TemporaryDirectory(prefix="h100-reapable-directory-") as directory:
+            with self.assertRaises(runner.QualificationFailure):
+                runner._set_reapable_service_directory(pathlib.Path(directory) / "service", 1203)
+
     def test_process_teardown_kills_descendants_after_leader_exits(self):
         with tempfile.TemporaryDirectory(prefix="h100-stop-descendant-") as directory:
             marker = pathlib.Path(directory) / "child-pid"

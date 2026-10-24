@@ -15,6 +15,7 @@ import hashlib
 import json
 import sys
 import signal
+import stat
 
 MAX_HEADER_BYTES = 16 * 1024
 MAX_BODY_BYTES = 64 * 1024
@@ -37,7 +38,8 @@ class LocalTLSFixture:
     """Generate a private CA and serve one bounded PATCH request over loopback."""
 
     def __init__(self, timeout=10, wrong_hostname=False, tls11_only=False,
-                 expected_api_key=None, directory=None, expected_path=None):
+                 expected_api_key=None, directory=None, expected_path=None,
+                 prepared_directory=False):
         if not 0 < timeout <= 60:
             raise ValueError("timeout must be between 0 and 60 seconds")
         self.timeout = timeout
@@ -54,6 +56,7 @@ class LocalTLSFixture:
             raise ValueError("fixture path must be a bounded ASCII origin path")
         self.expected_path = expected_path
         self._requested_directory = pathlib.Path(directory) if directory is not None else None
+        self._prepared_directory = bool(prepared_directory)
         self.host = "127.0.0.1"
         self.server_hostname = self.host
         self.port = None
@@ -82,10 +85,13 @@ class LocalTLSFixture:
             raise RuntimeError("fixture cannot be started in its current state")
         if self._requested_directory is None:
             self.directory = pathlib.Path(tempfile.mkdtemp(prefix="h100-tls-"))
+        elif self._prepared_directory:
+            self._validate_prepared_directory(self._requested_directory)
+            self.directory = self._requested_directory
         else:
             self.directory = self._requested_directory
             self.directory.mkdir(mode=0o700, parents=False, exist_ok=False)
-        os.chmod(self.directory, 0o700)
+            os.chmod(self.directory, 0o700)
         try:
             self._generate_certificates()
             self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -106,6 +112,21 @@ class LocalTLSFixture:
         except BaseException:
             self.close()
             raise
+
+    @staticmethod
+    def _validate_prepared_directory(directory):
+        try:
+            metadata = directory.lstat()
+            mode = stat.S_IMODE(metadata.st_mode)
+            with os.scandir(directory) as entries:
+                empty = next(entries, None) is None
+            if (not stat.S_ISDIR(metadata.st_mode) or
+                    metadata.st_uid not in (0, os.geteuid()) or
+                    metadata.st_gid != os.getgid() or mode != 0o2770 or
+                    not empty):
+                raise ValueError("prepared certificate directory has an invalid ownership contract")
+        except OSError as exc:
+            raise ValueError("prepared certificate directory is unavailable") from exc
 
     def _run_openssl(self, *args):
         subprocess.run(["openssl", *map(str, args)], check=True, stdout=subprocess.DEVNULL,
@@ -320,6 +341,7 @@ def _serve_cli(argv=None):
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--serve", action="store_true")
     parser.add_argument("--directory", required=True)
+    parser.add_argument("--prepared-directory", action="store_true")
     parser.add_argument("--expected-api-key", required=True)
     parser.add_argument("--expected-path")
     parser.add_argument("--timeout", type=float, default=15)
@@ -328,7 +350,8 @@ def _serve_cli(argv=None):
         parser.error("local-only fixture sentinel and serve mode are required")
 
     fixture = LocalTLSFixture(timeout=args.timeout, expected_api_key=args.expected_api_key,
-                              directory=args.directory, expected_path=args.expected_path)
+                              directory=args.directory, expected_path=args.expected_path,
+                              prepared_directory=args.prepared_directory)
 
     def stop_on_sigterm(signum, _frame):
         raise SystemExit(128 + signum)
