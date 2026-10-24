@@ -1,14 +1,14 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://symphony.local/h100/p0/qualification-evidence/v3",
+  "$id": "https://symphony.local/h100/p0/qualification-evidence/v4",
   "title": "H100 P0 local host relay qualification evidence",
-  "schema_version": 3,
+  "schema_version": 4,
   "type": "object",
   "additionalProperties": false,
   "required": ["type", "schema_version", "qualified", "evidence"],
   "properties": {
     "type": {"const": "QUALIFICATION_RESULT"},
-    "schema_version": {"const": 3},
+    "schema_version": {"const": 4},
     "qualified": {"const": true},
     "evidence": {
       "type": "object",
@@ -23,7 +23,8 @@
         "client_application_data_record_count", "origin_request_count", "complete_request",
         "server_application_data_observed", "server_application_data_forwarded",
         "suppressed_encrypted_record_length", "suppressed_encrypted_record_sha256",
-        "finch_result", "retry_count", "replay_count", "ipv4_egress_canary",
+        "finch_result", "retry_count", "replay_count", "retry_replay_count_basis",
+        "dispatch_witness_ack_count", "ipv4_egress_canary",
         "ipv6_egress_canary", "proof_drop_packets_after_canaries",
         "unrelated_control_exchange", "tls_version", "tls_verify_peer",
         "tls_hostname_verification", "shared_trust_unchanged", "trust_material_removed",
@@ -37,7 +38,8 @@
         "proof_build_artifact_inventory_sha256", "proof_build_mix_lock_sha256",
         "proof_build_hex_version", "proof_build_hex_archive_sha256", "proof_build_rebar3_sha256",
         "proof_build_dependency_file_count", "proof_build_dependency_total_bytes",
-        "proof_build_dependency_source_sha256"
+        "proof_build_dependency_source_sha256", "implementation_commits",
+        "implementation_files_changed"
       ],
       "properties": {
         "policy_mechanism": {"type": "string", "maxLength": 256},
@@ -87,6 +89,8 @@
         "finch_result": {"const": "transport_failure"},
         "retry_count": {"const": 0},
         "replay_count": {"const": 0},
+        "retry_replay_count_basis": {"const": "configuration_assertion"},
+        "dispatch_witness_ack_count": {"const": 1},
         "ipv4_egress_canary": {"const": "blocked"},
         "ipv6_egress_canary": {"const": "blocked"},
         "proof_drop_packets_after_canaries": {"type": "integer", "minimum": 2},
@@ -122,7 +126,16 @@
         "proof_build_rebar3_sha256": {"$ref": "#/$defs/sha256"},
         "proof_build_dependency_file_count": {"type": "integer", "minimum": 1, "maximum": 50000},
         "proof_build_dependency_total_bytes": {"type": "integer", "minimum": 1, "maximum": 536870912},
-        "proof_build_dependency_source_sha256": {"$ref": "#/$defs/sha256"}
+        "proof_build_dependency_source_sha256": {"$ref": "#/$defs/sha256"},
+        "implementation_commits": {
+          "type": "array", "minItems": 1, "maxItems": 128,
+          "items": {"$ref": "#/$defs/git_sha"}
+        },
+        "implementation_files_changed": {
+          "type": "array", "minItems": 1, "maxItems": 128,
+          "items": {"type": "string", "minLength": 1, "maxLength": 512,
+            "pattern": "^[A-Za-z0-9._/-]+$"}
+        }
       }
     }
   },

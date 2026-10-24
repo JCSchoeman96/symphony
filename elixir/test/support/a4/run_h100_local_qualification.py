@@ -25,7 +25,7 @@ import re
 
 
 MAX_IPC_BYTES = 16_384
-EVIDENCE_SCHEMA_VERSION = 3
+EVIDENCE_SCHEMA_VERSION = 4
 SYSTEM_PATH = "/usr/local/bin:/usr/bin:/bin"
 PROOF_UID = 1201
 RELAY_UID = 1202
@@ -1148,6 +1148,13 @@ def _setpriv_command(uid, command):
             f"--reuid={uid}", f"--regid={uid}", "--clear-groups", *command]
 
 
+def namespace_unshare_options():
+    """Make PID 1 own descendants and have unshare kill it if its wrapper dies."""
+    return ["--user", "--map-auto", "--map-root-user", "--net", "--mount",
+            "--pid", "--fork", "--mount-proc", "--kill-child=KILL",
+            "--propagation", "private"]
+
+
 def _stop_process(process, *, timeout=3):
     if process is None:
         return True
@@ -1325,7 +1332,8 @@ def _validate_schema_value(value, schema, root):
             if key in properties:
                 _validate_schema_value(item, properties[key], root)
     elif schema_type == "array":
-        if len(value) > schema.get("maxItems", len(value)):
+        if (len(value) < schema.get("minItems", 0) or
+                len(value) > schema.get("maxItems", len(value))):
             raise QualificationFailure("qualification evidence exceeds its schema bound")
         item_schema = schema.get("items")
         if item_schema is not None:
@@ -1532,6 +1540,29 @@ def _cleanup_inside_resources(*, control_server, processes, canaries, ca_path,
         raise QualificationFailure("qualification cleanup failed: " + ",".join(failures))
 
 
+def _cleanup_outer_resources(process, cleanup_failures):
+    """Stop the namespace process group even when its original leader has exited."""
+    if process is None:
+        return True
+    if process.poll() is None:
+        namespace_stopped = _stop_process(process, timeout=20)
+    else:
+        try:
+            namespace_stopped = not _active_process_group_members(process.pid)
+        except QualificationFailure:
+            namespace_stopped = False
+    if not namespace_stopped:
+        cleanup_failures.append("namespace_process")
+    for stream_name in ("stdin", "stdout"):
+        stream = getattr(process, stream_name, None)
+        if stream is not None:
+            try:
+                stream.close()
+            except OSError:
+                cleanup_failures.append("namespace_pipe")
+    return namespace_stopped
+
+
 def _set_owner(path, uid, mode):
     path.mkdir(parents=True, exist_ok=True)
     os.chown(path, uid, uid)
@@ -1735,6 +1766,26 @@ def verify_private_source_cleanliness(repo_root):
     return True
 
 
+def candidate_change_inventory(repo_root):
+    """Return bounded commit and file inventories derived from the accepted base."""
+    environment = {"PATH": SYSTEM_PATH, "LANG": "C.UTF-8", "GIT_CONFIG_GLOBAL": "/dev/null",
+                   "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0"}
+    commits = _run_bounded(
+        ["git", "-C", str(repo_root), "rev-list", "--reverse", IMPLEMENTATION_BASE + "..HEAD"],
+        env=environment, max_output_bytes=65_536,
+    ).decode("ascii").splitlines()
+    files = _run_bounded(
+        ["git", "-C", str(repo_root), "diff", "--name-only", IMPLEMENTATION_BASE + "..HEAD"],
+        env=environment, max_output_bytes=65_536,
+    ).decode("ascii").splitlines()
+    if (not 1 <= len(commits) <= 128 or not 1 <= len(files) <= 128 or
+            any(re.fullmatch(r"[0-9a-f]{40}", commit) is None for commit in commits) or
+            any(re.fullmatch(r"[A-Za-z0-9._/-]{1,512}", path) is None or
+                path.startswith("/") or ".." in pathlib.PurePosixPath(path).parts for path in files)):
+        raise QualificationFailure("candidate commit and file inventory is invalid")
+    return commits, files
+
+
 def outer_main(repo_root):
     repo_root = pathlib.Path(repo_root).resolve()
     if not repo_root.is_dir():
@@ -1756,6 +1807,7 @@ def outer_main(repo_root):
                              "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0"}).decode().strip()
     if base != IMPLEMENTATION_BASE or len(head) != 40 or len(tree) != 40:
         raise QualificationFailure("candidate is not based on the accepted implementation base")
+    implementation_commits, implementation_files_changed = candidate_change_inventory(str(repo_root))
     unshare = shutil.which("unshare")
     if unshare is None:
         raise QualificationFailure("rootless user, network, and mount namespaces are required")
@@ -1776,8 +1828,8 @@ def outer_main(repo_root):
     clean_env = {"PATH": SYSTEM_PATH, "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8",
                  "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1",
                  "GIT_TERMINAL_PROMPT": "0"}
-    command = [unshare, "--user", "--map-auto", "--map-root-user", "--net", "--mount",
-               "--propagation", "private", "--", sys.executable, "-I", str(pathlib.Path(__file__).resolve()),
+    command = [unshare, *namespace_unshare_options(), "--", sys.executable, "-I",
+               str(pathlib.Path(__file__).resolve()),
                "--inside", "--repo-root", str(repo_root), "--temp-root", str(temp_root),
                "--head", head, "--tree", tree, "--request-id", "preq_" + str(uuid.uuid4()),
                "--mix-path", mix_path, "--runtime-path", runtime_path,
@@ -1828,29 +1880,23 @@ def outer_main(repo_root):
     finally:
         listener.close()
         cleanup_failures = []
-        if process is not None:
-            if process.poll() is None:
-                if not _stop_process(process, timeout=20):
-                    cleanup_failures.append("namespace_process")
-            for stream in (process.stdin, process.stdout):
-                if stream is not None:
-                    try:
-                        stream.close()
-                    except OSError:
-                        cleanup_failures.append("namespace_pipe")
+        namespace_stopped = _cleanup_outer_resources(process, cleanup_failures)
         if outside_thread_started:
             outside_thread.join(1)
             if outside_thread.is_alive():
                 cleanup_failures.append("outside_control_listener")
-        try:
-            if temp_root.is_symlink():
-                temp_root.unlink()
-            elif temp_root.exists():
-                shutil.rmtree(temp_root)
-        except OSError:
-            cleanup_failures.append("temporary_root")
-        if temp_root.exists() or temp_root.is_symlink():
-            cleanup_failures.append("temporary_root")
+        if namespace_stopped:
+            try:
+                if temp_root.is_symlink():
+                    temp_root.unlink()
+                elif temp_root.exists():
+                    shutil.rmtree(temp_root)
+            except OSError:
+                cleanup_failures.append("temporary_root")
+            if temp_root.exists() or temp_root.is_symlink():
+                cleanup_failures.append("temporary_root")
+        elif temp_root.exists() or temp_root.is_symlink():
+            cleanup_failures.append("temporary_root_preserved_while_namespace_active")
         if cleanup_failures:
             raise QualificationFailure("outer qualification cleanup failed: " + ",".join(cleanup_failures))
 
@@ -2168,7 +2214,7 @@ def _inside_main(repo_root, temp_root, head, tree, request_id, outside_control_p
         ready = state["ready"]
         stage_b = policy.last_stage_b_evidence
         evidence = {
-            "policy_mechanism": "temporary nftables table in disposable rootless user/network/mount namespaces",
+            "policy_mechanism": "temporary nftables table in disposable rootless user/network/PID/mount namespaces",
             "policy_scope": {"proof_uid": PROOF_UID, "relay_uid": RELAY_UID, "origin_uid": ORIGIN_UID,
                              "netns_inode": stage_b["netns_inode"], "userns_inode": stage_b["userns_inode"],
                              "proof_cgroup": stage_b["cgroup"], "proof_uid_map": stage_b["proof_uid_map"]},
@@ -2197,6 +2243,8 @@ def _inside_main(repo_root, temp_root, head, tree, request_id, outside_control_p
             "finch_result": proof_result["transport_result"],
             "retry_count": proof_result["retry_count"],
             "replay_count": proof_result["replay_count"],
+            "retry_replay_count_basis": "configuration_assertion",
+            "dispatch_witness_ack_count": proof_result["dispatch_witness_ack_count"],
             "ipv4_egress_canary": proof_result["direct_ipv4_canary"],
             "ipv6_egress_canary": proof_result["direct_ipv6_canary"],
             "proof_drop_packets_after_canaries": proof_result["canary_drop_packets"],
@@ -2229,6 +2277,8 @@ def _inside_main(repo_root, temp_root, head, tree, request_id, outside_control_p
             "proof_build_dependency_file_count": dependency_copy["file_count"],
             "proof_build_dependency_total_bytes": dependency_copy["total_bytes"],
             "proof_build_dependency_source_sha256": dependency_copy["source_sha256"],
+            "implementation_commits": implementation_commits,
+            "implementation_files_changed": implementation_files_changed,
         }
         return {"type": "QUALIFICATION_RESULT", "qualified": True, "evidence": evidence}
     finally:

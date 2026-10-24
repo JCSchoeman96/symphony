@@ -4,9 +4,9 @@
 
 **Goal:** Implement the accepted H100 P0 host-relay boundary and qualify it locally with real, temporary OS egress policy, isolated TLS trust, complete encrypted response suppression, and secret-free evidence.
 
-**Architecture:** Keep the accepted A4 schemas and proof Finch contract. An unprivileged in-BEAM controller remains A4's same-node PID and talks over a private Unix socket to an external, narrowly scoped launcher. The launcher establishes a rootless user/network namespace with dedicated mapped UIDs, installs UID-scoped nftables rules only inside that disposable network namespace, and uses a separate read-only verifier to inspect effective rules and process identity. A separate standard-library Python relay runs as its own UID, listens on loopback, validates one CONNECT correlation ID and authority, then parses TLS record framing only and suppresses the first complete server application-data record. The local qualification runs the real proof Finch through that relay to a local TLS 1.2 fixture with per-connection CA trust.
+**Architecture:** Keep the accepted A4 schemas and proof Finch contract. An unprivileged in-BEAM controller remains A4's same-node PID and talks over a private Unix socket to an external, narrowly scoped launcher. The launcher establishes rootless user, network, mount, and PID namespaces with dedicated mapped UIDs; its namespace controller is PID 1, so the kernel terminates detached service sessions if that controller exits. It installs UID-scoped nftables rules only inside the disposable network namespace and uses a separate read-only verifier to inspect effective rules and process identity. A separate standard-library Python relay runs as its own UID, listens on loopback, validates one CONNECT correlation ID and authority, then parses TLS record framing only and suppresses the first complete server application-data record. The local qualification runs the real proof Finch through that relay to a local TLS 1.2 fixture with per-connection CA trust.
 
-**Tech Stack:** Elixir/OTP and Finch already in the repository; Python standard library; Linux user, mount, and network namespaces; scoped nftables; OpenSSL CLI for ephemeral local certificates. No new runtime dependency.
+**Tech Stack:** Elixir/OTP and Finch already in the repository; Python standard library; Linux user, mount, network, and PID namespaces; scoped nftables; OpenSSL CLI for ephemeral local certificates. No new runtime dependency.
 
 ---
 
@@ -111,14 +111,14 @@
 - Create: `elixir/test/python/test_h100_local_policy_integration.py` for disposable namespace policy integration tests.
 
 **Tests/qualification:**
-- Use rootless user and network namespaces with dedicated subordinate UID mappings; bring up namespace loopback; install deny-all for the preselected proof UID before process spawn; independently verify Stage A.
+- Use rootless user, network, mount, and PID namespaces with dedicated subordinate UID mappings; run the namespace controller as PID 1 with `/proc` mounted for that PID namespace; prove the kernel terminates detached sessions when PID 1 exits. Bring up namespace loopback; install deny-all for the preselected proof UID before process spawn; independently verify Stage A.
 - Spawn the proof BEAM under the proof UID with no capabilities and a sanitized allowlist environment. Run relay and TLS origin as separate UIDs. Keep namespace/cgroup scope distinct from the invoking user's unrelated process.
 - Give the separate relay UID only the exact TCP path to the local fixture; deny all other relay egress. The TLS origin UID accepts local fixture traffic only. Neither process receives policy-changing capability.
 - After relay binds `127.0.0.1:<ephemeral-port>`, install only the exact proof-UID TCP loopback-port exception and independently verify Stage B against the actual proof PID and rules/counters. The BEAM proxy does not return READY before that check.
 - Verify the proof process can reach the relay, cannot reach direct IPv4 or IPv6 canaries, and records rule counters. Verify a separate non-proof process completes its local control exchange.
 - Run the real Finch request. If it spans more than one client application-data record, fail qualification and stop without changing the accepted record limit.
 - Verify one exact local request arrives complete; the first encrypted server application-data record is observed and zero bytes from it reach Finch; both sockets close; no retry/replay occurs.
-- Exercise process/relay/fixture failure paths and prove teardown removes namespace policy, sockets, children, generated trust, and all temporary files.
+- Exercise process/relay/fixture failure paths and prove teardown removes namespace policy, sockets, child processes in separate sessions, generated trust, and all temporary files. Outer teardown always checks the namespace process group even after its original leader exits.
 
 **Commit:** `test(h100): qualify proof egress in isolated namespace`.
 
@@ -129,12 +129,12 @@
 - Modify: `.github/workflows/make-all.yml` to run Python unit tests in CI and make the final aggregate depend on them; do not run the real local host qualification in CI.
 - Modify: `elixir/README.md` with safe local-only qualification instructions and explicit prohibitions on production credentials and live Plane access.
 - Create: `elixir/test/support/a4/evidence_schema.json` or equivalent versioned field contract for secret-free evidence.
-- Bump the separate host-qualification evidence contract to v3 to record the copied dependency file count, byte count, and source inventory hash; do not change the accepted A4 manifest or READY schema.
+- Bump the separate host-qualification evidence contract to v4 to record dependency provenance, implementation commit/file inventories, the measured dispatch-witness acknowledgement, and the basis of retry/replay assertions; do not change the accepted A4 manifest or READY schema.
 - Output only at runtime: `elixir/_build/h100-p0-host-relay-evidence.json` (ignored build output, not a tracked self-referential artifact).
 
 **Tests/verification:**
 - Test evidence schema/required fields and recursively reject secret-bearing keys, payload fields, authorization material, and unbounded values.
-- Confirm evidence records source/spec base, implementation SHA/tree, file/commit inventory, relay/manifest hashes, identity/policy/port checks, TLS/version/trust, connection/record counts, canaries, Finch classification, cleanup, and exact test commands/results.
+- Confirm the qualification packet records source/spec base, implementation SHA/tree, file/commit inventory, relay/manifest hashes, identity/policy/port checks, TLS/version/trust, connection/record counts, canaries, measured dispatch acknowledgement, configuration-based retry/replay assertions, and cleanup. Include exact test commands/results in a separate secret-free verification evidence supplement linked to the packet.
 - Run targeted Python and Elixir tests, existing A4 transport proof tests, format, lint/static checks, Dialyzer, full `make -C elixir all`, and `make -C elixir isolation-proof` using safe clean environment boundaries.
 
 **Commit:** `docs(h100): record local host relay qualification evidence`.

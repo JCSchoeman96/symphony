@@ -25,6 +25,7 @@ EVIDENCE_FIELDS = {
     "origin_request_count", "complete_request", "server_application_data_observed",
     "server_application_data_forwarded", "suppressed_encrypted_record_length",
     "suppressed_encrypted_record_sha256", "finch_result", "retry_count", "replay_count",
+    "retry_replay_count_basis", "dispatch_witness_ack_count",
     "ipv4_egress_canary", "ipv6_egress_canary", "proof_drop_packets_after_canaries",
     "unrelated_control_exchange", "tls_version", "tls_verify_peer", "tls_hostname_verification",
     "shared_trust_unchanged", "trust_material_removed", "policy_deny_all_restored",
@@ -38,7 +39,7 @@ EVIDENCE_FIELDS = {
     "proof_build_artifact_inventory_sha256", "proof_build_mix_lock_sha256",
     "proof_build_hex_version", "proof_build_hex_archive_sha256", "proof_build_rebar3_sha256",
     "proof_build_dependency_file_count", "proof_build_dependency_total_bytes",
-    "proof_build_dependency_source_sha256",
+    "proof_build_dependency_source_sha256", "implementation_commits", "implementation_files_changed",
 }
 
 
@@ -51,7 +52,7 @@ def _sample(schema, root):
     if schema_type == "object":
         return {key: _sample(schema["properties"][key], root) for key in schema.get("required", [])}
     if schema_type == "array":
-        return []
+        return [_sample(schema["items"], root) for _ in range(schema.get("minItems", 0))]
     if schema_type == "integer":
         return schema.get("minimum", 0)
     if schema_type == "boolean":
@@ -77,9 +78,9 @@ def valid_result():
 class QualificationEvidenceTests(unittest.TestCase):
     def test_schema_is_versioned_and_names_every_evidence_field(self):
         schema = json.loads(SCHEMA_PATH.read_text(encoding="ascii"))
-        self.assertEqual(schema["schema_version"], 3)
-        self.assertTrue(schema["$id"].endswith("/v3"))
-        self.assertEqual(runner.EVIDENCE_SCHEMA_VERSION, 3)
+        self.assertEqual(schema["schema_version"], 4)
+        self.assertTrue(schema["$id"].endswith("/v4"))
+        self.assertEqual(runner.EVIDENCE_SCHEMA_VERSION, 4)
         self.assertEqual(set(schema["properties"]["evidence"]["required"]), EVIDENCE_FIELDS)
 
     def test_validator_accepts_the_exact_payload_free_evidence_shape(self):
@@ -95,7 +96,7 @@ class QualificationEvidenceTests(unittest.TestCase):
 
     def test_validator_rejects_wrong_version_and_unbounded_evidence(self):
         result = valid_result()
-        result["schema_version"] = 4
+        result["schema_version"] = 5
         with self.assertRaises(runner.QualificationFailure):
             runner.validate_qualification_result(result)
         result = valid_result()
@@ -110,6 +111,13 @@ class QualificationEvidenceTests(unittest.TestCase):
                 result["evidence"][field] = "b" * 40
                 with self.assertRaises(runner.QualificationFailure):
                     runner.validate_qualification_result(result)
+
+    def test_evidence_binds_commit_file_and_observed_dispatch_inventory(self):
+        evidence = valid_result()["evidence"]
+        self.assertTrue(evidence["implementation_commits"])
+        self.assertTrue(evidence["implementation_files_changed"])
+        self.assertEqual(evidence["dispatch_witness_ack_count"], 1)
+        self.assertEqual(evidence["retry_replay_count_basis"], "configuration_assertion")
 
 
 if __name__ == "__main__":

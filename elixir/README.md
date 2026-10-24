@@ -572,7 +572,8 @@ The complete deterministic proof and the external-proof boundary are recorded in
 
 The H100 P0 host relay checks only a local TLS 1.2 fixture. Run it from a clean, committed
 implementation worktree with rootless user, network, and mount namespaces, `nft`, `ip`, `setpriv`,
-`newuidmap`, and `newgidmap` available:
+`newuidmap`, and `newgidmap` available. The namespace controller is PID 1 in a disposable PID
+namespace, so the kernel terminates detached service sessions if the controller exits:
 
 ```bash
 make -C elixir python-test

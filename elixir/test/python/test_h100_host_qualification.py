@@ -9,6 +9,7 @@ import subprocess
 import sys
 import unittest
 import json
+import signal
 import tempfile
 import time
 from unittest.mock import patch
@@ -35,6 +36,19 @@ class HostQualificationLauncherTests(unittest.TestCase):
         with patch.object(runner, "_run_bounded", return_value=b"!! elixir/priv/h100/__pycache__/relay.pyc\n"):
             with self.assertRaises(runner.QualificationFailure):
                 verify("/repo")
+
+    def test_candidate_inventory_records_bounded_commit_and_file_lists(self):
+        with patch.object(runner, "_run_bounded", side_effect=[b"a" * 40 + b"\n", b"elixir/priv/h100/relay.py\n"]) as run:
+            commits, files = runner.candidate_change_inventory("/repo")
+
+        self.assertEqual(commits, ["a" * 40])
+        self.assertEqual(files, ["elixir/priv/h100/relay.py"])
+        self.assertEqual(run.call_count, 2)
+
+    def test_candidate_inventory_rejects_unbounded_or_unsafe_entries(self):
+        with patch.object(runner, "_run_bounded", side_effect=[b"bad\n", b"../private\n"]):
+            with self.assertRaises(runner.QualificationFailure):
+                runner.candidate_change_inventory("/repo")
 
     def test_unrelated_control_listener_starts_only_when_requested(self):
         listener, port, result, thread = runner._outer_listener()
@@ -1045,6 +1059,152 @@ class HostQualificationLauncherTests(unittest.TestCase):
                 patch.object(runner.time, "monotonic", side_effect=[0.0, 0.05]):
             self.assertFalse(runner._wait_for_process_group(StillRunningProcess(), 123, 0.05))
         self.assertEqual(len(wait_calls), 1)
+
+    def test_namespace_options_make_controller_pid1_own_descendant_cleanup(self):
+        options = runner.namespace_unshare_options()
+        self.assertIn("--pid", options)
+        self.assertIn("--fork", options)
+        self.assertIn("--mount-proc", options)
+        self.assertIn("--kill-child=KILL", options)
+
+    def test_outer_cleanup_checks_process_scope_after_launcher_leader_exits(self):
+        class Stream:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        class ExitedController:
+            pid = 43210
+
+            def __init__(self):
+                self.stdin = Stream()
+                self.stdout = Stream()
+                self.poll_result = 137
+
+            def poll(self):
+                return self.poll_result
+
+        process = ExitedController()
+        failures = []
+        with patch.object(runner, "_active_process_group_members", return_value=[43211]) as members:
+            with patch.object(runner, "_stop_process") as stop:
+                stopped = runner._cleanup_outer_resources(process, failures)
+
+        members.assert_called_once_with(process.pid)
+        stop.assert_not_called()
+        self.assertIs(stopped, False)
+        self.assertEqual(failures, ["namespace_process"])
+        self.assertTrue(process.stdin.closed)
+        self.assertTrue(process.stdout.closed)
+
+    def test_outer_cleanup_accepts_an_exited_controller_with_an_empty_process_group(self):
+        class ExitedController:
+            pid = 43210
+            stdin = None
+            stdout = None
+
+            @staticmethod
+            def poll():
+                return 0
+
+        process = ExitedController()
+        failures = []
+        with patch.object(runner, "_active_process_group_members", return_value=[]) as members:
+            with patch.object(runner, "_stop_process") as stop:
+                stopped = runner._cleanup_outer_resources(process, failures)
+
+        members.assert_called_once_with(process.pid)
+        stop.assert_not_called()
+        self.assertIs(stopped, True)
+        self.assertEqual(failures, [])
+
+    def test_unshare_controller_death_kills_descendants_in_separate_sessions(self):
+        unshare = runner.shutil.which("unshare")
+        if unshare is None:
+            self.skipTest("unshare is unavailable")
+
+        with tempfile.TemporaryDirectory(prefix="h100-pidns-cleanup-") as directory:
+            marker = pathlib.Path(directory) / "child-ready"
+            script = (
+                "import os,pathlib,sys,time\n"
+                "pid=os.fork()\n"
+                "if pid==0:\n"
+                " os.setsid(); pathlib.Path(sys.argv[1]).write_text('ready')\n"
+                " while True: time.sleep(1)\n"
+                "while not pathlib.Path(sys.argv[1]).exists(): time.sleep(.01)\n"
+                "while True: time.sleep(1)\n"
+            )
+            process = subprocess.Popen(
+                [unshare, *runner.namespace_unshare_options(), "--", sys.executable, "-I",
+                 "-c", script, str(marker)],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"},
+                start_new_session=True,
+            )
+            child_pid = None
+            try:
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline and not marker.exists() and process.poll() is None:
+                    time.sleep(0.01)
+                if not marker.exists():
+                    _output, error = process.communicate(timeout=3)
+                    if b"Operation not permitted" in error:
+                        self.skipTest("unprivileged PID namespaces are unavailable")
+                    self.fail("PID namespace fixture exited before starting its detached child")
+
+                deadline = time.monotonic() + 1
+                while time.monotonic() < deadline and child_pid is None:
+                    try:
+                        init_pid = int(pathlib.Path(
+                            f"/proc/{process.pid}/task/{process.pid}/children"
+                        ).read_text().split()[0])
+                        children = pathlib.Path(
+                            f"/proc/{init_pid}/task/{init_pid}/children"
+                        ).read_text().split()
+                        if children:
+                            child_pid = int(children[0])
+                    except (FileNotFoundError, IndexError, ValueError):
+                        pass
+                    if child_pid is None:
+                        time.sleep(0.01)
+                self.assertIsNotNone(child_pid, "detached namespace child was not inspectable")
+                os.kill(process.pid, signal.SIGKILL)
+                _output, error = process.communicate(timeout=5)
+                self.assertEqual(process.returncode, -signal.SIGKILL,
+                                 error[:256].decode("utf-8", errors="replace"))
+                failures = []
+                self.assertIs(runner._cleanup_outer_resources(process, failures), True)
+                self.assertEqual(failures, [])
+
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline:
+                    stat_path = pathlib.Path(f"/proc/{child_pid}/stat")
+                    if not stat_path.exists():
+                        break
+                    state = stat_path.read_text().rsplit(")", 1)[1].split()[0]
+                    if state in ("Z", "X"):
+                        break
+                    time.sleep(0.01)
+                stat_path = pathlib.Path(f"/proc/{child_pid}/stat")
+                if stat_path.exists():
+                    state = stat_path.read_text().rsplit(")", 1)[1].split()[0]
+                    self.assertIn(state, ("Z", "X"), "PID namespace left a runnable descendant")
+            finally:
+                if process.poll() is None:
+                    runner._stop_process(process, timeout=2)
+                if process.stderr is not None:
+                    process.stderr.close()
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                if child_pid is not None:
+                    try:
+                        os.kill(child_pid, 9)
+                    except ProcessLookupError:
+                        pass
 
     def test_process_teardown_kills_descendants_after_leader_exits(self):
         with tempfile.TemporaryDirectory(prefix="h100-stop-descendant-") as directory:

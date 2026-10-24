@@ -33,15 +33,55 @@ defmodule SymphonyElixir.A4ProofTLSTrustTest do
     assert :public_key.cacerts_get() == shared_trust_before
   end
 
+  test "trust fixture teardown stops the child process" do
+    {fixture, _ready} = start_local_fixture()
+    {:os_pid, pid} = Port.info(fixture, :os_pid)
+
+    try do
+      stop_local_fixture(fixture)
+      assert wait_for_fixture_exit(pid, 1_000)
+    after
+      terminate_fixture(pid)
+    end
+  end
+
+  test "trust fixture teardown stops each concurrently running fixture" do
+    {first, _first_ready} = start_local_fixture()
+    {second, _second_ready} = start_local_fixture()
+    {:os_pid, first_pid} = Port.info(first, :os_pid)
+    {:os_pid, second_pid} = Port.info(second, :os_pid)
+
+    try do
+      stop_local_fixture(first)
+      stop_local_fixture(second)
+      assert wait_for_fixture_exit(first_pid, 1_000)
+      assert wait_for_fixture_exit(second_pid, 1_000)
+    after
+      terminate_fixture(first_pid)
+      terminate_fixture(second_pid)
+    end
+  end
+
   test "Finch rejects a locally trusted server when its CA is not trusted" do
     {fixture, ready} = start_local_fixture()
     on_exit(fn -> stop_local_fixture(fixture) end)
     {untrusted_fixture, untrusted_ready} = start_local_fixture()
     on_exit(fn -> stop_local_fixture(untrusted_fixture) end)
+    {:os_pid, fixture_pid} = Port.info(fixture, :os_pid)
+    {:os_pid, untrusted_fixture_pid} = Port.info(untrusted_fixture, :os_pid)
 
-    untrusted_ca = Base.decode64!(untrusted_ready["ca_der_base64"])
-    assert {:error, _transport_error} = request_fixture(ready, "127.0.0.1", untrusted_ca)
-    assert {:LOCAL_TLS_ERROR, _stage} = await_fixture_result(fixture)
+    try do
+      untrusted_ca = Base.decode64!(untrusted_ready["ca_der_base64"])
+      assert {:error, _transport_error} = request_fixture(ready, "127.0.0.1", untrusted_ca)
+      assert {:LOCAL_TLS_ERROR, _stage} = await_fixture_result(fixture)
+      stop_local_fixture(untrusted_fixture)
+      stop_local_fixture(fixture)
+      assert wait_for_fixture_exit(untrusted_fixture_pid, 1_000)
+      assert wait_for_fixture_exit(fixture_pid, 1_000)
+    after
+      terminate_fixture(untrusted_fixture_pid)
+      terminate_fixture(fixture_pid)
+    end
   end
 
   test "Finch rejects the trusted local certificate for a wrong hostname" do
@@ -96,19 +136,39 @@ defmodule SymphonyElixir.A4ProofTLSTrustTest do
 
   defp start_local_fixture do
     python = System.find_executable("python3") || raise "python3 is required for the local TLS fixture"
+    env = System.find_executable("env") || raise "env is required for the local TLS fixture"
     fixture_script = Path.expand("../../priv/h100/local_tls_fixture.py", __DIR__)
     directory = Path.join(System.tmp_dir!(), "h100-finch-trust-#{System.unique_integer([:positive])}")
     expected_path = "/api/v1/work-items/work-1/"
 
     port =
       Port.open(
-        {:spawn_executable, python},
+        {:spawn_executable, env},
         [
           :binary,
           :exit_status,
           :use_stdio,
           {:line, 16_384},
-          {:args, ["-I", fixture_script, "--serve", "--directory", directory, "--expected-api-key", "local-qualification-only", "--expected-path", expected_path, "--timeout", "10"]}
+          {:args,
+           [
+             "-i",
+             "PATH=/usr/bin:/bin",
+             "LANG=C.UTF-8",
+             "LC_ALL=C.UTF-8",
+             "HOME=#{System.tmp_dir!()}",
+             python,
+             "-I",
+             fixture_script,
+             "--serve",
+             "--directory",
+             directory,
+             "--expected-api-key",
+             "local-qualification-only",
+             "--expected-path",
+             expected_path,
+             "--timeout",
+             "10"
+           ]}
         ]
       )
 
@@ -144,8 +204,64 @@ defmodule SymphonyElixir.A4ProofTLSTrustTest do
   end
 
   defp stop_local_fixture(port) do
-    Port.close(port)
+    case Port.info(port, :os_pid) do
+      {:os_pid, pid} ->
+        signal_fixture(pid)
+        await_local_fixture_exit(port)
+
+      nil ->
+        :ok
+    end
   rescue
     ArgumentError -> :ok
+  end
+
+  defp await_local_fixture_exit(port) do
+    receive do
+      {^port, {:data, _line}} -> await_local_fixture_exit(port)
+      {^port, {:exit_status, _status}} -> :ok
+    after
+      3_000 -> raise "local TLS fixture did not stop during test teardown"
+    end
+  end
+
+  defp wait_for_fixture_exit(pid, timeout_ms) do
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+    wait_for_fixture_exit_until(pid, deadline)
+  end
+
+  defp wait_for_fixture_exit_until(pid, deadline) do
+    case File.read("/proc/#{pid}/stat") do
+      {:ok, stat} ->
+        state = stat |> String.split(")", parts: 2) |> List.last() |> String.trim_leading() |> String.first()
+        if state in ["Z", "X"], do: true, else: wait_again(pid, deadline)
+
+      {:error, :enoent} ->
+        true
+
+      {:error, _reason} ->
+        false
+    end
+  end
+
+  defp wait_again(pid, deadline) do
+    if System.monotonic_time(:millisecond) >= deadline do
+      false
+    else
+      Process.sleep(10)
+      wait_for_fixture_exit_until(pid, deadline)
+    end
+  end
+
+  defp terminate_fixture(pid) do
+    signal_fixture(pid)
+  end
+
+  defp signal_fixture(pid) do
+    env = System.find_executable("env") || raise "env is required to stop the local TLS fixture"
+    kill = System.find_executable("kill") || "/bin/kill"
+    args = ["-i", "PATH=/usr/bin:/bin", "LANG=C.UTF-8", "LC_ALL=C.UTF-8", kill, "-TERM", Integer.to_string(pid)]
+    {_output, status} = System.cmd(env, args, stderr_to_stdout: true)
+    if status not in [0, 1], do: raise("local TLS fixture could not be signaled")
   end
 end
