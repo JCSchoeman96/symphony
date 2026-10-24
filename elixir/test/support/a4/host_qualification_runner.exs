@@ -461,6 +461,15 @@ defmodule SymphonyElixir.H100HostQualificationRunner do
               :manifest_unavailable,
               :stage_b_not_verified,
               :request_identity_mismatch,
+              :invalid_dispatch_request,
+              :invalid_dispatch_witness_configuration,
+              :provider_mutation_envelope_required,
+              :provider_mutation_binding_mismatch,
+              :invalid_provider_mutation_envelope,
+              :invalid_provider_dispatch_witness,
+              :sink_invalid,
+              :acknowledgment_mismatch,
+              :invalid_acknowledgment,
               :direct_egress_not_denied,
               :canary_probe_failed,
               :local_qualification_gate_failed,
@@ -470,6 +479,9 @@ defmodule SymphonyElixir.H100HostQualificationRunner do
               :sink_exception
             ],
        do: Atom.to_string(reason)
+
+  defp proof_result_failure_code({:error, {:dispatch_witness_failed, {:adapter_preflight_failed, _reason}}}),
+    do: "adapter_preflight_failed"
 
   defp proof_result_failure_code({:error, {:dispatch_witness_failed, {:proof_finch_start_failed, :already_started}}}),
     do: "proof_finch_already_started"
