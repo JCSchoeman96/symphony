@@ -735,19 +735,25 @@ def _outer_listener():
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
     listener.bind(("127.0.0.1", 0))
     listener.listen(1)
-    listener.settimeout(15)
     port = listener.getsockname()[1]
     result = {"complete": False}
 
     def accept_control():
-        try:
-            connection, _address = listener.accept()
-            with connection:
-                message = connection.recv(128)
-                result["complete"] = message == b"h100-non-proof-control"
-                connection.sendall(b"ok" if result["complete"] else b"no")
-        except OSError:
-            result["complete"] = False
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            listener.settimeout(min(0.25, deadline - time.monotonic()))
+            try:
+                connection, _address = listener.accept()
+                with connection:
+                    message = connection.recv(128)
+                    result["complete"] = message == b"h100-non-proof-control"
+                    connection.sendall(b"ok" if result["complete"] else b"no")
+                return
+            except socket.timeout:
+                continue
+            except OSError:
+                result["complete"] = False
+                return
 
     thread = threading.Thread(target=accept_control, name="h100-outside-control", daemon=True)
     thread.start()

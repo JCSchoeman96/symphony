@@ -27,6 +27,13 @@ class HostQualificationLauncherTests(unittest.TestCase):
                 self.assertEqual(runner.main(["--repo-root", "/tmp"]), 0)
         outer.assert_called_once_with("/tmp")
 
+    def test_outside_control_listener_stops_promptly_when_closed(self):
+        listener, _port, result, thread = runner._outer_listener()
+        listener.close()
+        thread.join(timeout=1)
+        self.assertFalse(thread.is_alive())
+        self.assertFalse(result["complete"])
+
     def test_cleanup_attempts_every_resource_and_reports_a_child_that_would_not_stop(self):
         class Process:
             def __init__(self):
