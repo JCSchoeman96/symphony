@@ -61,6 +61,12 @@ def proof_stderr_category(stderr):
     if b"failed to create scheduler thread" in value or b"could not start vm" in value:
         return "erlang_startup_error"
     if b"permission denied" in value:
+        if b"_build" in value:
+            return "permission_build_output"
+        if b".mix" in value or b".hex" in value:
+            return "permission_proof_home"
+        if b"mix.exs" in value or b"/repo/" in value or b".exs" in value:
+            return "permission_project_source"
         return "permission_error"
     if b"no such file or directory" in value:
         return "file_missing"

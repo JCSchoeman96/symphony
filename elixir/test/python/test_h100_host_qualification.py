@@ -43,6 +43,8 @@ class HostQualificationLauncherTests(unittest.TestCase):
                          "erlang_startup_error")
         self.assertEqual(runner.proof_stderr_category(b"Permission denied: secret path"),
                          "permission_error")
+        self.assertEqual(runner.proof_stderr_category(b"Permission denied writing _build/test"),
+                         "permission_build_output")
         self.assertEqual(runner.proof_stderr_category(b"unrecognized sensitive output"),
                          "unclassified_stderr")
 
