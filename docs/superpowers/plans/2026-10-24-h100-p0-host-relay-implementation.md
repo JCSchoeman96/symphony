@@ -40,7 +40,6 @@
 - Test one accepted CONNECT and prove a second upstream connection cannot be created.
 - Feed arbitrary TLS records through socket pairs and verify byte-for-byte forwarding; malformed and truncated headers/payloads and watchdog expiry close both sides.
 - Permit one client application-data record and fail closed on a second; verify server application-data bytes are wholly withheld and both directions close.
-- Exercise wrong TLS-version negotiation against the local fixture/client path and confirm it fails; relay only observes record framing, content type, and length.
 - Verify evidence is bounded and excludes tunnel payload and HTTP content.
 
 **Commit:** `feat(h100): add correlated single-use TLS relay`.
@@ -92,6 +91,7 @@
 
 **Tests:**
 - Generate CA/key/server material under a private temporary directory, restrict file access to the origin UID, trust only the generated CA in the one proof connection, and assert exact hostname verification.
+- Confirm a peer-verified TLS 1.1-only fixture fails while the TLS 1.2 fixture succeeds; the relay itself only observes record framing, content type, and length.
 - Send the exact bounded local PATCH once; fixture confirms one complete request without writing its body to logs/evidence.
 - Confirm origin emits a server application-data record, relay suppresses the full record, Finch reports transport failure, and there is one dispatch, one CONNECT, one upstream, one client application-data record, zero retries, and zero replays.
 - Failure/interrupt paths remove CA, certificate, key, temporary trust files, sockets, and all fixture children.
