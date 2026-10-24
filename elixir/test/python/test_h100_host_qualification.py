@@ -1225,6 +1225,13 @@ class HostQualificationLauncherTests(unittest.TestCase):
                 "module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)\n"
                 "directory=pathlib.Path(sys.argv[2])/'origin'\n"
                 "module._set_reapable_service_directory(directory,int(sys.argv[3]))\n"
+                "source_root=pathlib.Path(sys.argv[2])/'source'\n"
+                "source_root.mkdir()\n"
+                "build_root=pathlib.Path(sys.argv[2])/'proof-build-source'\n"
+                "artifact=build_root/'_build/test/lib/sample/ebin/Elixir.Sample.beam'\n"
+                "artifact.parent.mkdir(parents=True)\n"
+                "artifact.write_bytes(b'compiled-proof-artifact')\n"
+                "module._seal_proof_build(build_root,source_root)\n"
                 "pid=os.fork()\n"
                 "if pid==0:\n"
                 " os.setgroups([]);os.setgid(int(sys.argv[3]));os.setuid(int(sys.argv[3]))\n"
@@ -1275,6 +1282,14 @@ class HostQualificationLauncherTests(unittest.TestCase):
                 with self.assertRaises(PermissionError):
                     private_key.read_bytes()
                 self.assertEqual(private_key.stat().st_mode & 0o777, 0o600)
+                build_root = temp_root / "proof-build-source"
+                sealed_directory = build_root / "_build/test/lib/sample/ebin"
+                self.assertEqual(sealed_directory.stat().st_mode & 0o777, 0o555)
+                restore_build = getattr(runner, "restore_host_reapable_build_directories", None)
+                self.assertTrue(callable(restore_build),
+                                "outer cleanup cannot reap the sealed proof build")
+                restore_build(temp_root)
+                self.assertEqual(sealed_directory.stat().st_mode & stat.S_IWUSR, stat.S_IWUSR)
 
                 import shutil
                 shutil.rmtree(temp_root)
@@ -1285,6 +1300,11 @@ class HostQualificationLauncherTests(unittest.TestCase):
                 if process.stderr is not None:
                     process.stderr.close()
                 if temp_root.exists():
+                    for root, directories, _files in os.walk(temp_root):
+                        for name in directories:
+                            path = pathlib.Path(root) / name
+                            if not path.is_symlink() and path.stat().st_uid == os.getuid():
+                                path.chmod(path.stat().st_mode | stat.S_IWUSR)
                     import shutil
                     shutil.rmtree(temp_root, ignore_errors=True)
 
@@ -1292,6 +1312,45 @@ class HostQualificationLauncherTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="h100-reapable-directory-") as directory:
             with self.assertRaises(runner.QualificationFailure):
                 runner._set_reapable_service_directory(pathlib.Path(directory) / "service", 1203)
+
+    def test_build_cleanup_restores_only_owned_directories_without_following_links(self):
+        with tempfile.TemporaryDirectory(prefix="h100-build-reaper-") as directory:
+            parent = pathlib.Path(directory)
+            temp_root = parent / "qualification"
+            temp_root.mkdir()
+            build_root = temp_root / "proof-build-source"
+            sealed = build_root / "_build/test/lib/sample/ebin"
+            sealed.mkdir(parents=True)
+            artifact = sealed / "Elixir.Sample.beam"
+            artifact.write_bytes(b"compiled-artifact")
+            artifact.chmod(0o444)
+            outside = parent / "outside"
+            outside.mkdir()
+            outside.chmod(0o555)
+            (build_root / "outside-link").symlink_to(outside, target_is_directory=True)
+            for directory_path in (build_root, build_root / "_build", build_root / "_build/test",
+                                   build_root / "_build/test/lib", build_root / "_build/test/lib/sample",
+                                   sealed):
+                directory_path.chmod(0o555)
+
+            self.assertTrue(runner.restore_host_reapable_build_directories(temp_root))
+
+            for directory_path in (build_root, build_root / "_build", build_root / "_build/test",
+                                   build_root / "_build/test/lib", build_root / "_build/test/lib/sample",
+                                   sealed):
+                self.assertTrue(directory_path.stat().st_mode & stat.S_IWUSR)
+            self.assertEqual(artifact.stat().st_mode & 0o777, 0o444)
+            self.assertEqual(outside.stat().st_mode & 0o777, 0o555)
+            self.assertTrue((build_root / "outside-link").is_symlink())
+
+            with patch.object(runner.os, "getuid", return_value=os.getuid() + 1):
+                with self.assertRaises(runner.QualificationFailure):
+                    runner.restore_host_reapable_build_directories(temp_root)
+
+            import shutil
+            shutil.rmtree(temp_root)
+            self.assertFalse(temp_root.exists())
+            outside.chmod(0o755)
 
     def test_process_teardown_kills_descendants_after_leader_exits(self):
         with tempfile.TemporaryDirectory(prefix="h100-stop-descendant-") as directory:

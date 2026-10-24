@@ -1581,6 +1581,60 @@ def _set_reapable_service_directory(path, service_uid):
     return True
 
 
+def _restore_build_directory_permissions(directory_fd, expected_uid, directory_flags):
+    directory_stat = os.fstat(directory_fd)
+    if not stat.S_ISDIR(directory_stat.st_mode) or directory_stat.st_uid != expected_uid:
+        raise QualificationFailure("proof build directory is not owned by the host launcher")
+    os.fchmod(directory_fd, stat.S_IMODE(directory_stat.st_mode) | stat.S_IWUSR)
+    with os.scandir(directory_fd) as entries:
+        names = [entry.name for entry in entries]
+    for name in names:
+        try:
+            child_stat = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except OSError as exc:
+            raise QualificationFailure("proof build changed during host cleanup") from exc
+        if stat.S_ISLNK(child_stat.st_mode) or not stat.S_ISDIR(child_stat.st_mode):
+            continue
+        try:
+            child_fd = os.open(name, directory_flags, dir_fd=directory_fd)
+        except OSError as exc:
+            raise QualificationFailure("proof build directory could not be opened safely") from exc
+        try:
+            _restore_build_directory_permissions(child_fd, expected_uid, directory_flags)
+        finally:
+            os.close(child_fd)
+
+
+def restore_host_reapable_build_directories(temp_root):
+    """Restore write permission only on caller-owned proof build directories."""
+    directory_flags = (os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) |
+                       getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0))
+    if not getattr(os, "O_DIRECTORY", 0) or not getattr(os, "O_NOFOLLOW", 0):
+        raise QualificationFailure("safe proof build cleanup is unavailable")
+    expected_uid = os.getuid()
+    try:
+        root_fd = os.open(pathlib.Path(temp_root), directory_flags)
+    except OSError as exc:
+        raise QualificationFailure("qualification root could not be opened safely") from exc
+    try:
+        root_stat = os.fstat(root_fd)
+        if not stat.S_ISDIR(root_stat.st_mode) or root_stat.st_uid != expected_uid:
+            raise QualificationFailure("qualification root is not owned by the host launcher")
+        try:
+            build_fd = os.open("proof-build-source", directory_flags, dir_fd=root_fd)
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            raise QualificationFailure("proof build root could not be opened safely") from exc
+        try:
+            _restore_build_directory_permissions(build_fd, expected_uid, directory_flags)
+        finally:
+            os.close(build_fd)
+    finally:
+        os.close(root_fd)
+    return True
+
+
 def _bind_read_only_path(source_path, mount_path, *, unmount):
     source_path = pathlib.Path(source_path).resolve()
     mount_path = pathlib.Path(mount_path)
@@ -1913,13 +1967,21 @@ def outer_main(repo_root):
             if outside_thread.is_alive():
                 cleanup_failures.append("outside_control_listener")
         if namespace_stopped:
-            try:
-                if temp_root.is_symlink():
+            if temp_root.is_symlink():
+                try:
                     temp_root.unlink()
-                elif temp_root.exists():
-                    shutil.rmtree(temp_root)
-            except OSError:
-                cleanup_failures.append("temporary_root")
+                except OSError:
+                    cleanup_failures.append("temporary_root")
+            elif temp_root.exists():
+                try:
+                    restore_host_reapable_build_directories(temp_root)
+                except (OSError, QualificationFailure):
+                    cleanup_failures.append("proof_build_permissions")
+                else:
+                    try:
+                        shutil.rmtree(temp_root)
+                    except OSError:
+                        cleanup_failures.append("temporary_root")
             if temp_root.exists() or temp_root.is_symlink():
                 cleanup_failures.append("temporary_root")
         elif temp_root.exists() or temp_root.is_symlink():

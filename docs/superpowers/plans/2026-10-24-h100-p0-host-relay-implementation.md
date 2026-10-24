@@ -122,6 +122,7 @@
 - Verify one exact local request arrives complete; the first encrypted server application-data record is observed and zero bytes from it reach Finch; both sockets close; no retry/replay occurs.
 - Exercise process/relay/fixture failure paths and prove teardown removes namespace policy, sockets, child processes in separate sessions, generated trust, and all temporary files. Outer teardown always checks the namespace process group even after its original leader exits.
 - Kill the namespace controller while the origin UID owns generated private material; prove the service process dies, the host cannot read the private key, and the host launcher can remove the complete temporary tree.
+- After namespace shutdown, restore owner-write permission only on verified caller-owned directories beneath `proof-build-source`; do not follow symlinks or widen file permissions. Cover a sealed build tree, a private key, and an external symlink target in cleanup regressions.
 
 **Commit:** `test(h100): qualify proof egress in isolated namespace`.
 
