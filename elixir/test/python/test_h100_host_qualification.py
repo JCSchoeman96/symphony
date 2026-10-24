@@ -234,6 +234,37 @@ class HostQualificationLauncherTests(unittest.TestCase):
         child = runner.child_environment({}, home="/tmp/proof-home", runtime_path=runtime_path)
         self.assertEqual(child["PATH"], runtime_path + ":" + runner.SYSTEM_PATH)
 
+    def test_runtime_mount_plan_maps_only_pinned_elixir_and_erlang_installs(self):
+        with tempfile.TemporaryDirectory(prefix="h100-runtime-plan-") as directory:
+            root = pathlib.Path(directory)
+            elixir_bin = root / "elixir" / "1.19" / "bin"
+            erlang_bin = root / "erlang" / "28" / "bin"
+            elixir_bin.mkdir(parents=True)
+            erlang_bin.mkdir(parents=True)
+            (elixir_bin / "mix").touch()
+            (elixir_bin / "elixir").touch()
+            (erlang_bin / "erl").touch()
+            plan = runner.runtime_mount_plan(
+                str(elixir_bin / "mix"),
+                os.pathsep.join((str(elixir_bin), str(erlang_bin))),
+                str(root / "namespace"),
+            )
+            self.assertEqual(
+                [(item["source"], item["destination"]) for item in plan["mounts"]],
+                [
+                    (str(elixir_bin.parent), str(root / "namespace/runtime/elixir")),
+                    (str(erlang_bin.parent), str(root / "namespace/runtime/erlang")),
+                ],
+            )
+            self.assertEqual(plan["mix_path"], str(root / "namespace/runtime/elixir/bin/mix"))
+            self.assertEqual(
+                plan["runtime_path"],
+                os.pathsep.join((
+                    str(root / "namespace/runtime/elixir/bin"),
+                    str(root / "namespace/runtime/erlang/bin"),
+                )),
+            )
+
     def test_proof_identity_failure_reports_only_child_exit_status(self):
         class ExitedProcess:
             pid = 321

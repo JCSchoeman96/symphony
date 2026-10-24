@@ -155,6 +155,37 @@ def _valid_runtime_path(runtime_path):
             all(part.startswith("/") and "\x00" not in part for part in runtime_path.split(os.pathsep)))
 
 
+def runtime_mount_plan(mix_path, runtime_path, temp_root):
+    """Map the exact Elixir and Erlang installs into namespace-readable paths."""
+    if (not isinstance(mix_path, str) or not mix_path.startswith("/") or
+            not _valid_runtime_path(runtime_path) or not isinstance(temp_root, str) or
+            not temp_root.startswith("/")):
+        raise QualificationFailure("runtime mount inputs are invalid")
+    elixir_bin = pathlib.Path(mix_path).parent.resolve()
+    if pathlib.Path(mix_path).name != "mix" or not (elixir_bin / "elixir").is_file():
+        raise QualificationFailure("pinned Elixir runtime installation is incomplete")
+    erlang_bins = [pathlib.Path(entry).resolve() for entry in runtime_path.split(os.pathsep)
+                   if (pathlib.Path(entry) / "erl").is_file()]
+    if len(erlang_bins) != 1:
+        raise QualificationFailure("pinned Erlang runtime installation is ambiguous")
+
+    mount_root = pathlib.Path(temp_root) / "runtime"
+    elixir_destination = mount_root / "elixir"
+    erlang_destination = mount_root / "erlang"
+    return {
+        "mounts": [
+            {"source": str(elixir_bin.parent), "destination": str(elixir_destination)},
+            {"source": str(erlang_bins[0].parent), "destination": str(erlang_destination)},
+        ],
+        "mix_path": str(elixir_destination / "bin/mix"),
+        "runtime_path": runtime_path_for(
+            str(elixir_destination / "bin/mix"),
+            str(elixir_destination / "bin/elixir"),
+            str(erlang_destination / "bin/erl"),
+        ),
+    }
+
+
 def child_environment(values, *, home, runtime_path=SYSTEM_PATH):
     """Build a clean child environment from fixed names and explicit values."""
     if (not isinstance(values, dict) or not isinstance(home, str) or not home.startswith("/") or
@@ -756,7 +787,8 @@ def _cleanup_preserving_failure(primary_failure, cleanup):
 
 
 def _cleanup_inside_resources(*, control_server, processes, canaries, ca_path,
-                              cert_directory, policy, mount_path, mounted, temp_root):
+                              cert_directory, policy, mount_path, mounted, temp_root,
+                              runtime_mounts=()):
     """Attempt every teardown action and fail qualification if any cannot be verified."""
     failures = []
 
@@ -793,6 +825,9 @@ def _cleanup_inside_resources(*, control_server, processes, canaries, ca_path,
     if policy is not None:
         attempt("policy", lambda: _nft_delete_if_present(policy))
 
+    for index, runtime_mount in enumerate(reversed(runtime_mounts)):
+        attempt("runtime_mount_" + str(index), lambda path=runtime_mount: _unmount_mount(path))
+
     if mounted:
         attempt("source_mount", lambda: _unmount_repo(mount_path))
 
@@ -817,11 +852,13 @@ def _set_owner(path, uid, mode):
     os.chmod(path, mode)
 
 
-def _bind_repo_read_only(repo_root, mount_path):
+def _bind_read_only_path(source_path, mount_path, *, unmount):
+    source_path = pathlib.Path(source_path).resolve()
+    mount_path = pathlib.Path(mount_path)
     mount_path.mkdir(parents=True, exist_ok=True)
     bound = False
     try:
-        _run_bounded(["mount", "--bind", str(repo_root), str(mount_path)], env=service_environment("/"))
+        _run_bounded(["mount", "--bind", str(source_path), str(mount_path)], env=service_environment("/"))
         bound = True
         _run_bounded(["mount", "-o", "remount,bind,ro", str(mount_path)], env=service_environment("/"))
         mount_point = str(mount_path)
@@ -831,11 +868,29 @@ def _bind_repo_read_only(repo_root, mount_path):
                 if "ro" in fields[5].split(","):
                     return
                 break
-        raise QualificationFailure("implementation source mount is not read-only")
+        raise QualificationFailure("qualification mount is not read-only")
     except BaseException:
         if bound:
-            _unmount_repo(mount_path)
+            unmount(mount_path)
         raise
+
+
+def _bind_repo_read_only(repo_root, mount_path):
+    _bind_read_only_path(repo_root, mount_path, unmount=_unmount_repo)
+
+
+def _bind_runtime_installations(plan):
+    mounted = []
+    try:
+        for item in plan["mounts"]:
+            destination = pathlib.Path(item["destination"])
+            _bind_read_only_path(item["source"], destination, unmount=_unmount_mount)
+            mounted.append(destination)
+    except BaseException:
+        for destination in reversed(mounted):
+            _unmount_mount(destination)
+        raise
+    return mounted
 
 
 def _start_canary(family, address):
@@ -1062,6 +1117,7 @@ def _inside_main(repo_root, temp_root, head, tree, request_id, outside_control_p
     os.chmod(temp_root, 0o711)
     mount_path = temp_root / "repo"
     mounted = False
+    runtime_mounts = []
     policy = None
     session = None
     proof_process = None
@@ -1093,6 +1149,9 @@ def _inside_main(repo_root, temp_root, head, tree, request_id, outside_control_p
         POLICY_PATH_OVERRIDE = policy_path
         sys.path.insert(0, str(h100_directory))
         import host_qualification as host
+
+        runtime_plan = runtime_mount_plan(mix_path, runtime_path, str(temp_root))
+        runtime_mounts = _bind_runtime_installations(runtime_plan)
 
         _set_owner(relay_home, RELAY_UID, 0o700)
         _set_owner(origin_home, ORIGIN_UID, 0o700)
@@ -1225,8 +1284,10 @@ def _inside_main(repo_root, temp_root, head, tree, request_id, outside_control_p
             "H100_QUAL_EXPECTED_PATH": EXPECTED_PATH,
             "H100_QUAL_RESULT_FILE": str(result_path),
         }
-        proof_environment = child_environment(result_values, home=str(proof_home), runtime_path=runtime_path)
-        target = [mix_path, "run", "--no-compile", "--no-start", str(proof_runner_path)]
+        proof_environment = child_environment(
+            result_values, home=str(proof_home), runtime_path=runtime_plan["runtime_path"]
+        )
+        target = [runtime_plan["mix_path"], "run", "--no-compile", "--no-start", str(proof_runner_path)]
         proof_command = _setpriv_command(PROOF_UID, proof_launch_command(target))
         control_server.start()
         proof_stderr_file = tempfile.TemporaryFile()
@@ -1371,6 +1432,7 @@ def _inside_main(repo_root, temp_root, head, tree, request_id, outside_control_p
                     canaries=(canary4, canary6), ca_path=ca_path,
                     cert_directory=cert_directory, policy=policy,
                     mount_path=mount_path, mounted=mounted, temp_root=temp_root,
+                    runtime_mounts=runtime_mounts,
                 ),
             )
         finally:
@@ -1378,12 +1440,16 @@ def _inside_main(repo_root, temp_root, head, tree, request_id, outside_control_p
                 proof_stderr_file.close()
 
 
-def _unmount_repo(mount_path):
+def _unmount_mount(mount_path):
     completed = subprocess.run(["umount", str(mount_path)], check=False,
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                timeout=3, env=service_environment("/"))
     if completed.returncode != 0:
-        raise QualificationFailure("read-only implementation mount could not be removed")
+        raise QualificationFailure("read-only qualification mount could not be removed")
+
+
+def _unmount_repo(mount_path):
+    _unmount_mount(mount_path)
 
 
 def _write_status(value):
