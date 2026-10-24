@@ -164,7 +164,7 @@ class LocalTLSFixture:
                         "method": "PATCH",
                         "tls_version": tls.version(),
                     }
-                    tls.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    self._send_response(tls)
         except (OSError, ssl.SSLError, ValueError) as exc:
             self._error = type(exc).__name__
         finally:
@@ -179,6 +179,14 @@ class LocalTLSFixture:
 
     def _deadline_at(self):
         return self._expires_at
+
+    @staticmethod
+    def _send_response(connection):
+        try:
+            connection.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            return True
+        except (OSError, ssl.SSLError):
+            return False
 
     def _expire(self):
         connection = self._active_connection

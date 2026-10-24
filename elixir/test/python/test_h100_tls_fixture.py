@@ -15,6 +15,13 @@ spec.loader.exec_module(fixture_module)
 
 
 class LocalTLSFixtureTests(unittest.TestCase):
+    def test_response_write_failure_after_complete_request_is_tolerated(self):
+        class ClosedTLSConnection:
+            def sendall(self, _data):
+                raise ssl.SSLEOFError("peer closed after request capture")
+
+        self.assertFalse(fixture_module.LocalTLSFixture._send_response(ClosedTLSConnection()))
+
     def request(self, fixture, context, authorization=None):
         with socket.create_connection((fixture.host, fixture.port), timeout=2) as raw:
             with context.wrap_socket(raw, server_hostname=fixture.server_hostname) as connection:
