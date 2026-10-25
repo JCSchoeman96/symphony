@@ -27,6 +27,10 @@ erl_crash.dump
 /.elixir_ls/
 /.fetch/
 
+# Python qualification support bytecode.
+__pycache__/
+*.py[cod]
+
 # Editor / OS temporary files.
 .DS_Store
 *.swp

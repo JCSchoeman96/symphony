@@ -18,6 +18,9 @@ defmodule SymphonyElixir.Plane.Client do
   @receive_timeout_ms 15_000
   @page_size 100
   @max_pages 100
+  @max_proof_ca_certificates 8
+  @max_proof_ca_certificate_bytes 16_384
+  @max_proof_ca_bundle_bytes 65_536
   @max_work_items 10_000
   @max_states 64
   @max_response_bytes 4_000_000
@@ -149,6 +152,18 @@ defmodule SymphonyElixir.Plane.Client do
       timeout: @connect_timeout_ms
     ]
   end
+
+  @doc false
+  @spec proof_tls_options(String.t(), [binary()]) :: keyword()
+  def proof_tls_options(host, cacerts) when is_binary(host) and is_list(cacerts) do
+    if valid_proof_cacerts?(cacerts) do
+      tls_options(host) |> Keyword.put(:cacerts, cacerts)
+    else
+      raise ArgumentError, "invalid isolated proof CA bundle"
+    end
+  end
+
+  def proof_tls_options(_host, _cacerts), do: raise(ArgumentError, "invalid isolated proof CA bundle")
 
   @spec validate_config(config()) :: :ok | {:error, term()}
   def validate_config(config) when is_map(config) do
@@ -579,11 +594,12 @@ defmodule SymphonyElixir.Plane.Client do
     with true <- Keyword.get(opts, :dispatch_witness_required?, false),
          %ProviderMutationEnvelope{} <- envelope,
          :ok <- validate_proof_binding(config, request, envelope, token),
+         :ok <- validate_proof_trust_context(token.manifest, opts),
          nil <- Keyword.get(opts, :request_fun),
          {:ok, ready_token} <- A4Proof.ready(token),
          :ok <- validate_proof_ready(envelope, ready_token),
          :ok <- A4Proof.consume(ready_token, ready_token.bindings),
-         {:ok, finch_pid} <- start_proof_finch(ready_token) do
+         {:ok, finch_pid} <- start_proof_finch(ready_token, opts) do
       try do
         perform_mutation_request(config, request, Keyword.put(opts, :a4_proof_ready, ready_token))
       after
@@ -676,11 +692,12 @@ defmodule SymphonyElixir.Plane.Client do
     if valid?, do: :ok, else: proof_failure({:proof_manifest_mismatch, :ready})
   end
 
-  defp start_proof_finch(token) do
+  defp start_proof_finch(token, opts) do
     manifest = token.manifest
     ready = token.ready
     host = manifest_value(manifest, :origin_authority) |> String.split(":") |> hd()
     port = ready_value(ready, :bound_port)
+    tls_opts = proof_transport_tls_options(manifest, host, opts)
 
     pools = %{
       default: [
@@ -690,7 +707,7 @@ defmodule SymphonyElixir.Plane.Client do
         conn_opts: [
           proxy: {:http, "127.0.0.1", port, []},
           proxy_headers: [{"x-symphony-provider-request-id", manifest_value(manifest, :provider_request_id)}],
-          transport_opts: tls_options(host)
+          transport_opts: tls_opts
         ]
       ]
     }
@@ -701,6 +718,41 @@ defmodule SymphonyElixir.Plane.Client do
     end
   rescue
     _ -> proof_failure(:proof_finch_start_failed)
+  end
+
+  defp proof_transport_tls_options(manifest, host, opts) do
+    case {local_qualification_origin?(manifest), Keyword.fetch(opts, :a4_proof_cacerts)} do
+      {true, {:ok, cacerts}} -> proof_tls_options(host, cacerts)
+      {false, :error} -> tls_options(host)
+      _ -> raise ArgumentError, "invalid proof TLS trust context"
+    end
+  end
+
+  defp validate_proof_trust_context(manifest, opts) do
+    case {local_qualification_origin?(manifest), Keyword.fetch(opts, :a4_proof_cacerts)} do
+      {true, {:ok, cacerts}} ->
+        host = manifest_value(manifest, :origin_authority) |> String.split(":") |> hd()
+        _ = proof_tls_options(host, cacerts)
+        :ok
+
+      {false, :error} ->
+        :ok
+
+      _ ->
+        proof_failure(:invalid_proof_tls_trust_context)
+    end
+  rescue
+    _ -> proof_failure(:invalid_proof_tls_trust_context)
+  end
+
+  defp local_qualification_origin?(manifest) do
+    manifest_value(manifest, :origin_kind) in [:local_qualification, "local_qualification"]
+  end
+
+  defp valid_proof_cacerts?(cacerts) do
+    length(cacerts) in 1..@max_proof_ca_certificates and
+      Enum.all?(cacerts, &(is_binary(&1) and byte_size(&1) in 1..@max_proof_ca_certificate_bytes)) and
+      Enum.reduce(cacerts, 0, &(byte_size(&1) + &2)) <= @max_proof_ca_bundle_bytes
   end
 
   defp stop_proof_finch(pid) when is_pid(pid) do

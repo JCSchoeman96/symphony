@@ -1,12 +1,13 @@
-.PHONY: help all setup deps build fmt fmt-check lint test coverage coverage-clean coverage-partition coverage-transition-fixture \
-	h070a-scale coverage-report ci dialyzer e2e isolation-proof verify-codex
+.PHONY: help all setup deps build fmt fmt-check lint test python-test h100-policy-integration h100-local-qualification \
+	coverage coverage-clean coverage-partition coverage-transition-fixture h070a-scale coverage-report ci dialyzer \
+	e2e isolation-proof verify-codex
 
 MIX ?= mix
 COVERAGE_PARTITIONS := 8
 COVERAGE_TEST_FILES := $(shell find test -type f -name '*_test.exs' ! -path 'test/symphony_elixir/transition_coordinator_default_path_test.exs' ! -path 'test/symphony_elixir/transition_coordinator_test.exs' | sort)
 
 help:
-	@echo "Targets: setup, deps, build, fmt, fmt-check, lint, test, coverage, coverage-partition, coverage-transition-fixture, h070a-scale, coverage-report, dialyzer, e2e, isolation-proof, ci"
+	@echo "Targets: setup, deps, build, fmt, fmt-check, lint, test, python-test, h100-policy-integration, h100-local-qualification, coverage, coverage-partition, coverage-transition-fixture, h070a-scale, coverage-report, dialyzer, e2e, isolation-proof, ci"
 
 setup:
 	$(MIX) setup
@@ -53,6 +54,20 @@ coverage-report:
 test:
 	$(MIX) test
 
+python-test:
+	python3 -I test/python/test_h100_evidence.py
+	python3 -I test/python/test_h100_host_qualification.py
+	python3 -I test/python/test_h100_policy.py
+	python3 -I test/python/test_h100_relay.py
+	python3 -I test/python/test_h100_tls_fixture.py
+
+h100-policy-integration:
+	python3 -I test/python/test_h100_local_policy_integration.py
+
+h100-local-qualification:
+	@mkdir -p _build
+	python3 -I test/support/a4/run_h100_local_qualification.py --repo-root .. > _build/h100-p0-host-relay-evidence.json
+
 dialyzer:
 	$(MIX) deps.get
 	$(MIX) dialyzer --format short
@@ -76,6 +91,7 @@ ci:
 	$(MAKE) build
 	$(MAKE) fmt-check
 	$(MAKE) lint
+	$(MAKE) python-test
 	$(MAKE) coverage
 	$(MAKE) h070a-scale
 	$(MAKE) coverage-report

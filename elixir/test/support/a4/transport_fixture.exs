@@ -18,15 +18,7 @@ defmodule SymphonyElixir.A4TransportProofFixture do
 
     try do
       certificate = make_certificate!(root)
-      :public_key.cacerts_clear()
-      :ok = :public_key.cacerts_load(certificate.ca_pem)
-
-      try do
-        run_suppression(root, certificate)
-      after
-        :public_key.cacerts_clear()
-        :ok = :public_key.cacerts_load()
-      end
+      run_suppression(root, certificate)
     after
       on_exit.()
     end
@@ -150,7 +142,8 @@ defmodule SymphonyElixir.A4TransportProofFixture do
 
             {:ok, witness.provider_request_id}
           end,
-          a4_session: token
+          a4_session: token,
+          a4_proof_cacerts: [certificate.ca_der]
         )
       end)
 
@@ -456,8 +449,8 @@ defmodule SymphonyElixir.A4TransportProofFixture do
     File.write!(ext, "subjectAltName=IP:127.0.0.1\nextendedKeyUsage=serverAuth\nkeyUsage=digitalSignature,keyEncipherment\n")
     cmd!("openssl", ["x509", "-req", "-in", server_csr, "-CA", ca_pem, "-CAkey", ca_key, "-CAcreateserial", "-out", server_cert, "-days", "1", "-extfile", ext])
     [ca_entry] = :public_key.pem_decode(File.read!(ca_pem))
-    _ = :public_key.pem_entry_decode(ca_entry)
-    %{ca_pem: ca_pem, server_cert: server_cert, server_key: server_key}
+    {:Certificate, ca_der, :not_encrypted} = ca_entry
+    %{ca_pem: ca_pem, ca_der: ca_der, server_cert: server_cert, server_key: server_key}
   end
 
   defp durable_attempt!(root, request_id, attempt_id) do

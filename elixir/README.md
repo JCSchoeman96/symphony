@@ -568,6 +568,27 @@ SYMPHONY_RUN_GITLAB_LIVE_E2E=1 mise exec -- mix test test/symphony_elixir/gitlab
 The complete deterministic proof and the external-proof boundary are recorded in
 [`../docs/symphony-agent-router-dependency-proof.md`](../docs/symphony-agent-router-dependency-proof.md).
 
+## H100 P0 local host relay qualification
+
+The H100 P0 host relay checks only a local TLS 1.2 fixture. Run it from a clean, committed
+implementation worktree with rootless user, network, and mount namespaces, `nft`, `ip`, `setpriv`,
+`newuidmap`, and `newgidmap` available. The namespace controller is PID 1 in a disposable PID
+namespace, so the kernel terminates detached service sessions if the controller exits:
+
+```bash
+make -C elixir python-test
+make -C elixir h100-policy-integration
+make -C elixir h100-local-qualification
+```
+
+The local qualification creates temporary UIDs, namespace-scoped nftables rules, a generated CA,
+server certificate, and server key. It removes those files and rules during teardown. It writes the
+bounded, payload-free result to `elixir/_build/h100-p0-host-relay-evidence.json`.
+
+Do not source `providers.env` or set a Plane credential for these commands. The proof sends the
+local fixture sentinel to the local TLS server. The qualification does not contact Plane, make a
+provider mutation, run H100 or H110, mint a GitHub token, or change GitHub App permissions.
+
 ## FAQ
 
 ### Why Elixir?
