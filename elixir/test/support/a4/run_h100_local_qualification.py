@@ -25,7 +25,7 @@ import re
 
 
 MAX_IPC_BYTES = 16_384
-EVIDENCE_SCHEMA_VERSION = 4
+EVIDENCE_SCHEMA_VERSION = 5
 SYSTEM_PATH = "/usr/local/bin:/usr/bin:/bin"
 PROOF_UID = 1201
 RELAY_UID = 1202
@@ -326,18 +326,23 @@ def runtime_mount_plan(mix_path, runtime_path, temp_root, *, erlang_otp_release=
     }
 
 
-def _build_environment(mix_build_path, *, home, runtime_path):
+def _build_environment(mix_build_path, *, home, runtime_path, hex_home=None):
     if (not isinstance(mix_build_path, str) or not mix_build_path.startswith("/") or
             "\x00" in mix_build_path or not isinstance(home, str) or not home.startswith("/") or
             not _valid_runtime_path(runtime_path)):
         raise QualificationFailure("proof build environment is invalid")
+    if hex_home is None:
+        hex_home = os.path.join(home, ".hex")
+    if not isinstance(hex_home, str) or not hex_home.startswith("/") or "\x00" in hex_home:
+        raise QualificationFailure("isolated Hex cache path is invalid")
     return {
         "PATH": runtime_path + os.pathsep + SYSTEM_PATH,
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
         "HOME": home,
         "MIX_HOME": os.path.join(home, ".mix"),
-        "HEX_HOME": os.path.join(home, ".hex"),
+        "HEX_HOME": hex_home,
+        "HEX_OFFLINE": "1",
         "MIX_ENV": "prod",
         "MIX_BUILD_PATH": mix_build_path,
         "GIT_CONFIG_GLOBAL": "/dev/null",
@@ -868,6 +873,7 @@ def copy_dependency_tree(source_path, destination_path, *, maximum_files=50_000,
                 if (len(files) > maximum_files or len(directories) + len(files) > maximum_files * 2 or
                         total_bytes > maximum_bytes):
                     raise QualificationFailure("dependency source exceeds its copy bound")
+        files.sort(key=lambda item: item[0].as_posix())
         destination.mkdir(mode=0o755, parents=True, exist_ok=False)
         created_destination = True
         for relative_directory in directories[1:]:
@@ -921,10 +927,146 @@ def copy_dependency_tree(source_path, destination_path, *, maximum_files=50_000,
         raise QualificationFailure("dependency sources could not be copied safely") from exc
 
 
+def _seal_hex_package_cache(package_path):
+    """Make the staged package-only Hex cache read-only before namespace entry."""
+    root = pathlib.Path(package_path)
+    if root.is_symlink() or not root.is_dir():
+        raise QualificationFailure("staged Hex package cache is unavailable")
+    try:
+        entries = sorted(root.rglob("*"), key=lambda path: len(path.parts), reverse=True)
+        for path in entries:
+            file_stat = path.lstat()
+            if stat.S_ISLNK(file_stat.st_mode):
+                raise QualificationFailure("staged Hex package cache contains a symbolic link")
+            if stat.S_ISDIR(file_stat.st_mode):
+                path.chmod(0o555)
+            elif stat.S_ISREG(file_stat.st_mode):
+                path.chmod(0o444)
+            else:
+                raise QualificationFailure("staged Hex package cache contains an unsupported file")
+        root.chmod(0o555)
+    except QualificationFailure:
+        raise
+    except OSError as exc:
+        raise QualificationFailure("staged Hex package cache could not be sealed") from exc
+
+
+def _restore_staged_hex_cache_permissions(temp_root):
+    """Restore owner write access to staged cache directories for reliable cleanup."""
+    cache_root = pathlib.Path(temp_root) / "hex-cache"
+    if not cache_root.exists() and not cache_root.is_symlink():
+        return
+    if cache_root.is_symlink() or not cache_root.is_dir():
+        raise QualificationFailure("staged Hex cache root changed before cleanup")
+    packages = cache_root / "packages"
+    if packages.exists() or packages.is_symlink():
+        if packages.is_symlink() or not packages.is_dir():
+            raise QualificationFailure("staged Hex package cache changed before cleanup")
+        try:
+            directories = [packages, *[path for path in packages.rglob("*") if path.is_dir()]]
+            for path in sorted(directories, key=lambda item: len(item.parts), reverse=True):
+                if path.is_symlink():
+                    raise QualificationFailure("staged Hex package cache changed before cleanup")
+                path.chmod(stat.S_IMODE(path.lstat().st_mode) | stat.S_IWUSR | stat.S_IXUSR)
+            cache_root.chmod(stat.S_IMODE(cache_root.lstat().st_mode) | stat.S_IWUSR | stat.S_IXUSR)
+        except QualificationFailure:
+            raise
+        except OSError as exc:
+            raise QualificationFailure("staged Hex cache permissions could not be restored") from exc
+
+
+def materialize_locked_hex_dependencies(mix_path, elixir_path, project_path, *, destination_path, home,
+                                        runtime_path, hex_home, mix_tools,
+                                        failure_stderr_bytes=0):
+    """Verify cached Hex tarballs against mix.lock, then materialize with Hex itself."""
+    if (any(not isinstance(value, str) or not value.startswith("/") or "\x00" in value
+            for value in (mix_path, elixir_path, project_path, destination_path, home, hex_home)) or
+            not _valid_runtime_path(runtime_path) or not isinstance(mix_tools, dict) or
+            set(mix_tools) != {"hex_version", "hex_archive_sha256", "rebar3_sha256"} or
+            not isinstance(mix_tools["hex_version"], str) or
+            re.fullmatch(r"\d+(?:\.\d+){1,2}", mix_tools["hex_version"]) is None or
+            not _valid_sha256(mix_tools["hex_archive_sha256"]) or
+            not _valid_sha256(mix_tools["rebar3_sha256"])):
+        raise QualificationFailure("locked Hex materialization inputs are invalid")
+    project = pathlib.Path(project_path).resolve()
+    lock_path = project / "mix.lock"
+    deps_path = pathlib.Path(destination_path)
+    materialization_cwd = deps_path.parent
+    if (not project.is_dir() or not (project / "mix.exs").is_file() or
+            lock_path.is_symlink() or not lock_path.is_file() or
+            deps_path.exists() or deps_path.is_symlink() or materialization_cwd.is_symlink() or
+            not materialization_cwd.is_dir()):
+        raise QualificationFailure("candidate dependency source tree is not fresh")
+    try:
+        lock_digest = hashlib.sha256(lock_path.read_bytes()).hexdigest()
+        mix_install = pathlib.Path(mix_path).resolve(strict=True).parent.parent
+        mix_ebin = mix_install / "lib/mix/ebin"
+        target_mix_home = pathlib.Path(home) / ".mix"
+        hex_version = mix_tools["hex_version"]
+        hex_ebin = target_mix_home / "archives" / f"hex-{hex_version}" / f"hex-{hex_version}" / "ebin"
+        helper = project / "test/support/a4/materialize_locked_hex_dependencies.exs"
+        if (mix_path and pathlib.Path(mix_path).name != "mix" or
+                elixir_path and pathlib.Path(elixir_path).name != "elixir" or
+                not mix_ebin.is_dir() or not hex_ebin.is_dir() or
+                helper.is_symlink() or not helper.is_file() or
+                not pathlib.Path(hex_home, "packages").is_dir()):
+            raise QualificationFailure("locked Hex tooling or package cache is unavailable")
+        environment = _build_environment(
+            str(pathlib.Path(home) / "hex-materialization-build"),
+            home=home,
+            runtime_path=runtime_path,
+            hex_home=hex_home,
+        )
+        output = _run_bounded(
+            [elixir_path, "-pa", str(mix_ebin), "-pa", str(hex_ebin), str(helper),
+             str(lock_path), str(deps_path)],
+            env=environment,
+            timeout=300,
+            cwd=str(materialization_cwd),
+            max_output_bytes=65_536,
+            failure_stderr_bytes=failure_stderr_bytes,
+        )
+    except QualificationFailure:
+        if deps_path.exists() and not deps_path.is_symlink():
+            shutil.rmtree(deps_path, ignore_errors=True)
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
+        if deps_path.exists() and not deps_path.is_symlink():
+            shutil.rmtree(deps_path, ignore_errors=True)
+        raise QualificationFailure("locked Hex package material could not be prepared") from exc
+
+    match = re.fullmatch(
+        rb"H100_LOCKED_HEX_PROVENANCE ([0-9]{1,4}) ([0-9]{1,9}) ([a-f0-9]{64}) ([a-f0-9]{64})\n?",
+        output,
+    )
+    try:
+        if (match is None or hashlib.sha256(lock_path.read_bytes()).hexdigest() != lock_digest or
+                deps_path.is_symlink() or not deps_path.is_dir()):
+            raise QualificationFailure("locked Hex materialization provenance is invalid")
+        dependency_count = int(match.group(1))
+        archive_bytes = int(match.group(2))
+        inventory_sha256 = match.group(3).decode("ascii")
+        materialized_source_sha256 = match.group(4).decode("ascii")
+        if dependency_count > 1_000 or archive_bytes > 536_870_912:
+            raise QualificationFailure("locked Hex materialization provenance exceeds its bound")
+        return {
+            "dependency_source": "hex_lock_cache_v1",
+            "locked_dependency_count": dependency_count,
+            "locked_dependency_archive_bytes": archive_bytes,
+            "locked_dependency_inventory_sha256": inventory_sha256,
+            "materialized_source_sha256": materialized_source_sha256,
+        }
+    except BaseException:
+        if deps_path.exists() and not deps_path.is_symlink():
+            shutil.rmtree(deps_path, ignore_errors=True)
+        raise
+
+
 def compile_fresh_proof_build(mix_path, project_path, build_path, *, home, runtime_path,
                               source_head_sha, source_tree_sha, rebar_key=None,
                               source_mix_home=None, selected_elixir_path=None,
                               selected_erlang_path=None, selected_otp_release=None,
+                              hex_home=None, mix_tools=None, dependency_provenance=None,
                               failure_stderr_bytes=0):
     """Compile the exact local project into a fresh, separate Mix build path."""
     if (not isinstance(mix_path, str) or not mix_path.startswith("/") or "\x00" in mix_path or
@@ -989,15 +1131,32 @@ def compile_fresh_proof_build(mix_path, project_path, build_path, *, home, runti
         if selected_otp_release is not None and selected_otp_release != otp_release:
             raise QualificationFailure("preselected Erlang OTP release changed")
     runtime_path = runtime_path_for(mix_path, elixir_path, selected_erlang_path or erlang_path)
+    if rebar_key is None:
+        rebar_key = mix_rebar_home_key(mix_path, mix_home=source_mix_home)
+    if mix_tools is None:
+        mix_tools = prepare_isolated_mix_home(source_mix_home, str(pathlib.Path(home) / ".mix"),
+                                              rebar_key=rebar_key)
+    if dependency_provenance is None:
+        if hex_home is None:
+            hex_home = str(pathlib.Path(home) / ".hex")
+        dependency_provenance = materialize_locked_hex_dependencies(
+            mix_path, elixir_path, str(project), destination_path=str(project / "deps"),
+            home=home, runtime_path=runtime_path,
+            hex_home=hex_home, mix_tools=mix_tools,
+            failure_stderr_bytes=failure_stderr_bytes,
+        )
+    else:
+        _validate_locked_dependency_provenance(dependency_provenance)
+        if (not (project / "deps").is_dir() or (project / "deps").is_symlink() or
+                hashlib.sha256(lock_path.read_bytes()).hexdigest() != lock_digest):
+            raise QualificationFailure("materialized dependencies no longer match the candidate lock")
     try:
         build_root.mkdir(parents=True, mode=0o700, exist_ok=False)
     except OSError as exc:
         raise QualificationFailure("fresh proof build directory could not be created") from exc
-    if rebar_key is None:
-        rebar_key = mix_rebar_home_key(mix_path, mix_home=source_mix_home)
-    mix_tools = prepare_isolated_mix_home(source_mix_home, str(pathlib.Path(home) / ".mix"),
-                                          rebar_key=rebar_key)
-    environment = _build_environment(str(build_root), home=home, runtime_path=runtime_path)
+    environment = _build_environment(
+        str(build_root), home=home, runtime_path=runtime_path, hex_home=hex_home,
+    )
     _run_bounded([mix_path, "compile", "--warnings-as-errors"], env=environment,
                  timeout=300, cwd=str(project), max_output_bytes=1_048_576,
                  failure_stderr_bytes=failure_stderr_bytes)
@@ -1013,7 +1172,24 @@ def compile_fresh_proof_build(mix_path, project_path, build_path, *, home, runti
         "artifact_inventory_sha256": inventory["artifact_inventory_sha256"],
         "mix_lock_sha256": lock_digest,
         **mix_tools,
+        **dependency_provenance,
     }
+
+
+def _validate_locked_dependency_provenance(provenance):
+    if (not isinstance(provenance, dict) or set(provenance) != {
+            "dependency_source", "locked_dependency_count", "locked_dependency_archive_bytes",
+            "locked_dependency_inventory_sha256", "materialized_source_sha256"} or
+            provenance["dependency_source"] != "hex_lock_cache_v1" or
+            not isinstance(provenance["locked_dependency_count"], int) or
+            isinstance(provenance["locked_dependency_count"], bool) or
+            not 0 <= provenance["locked_dependency_count"] <= 1_000 or
+            not isinstance(provenance["locked_dependency_archive_bytes"], int) or
+            isinstance(provenance["locked_dependency_archive_bytes"], bool) or
+            not 0 <= provenance["locked_dependency_archive_bytes"] <= 536_870_912 or
+            not _valid_sha256(provenance["locked_dependency_inventory_sha256"]) or
+            not _valid_sha256(provenance["materialized_source_sha256"])):
+        raise QualificationFailure("locked dependency provenance is malformed")
 
 
 def _valid_git_sha(value):
@@ -1146,7 +1322,11 @@ def proof_elixir_command(elixir_path, build_provenance, script_path):
             for value in (elixir_path, script_path)) or not isinstance(build_provenance, dict) or
             set(build_provenance) != {"build_lib_path", "source_root", "source_head_sha", "source_tree_sha",
                                       "artifact_count", "artifact_inventory_sha256", "mix_lock_sha256",
-                                      "hex_version", "hex_archive_sha256", "rebar3_sha256"}):
+                                      "hex_version", "hex_archive_sha256", "rebar3_sha256",
+                                      "dependency_source", "locked_dependency_count",
+                                      "locked_dependency_archive_bytes",
+                                      "locked_dependency_inventory_sha256",
+                                      "materialized_source_sha256"}):
         raise QualificationFailure("proof BEAM command paths are invalid")
     if (not _valid_git_sha(build_provenance["source_head_sha"]) or
             not _valid_git_sha(build_provenance["source_tree_sha"]) or
@@ -1156,7 +1336,16 @@ def proof_elixir_command(elixir_path, build_provenance, script_path):
             not isinstance(build_provenance["hex_version"], str) or
             re.fullmatch(r"\d+(?:\.\d+){1,2}", build_provenance["hex_version"]) is None or
             not _valid_sha256(build_provenance["hex_archive_sha256"]) or
-            not _valid_sha256(build_provenance["rebar3_sha256"])):
+            not _valid_sha256(build_provenance["rebar3_sha256"]) or
+            build_provenance["dependency_source"] != "hex_lock_cache_v1" or
+            not isinstance(build_provenance["locked_dependency_count"], int) or
+            isinstance(build_provenance["locked_dependency_count"], bool) or
+            not 0 <= build_provenance["locked_dependency_count"] <= 1_000 or
+            not isinstance(build_provenance["locked_dependency_archive_bytes"], int) or
+            isinstance(build_provenance["locked_dependency_archive_bytes"], bool) or
+            not 0 <= build_provenance["locked_dependency_archive_bytes"] <= 536_870_912 or
+            not _valid_sha256(build_provenance["locked_dependency_inventory_sha256"]) or
+            not _valid_sha256(build_provenance["materialized_source_sha256"])):
         raise QualificationFailure("proof build provenance is malformed")
     build_lib_path = build_provenance["build_lib_path"]
     if not isinstance(build_lib_path, str) or not build_lib_path.startswith("/") or "\x00" in build_lib_path:
@@ -1500,7 +1689,10 @@ def _safe_command_failure_diagnostic(stderr, maximum):
     )
     text = stderr[-maximum:].decode("utf-8", errors="replace")
     lines = []
-    for line in text.splitlines()[-8:]:
+    diagnostic_lines = text.splitlines()
+    if len(diagnostic_lines) > 8:
+        diagnostic_lines = diagnostic_lines[:4] + diagnostic_lines[-4:]
+    for line in diagnostic_lines:
         if sensitive.search(line):
             line = "[redacted sensitive diagnostic]"
         else:
@@ -2351,12 +2543,24 @@ def outer_main(repo_root):
     _emit_erlang_runtime_diagnostic(erlang_path, otp_release)
     runtime_path = runtime_path_for(mix_path, elixir_path, erlang_path)
 
+    source_hex_home = os.environ.get("HEX_HOME") or str(pathlib.Path.home() / ".hex")
+    if not source_hex_home.startswith("/") or "\x00" in source_hex_home:
+        raise QualificationFailure("local Hex package cache path is invalid")
     temp_root = pathlib.Path(tempfile.mkdtemp(prefix="h100-local-qualification-"))
     candidate_source = temp_root / "candidate-source"
+    hex_cache_home = temp_root / "hex-cache"
     try:
         materialize_candidate_source_snapshot(str(repo_root), str(candidate_source), head, tree)
-        copy_dependency_tree(str(repo_root / "elixir/deps"), str(candidate_source / "elixir/deps"))
+        candidate_deps = candidate_source / "elixir/deps"
+        if candidate_deps.exists() or candidate_deps.is_symlink():
+            raise QualificationFailure("candidate source tree contains a dependency path")
+        candidate_deps.mkdir(mode=0o755)
+        hex_cache_home.mkdir(mode=0o700)
+        copy_dependency_tree(str(pathlib.Path(source_hex_home) / "packages"),
+                             str(hex_cache_home / "packages"))
+        _seal_hex_package_cache(hex_cache_home / "packages")
     except BaseException:
+        _restore_staged_hex_cache_permissions(temp_root)
         shutil.rmtree(temp_root, ignore_errors=True)
         raise
     listener, outside_port, outside_result, outside_thread = _outer_listener()
@@ -2370,7 +2574,7 @@ def outer_main(repo_root):
                "--inside", "--repo-root", str(candidate_source), "--temp-root", str(temp_root),
                "--head", head, "--tree", tree, "--request-id", "preq_" + str(uuid.uuid4()),
                "--mix-path", mix_path, "--runtime-path", runtime_path,
-               "--source-mix-home", source_mix_home,
+               "--source-mix-home", source_mix_home, "--hex-cache-home", str(hex_cache_home),
                "--outside-control-port", str(outside_port)]
     try:
         process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -2434,6 +2638,7 @@ def outer_main(repo_root):
             elif temp_root.exists():
                 try:
                     restore_host_reapable_build_directories(temp_root)
+                    _restore_staged_hex_cache_permissions(temp_root)
                 except (OSError, QualificationFailure):
                     cleanup_failures.append("proof_build_permissions")
                 else:
@@ -2450,7 +2655,7 @@ def outer_main(repo_root):
 
 
 def _inside_main(repo_root, temp_root, head, tree, request_id, outside_control_port,
-                 mix_path, runtime_path, source_mix_home):
+                 mix_path, runtime_path, source_mix_home, hex_cache_home):
     global POLICY_PATH_OVERRIDE
     repo_root = pathlib.Path(repo_root).resolve()
     if pathlib.Path(__file__).resolve(strict=True) != pathlib.Path(
@@ -2459,6 +2664,10 @@ def _inside_main(repo_root, temp_root, head, tree, request_id, outside_control_p
     temp_root = pathlib.Path(temp_root).resolve()
     temp_root.mkdir(parents=True, exist_ok=True)
     os.chmod(temp_root, 0o711)
+    hex_cache_home = pathlib.Path(hex_cache_home).resolve(strict=True)
+    if (hex_cache_home != temp_root / "hex-cache" or hex_cache_home.is_symlink() or
+            not (hex_cache_home / "packages").is_dir()):
+        raise QualificationFailure("isolated Hex package cache path is invalid")
     mount_path = temp_root / "repo"
     mounted = False
     dependency_mount = None
@@ -2515,10 +2724,24 @@ def _inside_main(repo_root, temp_root, head, tree, request_id, outside_control_p
         )
         runtime_mounts = _bind_runtime_installations(runtime_plan)
         dependency_mount = source_elixir / "deps"
-        dependency_copy = copy_dependency_tree(str(dependency_mount), str(temp_root / "proof-deps"))
+        build_home.mkdir(mode=0o700)
+        mix_tools = prepare_isolated_mix_home(
+            source_mix_home, str(build_home / ".mix"),
+            rebar_key=mix_rebar_home_key(mix_path, mix_home=source_mix_home),
+        )
+        verified_dependencies = temp_root / "verified-deps"
+        dependency_provenance = materialize_locked_hex_dependencies(
+            runtime_plan["mix_path"], runtime_plan["elixir_path"], str(source_elixir),
+            destination_path=str(verified_dependencies), home=str(build_home),
+            runtime_path=runtime_plan["runtime_path"], hex_home=str(hex_cache_home),
+            mix_tools=mix_tools,
+            failure_stderr_bytes=4096,
+        )
+        dependency_copy = copy_dependency_tree(str(verified_dependencies), str(temp_root / "proof-deps"))
+        if dependency_copy["source_sha256"] != dependency_provenance["materialized_source_sha256"]:
+            raise QualificationFailure("materialized dependencies changed after Hex checksum verification")
         _bind_writable_dependency_copy(str(temp_root / "proof-deps"), str(dependency_mount))
         runtime_mounts.append(dependency_mount)
-        build_home.mkdir(mode=0o700)
         proof_build = compile_fresh_proof_build(
             runtime_plan["mix_path"],
             str(source_elixir),
@@ -2532,9 +2755,9 @@ def _inside_main(repo_root, temp_root, head, tree, request_id, outside_control_p
             selected_elixir_path=runtime_plan["elixir_path"],
             selected_erlang_path=runtime_plan["erlang_path"],
             selected_otp_release=runtime_plan["otp_release"],
+            hex_home=str(hex_cache_home), mix_tools=mix_tools,
+            dependency_provenance=dependency_provenance,
         )
-        _unmount_mount(dependency_mount)
-        runtime_mounts.remove(dependency_mount)
         _bind_read_only_path(proof_build_source, proof_build_mount, unmount=_unmount_mount)
         runtime_mounts.append(proof_build_mount)
         proof_build = {
@@ -2843,6 +3066,11 @@ def _inside_main(repo_root, temp_root, head, tree, request_id, outside_control_p
             "proof_build_dependency_file_count": dependency_copy["file_count"],
             "proof_build_dependency_total_bytes": dependency_copy["total_bytes"],
             "proof_build_dependency_source_sha256": dependency_copy["source_sha256"],
+            "proof_build_dependency_source": proof_build["dependency_source"],
+            "proof_build_locked_dependency_count": proof_build["locked_dependency_count"],
+            "proof_build_locked_dependency_archive_bytes": proof_build["locked_dependency_archive_bytes"],
+            "proof_build_locked_dependency_inventory_sha256":
+                proof_build["locked_dependency_inventory_sha256"],
         }
         return {"type": "QUALIFICATION_RESULT", "qualified": True, "evidence": evidence}
     finally:
@@ -2901,6 +3129,7 @@ def main(argv=None):
     parser.add_argument("--mix-path")
     parser.add_argument("--runtime-path")
     parser.add_argument("--source-mix-home")
+    parser.add_argument("--hex-cache-home")
     parser.add_argument("--outside-control-port", type=int)
     args = parser.parse_args(argv)
     try:
@@ -2915,6 +3144,8 @@ def main(argv=None):
                 "\x00" in args.mix_path or not _valid_runtime_path(args.runtime_path) or
                 not isinstance(args.source_mix_home, str) or not args.source_mix_home.startswith("/") or
                 "\x00" in args.source_mix_home or
+                not isinstance(args.hex_cache_home, str) or not args.hex_cache_home.startswith("/") or
+                "\x00" in args.hex_cache_home or
                 not isinstance(args.request_id, str) or not args.request_id.startswith("preq_") or
                 not 1 <= len(args.request_id) <= 128 or
                 not isinstance(args.outside_control_port, int) or not 1 <= args.outside_control_port <= 65535):
@@ -2923,17 +3154,29 @@ def main(argv=None):
         try:
             result = _inside_main(args.repo_root, args.temp_root, args.head, args.tree,
                                   args.request_id, args.outside_control_port,
-                                  args.mix_path, args.runtime_path, args.source_mix_home)
+                                  args.mix_path, args.runtime_path, args.source_mix_home,
+                                  args.hex_cache_home)
         finally:
             signal.signal(signal.SIGTERM, previous_sigterm)
         _write_status(result)
         return 0
     except QualificationFailure as exc:
-        reason = _safe_failure_reason(str(exc)) or "local_qualification_failed"
+        raw_reason = str(exc)
+        reason = _safe_failure_reason(raw_reason)
+        if reason is None and raw_reason.startswith("local qualification command failed: "):
+            clipped = raw_reason.encode("ascii", errors="replace").decode("ascii")
+            clipped = "".join(character if 32 <= ord(character) <= 126 else " "
+                               for character in clipped)
+            reason = clipped[:160]
+        reason = reason or "local_qualification_failed"
         _write_status({"type": "QUALIFICATION_ERROR", "reason": reason})
         return 1
-    except Exception:
-        _write_status({"type": "QUALIFICATION_ERROR", "reason": "local_qualification_failed"})
+    except Exception as exc:
+        error_name = type(exc).__name__
+        if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", error_name) is None:
+            error_name = "unknown"
+        _write_status({"type": "QUALIFICATION_ERROR",
+                       "reason": "local_qualification_failed:" + error_name})
         return 1
 
 

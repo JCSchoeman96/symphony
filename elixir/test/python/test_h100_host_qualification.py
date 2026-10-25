@@ -1,9 +1,11 @@
 """Unit tests for the credential-free local qualification launcher."""
 
 import importlib.util
+import hashlib
 import io
 import os
 import pathlib
+import re
 import socket
 import stat
 import subprocess
@@ -11,6 +13,7 @@ import sys
 import unittest
 import json
 import signal
+import shutil
 import tempfile
 import time
 from unittest.mock import patch
@@ -23,6 +26,126 @@ spec.loader.exec_module(runner)
 
 
 class HostQualificationLauncherTests(unittest.TestCase):
+    def _locked_telemetry_fixture(self, root, *, package_cache_mode="present", version=None,
+                                  checksum_mismatch=False):
+        mix_entry = runner.shutil.which("mix")
+        elixir_entry = runner.shutil.which("elixir")
+        erlang_entry = runner.shutil.which("erl")
+        if not all((mix_entry, elixir_entry, erlang_entry)):
+            self.skipTest("Mix and its pinned Elixir/Erlang runtime are unavailable")
+
+        source_mix_home = os.environ.get("MIX_HOME") or str(pathlib.Path.home() / ".mix")
+        host_mix_path, host_elixir_path = runner.resolve_mix_runtime_paths(mix_entry, source_mix_home)
+        project = root / "candidate/elixir"
+        project.mkdir(parents=True)
+        (project / "mise.toml").write_text('[tools]\nerlang = "28"\n', encoding="ascii")
+        helper = project / "test/support/a4/materialize_locked_hex_dependencies.exs"
+        helper.parent.mkdir(parents=True)
+        shutil.copyfile(
+            pathlib.Path(__file__).resolve().parents[1] /
+            "support/a4/materialize_locked_hex_dependencies.exs",
+            helper,
+        )
+
+        source_lock = pathlib.Path(__file__).resolve().parents[2] / "mix.lock"
+        telemetry_line = next(
+            line for line in source_lock.read_text(encoding="utf-8").splitlines()
+            if line.lstrip().startswith('"telemetry":')
+        )
+        match = re.match(r'\s*"telemetry": \{:hex, :telemetry, "([^"]+)"', telemetry_line)
+        self.assertIsNotNone(match, "fixture lock lacks a Hex telemetry package")
+        locked_version = match.group(1)
+        if version is not None:
+            telemetry_line = telemetry_line.replace(f'"{locked_version}"', f'"{version}"', 1)
+        if checksum_mismatch:
+            checksums = re.findall(r'"([0-9a-f]{64})"', telemetry_line)
+            self.assertEqual(len(checksums), 2)
+            telemetry_line = telemetry_line.replace(checksums[-1], "0" * 64, 1)
+
+        (project / "mix.exs").write_text(
+            "defmodule LockedFixture.MixProject do\n"
+            "  use Mix.Project\n"
+            f"  def project, do: [app: :locked_fixture, version: \"0.1.0\", deps: [{{:telemetry, \"== {locked_version}\"}}]]\n"
+            "  def application, do: []\n"
+            "end\n",
+            encoding="utf-8",
+        )
+        (project / "mix.lock").write_text("%{\n" + telemetry_line + "\n}\n", encoding="utf-8")
+        (project / "lib").mkdir()
+        (project / "lib/locked_fixture.ex").write_text(
+            "defmodule LockedFixture do\n  def ready, do: :telemetry.execute([:proof], %{}, %{})\nend\n",
+            encoding="utf-8",
+        )
+        stale_build = project / "_build/test/lib/locked_fixture/ebin/stale.beam"
+        stale_build.parent.mkdir(parents=True)
+        stale_build.write_bytes(b"stale repository build")
+
+        installs = root / "mise/installs"
+        elixir_install = installs / "elixir" / pathlib.Path(host_elixir_path).parent.parent.name
+        erlang_install = installs / "erlang" / pathlib.Path(runner.resolve_erlang_runtime_path(
+            erlang_entry,
+            selected_elixir_path=host_elixir_path,
+            expected_otp_major=runner.expected_otp_major(str(project), host_elixir_path),
+        )[0]).parent.parent.name
+
+        def write_runtime_wrapper(path, target):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                "#!/usr/bin/python3\nimport os, sys\n"
+                f"program = {str(target)!r}\n"
+                "os.execv(program, [program, *sys.argv[1:]])\n",
+                encoding="ascii",
+            )
+            path.chmod(0o700)
+
+        mix_path = elixir_install / "bin/mix"
+        elixir_path = elixir_install / "bin/elixir"
+        erlang_path = erlang_install / "bin/erl"
+        write_runtime_wrapper(mix_path, host_mix_path)
+        write_runtime_wrapper(elixir_path, host_elixir_path)
+        host_mix_ebin = pathlib.Path(host_mix_path).resolve().parent.parent / "lib/mix/ebin"
+        fake_mix_ebin = elixir_install / "lib/mix/ebin"
+        fake_mix_ebin.parent.mkdir(parents=True, exist_ok=True)
+        fake_mix_ebin.symlink_to(host_mix_ebin, target_is_directory=True)
+        host_otp_major = runner.expected_otp_major(str(project), host_elixir_path)
+        resolved_erlang_path, selected_otp_release = runner.resolve_erlang_runtime_path(
+            erlang_entry, selected_elixir_path=host_elixir_path, expected_otp_major=host_otp_major,
+        )
+        write_runtime_wrapper(erlang_path, resolved_erlang_path)
+        runtime_path = runner.runtime_path_for(str(mix_path), str(elixir_path), str(erlang_path))
+
+        source_hex_home = pathlib.Path(os.environ.get("HEX_HOME") or pathlib.Path.home() / ".hex")
+        cache_home = root / "trusted-hex-cache"
+        package_cache = cache_home / "packages/hexpm"
+        package_cache.mkdir(parents=True)
+        source_archive = source_hex_home / "packages/hexpm" / f"telemetry-{locked_version}.tar"
+        cache_archive_name = f"telemetry-{version or locked_version}.tar"
+        if package_cache_mode != "absent":
+            self.assertTrue(source_archive.is_file(), "locked Hex telemetry archive is unavailable")
+            shutil.copyfile(source_archive, package_cache / cache_archive_name)
+
+        untrusted_deps = root / "repository/elixir/deps/telemetry/src"
+        untrusted_deps.mkdir(parents=True)
+        (untrusted_deps / "telemetry.erl").write_text(
+            "-module(telemetry).\n-define(UNTRUSTED_PROOF_SOURCE, true).\n", encoding="ascii"
+        )
+
+        return {
+            "project": project,
+            "mix_path": str(mix_path),
+            "elixir_path": str(elixir_path),
+            "erlang_path": str(erlang_path),
+            "runtime_path": runtime_path,
+            "source_mix_home": source_mix_home,
+            "cache_home": cache_home,
+            "untrusted_deps": untrusted_deps,
+            "stale_build": stale_build,
+            "head": "a" * 40,
+            "tree": "b" * 40,
+            "selected_otp_release": selected_otp_release,
+            "locked_version": locked_version,
+        }
+
     def test_bounded_command_can_report_redacted_bounded_stderr_on_failure(self):
         error = subprocess.CalledProcessError(
             1,
@@ -227,6 +350,201 @@ class HostQualificationLauncherTests(unittest.TestCase):
                 runner.copy_dependency_tree(str(source), str(destination))
 
             self.assertFalse(dangling_target.exists())
+
+    def test_locked_hex_materialization_runs_from_writable_scratch_directory(self):
+        with tempfile.TemporaryDirectory(prefix="h100-locked-hex-cwd-") as directory:
+            root = pathlib.Path(directory)
+            fixture = self._locked_telemetry_fixture(root)
+            build_home = root / "build-home"
+            mix_tools = runner.prepare_isolated_mix_home(
+                str(fixture["source_mix_home"]), str(build_home / ".mix"),
+                rebar_key=runner.mix_rebar_home_key(
+                    fixture["mix_path"], mix_home=str(fixture["source_mix_home"]),
+                ),
+            )
+            observed_cwd = []
+            original_run = runner._run_bounded
+
+            def record_cwd(command, **kwargs):
+                if command and command[0] == fixture["elixir_path"]:
+                    observed_cwd.append(kwargs.get("cwd"))
+                return original_run(command, **kwargs)
+
+            with patch.object(runner, "_run_bounded", side_effect=record_cwd):
+                provenance = runner.materialize_locked_hex_dependencies(
+                    fixture["mix_path"], fixture["elixir_path"], str(fixture["project"]),
+                    destination_path=str(root / "verified-deps"), home=str(build_home),
+                    runtime_path=fixture["runtime_path"], hex_home=str(fixture["cache_home"]),
+                    mix_tools=mix_tools,
+                )
+
+            self.assertEqual(observed_cwd, [str(root.resolve())])
+            self.assertTrue((root / "verified-deps/telemetry/.hex").is_file())
+            self.assertEqual(provenance["locked_dependency_count"], 1)
+
+    def test_locked_hex_cache_build_ignores_working_dependencies_and_stale_build(self):
+        with tempfile.TemporaryDirectory(prefix="h100-locked-hex-build-") as directory:
+            root = pathlib.Path(directory)
+            fixture = self._locked_telemetry_fixture(root)
+            build_path = root / "fresh-proof-build"
+            lock_before = hashlib.sha256((fixture["project"] / "mix.lock").read_bytes()).hexdigest()
+            (fixture["untrusted_deps"] / "telemetry.erl").write_text(
+                "-module(telemetry).\n-define(MUTATED_AFTER_CANDIDATE_CAPTURE, true).\n",
+                encoding="ascii",
+            )
+            build_home = root / "build-home"
+            mix_tools = runner.prepare_isolated_mix_home(
+                str(fixture["source_mix_home"]), str(build_home / ".mix"),
+                rebar_key=runner.mix_rebar_home_key(
+                    fixture["mix_path"], mix_home=str(fixture["source_mix_home"]),
+                ),
+            )
+            dependency_provenance = runner.materialize_locked_hex_dependencies(
+                fixture["mix_path"], fixture["elixir_path"], str(fixture["project"]),
+                destination_path=str(fixture["project"] / "deps"), home=str(build_home),
+                runtime_path=fixture["runtime_path"], hex_home=str(fixture["cache_home"]),
+                mix_tools=mix_tools,
+            )
+            dependency_copy = runner.copy_dependency_tree(
+                str(fixture["project"] / "deps"), str(root / "verified-deps-copy"),
+            )
+            self.assertEqual(dependency_copy["source_sha256"],
+                             dependency_provenance["materialized_source_sha256"])
+
+            result = runner.compile_fresh_proof_build(
+                fixture["mix_path"],
+                str(fixture["project"]),
+                str(build_path),
+                home=str(build_home),
+                runtime_path=fixture["runtime_path"],
+                source_head_sha=fixture["head"],
+                source_tree_sha=fixture["tree"],
+                source_mix_home=str(fixture["source_mix_home"]),
+                hex_home=str(fixture["cache_home"]),
+                selected_elixir_path=fixture["elixir_path"],
+                selected_erlang_path=fixture["erlang_path"],
+                selected_otp_release=fixture["selected_otp_release"],
+                mix_tools=mix_tools, dependency_provenance=dependency_provenance,
+            )
+
+            compiled = build_path / "lib/locked_fixture/ebin/Elixir.LockedFixture.beam"
+            cached_source = fixture["project"] / "deps/telemetry/src/telemetry.erl"
+            self.assertTrue(compiled.is_file())
+            self.assertTrue(cached_source.is_file())
+            self.assertNotIn("UNTRUSTED_PROOF_SOURCE", cached_source.read_text(encoding="ascii"))
+            self.assertNotEqual(cached_source.read_bytes(),
+                                (fixture["untrusted_deps"] / "telemetry.erl").read_bytes())
+            self.assertFalse((build_path / "lib/locked_fixture/ebin/stale.beam").exists())
+            self.assertTrue(fixture["stale_build"].is_file())
+            self.assertEqual(result["locked_dependency_count"], 1)
+            self.assertEqual(result["dependency_source"], "hex_lock_cache_v1")
+            self.assertEqual(len(result["locked_dependency_inventory_sha256"]), 64)
+            self.assertEqual(dependency_provenance["locked_dependency_inventory_sha256"],
+                             result["locked_dependency_inventory_sha256"])
+            self.assertEqual(result["source_head_sha"], fixture["head"])
+            self.assertEqual(result["source_tree_sha"], fixture["tree"])
+            self.assertEqual(
+                hashlib.sha256((fixture["project"] / "mix.lock").read_bytes()).hexdigest(),
+                lock_before,
+            )
+            self.assertNotIn("MUTATED_AFTER_CANDIDATE_CAPTURE",
+                             cached_source.read_text(encoding="ascii"))
+            self.assertEqual(
+                runner.build_artifact_inventory(str(build_path), source_root=str(fixture["project"]))[
+                    "artifact_inventory_sha256"
+                ],
+                result["artifact_inventory_sha256"],
+            )
+
+    def test_tampered_locked_hex_archive_fails_before_mix_compilation(self):
+        with tempfile.TemporaryDirectory(prefix="h100-tampered-hex-cache-") as directory:
+            root = pathlib.Path(directory)
+            fixture = self._locked_telemetry_fixture(root)
+            archive = fixture["cache_home"] / "packages/hexpm" / f"telemetry-{fixture['locked_version']}.tar"
+            with archive.open("ab") as output:
+                output.write(b"cache tamper")
+            mix_commands = []
+            original_run = runner._run_bounded
+
+            def record_mix(command, **kwargs):
+                if command and command[0] == fixture["mix_path"]:
+                    mix_commands.append(command)
+                return original_run(command, **kwargs)
+
+            with patch.object(runner, "_run_bounded", side_effect=record_mix):
+                with self.assertRaises(runner.QualificationFailure):
+                    runner.compile_fresh_proof_build(
+                        fixture["mix_path"], str(fixture["project"]), str(root / "proof-build"),
+                        home=str(root / "build-home"), runtime_path=fixture["runtime_path"],
+                        source_head_sha=fixture["head"], source_tree_sha=fixture["tree"],
+                        source_mix_home=str(fixture["source_mix_home"]), hex_home=str(fixture["cache_home"]),
+                        selected_elixir_path=fixture["elixir_path"],
+                        selected_erlang_path=fixture["erlang_path"],
+                        selected_otp_release=fixture["selected_otp_release"],
+                    )
+
+            self.assertEqual(mix_commands, [])
+
+    def test_missing_locked_hex_archive_fails_before_mix_or_network_fallback(self):
+        with tempfile.TemporaryDirectory(prefix="h100-missing-hex-cache-") as directory:
+            root = pathlib.Path(directory)
+            fixture = self._locked_telemetry_fixture(root, package_cache_mode="absent")
+            commands = []
+            original_run = runner._run_bounded
+
+            def record_command(command, **kwargs):
+                commands.append((command, kwargs.get("env", {})))
+                return original_run(command, **kwargs)
+
+            with patch.object(runner, "_run_bounded", side_effect=record_command):
+                with self.assertRaises(runner.QualificationFailure):
+                    runner.compile_fresh_proof_build(
+                        fixture["mix_path"], str(fixture["project"]), str(root / "proof-build"),
+                        home=str(root / "build-home"), runtime_path=fixture["runtime_path"],
+                        source_head_sha=fixture["head"], source_tree_sha=fixture["tree"],
+                        source_mix_home=str(fixture["source_mix_home"]), hex_home=str(fixture["cache_home"]),
+                        selected_elixir_path=fixture["elixir_path"],
+                        selected_erlang_path=fixture["erlang_path"],
+                        selected_otp_release=fixture["selected_otp_release"],
+                    )
+
+            self.assertFalse(any(command[0] == fixture["mix_path"] for command, _env in commands))
+            materializer_environments = [
+                env for command, env in commands if command and command[0] == fixture["elixir_path"]
+            ]
+            self.assertTrue(materializer_environments)
+            self.assertTrue(all(env.get("HEX_OFFLINE") == "1" for env in materializer_environments))
+
+    def test_locked_hex_version_and_checksum_mismatches_fail_before_mix(self):
+        for version, checksum_mismatch in [("1.4.3", False), (None, True)]:
+            with self.subTest(version=version, checksum_mismatch=checksum_mismatch):
+                with tempfile.TemporaryDirectory(prefix="h100-invalid-hex-lock-") as directory:
+                    root = pathlib.Path(directory)
+                    fixture = self._locked_telemetry_fixture(
+                        root, version=version, checksum_mismatch=checksum_mismatch,
+                    )
+                    mix_commands = []
+                    original_run = runner._run_bounded
+
+                    def record_mix(command, **kwargs):
+                        if command and command[0] == fixture["mix_path"]:
+                            mix_commands.append(command)
+                        return original_run(command, **kwargs)
+
+                    with patch.object(runner, "_run_bounded", side_effect=record_mix):
+                        with self.assertRaises(runner.QualificationFailure):
+                            runner.compile_fresh_proof_build(
+                                fixture["mix_path"], str(fixture["project"]), str(root / "proof-build"),
+                                home=str(root / "build-home"), runtime_path=fixture["runtime_path"],
+                                source_head_sha=fixture["head"], source_tree_sha=fixture["tree"],
+                                source_mix_home=str(fixture["source_mix_home"]),
+                                hex_home=str(fixture["cache_home"]),
+                                selected_elixir_path=fixture["elixir_path"],
+                                selected_erlang_path=fixture["erlang_path"],
+                                selected_otp_release=fixture["selected_otp_release"],
+                            )
+
+                    self.assertEqual(mix_commands, [])
 
     def test_writable_dependency_overlay_requires_the_project_deps_mountpoint(self):
         bind_copy = getattr(runner, "_bind_writable_dependency_copy", None)
@@ -521,6 +839,15 @@ class HostQualificationLauncherTests(unittest.TestCase):
                 encoding="utf-8",
             )
             (project / "mix.lock").write_text("%{}\n", encoding="ascii")
+            (project / "deps").mkdir()
+            cache_home = root / "hex-cache"
+            (cache_home / "packages").mkdir(parents=True)
+            dependency_provenance = {
+                "dependency_source": "hex_lock_cache_v1", "locked_dependency_count": 0,
+                "locked_dependency_archive_bytes": 0,
+                "locked_dependency_inventory_sha256": "f" * 64,
+                "materialized_source_sha256": "e" * 64,
+            }
             with (patch.object(runner, "prepare_isolated_mix_home", return_value={
                     "hex_version": "2.5.1", "hex_archive_sha256": "c" * 64, "rebar3_sha256": "d" * 64,
                  }),
@@ -534,6 +861,7 @@ class HostQualificationLauncherTests(unittest.TestCase):
                     str(shim), str(project), str(root / "proof-build"), home=str(root / "build-home"),
                     runtime_path=runner.runtime_path_for(str(shim), str(installed_elixir), str(erlang)),
                     source_head_sha="a" * 40, source_tree_sha="b" * 40, source_mix_home=str(mix_home),
+                    hex_home=str(cache_home), dependency_provenance=dependency_provenance,
                 )
 
             self.assertEqual(run.call_args.args[0][0], str(installed_mix))
@@ -558,6 +886,15 @@ class HostQualificationLauncherTests(unittest.TestCase):
             (project / "mix.exs").write_text("", encoding="ascii")
             (project / "mise.toml").write_text('[tools]\nerlang = "28"\n', encoding="ascii")
             (project / "mix.lock").write_text("%{}\n", encoding="ascii")
+            (project / "deps").mkdir()
+            cache_home = root / "hex-cache"
+            (cache_home / "packages").mkdir(parents=True)
+            dependency_provenance = {
+                "dependency_source": "hex_lock_cache_v1", "locked_dependency_count": 0,
+                "locked_dependency_archive_bytes": 0,
+                "locked_dependency_inventory_sha256": "f" * 64,
+                "materialized_source_sha256": "e" * 64,
+            }
 
             with (patch.object(runner, "prepare_isolated_mix_home", return_value={
                     "hex_version": "2.5.1", "hex_archive_sha256": "c" * 64,
@@ -580,6 +917,7 @@ class HostQualificationLauncherTests(unittest.TestCase):
                     rebar_key="1-19-otp-28", source_mix_home=str(root / ".mix"),
                     selected_elixir_path=str(elixir_path),
                     selected_erlang_path=str(erlang_path), selected_otp_release="28",
+                    hex_home=str(cache_home), dependency_provenance=dependency_provenance,
                 )
 
             self.assertEqual(run.call_args.args[0][0], str(mix_path))
@@ -1083,6 +1421,11 @@ class HostQualificationLauncherTests(unittest.TestCase):
                 "hex_version": "2.5.1",
                 "hex_archive_sha256": "d" * 64,
                 "rebar3_sha256": "e" * 64,
+                "dependency_source": "hex_lock_cache_v1",
+                "locked_dependency_count": 1,
+                "locked_dependency_archive_bytes": 1234,
+                "locked_dependency_inventory_sha256": "f" * 64,
+                "materialized_source_sha256": "1" * 64,
             }
             command = runner.proof_elixir_command(
                 "/runtime/elixir/bin/elixir", provenance, "/repo/test/support/proof.exs"
@@ -1203,8 +1546,21 @@ class HostQualificationLauncherTests(unittest.TestCase):
             write_runtime_wrapper(mix_path, host_mix_path)
             write_runtime_wrapper(elixir_path, host_elixir_path)
             write_runtime_wrapper(concrete_erlang, host_erlang_path)
+            mix_ebin = elixir_install / "lib/mix/ebin"
+            mix_ebin.parent.mkdir(parents=True, exist_ok=True)
+            mix_ebin.symlink_to(
+                pathlib.Path(host_mix_path).resolve().parent.parent / "lib/mix/ebin",
+                target_is_directory=True,
+            )
             project = root / "project"
             (project / "lib").mkdir(parents=True)
+            helper = project / "test/support/a4/materialize_locked_hex_dependencies.exs"
+            helper.parent.mkdir(parents=True)
+            shutil.copyfile(
+                pathlib.Path(__file__).resolve().parents[1] /
+                "support/a4/materialize_locked_hex_dependencies.exs",
+                helper,
+            )
             (project / "mix.exs").write_text(
                 "defmodule BuildFixture.MixProject do\n"
                 "  use Mix.Project\n"
@@ -1218,6 +1574,8 @@ class HostQualificationLauncherTests(unittest.TestCase):
             )
             (project / "mix.lock").write_text("%{}\n", encoding="utf-8")
             (project / "mise.toml").write_text('[tools]\nerlang = "28"\n', encoding="ascii")
+            hex_home = root / "trusted-hex"
+            (hex_home / "packages").mkdir(parents=True)
             stale = project / "_build/test/lib/build_fixture/ebin/stale.beam"
             stale.parent.mkdir(parents=True)
             stale.write_bytes(b"stale repository build")
@@ -1258,6 +1616,7 @@ class HostQualificationLauncherTests(unittest.TestCase):
                     source_head_sha="a" * 40,
                     source_tree_sha="b" * 40,
                     source_mix_home=source_mix_home,
+                    hex_home=str(hex_home),
                     selected_erlang_path=resolved_erlang_path,
                     selected_otp_release=selected_otp_release,
                     failure_stderr_bytes=4096,
@@ -1915,6 +2274,7 @@ class HostQualificationLauncherTests(unittest.TestCase):
                 "                      '--tree', 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',",
                 "                      '--request-id', 'preq_signal', '--mix-path', '/usr/bin/mix',",
                 "                      '--runtime-path', '/usr/bin:/bin', '--source-mix-home', '/tmp/mix-home',",
+                "                      '--hex-cache-home', '/tmp/hex-cache',",
                 "                      '--outside-control-port', '1']))",
             ])
             process = subprocess.Popen([sys.executable, "-I", "-c", script, str(ready), str(cleaned)],

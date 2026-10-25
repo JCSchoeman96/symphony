@@ -39,7 +39,10 @@ EVIDENCE_FIELDS = {
     "proof_build_artifact_inventory_sha256", "proof_build_mix_lock_sha256",
     "proof_build_hex_version", "proof_build_hex_archive_sha256", "proof_build_rebar3_sha256",
     "proof_build_dependency_file_count", "proof_build_dependency_total_bytes",
-    "proof_build_dependency_source_sha256", "implementation_commits", "implementation_files_changed",
+    "proof_build_dependency_source_sha256", "proof_build_dependency_source",
+    "proof_build_locked_dependency_count", "proof_build_locked_dependency_archive_bytes",
+    "proof_build_locked_dependency_inventory_sha256", "implementation_commits",
+    "implementation_files_changed",
 }
 
 
@@ -78,9 +81,9 @@ def valid_result():
 class QualificationEvidenceTests(unittest.TestCase):
     def test_schema_is_versioned_and_names_every_evidence_field(self):
         schema = json.loads(SCHEMA_PATH.read_text(encoding="ascii"))
-        self.assertEqual(schema["schema_version"], 4)
-        self.assertTrue(schema["$id"].endswith("/v4"))
-        self.assertEqual(runner.EVIDENCE_SCHEMA_VERSION, 4)
+        self.assertEqual(schema["schema_version"], 5)
+        self.assertTrue(schema["$id"].endswith("/v5"))
+        self.assertEqual(runner.EVIDENCE_SCHEMA_VERSION, 5)
         self.assertEqual(set(schema["properties"]["evidence"]["required"]), EVIDENCE_FIELDS)
 
     def test_validator_accepts_the_exact_payload_free_evidence_shape(self):
@@ -96,7 +99,7 @@ class QualificationEvidenceTests(unittest.TestCase):
 
     def test_validator_rejects_wrong_version_and_unbounded_evidence(self):
         result = valid_result()
-        result["schema_version"] = 5
+        result["schema_version"] = 6
         with self.assertRaises(runner.QualificationFailure):
             runner.validate_qualification_result(result)
         result = valid_result()

@@ -1,14 +1,14 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://symphony.local/h100/p0/qualification-evidence/v4",
+  "$id": "https://symphony.local/h100/p0/qualification-evidence/v5",
   "title": "H100 P0 local host relay qualification evidence",
-  "schema_version": 4,
+  "schema_version": 5,
   "type": "object",
   "additionalProperties": false,
   "required": ["type", "schema_version", "qualified", "evidence"],
   "properties": {
     "type": {"const": "QUALIFICATION_RESULT"},
-    "schema_version": {"const": 4},
+    "schema_version": {"const": 5},
     "qualified": {"const": true},
     "evidence": {
       "type": "object",
@@ -38,7 +38,9 @@
         "proof_build_artifact_inventory_sha256", "proof_build_mix_lock_sha256",
         "proof_build_hex_version", "proof_build_hex_archive_sha256", "proof_build_rebar3_sha256",
         "proof_build_dependency_file_count", "proof_build_dependency_total_bytes",
-        "proof_build_dependency_source_sha256", "implementation_commits",
+        "proof_build_dependency_source_sha256", "proof_build_dependency_source",
+        "proof_build_locked_dependency_count", "proof_build_locked_dependency_archive_bytes",
+        "proof_build_locked_dependency_inventory_sha256", "implementation_commits",
         "implementation_files_changed"
       ],
       "properties": {
@@ -127,6 +129,10 @@
         "proof_build_dependency_file_count": {"type": "integer", "minimum": 1, "maximum": 50000},
         "proof_build_dependency_total_bytes": {"type": "integer", "minimum": 1, "maximum": 536870912},
         "proof_build_dependency_source_sha256": {"$ref": "#/$defs/sha256"},
+        "proof_build_dependency_source": {"const": "hex_lock_cache_v1"},
+        "proof_build_locked_dependency_count": {"type": "integer", "minimum": 1, "maximum": 1000},
+        "proof_build_locked_dependency_archive_bytes": {"type": "integer", "minimum": 1, "maximum": 536870912},
+        "proof_build_locked_dependency_inventory_sha256": {"$ref": "#/$defs/sha256"},
         "implementation_commits": {
           "type": "array", "minItems": 1, "maxItems": 128,
           "items": {"$ref": "#/$defs/git_sha"}
