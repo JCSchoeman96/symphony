@@ -114,11 +114,12 @@ class HostQualificationLauncherTests(unittest.TestCase):
         write_runtime_wrapper(erlang_path, resolved_erlang_path)
         runtime_path = runner.runtime_path_for(str(mix_path), str(elixir_path), str(erlang_path))
 
-        source_hex_home = pathlib.Path(os.environ.get("HEX_HOME") or pathlib.Path.home() / ".hex")
         cache_home = root / "trusted-hex-cache"
         package_cache = cache_home / "packages/hexpm"
         package_cache.mkdir(parents=True)
-        source_archive = source_hex_home / "packages/hexpm" / f"telemetry-{locked_version}.tar"
+        source_archive = (
+            pathlib.Path(__file__).resolve().parent / "fixtures/hex" / f"telemetry-{locked_version}.tar"
+        )
         cache_archive_name = f"telemetry-{version or locked_version}.tar"
         if package_cache_mode != "absent":
             self.assertTrue(source_archive.is_file(), "locked Hex telemetry archive is unavailable")
