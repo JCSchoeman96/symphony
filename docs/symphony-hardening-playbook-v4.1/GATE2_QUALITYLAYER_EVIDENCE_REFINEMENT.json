@@ -1,0 +1,620 @@
+{
+  "schema_version": "G2-QL-EVIDENCE-REFINEMENT-1.0.0",
+  "projection_role": "DERIVATIVE_OF_SUPPLIED_MASTER_GATE_DECISION_NOT_INDEPENDENT_AUTHORITY",
+  "authority_input": {
+    "class": "SUPPLIED_MASTER_GATE_REFERENCE_ACCEPTANCE_AND_SUPPLEMENTAL_QUALIFICATION_DECISION",
+    "date": "2026-11-03",
+    "decision_reference": null,
+    "exact_decision_timestamp": null,
+    "repository_persistence": "CANDIDATE_PENDING_INDEPENDENT_MASTER_GATE_REVIEW_AND_HUMAN_MERGE",
+    "implementation_authority": "NONE"
+  },
+  "materialization_baseline": {
+    "main_sha": "0c53c732bbf68641482741c98afb25e073721ad9",
+    "main_tree": "a9fbf6ad3d57ee24d8b4989a953e512de41cb264",
+    "main_protected": true,
+    "parents": [
+      "86336d28671cfd6ac0a55c2ebe48094b8d8a8237",
+      "1d7deb1434011eb86803a7623d0c8823fd059498"
+    ],
+    "accepted_Herdr_pr": 63,
+    "required_checks": [
+      {
+        "context": "make-all",
+        "app_id": 15368
+      },
+      {
+        "context": "validate-pr-description",
+        "app_id": 15368
+      }
+    ]
+  },
+  "research_source": {
+    "full_evaluation": {
+      "path": "docs/symphony-hardening-playbook-v4.1/research/QUALITYLAYER_GATE2_EVALUATION_2026-11-03.md",
+      "git_blob": "26709af1aef0f55ab7dea808a2b0505ee8756d87",
+      "raw_sha256": "f1b25fc2bf1c8552c067d5331cb507254d421ce3e2fdf8778b17adbf8d4fb615",
+      "raw_bytes": 55735,
+      "source_body_sha256": "6e7a24f47f43b80169f4a5e62facdf1047c17c6e03f2da46d6a16f512e712846",
+      "preservation": "Archive header followed by exact supplied report body."
+    },
+    "architectural_reference": {
+      "path": "docs/symphony-hardening-playbook-v4.1/research/QUALITYLAYER_ARCHITECTURAL_REFERENCE_v1.0.0.md",
+      "git_blob": "0bf5f5d074d45fe21bb4cdda169662099ec31744",
+      "raw_sha256": "ddd3d2d6305c75b3dd084b5b96c8bf7c4d27812509e0e89d60bd4e048aceb056",
+      "raw_bytes": 24286,
+      "source_sha256": "1857d9b28413aead326f3a9bd1e18a022e8976773638a659901b496b288653b7",
+      "preservation": "Only the two relative evaluation links are corrected for repository relocation; all other bytes are preserved.",
+      "governance_authority": "NONE"
+    },
+    "QualityLayer_repository": "https://github.com/maxritter/qualitylayer",
+    "commit": "16ec3e148a0a4aeb28bbbe053ae3b690ea9e9c4f",
+    "tree": "e8424e83395324a20fe6ea54dead993b6215ae76",
+    "licence_identity": {
+      "name": "QualityLayer Software License Agreement, custom proprietary terms",
+      "path": "LICENSE",
+      "git_blob": "467a5e40c642fc69497d1193b4405ed5eaa4f02d",
+      "raw_sha256": "0de841524089e421084a8cb4b8e5261244d637ed6ae36d4d64b2f3b80736f180"
+    },
+    "source_access_limitations": [
+      "Implementation and tests under qualitylayer/ were git-crypt encrypted at the pinned revision.",
+      "Readable public documentation supports documented workflow semantics only.",
+      "Runtime enforcement, state-machine implementation, evidence integrity, general stale-review rejection and independent-review isolation remain UNKNOWN where source access was unavailable.",
+      "Infer no behavior from encrypted filenames; no QualityLayer build, execution, test run, decryption or access-control circumvention occurred."
+    ],
+    "investigation_proof_class": {
+      "documented_semantics": "CONFIRMED_FROM_DOCS",
+      "inaccessible_runtime_behavior": "UNKNOWN",
+      "recommendations": "INFERENCE",
+      "implementation_qualification": "NOT_PROVEN"
+    }
+  },
+  "master_gate_disposition": {
+    "QUALITYLAYER_RESEARCH_STATUS": "ACCEPTED_AS_REFERENCE_RESEARCH",
+    "QUALITYLAYER_STRATEGY": "REFERENCE_ONLY",
+    "QUALITYLAYER_AUTHORITY_DELTA": "NONE",
+    "QUALITYLAYER_RUNTIME_DEPENDENCY": "NO",
+    "QUALITYLAYER_CODE_REUSE": "NO",
+    "QUALITYLAYER_SCHEMA_REUSE": "NO",
+    "QUALITYLAYER_PROMPT_TEMPLATE_REUSE": "NO",
+    "QUALITYLAYER_SKILL_REUSE": "NO",
+    "QUALITYLAYER_WORKFLOW_REUSE": "NO",
+    "QUALITYLAYER_ARCHITECTURE_CLONING": "NO",
+    "PROOF_OBLIGATION_RECOMMENDATION": "DO_NOT_ADD",
+    "GATE2_ARCHITECTURE_CHANGE": "NO",
+    "GATE2_AUTHORITY_MODEL_CHANGE": "NO",
+    "GATE2_PACKAGE_TOPOLOGY_CHANGE": "NO",
+    "GATE2_PACKAGE_TOPOLOGY": "P01-P09",
+    "GATE2_CANONICAL_PLAN_CHANGE": "NO",
+    "QUALITYLAYER_EVIDENCE_QUALIFICATION_REFINEMENT": "YES"
+  },
+  "architecture_delta": "NONE",
+  "authority_delta": "NONE",
+  "package_topology_delta": "NONE",
+  "canonical_plan_relationship": "Canonical plan unchanged; these mandatory qualification refinements derive from the separate supplied Master Gate decision, not the non-authoritative research/reference artifacts.",
+  "unchanged_governing_artifacts": [
+    {
+      "path": "docs/superpowers/plans/2026-11-03-gate2-v1-implementation-plan.md",
+      "git_blob": "bdb2840e5ea4ca8c8912d6cada3287078bbb3c72",
+      "raw_sha256": "a1d5cdba65c19a09e86ed814a595e8bbae0c9dcfc97afe021ab67826db09ff68",
+      "raw_bytes": 231932
+    },
+    {
+      "path": "docs/symphony-hardening-playbook-v4.1/GATE2_INVENTORY_FREEZE_PACKET_1458bb041215c626.json",
+      "git_blob": "6cf92dbad8507d4e6c7553392b163fcac02b897d",
+      "raw_sha256": "a651b1574ec0a186f6b4cd9548787cf9b67009f6692268ce5a8d0669d9d0636a",
+      "raw_bytes": 683322
+    },
+    {
+      "path": "docs/symphony-hardening-playbook-v4.1/GATE2_SCANNER_GOVERNANCE_ADDENDUM_2026-11-03.md",
+      "git_blob": "1371606b208da8df4c8bcc69387bb86153fec7a2",
+      "raw_sha256": "8b3aade539270bed6c7a4647ff00e5aaf3bcb79a08cc0e5cc3a45a9eb45be34b",
+      "raw_bytes": 5619
+    },
+    {
+      "path": "docs/symphony-hardening-playbook-v4.1/GATE2_V1_CANDIDATE_VALIDATION_1.0.0.json",
+      "git_blob": "72632e9f2d92d176668286016f2ed3dfda500d85",
+      "raw_sha256": "0d67fe1c0c532294dd3e946618d5bfd40c3d5ce6f50804e4bd20823ae5f756b7",
+      "raw_bytes": 6237
+    },
+    {
+      "path": "docs/symphony-hardening-playbook-v4.1/GATE2_SCANNER_GOVERNANCE_PROJECTION.json",
+      "git_blob": "d754155b5a1391a885d5c6ade6bd5066a969ac10",
+      "raw_sha256": "675b84627a5dade8f1c5689c5764572bb156652484f42b41f4f56b29f188a5d9",
+      "raw_bytes": 7784
+    },
+    {
+      "path": "docs/symphony-hardening-playbook-v4.1/GATE2_HERDR_QUALIFICATION_REFINEMENT_2026-11-03.md",
+      "git_blob": "1f33baa3a940b7c7731e677303b8987d43366462",
+      "raw_sha256": "3beb42d4cd42b1e4ed233d107a5859d8423fbc7614325b80ec6aa7c600cc8300",
+      "raw_bytes": 23993
+    },
+    {
+      "path": "docs/symphony-hardening-playbook-v4.1/GATE2_HERDR_QUALIFICATION_REFINEMENT.json",
+      "git_blob": "ebe3c1acca960ccb6a1f71bed02c9fee5804df16",
+      "raw_sha256": "b230efeaf840eef2bc4af90ed2e9be2afebc875d58f348dd17f6eaa632991b78",
+      "raw_bytes": 26495
+    }
+  ],
+  "refinements": [
+    {
+      "id": "G2-QL-Q01",
+      "name": "OBLIGATION_EVIDENCE_DISPOSITION_TRACEABILITY",
+      "source_concept": "Acceptance result, proving scenario, evidence and reviewer disposition traceability.",
+      "target_packages": {
+        "primary": [
+          "P09"
+        ],
+        "secondary": [
+          "P06",
+          "P07",
+          "P08"
+        ]
+      },
+      "invariants": [
+        "Follow frozen obligation definition -> required proof classes -> owner-issued applicable evidence references -> current applicability -> unresolved requirements -> claim-specific disposition.",
+        "P09 assesses the expected frozen obligation set. Completeness is not 26 files, one attachment per obligation or an overall reviewer PASS.",
+        "P09 consumes owner-issued results without reimplementing scanner, cleanup, provider-effect, review or merge verification."
+      ],
+      "mandatory_qualification_expectations": [
+        "Detect and expose missing expected obligation IDs.",
+        "Detect and expose duplicate or ambiguous obligation assessments.",
+        "Detect and expose wrong evidence subjects.",
+        "Detect and expose wrong policy/version.",
+        "Detect and expose wrong implementation/configuration identity where relevant.",
+        "Detect and expose stale generations.",
+        "Detect and expose missing required proof classes.",
+        "Detect and expose incomplete coverage.",
+        "Detect and expose unsupported evidence-transfer applicability.",
+        "Detect and expose unresolved required evidence."
+      ],
+      "failure_unresolved_semantics": [
+        "Missing, ambiguous, inapplicable, stale or incomplete required evidence remains unresolved and blocks qualification wherever the owning obligation requires it.",
+        "An overall favorable review cannot substitute for claim-specific coverage."
+      ],
+      "authority_limits": [
+        "No new subsystem, package, obligation registry or authority owner.",
+        "Consume owner-issued evidence/results; do not copy domain truth into a second store or recompute domain verdicts.",
+        "No implementation or execution authority is granted."
+      ],
+      "implementation_status": "NOT_IMPLEMENTED",
+      "qualification_status": "NOT_PROVEN",
+      "provenance_licensing_boundary": [
+        "Generic Master Gate-selected Symphony evidence/qualification principle only; no QualityLayer expression, structure, schema or workflow is adopted.",
+        "Implementation must derive from Symphony frozen obligations, canonical package contracts and existing typed evidence owners.",
+        "This is not a clean-room implementation specification or legal clearance. Deeper expressive/structural similarity requires separate licensing/legal review or explicit suitable permission."
+      ]
+    },
+    {
+      "id": "G2-QL-Q02",
+      "name": "UNRESOLVED_EVIDENCE_PERSISTENCE",
+      "source_concept": "Unresolved verification state survives favorable review or approval.",
+      "target_packages": {
+        "primary": [
+          "P08",
+          "P09"
+        ],
+        "secondary": []
+      },
+      "invariants": [
+        "A favorable semantic review or human approval does not erase unresolved evidence state.",
+        "Preserve domain vocabulary where it is stronger; do not impose a universal evidence-result enum.",
+        "An explanation for missing evidence is not the evidence. Human approval cannot convert UNKNOWN, UNCERTAIN or STALE to PASS."
+      ],
+      "mandatory_qualification_expectations": [
+        "Preserve and expose conditions equivalent to FAILED, MISSING, UNAVAILABLE, UNCERTAIN, STALE, PENDING, INCOMPLETE and NOT_APPLICABLE_WITHOUT_ACCEPTED_JUSTIFICATION.",
+        "Preserve each unresolved condition and its owning-contract consequence through review, approval and retained evidence presentation."
+      ],
+      "failure_unresolved_semantics": [
+        "Mechanical incompleteness remains a mechanical block wherever the owning contract says it blocks.",
+        "Unjustified non-applicability remains unresolved, not a satisfied obligation."
+      ],
+      "authority_limits": [
+        "No new subsystem, package, obligation registry or authority owner.",
+        "Consume owner-issued evidence/results; do not copy domain truth into a second store or recompute domain verdicts.",
+        "No implementation or execution authority is granted."
+      ],
+      "implementation_status": "NOT_IMPLEMENTED",
+      "qualification_status": "NOT_PROVEN",
+      "provenance_licensing_boundary": [
+        "Generic Master Gate-selected Symphony evidence/qualification principle only; no QualityLayer expression, structure, schema or workflow is adopted.",
+        "Implementation must derive from Symphony frozen obligations, canonical package contracts and existing typed evidence owners.",
+        "This is not a clean-room implementation specification or legal clearance. Deeper expressive/structural similarity requires separate licensing/legal review or explicit suitable permission."
+      ]
+    },
+    {
+      "id": "G2-QL-Q03",
+      "name": "PER_CLAIM_REVIEW_SCOPE_AND_DISPOSITION",
+      "source_concept": "Per-claim review coverage and explicit independence/provenance visibility.",
+      "target_packages": {
+        "primary": [
+          "P09"
+        ],
+        "secondary": [
+          "P07"
+        ]
+      },
+      "invariants": [
+        "A single global REVIEW_ACCEPTED=true is not sufficient evidence of substantive coverage.",
+        "Preserve fresh Reviewer RuntimeAttempt, responsibility, lineage, candidate/tree/policy binding, signed host provenance, freshness/invalidation and separate human authority.",
+        "Reviewer narrative cannot mint mechanical truth. A different model family does not prove independence.",
+        "A disclosed non-independent review cannot satisfy mandatory independent review."
+      ],
+      "mandatory_qualification_expectations": [
+        "For each assigned claim, retain or derive the obligation/claim reviewed and applicable evidence references considered.",
+        "Expose what the reviewer established within their responsibility, what remained unresolved, their disposition and the reviewer provenance already required by Symphony."
+      ],
+      "failure_unresolved_semantics": [
+        "Missing scope, unresolved required coverage or invalid/missing independence/provenance cannot be replaced by a global acceptance flag.",
+        "Apply existing review authority and invalidation rules; change no accepted review path."
+      ],
+      "authority_limits": [
+        "No new subsystem, package, obligation registry or authority owner.",
+        "Consume owner-issued evidence/results; do not copy domain truth into a second store or recompute domain verdicts.",
+        "No implementation or execution authority is granted.",
+        "No reviewer quorum, new review authority or model-family substitution is introduced."
+      ],
+      "implementation_status": "NOT_IMPLEMENTED",
+      "qualification_status": "NOT_PROVEN",
+      "provenance_licensing_boundary": [
+        "Generic Master Gate-selected Symphony evidence/qualification principle only; no QualityLayer expression, structure, schema or workflow is adopted.",
+        "Implementation must derive from Symphony frozen obligations, canonical package contracts and existing typed evidence owners.",
+        "This is not a clean-room implementation specification or legal clearance. Deeper expressive/structural similarity requires separate licensing/legal review or explicit suitable permission."
+      ]
+    },
+    {
+      "id": "G2-QL-Q04",
+      "name": "GUARD_CLASS_VISIBLE_SEPARATION",
+      "source_concept": "Presentation distinguishes mechanical verification, semantic assessment and human decision.",
+      "target_packages": {
+        "primary": [
+          "P07",
+          "P09"
+        ],
+        "secondary": []
+      },
+      "invariants": [
+        "Keep mechanical_guard, semantic_attestation and human_decision visibly distinct with their different powers explicit.",
+        "Mechanical evidence cannot be satisfied by semantic review; semantic review cannot manufacture a mechanical fact.",
+        "Human approval cannot repair a failed mechanical guard; one passing class cannot silently satisfy another required class."
+      ],
+      "mandatory_qualification_expectations": [
+        "Qualification/review material identifies which required guard classes actually hold.",
+        "Do not collapse proof into APPROVED, PASS or GREEN where that presentation hides required-class satisfaction."
+      ],
+      "failure_unresolved_semantics": [
+        "A missing or failed required class remains unsatisfied despite success or approval in another class.",
+        "Presentation ambiguity cannot establish satisfaction of a required guard."
+      ],
+      "authority_limits": [
+        "No new subsystem, package, obligation registry or authority owner.",
+        "Consume owner-issued evidence/results; do not copy domain truth into a second store or recompute domain verdicts.",
+        "No implementation or execution authority is granted.",
+        "This is qualification/presentation over the existing GuardClass model, not a new guard model."
+      ],
+      "implementation_status": "NOT_IMPLEMENTED",
+      "qualification_status": "NOT_PROVEN",
+      "provenance_licensing_boundary": [
+        "Generic Master Gate-selected Symphony evidence/qualification principle only; no QualityLayer expression, structure, schema or workflow is adopted.",
+        "Implementation must derive from Symphony frozen obligations, canonical package contracts and existing typed evidence owners.",
+        "This is not a clean-room implementation specification or legal clearance. Deeper expressive/structural similarity requires separate licensing/legal review or explicit suitable permission."
+      ]
+    },
+    {
+      "id": "G2-QL-Q05",
+      "name": "HISTORICAL_RESULT_CURRENT_APPLICABILITY_SEPARATION",
+      "source_concept": "Historical recorded result remains separate from currently resolved applicability.",
+      "target_packages": {
+        "primary": [
+          "P09"
+        ],
+        "secondary": [
+          "P06",
+          "P07",
+          "P08"
+        ]
+      },
+      "invariants": [
+        "recorded_result != current_applicability; RECORDED_RESULT=PASS with CURRENT_APPLICABILITY=STALE is representable without rewriting historical PASS.",
+        "Current applicability follows the owning contract relevant invalidation dependencies, not one universal identity tuple.",
+        "Historical evidence is immutable. STALE can become newly assessed CURRENT only through fresh owner-resolution/reconciliation under a new assessment generation or equivalent current binding.",
+        "Timestamps alone never restore applicability. Memory retention and document age are not evidence freshness."
+      ],
+      "mandatory_qualification_expectations": [
+        "Resolve relevant candidate/tree, policy/version, implementation, configuration, RuntimeAttempt/lineage, resource/fence/recovery generation, credential/holder/channel, topology/version and evidence-transfer scope dependencies.",
+        "Qualify the complete applicability lifecycle below, including owner, guard, side effect, failure, restart and state meaning.",
+        "Permit NOT_APPLICABLE only with explicit governed justification for the exact subject/current scope, never merely to close the dossier."
+      ],
+      "failure_unresolved_semantics": [
+        "Any required invalidation dependency that moves or becomes uncertain invalidates current applicability.",
+        "Failed resolution remains UNRESOLVED; lost current applicability fails closed as STALE/UNRESOLVED, not restored authority.",
+        "Preserve historical results; create a fresh assessment rather than editing an old result into validity."
+      ],
+      "authority_limits": [
+        "No new subsystem, package, obligation registry or authority owner.",
+        "Consume owner-issued evidence/results; do not copy domain truth into a second store or recompute domain verdicts.",
+        "No implementation or execution authority is granted."
+      ],
+      "implementation_status": "NOT_IMPLEMENTED",
+      "qualification_status": "NOT_PROVEN",
+      "provenance_licensing_boundary": [
+        "Generic Master Gate-selected Symphony evidence/qualification principle only; no QualityLayer expression, structure, schema or workflow is adopted.",
+        "Implementation must derive from Symphony frozen obligations, canonical package contracts and existing typed evidence owners.",
+        "This is not a clean-room implementation specification or legal clearance. Deeper expressive/structural similarity requires separate licensing/legal review or explicit suitable permission."
+      ]
+    }
+  ],
+  "applicability_lifecycle": {
+    "states": [
+      "UNRESOLVED",
+      "CURRENT",
+      "STALE",
+      "NOT_APPLICABLE"
+    ],
+    "transitions": [
+      {
+        "from": "UNRESOLVED",
+        "to": "CURRENT",
+        "owner": "P09 applicability resolver consuming current owner-issued evidence",
+        "guard": "Required obligation definition, proof classes, subject identities, policy/implementation/configuration identities and owner verification resolve without unresolved dependency.",
+        "side_effect": "Record a current applicability assessment referencing immutable historical evidence rather than copying its truth.",
+        "failure_transition": "Remain UNRESOLVED.",
+        "restart_semantics": "Re-resolve current dependencies; never assume previous process-memory state or restore current authority from it.",
+        "current_terminal_meaning": "CURRENT is a revocable derived applicability assessment, not execution authority or a terminal evidence verdict."
+      },
+      {
+        "from": "CURRENT",
+        "to": "STALE",
+        "owner": "Applicability/reconciliation boundary",
+        "guard": "Any required invalidation dependency moves or becomes uncertain.",
+        "side_effect": "Preserve historical result and record stale applicability with explicit invalidation reason.",
+        "failure_transition": "Fail closed as STALE/UNRESOLVED; never preserve current authority when invalidation or assessment persistence is uncertain.",
+        "restart_semantics": "Restore no current applicability unless dependencies re-resolve.",
+        "current_terminal_meaning": "STALE is unusable as current applicable proof; historical results remain unchanged."
+      },
+      {
+        "from": "STALE",
+        "to": "CURRENT",
+        "owner": "P09 applicability resolver consuming fresh owner-issued evidence/reconciliation",
+        "guard": "Fresh owner-issued evidence/reconciliation proves applicability under present identities, policies and generations.",
+        "side_effect": "Create a fresh applicability assessment under a new generation or equivalent current binding; do not mutate historical result.",
+        "failure_transition": "Remain STALE or UNRESOLVED under existing reconciliation semantics; do not reuse an old current assessment.",
+        "restart_semantics": "Re-resolve present dependencies; process restart or restored assessment history is not renewed applicability.",
+        "current_terminal_meaning": "Newly assessed CURRENT is revocable; the old assessment and immutable evidence remain historical."
+      },
+      {
+        "from": "UNRESOLVED",
+        "to": "NOT_APPLICABLE",
+        "owner": "P09 applicability resolver applying frozen/governed applicability rules",
+        "guard": "Frozen/governed applicability rules establish non-applicability for the exact subject and current scope.",
+        "side_effect": "Record explicit governed justification and the subject/scope/rules it depends on.",
+        "failure_transition": "Remain UNRESOLVED when justification is missing, ambiguous, unsupported or merely a model/reviewer preference.",
+        "restart_semantics": "Re-resolve governed justification and its dependencies; scope/rule movement or uncertainty requires fresh UNRESOLVED assessment.",
+        "current_terminal_meaning": "NOT_APPLICABLE resolves this assessment only within its justified governed scope; it is not PASS, a waiver or authority."
+      }
+    ],
+    "invalidation_dependencies": [
+      "candidate identity/tree",
+      "policy identity/version",
+      "implementation identity",
+      "configuration identity",
+      "RuntimeAttempt/lineage",
+      "resource/fence/recovery generation",
+      "credential/holder/channel",
+      "topology/version applicability",
+      "evidence-transfer scope"
+    ],
+    "owners": [
+      "P09 applicability resolver",
+      "existing evidence owner verification/reconciliation boundaries"
+    ],
+    "current_terminal_meanings": {
+      "UNRESOLVED": "Required applicability is not established; no qualification satisfaction follows.",
+      "CURRENT": "Revocable derived assessment for current owner-verified dependencies; no execution authority.",
+      "STALE": "Prior assessment is not usable as current applicability; retain historical result.",
+      "NOT_APPLICABLE": "Scoped governed justification, not a passing proof or waiver. Dependency movement/uncertainty requires a new UNRESOLVED assessment."
+    },
+    "additional_reconciliation_rule": "If governed justification for NOT_APPLICABLE moves or becomes uncertain, start a new UNRESOLVED assessment and preserve the previous justified assessment as history.",
+    "authority_limit": "This lifecycle describes derived applicability within existing P09 responsibilities. It creates no independent runtime authority owner or universal subject identity."
+  },
+  "rejects": [
+    {
+      "id": "G2-QL-R01",
+      "name": "QUALITYLAYER_AS_AUTHORITY_KERNEL",
+      "disposition": "REJECT",
+      "rule": "QualityLayer cannot determine guard/dependency satisfaction, candidate freshness, cleanup completeness, Gate 2 acceptance, merge authority or CompletionProof validity."
+    },
+    {
+      "id": "G2-QL-R02",
+      "name": "REVIEWER_WAIVER_OF_MECHANICAL_FAILURES",
+      "disposition": "REJECT",
+      "rule": "Required CI, scanner FAIL/UNCERTAIN, cleanup uncertainty, bearer nondisclosure failure/uncertainty and incomplete mandatory proof remain governed mechanical conditions."
+    },
+    {
+      "id": "G2-QL-R03",
+      "name": "GENERIC_TASK_CLOSURE_AS_SYMPHONY_DONE",
+      "disposition": "REJECT",
+      "rule": "Plan/review approval, local closure or merged PR is not CompletionProof.completed."
+    },
+    {
+      "id": "G2-QL-R04",
+      "name": "GENERIC_TASK_OUTPUT_PROMOTION",
+      "disposition": "REJECT",
+      "rule": "Logs, screenshots, task folders, command output and attachments do not become candidate output merely through task persistence."
+    },
+    {
+      "id": "G2-QL-R05",
+      "name": "OPTIONAL_INDEPENDENCE_SATISFYING_MANDATORY_REVIEW",
+      "disposition": "REJECT",
+      "rule": "Disclosure of missing independence does not satisfy an independent-review requirement."
+    },
+    {
+      "id": "G2-QL-R06",
+      "name": "MODEL_DIVERSITY_REPLACING_PROVENANCE",
+      "disposition": "REJECT",
+      "rule": "Different model family is supplementary only and does not establish reviewer RuntimeAttempt or provenance."
+    },
+    {
+      "id": "G2-QL-R07",
+      "name": "GENERIC_PROOF_OBLIGATION_AUTHORITY_ABSTRACTION",
+      "disposition": "REJECT",
+      "rule": "Create no additional owner of obligation definition, evidence validity or acceptance."
+    },
+    {
+      "id": "G2-QL-R08",
+      "name": "PROPRIETARY_IMPLEMENTATION_OR_EXPRESSION_REUSE",
+      "disposition": "REJECT_ABSENT_EXPLICIT_SUITABLE_PERMISSION",
+      "rule": "No QualityLayer code, schemas, prompts, templates, skills, UI expression or workflow implementation reuse absent explicit suitable permission."
+    },
+    {
+      "id": "G2-QL-R09",
+      "name": "QUALITYLAYER_WORKFLOW_OR_ARCHITECTURE_CLONING",
+      "disposition": "REJECT",
+      "rule": "Do not reproduce its complete workflow/state architecture or create a second workflow owner for Gate 2."
+    }
+  ],
+  "licensing_provenance_boundary": {
+    "disposition": {
+      "QUALITYLAYER_GENERIC_CONCEPT_REFERENCE": "PERMITTED_FOR_THIS_COMPARATIVE_GOVERNANCE_USE",
+      "QUALITYLAYER_CODE_REUSE": "NO",
+      "QUALITYLAYER_SCHEMA_REUSE": "NO",
+      "QUALITYLAYER_PROMPT_REUSE": "NO",
+      "QUALITYLAYER_TEMPLATE_REUSE": "NO",
+      "QUALITYLAYER_SKILL_REUSE": "NO",
+      "QUALITYLAYER_UI_COPYING": "NO",
+      "QUALITYLAYER_WORKFLOW_CLONING": "NO",
+      "QUALITYLAYER_ARCHITECTURE_CLONING": "NO"
+    },
+    "rules": [
+      "Generic Master Gate-selected Symphony evidence/qualification principle only; no QualityLayer expression, structure, schema or workflow is adopted.",
+      "Implementation must derive from Symphony frozen obligations, canonical package contracts and existing typed evidence owners.",
+      "This is not a clean-room implementation specification or legal clearance. Deeper expressive/structural similarity requires separate licensing/legal review or explicit suitable permission.",
+      "Restrictive custom licence covers code, documentation, skills, commands, configuration and UI; public GitHub visibility establishes no redistribution or derivative rights.",
+      "Redistribution, derivative works and competitive use are restricted; the derivative-work definition includes substantial architecture or structure reuse. Internal-use rights do not establish distributed-product reuse rights.",
+      "No definitive legal enforceability claim or legal clearance is made."
+    ]
+  },
+  "existing_authority_owners": [
+    {
+      "record": "ValidationEvidence",
+      "owner": "candidate scanner/validation owner"
+    },
+    {
+      "record": "CleanupEvidence / CleanupEvidenceRef",
+      "owner": "cleanup verifier owner"
+    },
+    {
+      "record": "review provenance",
+      "owner": "SourceControl/reviewer binding"
+    },
+    {
+      "record": "MergeVerification",
+      "owner": "merge verification owner"
+    },
+    {
+      "record": "CompletionProof",
+      "owner": "controlled completion owner"
+    },
+    {
+      "record": "provider request/effect records",
+      "owner": "provider-effect owner"
+    },
+    {
+      "record": "QualificationIdentity / EvidenceApplicability / P09 dossier",
+      "owner": "integrated qualification/applicability layer"
+    }
+  ],
+  "p09_qualification": {
+    "mandatory": "All five applicable refinements are supplemental mandatory Gate 2 qualification requirements in their mapped existing package responsibilities. P09 final qualification verifies applicability, evidence and disposition for each.",
+    "implementation_choice": "A stronger Symphony-native mechanism may satisfy a refinement; no applicable requirement may be silently omitted.",
+    "prohibited": [
+      "copy owner records into another truth store",
+      "recompute domain verdicts",
+      "create another candidate identity",
+      "create another completion token",
+      "create another cleanup verdict",
+      "create another scanner verdict",
+      "create another provider-effect verdict"
+    ]
+  },
+  "escalation_rule": "If satisfying a refinement requires a new authority owner, package, workflow engine, changed candidate identity, completion authority, scanner semantics, credential authority or publication authority, STOP and return to Master Gate.",
+  "v1_1_deferred": {
+    "status": "DEFERRED_NON_GATE2_BLOCKING",
+    "directions": [
+      "read-only evidence dashboard",
+      "evidence-first operator presentation",
+      "candidate/obligation/evidence navigation",
+      "reviewer provenance/independence UI",
+      "current-vs-historical evidence browsing",
+      "human-readable obligation dashboard",
+      "read-only candidate evidence joined view"
+    ],
+    "authority_limits": [
+      "Read-only projections over existing authority records.",
+      "May locate or explain records; cannot mint validity, preserve stale authority or become a new prerequisite authority service.",
+      "Not Gate 2 acceptance prerequisites."
+    ]
+  },
+  "Herdr_relationship": {
+    "Herdr": [
+      "process replacement",
+      "stable kernel process handles",
+      "event loss/resynchronization",
+      "observer-before-effect",
+      "bounded diagnostic drainage",
+      "resource replacement cleanup races"
+    ],
+    "QualityLayer": [
+      "obligation/evidence traceability",
+      "unresolved evidence persistence",
+      "per-claim review scope",
+      "guard-class separation",
+      "historical result/current applicability separation"
+    ],
+    "common_limits": [
+      "Complementary research inputs, not external runtime dependencies.",
+      "Neither external project gains authority or changes P01-P09 topology."
+    ],
+    "historical_pending_status": "Herdr refinement QualityLayer-pending wording remains historical. This supplied Master Gate decision selects supplemental refinements; canonical plan amendment is not required. Do not rewrite the accepted Herdr artifacts."
+  },
+  "authorization_locks": {
+    "QUALITYLAYER_RESEARCH_MATERIALIZATION_AUTHORIZED": "YES",
+    "CREATE_WORKTREE_AUTHORIZED": "YES",
+    "CREATE_GOVERNANCE_BRANCH_AUTHORIZED": "YES",
+    "EDIT_QUALITYLAYER_RESEARCH_AND_REFINEMENT_DOCS_AUTHORIZED": "YES",
+    "LOCAL_DOCUMENT_VALIDATION_AUTHORIZED": "YES",
+    "COMMIT_QUALITYLAYER_DOCS_AUTHORIZED": "YES",
+    "PUSH_QUALITYLAYER_BRANCH_AUTHORIZED": "YES",
+    "OPEN_QUALITYLAYER_PR_AUTHORIZED": "YES",
+    "QUALITYLAYER_DOCS_PR_REQUIRED_CI_CODEX_EXECUTION_AUTHORIZED": "YES",
+    "QUALITYLAYER_DOCS_PR_REQUIRED_CI_CODEX_SCOPE": "EXISTING_REQUIRED_GITHUB_ACTIONS_FOR_THIS_EXACT_QUALITYLAYER_RESEARCH_GOVERNANCE_PR_ONLY",
+    "LOCAL_CODEX_EXECUTION_AUTHORIZED": "NO",
+    "QUALITYLAYER_EXECUTION_AUTHORIZED": "NO",
+    "QUALITYLAYER_DECRYPTION_AUTHORIZED": "NO",
+    "SCANNER_EXECUTION_AUTHORIZED": "NO",
+    "OAUTH_EXECUTION_AUTHORIZED": "NO",
+    "PROVIDER_EXECUTION_AUTHORIZED": "NO",
+    "H100_EXECUTION_AUTHORIZED": "NO",
+    "AUTH_07_CONSUMED": "NO",
+    "MERGE_AUTHORIZED": "NO",
+    "P02_IMPLEMENTATION_AUTHORIZED": "NO",
+    "P03_IMPLEMENTATION_AUTHORIZED": "NO",
+    "P04_IMPLEMENTATION_AUTHORIZED": "NO",
+    "P05_IMPLEMENTATION_AUTHORIZED": "NO",
+    "P06_IMPLEMENTATION_AUTHORIZED": "NO",
+    "P07_IMPLEMENTATION_AUTHORIZED": "NO",
+    "P08_IMPLEMENTATION_AUTHORIZED": "NO",
+    "P09_IMPLEMENTATION_AUTHORIZED": "NO",
+    "AUTH_07": "SUSPENDED_UNCONSUMED",
+    "GATE_2_STATUS": "INCOMPLETE",
+    "P01_CHANGE_REQUIRED_BY_QUALITYLAYER": "NO",
+    "P01_BLOCKED_BY_QUALITYLAYER": "NO",
+    "P01_AUTHORITY_CHANGED_BY_THIS_TASK": "NO"
+  },
+  "normative_document": {
+    "path": "docs/symphony-hardening-playbook-v4.1/GATE2_QUALITYLAYER_EVIDENCE_REFINEMENT_2026-11-03.md",
+    "git_blob": "0ac4308acf2691dee3493de0e45599ce668bdc3d",
+    "raw_sha256": "431a18d649e8b06bf69b2449f5575a30a824ee6535cb5962766fbf4b2a6dc03f",
+    "raw_bytes": 29409
+  }
+}
