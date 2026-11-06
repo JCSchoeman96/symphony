@@ -8,12 +8,13 @@ defmodule SymphonyElixir.Plane.Client do
 
   alias SymphonyElixir.Plane.ReadScheduler
   alias SymphonyElixir.Plane.ReqFinchErrorNormalizer
-  alias SymphonyElixir.WorkControl.{ProviderDispatchWitness, ProviderMutationEnvelope}
+  alias SymphonyElixir.WorkControl.{A4Proof, ProviderDispatchWitness, ProviderMutationEnvelope}
 
   @default_base_url "https://api.plane.so"
   @default_read_scheduler SymphonyElixir.Plane.ReadScheduler
   @read_wait_timeout_ms 240_000
   @connect_timeout_ms 5_000
+  @proof_finch_name SymphonyElixir.H100TransportProofFinch
   @receive_timeout_ms 15_000
   @page_size 100
   @max_pages 100
@@ -77,6 +78,8 @@ defmodule SymphonyElixir.Plane.Client do
          {:ok, response} <- mutation_request(config, work_item_path(config, id), %{"state" => state_id}, opts) do
       mutation_acknowledgement(response)
     end
+  after
+    release_proof_monitor(Keyword.get(opts, :a4_session))
   end
 
   @spec list_work_items(config(), keyword()) :: {:ok, [map()]} | {:error, term()}
@@ -119,6 +122,17 @@ defmodule SymphonyElixir.Plane.Client do
 
   @spec default_base_url() :: String.t()
   def default_base_url, do: @default_base_url
+
+  @spec tls_options(String.t()) :: keyword()
+  def tls_options(host) when is_binary(host) do
+    [
+      verify: :verify_peer,
+      versions: [:"tlsv1.2"],
+      cacerts: :public_key.cacerts_get(),
+      server_name_indication: String.to_charlist(host),
+      timeout: @connect_timeout_ms
+    ]
+  end
 
   @spec validate_config(config()) :: :ok | {:error, term()}
   def validate_config(config) when is_map(config) do
@@ -289,6 +303,12 @@ defmodule SymphonyElixir.Plane.Client do
       headers: [{"X-API-Key", config.api_key}, {"Accept", "application/json"}]
     }
 
+    with :ok <- qualification_transport_guard(config, opts) do
+      execute_request(config, request, opts, request_class)
+    end
+  end
+
+  defp execute_request(config, request, opts, request_class) do
     increment_request_metric(Keyword.get(opts, :request_metrics), 1)
 
     request_fun = Keyword.get(opts, :request_fun)
@@ -404,9 +424,51 @@ defmodule SymphonyElixir.Plane.Client do
       ]
     }
 
-    with :ok <- validate_request_transport(opts) do
+    with :ok <- qualification_transport_guard(config, opts),
+         :ok <- validate_request_transport(opts) do
       dispatch_mutation_request(config, request, opts)
     end
+  end
+
+  @doc false
+  @spec qualification_transport_guard(config(), keyword()) :: :ok | {:error, atom()}
+  def qualification_transport_guard(config, opts) do
+    if Application.get_env(:symphony_elixir, :a4_qualification_local_only, false) do
+      request_funs = Keyword.get_values(opts, :request_fun)
+      base_url = Map.get(config, :base_url)
+      uri = if is_binary(base_url), do: URI.parse(base_url), else: nil
+
+      cond do
+        length(request_funs) > 1 ->
+          {:error, :qualification_transport_ambiguous}
+
+        (uri && uri.host == "api.plane.so") and request_funs in [[], [nil]] and
+            not local_req_test_transport?(opts) ->
+          {:error, :qualification_live_plane_http_forbidden}
+
+        true ->
+          :ok
+      end
+    else
+      :ok
+    end
+  rescue
+    _error -> {:error, :qualification_transport_invalid}
+  end
+
+  defp local_req_test_transport?(opts) do
+    defaults = Req.default_options()
+    req_test_plug? = match?({Req.Test, _stub}, Keyword.get(defaults, :plug))
+
+    explicit_local_transport? =
+      Keyword.get(opts, :qualification_local_transport?, false) or
+        Application.get_env(:symphony_elixir, :a4_qualification_local_transport, false)
+
+    explicit_adapter? =
+      explicit_local_transport? and
+        Enum.any?(Keyword.take(defaults, [:adapter, :plug]), fn {_key, value} -> is_function(value) end)
+
+    req_test_plug? or explicit_adapter?
   end
 
   defp validate_witness_configuration(opts) do
@@ -459,7 +521,8 @@ defmodule SymphonyElixir.Plane.Client do
   defp provider_mutation_envelope?(_envelope), do: false
 
   defp validate_request_transport(opts) do
-    if Keyword.get(opts, :dispatch_witness_required?, false) and is_function(Keyword.get(opts, :request_fun)) do
+    if Keyword.get(opts, :dispatch_witness_required?, false) and is_function(Keyword.get(opts, :request_fun)) and
+         is_nil(Keyword.get(opts, :a4_session)) do
       {:error, {:dispatch_witness_failed, :request_fun_transport_not_supported}}
     else
       :ok
@@ -467,6 +530,13 @@ defmodule SymphonyElixir.Plane.Client do
   end
 
   defp dispatch_mutation_request(config, request, opts) do
+    case Keyword.get(opts, :a4_session) do
+      nil -> dispatch_ordinary_mutation_request(config, request, opts)
+      token -> proof_mutation_request(config, request, opts, token)
+    end
+  end
+
+  defp dispatch_ordinary_mutation_request(config, request, opts) do
     case Keyword.get(opts, :request_fun) do
       request_fun when is_function(request_fun) ->
         case invoke_mutation_request_fun(request_fun, request, config) do
@@ -482,6 +552,162 @@ defmodule SymphonyElixir.Plane.Client do
         {:error, :provider_unavailable}
     end
   end
+
+  defp proof_mutation_request(config, request, opts, token) do
+    do_proof_mutation_request(config, request, opts, token)
+  end
+
+  defp do_proof_mutation_request(config, request, opts, token) do
+    envelope = Keyword.get(opts, :provider_mutation_envelope)
+
+    with true <- Keyword.get(opts, :dispatch_witness_required?, false),
+         %ProviderMutationEnvelope{} <- envelope,
+         :ok <- validate_proof_binding(config, request, envelope, token),
+         nil <- Keyword.get(opts, :request_fun),
+         {:ok, ready_token} <- A4Proof.ready(token),
+         :ok <- validate_proof_ready(envelope, ready_token),
+         :ok <- A4Proof.consume(ready_token, ready_token.bindings),
+         {:ok, finch_pid} <- start_proof_finch(ready_token) do
+      try do
+        perform_mutation_request(config, request, Keyword.put(opts, :a4_proof_ready, ready_token))
+      after
+        stop_proof_finch(finch_pid)
+      end
+    else
+      {:error, {:dispatch_witness_failed, _reason}} = error -> error
+      false -> proof_failure(:witness_required)
+      nil -> proof_failure(:request_fun_transport_not_supported)
+      _ -> proof_failure(:invalid_proof_session)
+    end
+  end
+
+  defp validate_proof_binding(config, request, envelope, token) do
+    manifest = token.manifest
+    base_url = config.base_url
+    uri = URI.parse(base_url)
+    authority = proof_authority(uri)
+    body = Jason.encode!(request.body)
+    path = request.path
+    provider_request_id = envelope.provider_request_id
+
+    checks =
+      [
+        {token.owner == self(), :proof_token_owner_mismatch}
+      ] ++
+        proof_origin_checks(token, manifest, base_url, authority) ++
+        proof_identity_checks(manifest, envelope, request) ++
+        proof_request_checks(token, request, path, body, provider_request_id)
+
+    case Enum.find(checks, fn {valid?, _field} -> not valid? end) do
+      nil -> :ok
+      {_valid?, field} -> proof_failure({:proof_manifest_mismatch, field})
+    end
+  rescue
+    _ -> proof_failure(:invalid_proof_session)
+  end
+
+  defp proof_origin_checks(token, manifest, base_url, authority) do
+    origin_matches? =
+      token.bindings.origin_base_url == base_url and manifest_value(manifest, :origin_base_url) == base_url
+
+    [
+      {origin_matches?, :origin_base_url},
+      {manifest_value(manifest, :origin_authority) == authority, :origin_authority}
+    ]
+  end
+
+  defp proof_identity_checks(manifest, envelope, request) do
+    [
+      {manifest_value(manifest, :method) == "PATCH" and request.method == :patch, :method},
+      {manifest_value(manifest, :provider_request_id) == envelope.provider_request_id, :provider_request_id},
+      {manifest_value(manifest, :work_item_id) == envelope.work_item_id, :work_item_id},
+      {manifest_value(manifest, :workspace_id) == envelope.workspace_id, :workspace_id},
+      {manifest_value(manifest, :project_id) == envelope.project_id, :project_id},
+      {manifest_value(manifest, :target_state_id) == envelope.target_provider_state_id, :target_state_id},
+      {manifest_value(manifest, :transition_attempt_id) == envelope.transition_attempt_id, :transition_attempt_id}
+    ]
+  end
+
+  defp proof_request_checks(token, request, path, body, provider_request_id) do
+    [
+      {token.bindings.path == path and byte_size(path) <= 2048, :path_bytes},
+      {token.bindings.path_bytes == byte_size(path), :path_bytes},
+      {token.bindings.body_bytes == byte_size(body) and byte_size(body) <= 512, :body_bytes},
+      {request_id_absent_from_request?(request, path, body, provider_request_id), :provider_request_id_origin_leak}
+    ]
+  end
+
+  defp request_id_absent_from_request?(request, path, body, provider_request_id) do
+    not String.contains?(path, provider_request_id) and
+      not String.contains?(body, provider_request_id) and
+      Enum.all?(request.headers, fn {name, value} ->
+        not String.contains?(name, provider_request_id) and not String.contains?(value, provider_request_id)
+      end)
+  end
+
+  defp validate_proof_ready(envelope, token) do
+    manifest = token.manifest
+    ready = token.ready
+    request_id = envelope.provider_request_id
+
+    valid? =
+      ready_value(ready, :provider_request_id) == request_id and
+        ready_value(ready, :listen_host) == "127.0.0.1" and
+        is_integer(ready_value(ready, :bound_port)) and ready_value(ready, :bound_port) in 1..65_535 and
+        (ready_value(ready, :script_blob_sha256) || ready_value(ready, :relay_script_blob_sha256)) ==
+          manifest_value(manifest, :relay_script_blob_sha256)
+
+    if valid?, do: :ok, else: proof_failure({:proof_manifest_mismatch, :ready})
+  end
+
+  defp start_proof_finch(token) do
+    manifest = token.manifest
+    ready = token.ready
+    host = manifest_value(manifest, :origin_authority) |> String.split(":") |> hd()
+    port = ready_value(ready, :bound_port)
+
+    pools = %{
+      default: [
+        protocols: [:http1],
+        size: 1,
+        count: 1,
+        conn_opts: [
+          proxy: {:http, "127.0.0.1", port, []},
+          proxy_headers: [{"x-symphony-provider-request-id", manifest_value(manifest, :provider_request_id)}],
+          transport_opts: tls_options(host)
+        ]
+      ]
+    }
+
+    case Finch.start_link(name: @proof_finch_name, pools: pools) do
+      {:ok, pid} -> {:ok, pid}
+      {:error, reason} -> proof_failure({:proof_finch_start_failed, safe_finch_reason(reason)})
+    end
+  rescue
+    _ -> proof_failure(:proof_finch_start_failed)
+  end
+
+  defp stop_proof_finch(pid) when is_pid(pid) do
+    if Process.alive?(pid), do: Supervisor.stop(pid)
+    :ok
+  catch
+    _, _ -> :ok
+  end
+
+  defp proof_authority(%URI{host: host, port: port}) when is_binary(host) do
+    default_port = if port == 443, do: 443, else: port
+    "#{host}:#{default_port}"
+  end
+
+  defp proof_authority(_), do: nil
+
+  defp manifest_value(manifest, key), do: Map.get(manifest, key) || Map.get(manifest, Atom.to_string(key))
+  defp ready_value(ready, key), do: Map.get(ready, key) || Map.get(ready, Atom.to_string(key))
+  defp proof_failure(reason), do: {:error, {:dispatch_witness_failed, reason}}
+  defp safe_finch_reason({:already_started, _pid}), do: :already_started
+  defp safe_finch_reason(_reason), do: :start_failed
+
+  defp release_proof_monitor(token), do: A4Proof.release(token)
 
   defp invoke_mutation_request_fun(fun, request, config) do
     invoke_mutation_request_fun_by_arity(:erlang.fun_info(fun, :arity), fun, request, config)
@@ -522,6 +748,12 @@ defmodule SymphonyElixir.Plane.Client do
       redirect: false,
       into: &bounded_response_body/2
     ]
+
+    req_options =
+      case Keyword.get(opts, :a4_proof_ready) do
+        nil -> req_options
+        _ready -> req_options |> Keyword.delete(:connect_options) |> Keyword.put(:finch, @proof_finch_name)
+      end
 
     req_options = attach_request_correlation(req_options, envelope)
 
@@ -801,6 +1033,9 @@ defmodule SymphonyElixir.Plane.Client do
     project_id = first_present(config, [:project_id, "project_id"])
     api_key = first_present(config, [:api_key, "api_key"])
 
+    allow_test_or_proof_base? =
+      Keyword.has_key?(opts, :request_fun) or valid_local_proof_base?(base_url, opts)
+
     cond do
       not present?(workspace_slug) or not present?(project_id) ->
         {:error, :invalid_scope}
@@ -808,7 +1043,7 @@ defmodule SymphonyElixir.Plane.Client do
       not present?(api_key) ->
         {:error, :missing_credential}
 
-      validate_base_url(base_url, Keyword.has_key?(opts, :request_fun)) != :ok ->
+      validate_base_url(base_url, allow_test_or_proof_base?) != :ok ->
         {:error, :invalid_base_url}
 
       true ->
@@ -836,6 +1071,25 @@ defmodule SymphonyElixir.Plane.Client do
   end
 
   defp validate_base_url(_value, _test_request?), do: :error
+
+  defp valid_local_proof_base?(base_url, opts) do
+    case Keyword.get(opts, :a4_session) do
+      %{manifest: manifest} when is_map(manifest) ->
+        uri = URI.parse(base_url)
+        authority = proof_authority(uri)
+
+        manifest_value(manifest, :origin_kind) in [:local_qualification, "local_qualification"] and
+          manifest_value(manifest, :origin_base_url) == base_url and
+          manifest_value(manifest, :origin_authority) == authority and
+          uri.scheme == "https" and uri.host in ["127.0.0.1", "localhost", "::1"] and
+          is_integer(uri.port) and uri.port in 1..65_535
+
+      _ ->
+        false
+    end
+  rescue
+    _ -> false
+  end
 
   defp parse_base_url_uri(value) do
     case URI.parse(value) do

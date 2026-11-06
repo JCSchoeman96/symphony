@@ -125,6 +125,7 @@ defmodule SymphonyElixir.TrackerReadAttestationTest do
   defp with_plane_workflow(fun) do
     previous_workflow_path = Application.get_env(:symphony_elixir, :workflow_file_path)
     previous_signing_key = Application.get_env(:symphony_elixir, :completion_proof_signing_key)
+    previous_local_transport = Application.get_env(:symphony_elixir, :a4_qualification_local_transport)
     previous_plane_key = System.get_env("PLANE_API_KEY")
     previous_req_options = Req.default_options()
     root = Path.join(System.tmp_dir!(), "tracker-attestation-#{System.unique_integer([:positive])}")
@@ -142,6 +143,7 @@ defmodule SymphonyElixir.TrackerReadAttestationTest do
     after
       restore_application_env(:workflow_file_path, previous_workflow_path)
       restore_application_env(:completion_proof_signing_key, previous_signing_key)
+      restore_application_env(:a4_qualification_local_transport, previous_local_transport)
       restore_env("PLANE_API_KEY", previous_plane_key)
       Req.default_options(previous_req_options)
 
@@ -192,6 +194,8 @@ defmodule SymphonyElixir.TrackerReadAttestationTest do
   end
 
   defp install_plane_req_adapter do
+    Application.put_env(:symphony_elixir, :a4_qualification_local_transport, true)
+
     Req.default_options(
       adapter: fn request ->
         path = request.url.path

@@ -16,6 +16,7 @@ defmodule SymphonyElixir.TransitionCoordinatorDefaultPathTest do
     ProviderObservation,
     ProviderProjectContract,
     SemanticTransitionIntent,
+    TransitionAttemptLedger,
     WorkflowLifecycle,
     WorkItem
   }
@@ -67,6 +68,64 @@ defmodule SymphonyElixir.TransitionCoordinatorDefaultPathTest do
 
     assert {:ok, %{state: :verified}} = request_transition(coordinator, intent())
     assert_received {:applied, %WorkItem{validated_lifecycle_state: :in_progress}}
+  end
+
+  test "A4 requests a manifest only after durable runtime identity binding and still freshly verifies refusal" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory", symphony_project_id: "project-1")
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue("Ready", "state-ready")])
+    root = Path.join(System.tmp_dir!(), "a4-default-boundary-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(root)
+    on_exit(fn -> File.rm_rf(root) end)
+    {:ok, ledger} = TransitionAttemptLedger.open("project-1", %{tracker_kind: "memory", provider_scope: %{project_id: "project-1"}}, path: Path.join(root, "attempts.dets"))
+    parent = self()
+
+    controller =
+      spawn(fn ->
+        receive do
+          {:a4_manifest_request, _owner, _ref, _request, safe} ->
+            persisted = TransitionAttemptLedger.latest_for_work_item(ledger, "work-1")
+            send(parent, {:a4_durable_manifest_request, safe, persisted})
+
+            receive do
+              :stop -> :ok
+            end
+        end
+      end)
+
+    on_exit(fn -> Process.exit(controller, :kill) end)
+    proof_context = ready_context() |> Map.put(:work_item, work_item()) |> Map.put(:tracker_settings, %{provider: %{workspace_slug: "workspace-1", project_id: "project-1"}})
+    {:ok, orchestrator} = DefaultPathOrchestrator.start_link(transition_context: {:ok, proof_context})
+
+    {:ok, coordinator} =
+      TransitionCoordinator.start_link(
+        name: nil,
+        ledger: ledger,
+        orchestrator: orchestrator,
+        refresh_contract: fn _ -> {:ok, contract()} end,
+        dispatch_witness_required?: true,
+        dispatch_witness_sink: fn _ -> flunk("A4 refusal must not create a witness") end,
+        a4_controller: %{
+          controller: controller,
+          ref: make_ref(),
+          gate: :atomics.new(1, signed: false),
+          timeout_ms: 50,
+          candidate_sha: String.duplicate("a", 40),
+          candidate_tree: String.duplicate("b", 40)
+        }
+      )
+
+    assert {:ok, result} = request_transition(coordinator, intent())
+    assert result.state in [:provider_failed, :indeterminate]
+    assert_received {:a4_durable_manifest_request, safe, {:ok, persisted}}
+    assert persisted.state == :mutation_submitted
+    assert persisted.provider_request_id == safe.provider_request_id
+    assert persisted.transition_attempt_id == safe.transition_attempt_id
+    refute Map.has_key?(safe, :body)
+    refute Map.has_key?(safe, :api_key)
+    assert result.provider_ack_status == :ambiguous
+    send(controller, :stop)
+    GenServer.stop(coordinator)
+    GenServer.stop(orchestrator)
   end
 
   test "Done submission requires SourceControl merge verification and closes against the fresh Done read" do

@@ -109,6 +109,36 @@ defmodule SymphonyElixir.Plane.Adapter do
         mapping.state_id,
         request_opts(Keyword.get(opts, :request_fun), opts)
       )
+    else
+      {:error, reason} ->
+        if is_nil(Keyword.get(opts, :a4_session)) do
+          {:error, reason}
+        else
+          {:error, {:dispatch_witness_failed, {:adapter_preflight_failed, reason}}}
+        end
+    end
+  end
+
+  @doc false
+  @spec a4_binding(map(), map()) :: {:ok, map()} | {:error, term()}
+  def a4_binding(settings, envelope) do
+    {slug, _workspace, project} = configured_scope(settings, provider_settings(settings))
+
+    if is_binary(slug) and is_binary(project) do
+      encode = &URI.encode(&1, fn char -> URI.char_unreserved?(char) end)
+      path = "/api/v1/workspaces/#{encode.(slug)}/projects/#{encode.(project)}/work-items/#{encode.(envelope.work_item_id)}/"
+
+      {:ok,
+       %{
+         origin_base_url: Client.default_base_url(),
+         origin_authority: "api.plane.so:443",
+         method: "PATCH",
+         path: path,
+         path_bytes: byte_size(path),
+         body_bytes: byte_size(Jason.encode!(%{"state" => envelope.target_provider_state_id}))
+       }}
+    else
+      {:error, :invalid_proof_scope}
     end
   end
 
@@ -459,6 +489,7 @@ defmodule SymphonyElixir.Plane.Adapter do
         :class,
         :epoch_id,
         :provider_mutation_envelope,
+        :a4_session,
         :dispatch_witness_sink,
         :dispatch_witness_required?,
         :dispatch_witness_timeout_ms
