@@ -282,6 +282,11 @@ defmodule SymphonyElixir.Plane.DependencyReader do
     end
   end
 
+  defp relation_target(entry, _project_id) when is_binary(entry) do
+    target_id = String.trim(entry)
+    if target_id == "", do: {:error, :relation_malformed}, else: {:ok, target_id}
+  end
+
   defp relation_target(_entry, _project_id), do: {:error, :relation_malformed}
 
   defp canonical_observation(:blocked_by, owner_id, target_id),

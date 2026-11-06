@@ -36,7 +36,9 @@ defmodule SymphonyElixir.PlaneClientReqPolicyTest do
       end
     )
 
-    assert {:ok, %{"id" => "project-1"}} = Client.get_project(@config)
+    assert {:ok, %{"id" => "project-1"}} =
+             Client.get_project(@config, qualification_local_transport?: true)
+
     assert_receive {:request, request}
     assert request.method == :get
     assert request.options[:compressed] == false
@@ -73,7 +75,9 @@ defmodule SymphonyElixir.PlaneClientReqPolicyTest do
       end
     )
 
-    assert {:error, :provider_unavailable} = Client.get_project(@config, scheduler: nil)
+    assert {:error, :provider_unavailable} =
+             Client.get_project(@config, scheduler: nil, qualification_local_transport?: true)
+
     assert_receive {:request, request}
     assert request.options[:retry] == false
     refute_receive {:request, _request}
@@ -97,7 +101,9 @@ defmodule SymphonyElixir.PlaneClientReqPolicyTest do
       end
     )
 
-    assert {:error, :provider_malformed} = Client.get_project(@config)
+    assert {:error, :provider_malformed} =
+             Client.get_project(@config, qualification_local_transport?: true)
+
     assert_receive {:request, request}
     refute_receive {:request, _request}
     assert request.options[:redirect] == false
@@ -111,7 +117,8 @@ defmodule SymphonyElixir.PlaneClientReqPolicyTest do
       end
     )
 
-    assert {:error, :provider_response_too_large} = Client.get_project(@config)
+    assert {:error, :provider_response_too_large} =
+             Client.get_project(@config, qualification_local_transport?: true)
   end
 
   test "required witness mode pins Finch over a global Req adapter" do

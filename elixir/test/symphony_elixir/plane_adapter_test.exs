@@ -822,7 +822,13 @@ defmodule SymphonyElixir.PlaneAdapterTest do
              Adapter.validate_config(%{kind: "plane", api_key: "secret", workspace_slug: "workspace-1", project_id: "project-1"})
 
     assert {:error, :missing_plane_api_key} =
-             Adapter.validate_config(%{kind: "plane", workspace_slug: "workspace-1", project_id: "project-1"})
+             Adapter.validate_config(%{
+               kind: "plane",
+               api_key: "",
+               workspace_slug: "workspace-1",
+               workspace_id: "workspace-stable-1",
+               project_id: "project-1"
+             })
 
     assert {:error, :invalid_plane_api_key_reference} =
              Adapter.validate_config(%{
